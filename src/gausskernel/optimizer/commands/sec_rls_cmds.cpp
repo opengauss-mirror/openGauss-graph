@@ -40,6 +40,7 @@
 #include "rewrite/rewriteManip.h"
 #include "rewrite/rewriteRlsPolicy.h"
 #include "storage/lock/lock.h"
+#include "storage/tcap.h"
 #include "utils/acl.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
@@ -51,6 +52,7 @@
 #include "utils/sec_rls_utils.h"
 #include "utils/syscache.h"
 #include "utils/snapmgr.h"
+#include "utils/knl_relcache.h"
 
 /*
  * The row level security policies for one relation should be
@@ -129,7 +131,7 @@ void CreateRlsPolicy(CreateRlsPolicyStmt* stmt)
 
     /* Get id of table.  Also handles permissions checks. */
     Oid tableOid = RangeVarGetRelidExtended(
-        stmt->relation, AccessExclusiveLock, false, false, false, false, RangeVarCallbackForRlsPolicy, (void*)stmt);
+        stmt->relation, RowExclusiveLock, false, false, false, false, RangeVarCallbackForRlsPolicy, (void*)stmt);
 
     /* Open target table to build quals. No additional lock is necessary. */
     Relation targetTable = relation_open(tableOid, NoLock);
@@ -291,7 +293,9 @@ void AlterRlsPolicy(AlterRlsPolicyStmt* stmt)
      */
     Oid relid = InvalidOid;
     relid = RangeVarGetRelidExtended(
-        stmt->relation, AccessExclusiveLock, false, false, false, false, RangeVarCallbackForRlsPolicy, (void*)stmt);
+        stmt->relation, RowExclusiveLock, false, false, false, false, RangeVarCallbackForRlsPolicy, (void*)stmt);
+
+    TrForbidAccessRbObject(RelationRelationId, relid, stmt->relation->relname);
 
     /* Open pg_rlspolicy relation */
     Relation pg_rlspolicy = heap_open(RlsPolicyRelationId, RowExclusiveLock);
@@ -473,13 +477,15 @@ void RenameRlsPolicy(RenameStmt* renameStmt)
      */
     Oid relid = InvalidOid;
     relid = RangeVarGetRelidExtended(renameStmt->relation,
-        AccessExclusiveLock,
+        RowExclusiveLock,
         false,
         false,
         false,
         false,
         RangeVarCallbackForRlsPolicy,
         (void*)renameStmt);
+
+    TrForbidAccessRbObject(RelationRelationId, relid, renameStmt->relation->relname);
 
     /* Open pg_rlspolicy relation */
     Relation pg_rlspolicy = heap_open(RlsPolicyRelationId, RowExclusiveLock);
@@ -696,7 +702,7 @@ void RemoveRlsPolicyById(Oid rlsPolicyOid)
     /* Open and exclusive-lock the relation the trigger belongs to. */
     Oid relationOid = ((Form_pg_rlspolicy)GETSTRUCT(tuple))->polrelid;
     Assert(OidIsValid(relationOid));
-    Relation targetTable = relation_open(relationOid, AccessExclusiveLock);
+    Relation targetTable = relation_open(relationOid, RowExclusiveLock);
 
     /* Check whether support RLS for this relation */
     SupportRlsForRel(targetTable);
@@ -711,7 +717,7 @@ void RemoveRlsPolicyById(Oid rlsPolicyOid)
     CacheInvalidateRelcache(targetTable);
 
     /* Remove tuple done */
-    relation_close(targetTable, AccessExclusiveLock);
+    relation_close(targetTable, RowExclusiveLock);
     heap_close(pg_rlspolicy, RowExclusiveLock);
     return;
 }
@@ -790,7 +796,7 @@ void RelationBuildRlsPolicies(Relation relation)
      * Set up memory context, always set up some kind of policy here.
      * If no explicit policies are found then an implicit default-deny policy is created.
      */
-    MemoryContext rlscxt = AllocSetContextCreate(u_sess->cache_mem_cxt,
+    MemoryContext rlscxt = AllocSetContextCreate(LocalMyDBCacheMemCxt(),
         "Row-level-security policy descriptor",
         ALLOCSET_SMALL_MINSIZE,
         ALLOCSET_SMALL_INITSIZE,

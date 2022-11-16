@@ -1,11 +1,12 @@
 /* -------------------------------------------------------------------------
  *
  * defrem.h
- *	  POSTGRES define and remove utility definitions.
+ *	  openGauss define and remove utility definitions.
  *
  *
  * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
+ * Portions Copyright (c) 2021, openGauss Contributors
  *
  * src/include/commands/defrem.h
  *
@@ -34,19 +35,31 @@ extern char* ChooseRelationName(
     bool reverseTruncate = false);
 extern bool CheckIndexCompatible(Oid oldId, char* accessMethodName, List* attributeList, List* exclusionOpNames);
 extern Oid GetDefaultOpClass(Oid type_id, Oid am_id);
+extern void ComputeIndexAttrs(IndexInfo* indexInfo, Oid* typeOidP, Oid* collationOidP, Oid* classOidP,
+    int16* colOptionP, List* attList, List* exclusionOpNames, Oid relId, const char* accessMethodName,
+    Oid accessMethodId, bool amcanorder, bool isconstraint);
+extern List* ChooseIndexColumnNames(const List* indexElems);
+
+#ifdef ENABLE_MULTIPLE_NODES
+extern void mark_indisvalid_local(char* schname, char* idxname);
+extern void mark_indisvalid_all_cns(char* schname, char* idxname);
+#endif
 
 /* commands/functioncmds.c */
 extern bool PrepareCFunctionLibrary(HeapTuple tup);
 extern void InsertIntoPendingLibraryDelete(const char* filename, bool atCommit);
 extern void libraryDoPendingDeletes(bool isCommit);
 extern void ResetPendingLibraryDelete();
-extern void CreateFunction(CreateFunctionStmt* stmt, const char* queryString);
+extern void CreateFunction(CreateFunctionStmt* stmt, const char* queryString, Oid pkg_oid = InvalidOid);
 extern void RemoveFunctionById(Oid funcOid);
+extern void remove_encrypted_proc_by_id(Oid funcOid);
+extern void RemovePackageById(Oid pkgOid, bool isBody = false);
+extern void DeleteFunctionByPackageOid(Oid package_oid);
 extern void SetFunctionReturnType(Oid funcOid, Oid newRetType);
 extern void SetFunctionArgType(Oid funcOid, int argIndex, Oid newArgType);
 extern void RenameFunction(List* name, List* argtypes, const char* newname);
 extern void AlterFunctionOwner(List* name, List* argtypes, Oid newOwnerId);
-extern void AlterFunctionOwner_oid(Oid procOid, Oid newOwnerId);
+extern void AlterFunctionOwner_oid(Oid procOid, Oid newOwnerId, bool byPackage = false);
 extern bool IsFunctionTemp(AlterFunctionStmt* stmt);
 extern void AlterFunction(AlterFunctionStmt* stmt);
 extern void CreateCast(CreateCastStmt* stmt);
@@ -57,6 +70,11 @@ extern void ExecuteDoStmt(DoStmt* stmt, bool atomic);
 extern Oid get_cast_oid(Oid sourcetypeid, Oid targettypeid, bool missing_ok);
 
 /* commands/operatorcmds.c */
+extern void CreatePackageCommand(CreatePackageStmt* parsetree, const char* queryString);
+extern void CreatePackageBodyCommand(CreatePackageBodyStmt* parsetree, const char* queryString);
+extern void AlterPackageOwner(List* name, Oid newOwnerId);
+extern void AlterFunctionOwnerByPkg(Oid package_oid, Oid newOwnerId);
+
 extern void DefineOperator(List* names, List* parameters);
 extern void RemoveOperatorById(Oid operOid);
 extern void AlterOperatorOwner(List* name, TypeName* typeName1, TypeName* typename2, Oid newOwnerId);
@@ -158,6 +176,7 @@ extern List* FindOrRemoveForeignTableOption(List* optList, const char* optName, 
 extern char* defGetString(DefElem* def);
 extern double defGetNumeric(DefElem* def);
 extern bool defGetBoolean(DefElem* def);
+extern int defGetMixdInt(DefElem *def);
 extern int64 defGetInt64(DefElem* def);
 extern List* defGetQualifiedName(DefElem* def);
 extern TypeName* defGetTypeName(DefElem* def);
@@ -166,6 +185,7 @@ extern List* defSetOption(List* options, const char* name, Node* value);
 extern void delete_file_handle(const char* library_path);
 extern int libraryGetPendingDeletes(bool forCommit, char** str_ptr, int* libraryLen);
 extern void removeLibrary(const char* filename);
+extern List *defGetStringList(DefElem *def);
 
 /* support routines in commands/datasourcecmds.cpp */
 extern void CreateDataSource(CreateDataSourceStmt* stmt);
@@ -177,6 +197,11 @@ extern void RemoveDataSourceById(Oid src_Id);
 extern Oid GetFunctionNodeGroup(CreateFunctionStmt* stmt, bool* multi_group);
 extern Oid GetFunctionNodeGroupByFuncid(Oid funcid);
 extern Oid GetFunctionNodeGroup(AlterFunctionStmt* stmt);
+
+#ifdef GS_GRAPH
+/* for agensgraph */
+extern Oid	ReindexLabel(RangeVar *relation, int options, ObjectType type);
+#endif
 
 #endif /* !FRONTEND_PARSER */
 extern DefElem* defWithOids(bool value);

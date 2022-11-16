@@ -1078,6 +1078,7 @@ WHERE d.classoid IS NULL AND p1.oid <= 9999 order by 1;
  1991 | comm_client_info
  1992 | global_comm_get_client_info
  1993 | shobj_description
+ 1995 | gs_comm_proxy_thread_status
  1998 | pg_get_running_xacts
  1999 | pg_check_xidlimit
  2000 | pg_get_xidlimit
@@ -2560,6 +2561,10 @@ WHERE d.classoid IS NULL AND p1.oid <= 9999 order by 1;
  4506 | listagg
  4507 | interval_list_agg_noarg2_transfn
  4508 | listagg
+ 4579 | gs_get_active_archiving_standby
+ 4580 | gs_pitr_archive_slot_force_advance
+ 4581 | gs_pitr_clean_history_global_barriers
+ 4582 | gs_pitr_get_warning_for_xlog_force_recycle
  4600 | checksum
  4601 | checksumtext_agg_transfn
  4651 | pg_cbm_tracked_location
@@ -2578,6 +2583,7 @@ WHERE d.classoid IS NULL AND p1.oid <= 9999 order by 1;
  4703 | has_directory_privilege
  4704 | has_directory_privilege
  4705 | has_directory_privilege
+ 4767 | gs_read_block_from_remote
  4789 | remote_rto_stat
  4999 | remote_recovery_status
  5000 | get_instr_workload_info
@@ -2613,6 +2619,12 @@ WHERE d.classoid IS NULL AND p1.oid <= 9999 order by 1;
  5030 | gs_wlm_readjust_user_space_through_username
  5031 | pg_stat_get_wlm_instance_info
  5032 | pg_stat_get_wlm_instance_info_with_cleanup
+ 5034 | gs_io_wait_status
+ 5077 | gs_hadr_local_rto_and_rpo_stat
+ 5078 | gs_hadr_remote_rto_and_rpo_stat
+ 5254 | gs_get_session_memctx_detail
+ 5255 | gs_get_shared_memctx_detail
+ 5256 | gs_get_thread_memctx_detail
  5345 | pv_builtin_functions
  5519 | int1cmp
  5520 | hashint1
@@ -2690,6 +2702,8 @@ WHERE d.classoid IS NULL AND p1.oid <= 9999 order by 1;
  6204 | pg_stop_backup
  6224 | gs_get_next_xid_csn
  6321 | pg_stat_file_recursive
+ 7001 | pg_stat_segment_extent_usage
+ 7002 | gs_space_shrink
  7777 | sysdate
  7998 | set_working_grand_version_num_manually
  8050 | datalength

@@ -276,6 +276,7 @@ void InitCollectInfo(WLMCollectInfo* pCollectInfo)
     int rc;
 
     /* reset collect info */
+    pfree_ext(pCollectInfo->sdetail.statement);
     rc = memset_s(pCollectInfo, sizeof(WLMCollectInfo), 0, sizeof(WLMCollectInfo));
     securec_check(rc, "\0", "\0");
 
@@ -2349,6 +2350,7 @@ void WLMReadjustUserSpaceByNameWithResetFlag(const char* username, bool resetFla
                 if (userdata->userid == uid) {
                     /* readjust user space */
                     WLMReAdjustUserSpaceWithResetFlag(userdata, resetFlag);
+                    hash_seq_term(&hash_seq);
                     break;
                 }
             }
@@ -2780,7 +2782,6 @@ void WLMUpdateUserInfo(void)
             Oid uid = uids[idx];
             char keystr[NAMEDATALEN + 64] = {0};
             char name[NAMEDATALEN];
-
             /* we will get user name, but maybe the user has been removed */
             if (GetRoleName(uid, name, sizeof(name)) == NULL) {
                 continue;
@@ -5695,13 +5696,7 @@ void WLMSetDNodeInfoStatus(const Qid* qid, WLMStatusTag status)
 
             break;
         case WLM_STATUS_RUNNING: {
-            TimestampTz now = GetCurrentTimestamp();
-
-            /* use cpu_collect_timer to compute interval end time and set a timer */
-            t_thrd.wlm_cxt.except_ctl->intvalEndTime =
-                TimestampTzPlusMilliseconds(now, u_sess->attr.attr_resource.cpu_collect_timer * MSECS_PER_SEC);
-            (void)WLMSetTimer(now, t_thrd.wlm_cxt.except_ctl->intvalEndTime);
-
+            /* set cpu time */
             WLMCheckPoint(WLM_STATUS_RUNNING);
 
             /* resource track is valid, we must save the session info */
@@ -6450,7 +6445,6 @@ void WLMInitializeStatInfo(void)
  */
 void WLMSetStatInfo(const char* sqltext)
 {
-    pfree_ext(t_thrd.wlm_cxt.collect_info->sdetail.statement);
     /* reset all statistics info */
     ResetAllStatInfo();
 
@@ -6939,6 +6933,29 @@ void WLMFillGeneralDataSingleNode(WLMGeneralData* gendata, WLMDNodeInfo* nodeInf
     setTopNWLMSessionInfo(gendata, queryMemInChunks, totalCpuTime, g_instance.attr.attr_common.PGXCNodeName, TOP5);
 }
 
+static bool WLMCheckSessionStatisticsAllowed()
+{
+    if (! (IS_PGXC_COORDINATOR || IS_SINGLE_NODE)) {
+        ereport(WARNING, (errmsg("This view is not allowed on datanode.")));
+        return false;
+    }
+
+    /* check workload manager is valid */
+    if (!ENABLE_WORKLOAD_CONTROL) {
+        ereport(WARNING, (errmsg("workload manager is not valid.")));
+        return false;
+    }
+
+    /* disable resource track function, nothing to fetch */
+    if (!u_sess->attr.attr_resource.enable_resource_track) {
+        ereport(WARNING, (errmsg("enable_resource_track is not valid.")));
+        return false;
+    }
+
+    return true;
+}
+
+
 /*
  * function name: WLMGetSessionStatistics
  * description  : get session statistics
@@ -6954,20 +6971,7 @@ void* WLMGetSessionStatistics(int* num)
 
     HASH_SEQ_STATUS hash_seq;
 
-    if (! (IS_PGXC_COORDINATOR || IS_SINGLE_NODE)) {
-        ereport(WARNING, (errmsg("This view is not allowed on datanode.")));
-        return NULL;
-    }
-
-    /* check workload manager is valid */
-    if (!ENABLE_WORKLOAD_CONTROL) {
-        ereport(WARNING, (errmsg("workload manager is not valid.")));
-        return NULL;
-    }
-
-    /* disable resource track function, nothing to fetch */
-    if (!u_sess->attr.attr_resource.enable_resource_track) {
-        ereport(WARNING, (errmsg("enable_resource_track is not valid.")));
+    if (!WLMCheckSessionStatisticsAllowed()) {
         return NULL;
     }
 
@@ -7004,7 +7008,15 @@ void* WLMGetSessionStatistics(int* num)
 
             SessionLevelMemory* entry = (SessionLevelMemory*)pDNodeInfo->mementry;
 
-            stat_element->statement = (pDNodeInfo->statement == NULL) ? (char*)"" : pstrdup(pDNodeInfo->statement);
+            /* Mask password in query string */
+            char* queryMaskedPassWd = NULL;
+            if (pDNodeInfo->statement != NULL) {
+                queryMaskedPassWd = maskPassword(pDNodeInfo->statement);
+            }
+            if (queryMaskedPassWd == NULL) {
+                queryMaskedPassWd = pDNodeInfo->statement == NULL ? (char*)"" : pDNodeInfo->statement;
+            }
+            stat_element->statement = queryMaskedPassWd;
             stat_element->query_plan = (entry->query_plan == NULL) ? (char*)"NoPlan" : pstrdup(entry->query_plan);
             stat_element->query_plan_issue =
                 (entry->query_plan_issue == NULL) ? (char*)"" : pstrdup(entry->query_plan_issue);
@@ -7179,11 +7191,10 @@ WLMIoStatisticsList* WLMGetIOStatisticsGeneral()
 int WLMGetProgPath(const char* argv0)
 {
     char gaussdb_bin_path[STAT_PATH_LEN] = {0};
-
     int rc;
+    char real_exec_path[PATH_MAX + 1] = {'\0'};
 
     char* exec_path = gs_getenv_r("GAUSSHOME");
-
     if (exec_path == NULL) {
         /* find the binary path with binary name */
         if (find_my_exec(argv0, gaussdb_bin_path) < 0) {
@@ -7198,17 +7209,23 @@ int WLMGetProgPath(const char* argv0)
         get_parent_directory(exec_path);
     }
     Assert(exec_path != NULL);
-    if (backend_env_valid(exec_path, "GAUSSHOME") == false) {
+
+    if (realpath(exec_path, real_exec_path) == NULL) {
+        ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                errmsg("Incorrect backend environment variable $GAUSSHOME"),
+                errdetail("Please refer to the backend instance log for the detail")));
+    }
+    if (backend_env_valid(real_exec_path, "GAUSSHOME") == false) {
         ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
             errmsg("Incorrect backend environment variable $GAUSSHOME"),
             errdetail("Please refer to the backend instance log for the detail")));
     }
-    check_backend_env(exec_path);
+    check_backend_env(real_exec_path);
     rc = snprintf_s(g_instance.wlm_cxt->stat_manager.execdir,
         sizeof(g_instance.wlm_cxt->stat_manager.execdir),
         sizeof(g_instance.wlm_cxt->stat_manager.execdir) - 1,
         "%s",
-        exec_path);
+        real_exec_path);
     securec_check_ss(rc, "\0", "\0");
 
     /* If it's absolute path, it will use it as log directory */
@@ -7506,8 +7523,8 @@ bool WLMUpdateMemoryInfo(bool need_adjust)
         if (need_adjust) {
             adjust_count /= 2;  // just adjust 2GB
 
-            gs_atomic_add_32(&dynmicTrackedMemChunks, -adjust_count);
-            gs_atomic_add_32(&processMemInChunks, -adjust_count);
+            (void)pg_atomic_sub_fetch_u32((volatile uint32*)&dynmicTrackedMemChunks, adjust_count);
+            (void)pg_atomic_sub_fetch_u32((volatile uint32*)&processMemInChunks, adjust_count);
             ereport(LOG,
                 (errmsg("Reset memory counting for real used memory is %d MB "
                         "and counting used memory is %d MB, adjust memory is %d MB.",
@@ -7812,6 +7829,8 @@ int WLMProcessThreadMain(void)
         /* Since not using PG_TRY, we must reset error stack by hand */
         t_thrd.log_cxt.error_context_stack = NULL;
 
+        t_thrd.log_cxt.call_stack = NULL;
+
         /* Prevents interrupts while cleaning up */
         HOLD_INTERRUPTS();
 
@@ -7837,6 +7856,8 @@ int WLMProcessThreadMain(void)
             AbortCurrentTransaction();
             t_thrd.wlm_cxt.wlm_xact_start = false;
         }
+        /* release resource held by lsc */
+        AtEOXact_SysDBCache(false);
 
         /*
          *   Notice: at the most time it isn't necessary to call because
@@ -8014,6 +8035,10 @@ int WLMProcessThreadMain(void)
 
     const int SEVEN_DAYS = 7 * 24 * 60 * 60 * 1000;
     TimestampTz get_thread_status_last_time = GetCurrentTimestamp();
+#ifdef ENABLE_MULTIPLE_NODES
+    const int ONE_HOURS = 60 * 60;
+    TimestampTz cgroupCheckLast = GetCurrentTimestamp();
+#endif
     while (g_instance.wlm_cxt->stat_manager.stop == 0) {
         if (!t_thrd.wlm_cxt.wlm_xact_start) {
             StartTransactionCommand();
@@ -8025,9 +8050,9 @@ int WLMProcessThreadMain(void)
             ProcessConfigFile(PGC_SIGHUP);
         }
 
-        if (u_sess->sig_cxt.got_PoolReload) {
+        if (IsGotPoolReload()) {
             processPoolerReload();
-            u_sess->sig_cxt.got_PoolReload = false;
+            ResetGotPoolReload(false);
         }
 
         /* timer is triggerred, start to get session info from the database. */
@@ -8035,6 +8060,17 @@ int WLMProcessThreadMain(void)
             WLMStartToGetStatistics();
             t_thrd.wlm_cxt.wlmalarm_dump_active = false;
         }
+
+#ifdef ENABLE_MULTIPLE_NODES
+        /* if cgroup not init, retry init it */
+        if (!g_instance.wlm_cxt->gscgroup_config_parsed) {
+            TimestampTz cgroupCheckNow = GetCurrentTimestamp();
+            if (cgroupCheckNow > cgroupCheckLast + ONE_HOURS * USECS_PER_SEC) {
+                gscgroup_init();
+                cgroupCheckLast = cgroupCheckNow;
+            }
+        }
+#endif
 
         /* Fetch collect info from each data nodes. */
         WLMCollectInfoScanner();

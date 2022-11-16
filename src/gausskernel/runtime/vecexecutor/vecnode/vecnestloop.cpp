@@ -23,8 +23,8 @@
 #include "postgres.h"
 #include "knl/knl_variable.h"
 
-#include "executor/execdebug.h"
-#include "executor/nodeNestloop.h"
+#include "executor/exec/execdebug.h"
+#include "executor/node/nodeNestloop.h"
 #include "utils/memutils.h"
 #include "utils/memprot.h"
 #include "vecexecutor/vecnodes.h"

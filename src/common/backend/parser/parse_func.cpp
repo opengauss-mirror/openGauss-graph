@@ -5,6 +5,7 @@
  *
  * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
+ * Portions Copyright (c) 2021, openGauss Contributors
  *
  *
  * IDENTIFICATION
@@ -14,6 +15,7 @@
  */
 #include "postgres.h"
 #include "knl/knl_variable.h"
+#include "catalog/gs_encrypted_proc.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_aggregate.h"
 #include "catalog/pg_proc.h"
@@ -32,10 +34,12 @@
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
 #include "utils/syscache.h"
+#include "catalog/gs_encrypted_columns.h"
 
 static Oid FuncNameAsType(List* funcname);
 static Node* ParseComplexProjection(ParseState* pstate, char* funcname, Node* first_arg, int location);
 static List* GetDefaultVale(Oid funcoid, const int* argnumbers, int ndargs);
+static Oid cl_get_input_param_original_type(Oid func_oid, int argno);
 
 /*
  *	Parse a function call
@@ -69,6 +73,7 @@ Node* ParseFuncOrColumn(ParseState* pstate, List* funcname, List* fargs, FuncCal
     bool func_variadic = (fn ? fn->func_variadic : false);
     WindowDef* over = (fn ? fn->over : NULL);
     Oid rettype;
+    int rettype_orig = -1;
     Oid funcid;
     ListCell* l = NULL;
     ListCell* nextl = NULL;
@@ -115,7 +120,6 @@ Node* ParseFuncOrColumn(ParseState* pstate, List* funcname, List* fargs, FuncCal
     for (l = list_head(fargs); l != NULL; l = nextl) {
         Node* arg = (Node*)lfirst(l);
         Oid argtype = exprType(arg);
-
         nextl = lnext(l);
 
         if (argtype == VOIDOID && IsA(arg, Param) && !is_column && !agg_within_group) {
@@ -217,7 +221,8 @@ Node* ParseFuncOrColumn(ParseState* pstate, List* funcname, List* fargs, FuncCal
         &declared_arg_types,
         &argdefaults,
         call_func,
-        &refSynOid);
+        &refSynOid,
+        &rettype_orig);
     name_string = NameListToString(funcname);
     if (fdresult == FUNCDETAIL_COERCION) {
         /*
@@ -228,7 +233,7 @@ Node* ParseFuncOrColumn(ParseState* pstate, List* funcname, List* fargs, FuncCal
             (Node*)linitial(fargs),
             actual_arg_types[0],
             rettype,
-            -1,
+            rettype_orig,
             COERCION_EXPLICIT,
             COERCE_EXPLICIT_CALL,
             location);
@@ -399,7 +404,7 @@ Node* ParseFuncOrColumn(ParseState* pstate, List* funcname, List* fargs, FuncCal
                             "Perhaps you misplaced ORDER BY; ORDER BY must appear "
                             "after all regular arguments of the aggregate."),
                     parser_errposition(pstate, location)));
-        } else
+        } else {
             ereport(ERROR,
                 (errcode(ERRCODE_UNDEFINED_FUNCTION),
                     errmsg("function %s does not exist",
@@ -407,6 +412,7 @@ Node* ParseFuncOrColumn(ParseState* pstate, List* funcname, List* fargs, FuncCal
                     errhint("No function matches the given name and argument types. "
                             "You might need to add explicit type casts."),
                     parser_errposition(pstate, location)));
+        }
     }
 
     /*
@@ -478,6 +484,7 @@ Node* ParseFuncOrColumn(ParseState* pstate, List* funcname, List* fargs, FuncCal
 
         funcexpr->funcid = funcid;
         funcexpr->funcresulttype = rettype;
+        funcexpr->funcresulttype_orig = rettype_orig;
         funcexpr->funcretset = retset;
         funcexpr->funcvariadic = func_variadic;
         funcexpr->funcformat = COERCE_EXPLICIT_CALL;
@@ -1395,6 +1402,63 @@ FuncCandidateList func_select_candidate(int nargs, Oid* input_typeids, FuncCandi
     return NULL; /* failed to select a best candidate */
 } /* func_select_candidate() */
 
+
+/*
+ * sort_candidate_func_list
+ *
+ * sort the candidate functions by function's all param num.
+ */
+FuncCandidateList sort_candidate_func_list(FuncCandidateList oldCandidates)
+{
+    if (oldCandidates == NULL || oldCandidates->next == NULL) {
+        return oldCandidates;
+    }
+
+    FuncCandidateList cur = oldCandidates;
+    int size = 0;
+    while (cur) {
+        size++;
+        cur = cur->next;
+    }
+
+    cur = oldCandidates;
+    FuncCandidateList* candidates = (FuncCandidateList*)palloc0(sizeof(FuncCandidateList) * size);
+    int index = 0;
+    while (cur) {
+        candidates[index++] = cur;
+        cur = cur->next;
+    }
+	
+    FuncCandidateList sortedCandidates = NULL;
+    FuncCandidateList lastCandidate = NULL;
+    for (int i = 0; i < size; i++) {
+        if (candidates[i] == NULL) {
+            continue;
+        }
+        int smallestIndex = i;
+        for (int j = 0; j < size; j++) {
+            FuncCandidateList cur2 = candidates[j];
+            if (cur2 != NULL && candidates[smallestIndex]->allArgNum > cur2->allArgNum) {
+                smallestIndex = j;
+            }
+        }
+
+        FuncCandidateList smallest = candidates[smallestIndex];
+        if (lastCandidate == NULL) {
+            lastCandidate = smallest;
+            sortedCandidates = smallest;
+        } else {
+            lastCandidate->next = smallest;
+            lastCandidate = lastCandidate->next;
+            smallest->next = NULL;
+        }
+        candidates[smallestIndex] = NULL;
+    }
+
+    pfree(candidates);
+    return sortedCandidates;
+}
+
 /* func_get_detail()
  *
  * Find the named function in the system catalogs.
@@ -1434,7 +1498,7 @@ FuncDetailCode func_get_detail(List* funcname, List* fargs, List* fargnames, int
     Oid* vatype,                                             /* return value */
     Oid** true_typeids,                                      /* return value */
     List** argdefaults, bool call_func,                      /* optional return value */
-    Oid* refSynOid)
+    Oid* refSynOid, int* rettype_orig)
 {
     FuncCandidateList raw_candidates = NULL;
     FuncCandidateList all_candidates = NULL;
@@ -1453,6 +1517,36 @@ FuncDetailCode func_get_detail(List* funcname, List* fargs, List* fargnames, int
         *refSynOid = InvalidOid;
     }
 
+#ifndef ENABLE_MULTIPLE_NODES
+    if (enable_out_param_override()) {
+        /* For A compatiablity, CALL statement only can invoke Procedure in SQL or Function in PLSQL, */ 
+        /* and SELECT statement can only invoke Function. but now it does't distinguish for compatible with the old code.*/
+        raw_candidates = FuncnameGetCandidates(funcname, nargs, fargnames, expand_variadic, expand_defaults, false, true, PROKIND_UNKNOWN);
+    } else {
+        /* Get list of possible candidates from namespace search */
+        raw_candidates = FuncnameGetCandidates(funcname, nargs, fargnames, expand_variadic, expand_defaults, false);
+
+        /* Get list of possible candidates from namespace search including proallargtypes for package function */
+        if (call_func && IsPackageFunction(funcname)) {
+            all_candidates =
+                FuncnameGetCandidates(funcname, nargs, fargnames, expand_variadic, expand_defaults, false, true);
+            if (all_candidates != NULL) {
+                if (raw_candidates != NULL) {
+                    best_candidate = raw_candidates;
+                    while (best_candidate && best_candidate->next) {
+                        best_candidate = best_candidate->next;
+                    }
+
+                    best_candidate->next = all_candidates;
+                } else {
+                    raw_candidates = all_candidates;
+                }
+            }
+        }
+    }
+
+    raw_candidates = sort_candidate_func_list(raw_candidates);
+#else
     /* Get list of possible candidates from namespace search */
     raw_candidates = FuncnameGetCandidates(funcname, nargs, fargnames, expand_variadic, expand_defaults, false);
 
@@ -1473,14 +1567,17 @@ FuncDetailCode func_get_detail(List* funcname, List* fargs, List* fargnames, int
             }
         }
     }
+#endif	
+
 
     /*
      * Quickly check if there is an exact match to the input datatypes (there
      * can be only one)
      */
     for (best_candidate = raw_candidates; best_candidate != NULL; best_candidate = best_candidate->next) {
-        if (memcmp(argtypes, best_candidate->args, nargs * sizeof(Oid)) == 0)
+        if (memcmp(argtypes, best_candidate->args, nargs * sizeof(Oid)) == 0) {
             break;
+        }
     }
 
     if (best_candidate == NULL) {
@@ -1652,6 +1749,15 @@ FuncDetailCode func_get_detail(List* funcname, List* fargs, List* fargnames, int
                     errmsg("cache lookup failed for function %u", best_candidate->oid)));
         pform = (Form_pg_proc)GETSTRUCT(ftup);
         *rettype = pform->prorettype;
+        if (IsClientLogicType(*rettype) && rettype_orig) {
+            HeapTuple gstup = SearchSysCache1(GSCLPROCID, ObjectIdGetDatum(best_candidate->oid));
+            if (!HeapTupleIsValid(gstup)) /* should not happen */
+                ereport(ERROR, (errcode(ERRCODE_CACHE_LOOKUP_FAILED),
+                    errmsg("cache lookup failed for function %u", best_candidate->oid)));
+            Form_gs_encrypted_proc gsform = (Form_gs_encrypted_proc)GETSTRUCT(gstup);
+            *rettype_orig = gsform->prorettype_orig;
+            ReleaseSysCache(gstup);
+        }
         *retset = pform->proretset;
         *vatype = pform->provariadic;
         /* fetch default args if caller wants 'em */
@@ -1894,7 +2000,13 @@ Oid LookupFuncName(List* funcname, int nargs, const Oid* argtypes, bool noError)
     clist = FuncnameGetCandidates(funcname, nargs, NIL, false, false, false);
 
     while (clist) {
-        if (memcmp(argtypes, clist->args, nargs * sizeof(Oid)) == 0)
+        /* if argtype is CL type replace it with original type */
+        for (int i = 0; i < nargs; i++) {
+            if (IsClientLogicType(clist->args[i])) {
+                clist->args[i] = cl_get_input_param_original_type(clist->oid, i);
+            }
+        }
+        if (memcmp(argtypes, clist->args, nargs * sizeof(Oid)) == 0 && OidIsValid(clist->oid))
             return clist->oid;
         clist = clist->next;
     }
@@ -1911,7 +2023,7 @@ Oid LookupFuncName(List* funcname, int nargs, const Oid* argtypes, bool noError)
  * LookupTypeNameOid
  *		Convenience routine to look up a type, silently accepting shell types
  */
-static Oid LookupTypeNameOid(const TypeName* typname)
+Oid LookupTypeNameOid(const TypeName* typname)
 {
     Oid result;
     Type typtup;
@@ -2126,9 +2238,15 @@ static List* GetDefaultVale(Oid funcoid, const int* argnumbers, int ndargs)
     AssertEreport(IsA(defaults, List), MOD_OPT, "");
     pfree_ext(defaultsstr);
 
-    defargposdatum = SysCacheGetAttr(PROCOID, tuple, Anum_pg_proc_prodefaultargpos, &isnull);
-    AssertEreport(!isnull, MOD_OPT, "");
-    defaultargpos = (int2vector*)DatumGetPointer(defargposdatum);
+    if (pronargs <= FUNC_MAX_ARGS_INROW) {
+        defargposdatum = SysCacheGetAttr(PROCOID, tuple, Anum_pg_proc_prodefaultargpos, &isnull);
+        AssertEreport(!isnull, MOD_OPT, "");
+        defaultargpos = (int2vector*)DatumGetPointer(defargposdatum);
+    } else {
+        defargposdatum = SysCacheGetAttr(PROCOID, tuple, Anum_pg_proc_prodefaultargposext, &isnull);
+        AssertEreport(!isnull, MOD_OPT, "");
+        defaultargpos = (int2vector*)PG_DETOAST_DATUM(defargposdatum);
+    }
 
     AssertEreport(pronargs >= ndargs, MOD_OPT, "");
     AssertEreport(pronargdefaults >= ndargs, MOD_OPT, "");
@@ -2191,4 +2309,30 @@ static List* GetDefaultVale(Oid funcoid, const int* argnumbers, int ndargs)
 
     ReleaseSysCache(tuple);
     return defaults;
+}
+
+/*
+ * Replace column managed type with original type
+ * to identify overloaded functions
+ */
+static Oid cl_get_input_param_original_type(Oid func_id, int argno)
+{
+    HeapTuple gs_oldtup = SearchSysCache1(GSCLPROCID, ObjectIdGetDatum(func_id));
+    Oid ret = InvalidOid;
+    if (HeapTupleIsValid(gs_oldtup)) {
+        bool isnull = false;
+        oidvector* proargcachedcol = (oidvector*)DatumGetPointer(
+            SysCacheGetAttr(GSCLPROCID, gs_oldtup, Anum_gs_encrypted_proc_proargcachedcol, &isnull));
+        if (!isnull && proargcachedcol->dim1 > argno) {
+            Oid cachedColId = proargcachedcol->values[argno];
+            HeapTuple tup = SearchSysCache1(CEOID, ObjectIdGetDatum(cachedColId));
+            if (HeapTupleIsValid(tup)) {
+                Form_gs_encrypted_columns ec_form = (Form_gs_encrypted_columns)GETSTRUCT(tup);
+                ret = ec_form->data_type_original_oid;
+                ReleaseSysCache(tup);
+            }
+        }
+        ReleaseSysCache(gs_oldtup);
+    }
+    return ret;
 }

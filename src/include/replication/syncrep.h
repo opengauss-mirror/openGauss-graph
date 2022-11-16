@@ -18,7 +18,8 @@
 #include "replication/replicainternal.h"
 
 #define SyncRepRequested() \
-    (g_instance.attr.attr_storage.max_wal_senders > 0 && synchronous_commit > SYNCHRONOUS_COMMIT_LOCAL_FLUSH)
+    (g_instance.attr.attr_storage.max_wal_senders > 0 && \
+    u_sess->attr.attr_storage.guc_synchronous_commit > SYNCHRONOUS_COMMIT_LOCAL_FLUSH)
 
 /* SyncRepWaitMode */
 #define SYNC_REP_NO_WAIT -1
@@ -38,10 +39,15 @@
 #define SYNC_REP_PRIORITY 0
 #define SYNC_REP_QUORUM 1
 
+#define SYNC_REP_MAX_GROUPS 256
+
 extern volatile bool most_available_sync;
 
 #define SyncStandbysDefined() \
     (u_sess->attr.attr_storage.SyncRepStandbyNames != NULL && u_sess->attr.attr_storage.SyncRepStandbyNames[0] != '\0')
+
+#define GetWalsndSyncRepConfig(walsnder)  \
+    (t_thrd.syncrep_cxt.SyncRepConfig[(walsnder)->sync_standby_group])
 
 /*
  * Struct for the configuration of synchronous replication.
@@ -60,7 +66,8 @@ typedef struct SyncRepConfigData {
 } SyncRepConfigData;
 
 /* called by user backend */
-extern void SyncRepWaitForLSN(XLogRecPtr XactCommitLSN);
+extern void SyncRepWaitForLSN(XLogRecPtr XactCommitLSN, bool enableHandleCancel = true);
+extern bool SyncPaxosWaitForLSN(XLogRecPtr PaxosConsensusLSN);
 
 /* called at backend exit */
 extern void SyncRepCleanupAtProcExit(void);
@@ -68,6 +75,8 @@ extern void SyncRepCleanupAtProcExit(void);
 /* called by wal sender */
 extern void SyncRepInitConfig(void);
 extern void SyncRepReleaseWaiters(void);
+extern int SyncRepWakeQueue(bool all, int mode);
+extern void SyncPaxosReleaseWaiters(XLogRecPtr PaxosConsensusLSN);
 
 /* called by wal writer */
 extern void SyncRepUpdateSyncStandbysDefined(void);

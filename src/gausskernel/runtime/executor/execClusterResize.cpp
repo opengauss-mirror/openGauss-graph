@@ -22,7 +22,7 @@
 #include "catalog/pg_namespace.h"
 #include "catalog/pgxc_group.h"
 #include "executor/executor.h"
-#include "executor/nodeModifyTable.h"
+#include "executor/node/nodeModifyTable.h"
 #include "optimizer/clauses.h"
 #include "parser/analyze.h"
 #include "parser/parsetree.h"
@@ -40,6 +40,7 @@
 #include "utils/snapmgr.h"
 
 #include "storage/lmgr.h"
+#include "postgres_ext.h"
 
 /*
  * ---------------------------------------------------------------------------------
@@ -128,11 +129,13 @@ static inline bool redis_ctid_retrive_function(const char* funcname, Oid rettype
  */
 void RecordDeletedTuple(Oid relid, int2 bucketid, const ItemPointer tupleid, const Relation deldelta_rel)
 {
-    Assert(deldelta_rel);
-
     Datum values[Natts_pg_delete_delta];
     bool nulls[Natts_pg_delete_delta];
     HeapTuple tup = NULL;
+
+    Assert(deldelta_rel);
+    /* In redistribution, table delete_delta has 3 or 2 column. */
+    Assert(RelationGetDescr(deldelta_rel)->natts <= 3);
 
     /* Iterate through attributes initializing nulls and values */
     for (int i = 0; i < Natts_pg_delete_delta; i++) {
@@ -143,7 +146,7 @@ void RecordDeletedTuple(Oid relid, int2 bucketid, const ItemPointer tupleid, con
         UInt64GetDatum(((uint64)u_sess->pgxc_cxt.PGXCNodeIdentifier << 32) | relid);
     values[Anum_pg_delete_delta_tablebucketid_and_ctid - 1] =
         UInt64GetDatum(((uint64)ItemPointerGetBlockNumber(tupleid) << 16) | ItemPointerGetOffsetNumber(tupleid));
-    if (bucketid != InvalidBktId) {
+    if (BUCKET_NODE_IS_VALID(bucketid)) {
         values[Anum_pg_delete_delta_tablebucketid_and_ctid - 1] |= ((uint64)bucketid << 48);
     }
     /* Record delta */
@@ -153,15 +156,6 @@ void RecordDeletedTuple(Oid relid, int2 bucketid, const ItemPointer tupleid, con
     tableam_tops_free_tuple(tup);
 }
 
-/*
- * - Brief: get and open delete_delta rel
- * - Parameter:
- *      @rel: target relation of UPDATE/DELETE/TRUNCATE operation
- *      @lockmode: lock mode
- *      @isMultiCatchup: multi catchup delta or not
- * - Return:
- *      delete_delta rel
- */
 /*
  * - Brief: Determine if the relation is under cluster resizing operation
  * - Parameter:
@@ -194,7 +188,26 @@ bool RelationInClusterResizingReadOnly(const Relation rel)
     Assert(rel != NULL);
 
     /* Check relation's append_mode status */
-    if (!IsInitdb && (RelationInRedistributeReadOnly(rel) || RelationInRedistributeEndCatchup(rel)))
+    if (!IsInitdb && RelationInRedistributeReadOnly(rel))
+        return true;
+
+    return false;
+}
+
+/*
+ * - Brief: Determine if the relation is under cluster resizing read only operation
+ * - Parameter:
+ *      @rel: relation that needs to check
+ * - Return:
+ *      @TRUE:  relation is under cluster resizing endcatchup(write error)
+ *      @FALSE: relation is not under cluster resizing endcatchup(write error)
+ */
+bool RelationInClusterResizingEndCatchup(const Relation rel)
+{
+    Assert(rel != NULL);
+
+    /* Check relation's append_mode status */
+    if (!IsInitdb && RelationInRedistributeEndCatchup(rel))
         return true;
 
     return false;
@@ -367,6 +380,15 @@ static inline void RelationGetDeleteDeltaTableName(Relation rel, char* delete_de
     return;
 }
 
+/*
+ * - Brief: get and open delete_delta rel
+ * - Parameter:
+ *      @rel: target relation of UPDATE/DELETE/TRUNCATE operation
+ *      @lockmode: lock mode
+ *      @isMultiCatchup: multi catchup delta or not
+ * - Return:
+ *      delete_delta rel
+ */
 Relation GetAndOpenDeleteDeltaRel(const Relation rel, LOCKMODE lockmode, bool isMultiCatchup)
 {
     Relation deldelta_rel;
@@ -458,7 +480,8 @@ void BlockUnsupportedDDL(const Node* parsetree)
         case T_AlterDatabaseSetStmt:
         case T_CreateTableSpaceStmt:
         case T_DropTableSpaceStmt:
-        case T_AlterTableSpaceOptionsStmt: {
+        case T_AlterTableSpaceOptionsStmt:
+        case T_CreateGroupStmt: {
             if (ClusterResizingInProgress()) {
                 ereport(ERROR,
                     (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
@@ -573,6 +596,9 @@ void BlockUnsupportedDDL(const Node* parsetree)
             if (stmt->relation) {
                 relid = RangeVarGetRelid(stmt->relation, AccessShareLock, true);
                 if (OidIsValid(relid)) {
+                    /* release index lock before lock table to avoid deadlock */
+                    UnlockRelationOid(relid, AccessShareLock);
+
                     Relation relation = relation_open(relid, NoLock);
                     bool inRedis = false;
 
@@ -585,8 +611,6 @@ void BlockUnsupportedDDL(const Node* parsetree)
                         relation_close(heapRelation, AccessShareLock);
                     }
                     relation_close(relation, NoLock);
-                    UnlockRelationOid(relid, AccessShareLock);
-
                     if (inRedis) {
                         ereport(ERROR,
                             (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
@@ -637,9 +661,35 @@ void BlockUnsupportedDDL(const Node* parsetree)
                         }
                     } break;
                     case AT_AddNodeList:
-                    case AT_DeleteNodeList:
-                        break;
-
+                    case AT_DeleteNodeList: {
+#ifndef ENABLE_MULTIPLE_NODES
+                        ereport(ERROR,
+                            (errmodule(MOD_FUNCTION),
+                            errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                            errmsg("Unsupported feature"),
+                            errdetail("The capability is not supported for openGauss."),
+                            errcause("%s is not supported for openGauss",
+                                cmd->subtype == AT_DeleteNodeList ? "DeleteNode" : "AddNode"),
+                            erraction("NA")));
+#endif
+                    } break;
+                    case AT_UpdateSliceLike: {
+#ifndef ENABLE_MULTIPLE_NODES
+                        ereport(ERROR,
+                            (errmodule(MOD_FUNCTION),
+                            errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                            errmsg("Unsupported feature"),
+                            errdetail("The capability is not supported for openGauss."),
+                            errcause("UpdateSliceLike is not supported for openGauss"),
+                            erraction("NA")));
+#endif
+                        if (!ClusterResizingInProgress() && IS_PGXC_COORDINATOR) {
+                            ereport(ERROR,
+                                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                                    errmsg("Cannot alter table update slice like when it is not "
+                                           "under redistribution")));
+                        }
+                    } break;
                     case AT_ResetRelOptions:
                     case AT_SetRelOptions:
                         if (cmd->def) {
@@ -1171,3 +1221,18 @@ void RelationGetNewTableName(Relation rel, char* newtable_name)
     }
     return;
 }
+
+/*
+ * - Brief: Determine if the relation is under cluster resizing write error mode
+ * - Parameter:
+ *      @rel: relation that needs to check
+ * - Return:
+ *      @TRUE:  relation is under cluster resizing write error mode
+ *      @FALSE: relation is not under cluster resizing write error mode
+ */
+bool RelationInClusterResizingWriteErrorMode(const Relation rel)
+{
+    return RelationInClusterResizingReadOnly(rel) ||
+        (RelationInClusterResizingEndCatchup(rel) && !pg_try_advisory_lock_for_redis(rel));
+}
+

@@ -28,11 +28,11 @@
 
 #include "access/relscan.h"
 #include "access/tableam.h"
-#include "executor/execdebug.h"
+#include "executor/exec/execdebug.h"
 #include "vecexecutor/vecnodecstorescan.h"
 #include "vecexecutor/vecnoderowtovector.h"
-#include "executor/nodeModifyTable.h"
-#include "executor/nodeSeqscan.h"
+#include "executor/node/nodeModifyTable.h"
+#include "executor/node/nodeSeqscan.h"
 #include "storage/cstore/cstore_compress.h"
 #include "access/cstore_am.h"
 #include "optimizer/clauses.h"
@@ -42,8 +42,8 @@
 #include "utils/rel.h"
 #include "utils/rel_gs.h"
 #include "utils/syscache.h"
-#include "executor/nodeSamplescan.h"
-#include "executor/nodeSeqscan.h"
+#include "executor/node/nodeSamplescan.h"
+#include "executor/node/nodeSeqscan.h"
 #include "access/cstoreskey.h"
 #include "catalog/pg_cast.h"
 #include "catalog/pg_operator.h"
@@ -468,18 +468,16 @@ void InitCStoreRelation(CStoreScanState* node, EState* estate, bool idx_flag, Re
         if (plan->itrs > 0) {
             Partition part = NULL;
             Partition curr_part = NULL;
-            
-            PruningResult* resultPlan = NULL;
-            if (plan->pruningInfo->expr != NULL) {
-                resultPlan = GetPartitionInfo(plan->pruningInfo, estate, curr_rel);
-            } else {
-                resultPlan = plan->pruningInfo;
-            }
-
             ListCell* cell = NULL;
-            List* part_seqs = resultPlan->ls_rangeSelectedPartitions;
+            PruningResult* resultPlan = NULL;
 
             if (!idx_flag) {
+                if (plan->pruningInfo->expr != NULL) {
+                    resultPlan = GetPartitionInfo(plan->pruningInfo, estate, curr_rel);
+                } else {
+                    resultPlan = plan->pruningInfo;
+                }
+                List* part_seqs = resultPlan->ls_rangeSelectedPartitions;
                 foreach (cell, part_seqs) {
                     Oid tbl_part_id = InvalidOid;
                     int part_seq = lfirst_int(cell);
@@ -525,6 +523,12 @@ void InitCStoreRelation(CStoreScanState* node, EState* estate, bool idx_flag, Re
                 // Now curr_rel is the index relation of logical table (parent relation)
                 // parent_rel is the logical heap relation
                 //
+                if (plan->pruningInfo->expr != NULL) {
+                    resultPlan = GetPartitionInfo(plan->pruningInfo, estate, parent_rel);
+                } else {
+                    resultPlan = plan->pruningInfo;
+                }
+                List* part_seqs = resultPlan->ls_rangeSelectedPartitions;
                 foreach (cell, part_seqs) {
                     Oid tbl_part_id = InvalidOid;
                     int part_seq = lfirst_int(cell);

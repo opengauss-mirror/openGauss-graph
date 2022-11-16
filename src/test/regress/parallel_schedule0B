@@ -10,15 +10,21 @@
 # ----------
 # single_node_commit/rollback tests
 # ----------
+#test: pldeveloper_gs_source
+test: plan_hint plan_hint_set plan_hint_no_expand plan_hint_iud
 test: single_node_produce_commit_rollback
 
 test: instr_unique_sql
 test: shutdown
 
+# List/Hash table exchange
+test: hw_partition_list_exchange
+# test: hw_partition_hash_exchange
+
 # interval partition 
 test: hw_partition_interval
 test: hw_partition_interval_exchange
-test: hw_partition_interval_unusable_index
+test: hw_partition_interval_unusable_index psql_desc_unusable_index
 test: hw_partition_interval_reindex
 test: hw_partition_interval_movement
 # To check create interval partition parallel
@@ -72,7 +78,7 @@ test: gpi_clean_wait
 # gpi vacuum
 test: gpi_vacuum_lazy
 test: gpi_hw_partition_vacuum_full
-test: gpi_hw_partition_vacuum_full_01
+#test: gpi_hw_partition_vacuum_full_01
 
 # gpi alter
 test: gpi_alter_partition
@@ -108,7 +114,7 @@ test: hw_cstore_vacuum
 test: hw_cstore_insert hw_cstore_delete hw_cstore_unsupport
 
 # test on extended statistics
-test: hw_es_multi_column_stats_prepare
+test: hw_es_multi_column_stats_prepare hw_es_multi_column_stats_eqclass
 test: hw_es_multi_column_stats_1 hw_es_multi_column_stats_1_1 hw_es_multi_column_stats_1_2 hw_es_multi_column_stats_1_3 hw_es_multi_column_stats_1_4 hw_es_multi_column_stats_1_5 hw_es_multi_column_stats_1_6 hw_es_multi_column_stats_2_1 hw_es_multi_column_stats_2_2 hw_es_multi_column_stats_2_3 hw_es_multi_column_stats_3 hw_es_multi_column_stats_3_1 hw_es_multi_column_stats_3_2
 test: hw_es_multi_column_stats_end
 
@@ -119,10 +125,10 @@ test: unsupported_features statistic statistic_2
 
 test: hw_setop_writefile
 
-test: vec_nestloop_pre vec_mergejoin_prepare vec_result vec_limit vec_mergejoin_1 vec_mergejoin_2 vec_stream
+test: vec_nestloop_pre vec_mergejoin_prepare vec_result vec_limit vec_mergejoin_1 vec_mergejoin_2 vec_stream force_vector_engine force_vector_engine2
 test: vec_mergejoin_inner vec_mergejoin_left vec_mergejoin_semi vec_mergejoin_anti llvm_vecexpr1 llvm_vecexpr2 llvm_vecexpr3 llvm_target_expr llvm_target_expr2 llvm_target_expr3 llvm_vecexpr_td
 #test: vec_nestloop1
-test: vec_mergejoin_aggregation llvm_vecagg llvm_vecagg2 llvm_vecagg3 llvm_vechashjoin
+test: vec_mergejoin_aggregation llvm_vecagg llvm_vecagg2 llvm_vecagg3 llvm_vechashjoin vector_subpartition
 #test: vec_nestloop_end
 
 # ----------$
@@ -155,7 +161,7 @@ test: interval tinterval macaddr tstypes comments
 # execute two copy tests parallel, to check that copy itself
 # is concurrent safe.(duplicate)
 # ----------
-test: copyselect copy_error_log
+test: copyselect copy_error_log copy_support_transform
 #test: copy_eol
 
 # ----------
@@ -175,10 +181,11 @@ test: hw_function_p_3 hw_function_p_4
 test: create_c_function
 test: cstore_replication_table_delete
 
-test: hw_cursor_part1 hw_cursor_part2 hw_cursor_part3 hw_cursor_part4 hw_cursor_part5 hw_cursor_part6 hw_cursor_part7 hw_cursor_part8
+#test: hw_cursor_part1 hw_cursor_part2 hw_cursor_part3 hw_cursor_part4 hw_cursor_part5 hw_cursor_part6 hw_cursor_part7 hw_cursor_part8
 test: vec_append_part1 vec_append_part2 vec_append_part3
 test: vec_cursor_part1 vec_cursor_part2
 test: vec_delete_part1 vec_delete_part2
+test: vec_name
 
 test: alter_schema_db_rename_seq
 
@@ -234,5 +241,9 @@ test: hw_partition_hash_dml
 test: hw_partition_hash_dql
 test: hw_partition_list_dml
 test: hw_partition_list_dql
-
+test: hw_cipher_sm4
+test: hw_cipher_aes128
+test: hw_pwd_encryption_sm3
+test: cstore_unique_index
 test: rule_test
+test: plpgsql_savepoint

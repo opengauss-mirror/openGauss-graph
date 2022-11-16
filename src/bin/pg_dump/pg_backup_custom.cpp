@@ -197,6 +197,13 @@ static void _ArchiveEntry(ArchiveHandle* AH, TocEntry* te)
     te->formatData = (void*)ctx;
 }
 
+#ifdef ENABLE_UT
+void uttest_custom_ArchiveEntry(ArchiveHandle* AH, TocEntry* te)
+{
+    _ArchiveEntry(AH, te);
+}
+#endif
+
 /*
  * Called by the Archiver to save any extra format-related TOC entry
  * data.
@@ -830,6 +837,13 @@ static size_t _CustomWriteFunc(ArchiveHandle* AH, const char* buf, size_t len)
     WriteInt(AH, len);
     return _WriteBuf(AH, buf, len);
 }
+
+#ifdef ENABLE_UT
+size_t uttest_CustomWriteFunc(ArchiveHandle* AH, const char* buf, size_t len)
+{
+    return _CustomWriteFunc(AH, buf, len);
+}
+#endif
 
 /*
  * Callback function for ReadDataFromArchive. To keep things simple, we

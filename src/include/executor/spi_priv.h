@@ -6,6 +6,7 @@
  * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
+ * Portions Copyright (c) 2021, openGauss Contributors
  * src/include/executor/spi_priv.h
  *
  * -------------------------------------------------------------------------
@@ -39,6 +40,8 @@ typedef struct _SPI_connection {
     uint32 spi_hash_key;           /* corresponding oid */
     uint32 visit_id;               /* visit count */
     int plan_id;
+
+    TimestampTz stmtTimestamp;     /* the 'original' statemant time, recovered on stack pop */
 } _SPI_connection;
 
 /*
@@ -93,6 +96,26 @@ typedef struct _SPI_plan {
     void* parserSetupArg;
     uint32 id;                   /* SPIplan id in a function */
     uint32 spi_key;              /* key in SPICacheTable */
+    List* stmt_list; /* the query list for use in client logic feature */
 } _SPI_plan;
+
+inline void spi_stack_record_log(const char* action, const char* filename, int lineno, const char* funcname,
+                                 const char* query_string, SPIPlanPtr spi)
+{
+    if (u_sess->attr.attr_common.log_min_messages <= DEBUG3 && module_logging_is_on(MOD_SPI)) {
+        const char* query = (query_string == NULL) ?
+                      ((spi && list_length(spi->plancache_list) > 0) ?
+                      ((CachedPlanSource*)linitial(spi->plancache_list))->query_string: NULL)
+                      : query_string;
+        ereport(DEBUG3, (errmodule(MOD_SPI), errcode(ERRCODE_LOG),
+            errmsg("SPISTACK(Action:%s, Location %s,%d, Funcname:%s): cur spiconnected:%d, cur spi:%d, query string:%s",
+                    action, filename, lineno, funcname, u_sess->SPI_cxt._connected, u_sess->SPI_cxt._curid,
+                    query != NULL ? maskPassword(query) : NULL)));
+    }
+}
+
+#define SPI_STACK_LOG(action, query_string, spi) \
+    (spi_stack_record_log(action, __FILE__, __LINE__, __func__, query_string, spi))
+
 
 #endif /* SPI_PRIV_H */

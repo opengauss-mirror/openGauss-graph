@@ -1,7 +1,7 @@
 /* -------------------------------------------------------------------------
  *
  * resowner.h
- *	  POSTGRES resource owner definitions.
+ *	  openGauss resource owner definitions.
  *
  * Query-lifespan resources are tracked by associating them with
  * ResourceOwner objects.  This provides a simple mechanism for ensuring
@@ -12,6 +12,7 @@
  * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
+ * Portions Copyright (c) 2021, openGauss Contributors
  * src/include/utils/resowner.h
  *
  * -------------------------------------------------------------------------
@@ -19,13 +20,14 @@
 #ifndef RESOWNER_H
 #define RESOWNER_H
 
-#include "storage/fd.h"
+#include "storage/smgr/fd.h"
 #include "utils/catcache.h"
+#include "utils/knl_globalsystupcache.h"
+#include "utils/knl_localsystupcache.h"
 #include "utils/plancache.h"
 #include "utils/snapshot.h"
 #include "utils/partcache.h"
 #include "storage/cucache_mgr.h"
-
 /*
  * ResourceOwner objects are an opaque data structure known only within
  * resowner.c.
@@ -59,21 +61,26 @@ typedef void (*ResourceReleaseCallback)(ResourceReleasePhase phase, bool isCommi
  */
 
 /* generic routines */
-extern ResourceOwner ResourceOwnerCreate(ResourceOwner parent, const char* name, MemoryGroupType memGroup);
+extern ResourceOwner ResourceOwnerCreate(ResourceOwner parent, const char* name, MemoryContext memCxt);
 extern void ResourceOwnerRelease(ResourceOwner owner, ResourceReleasePhase phase, bool isCommit, bool isTopLevel);
 extern void ResourceOwnerDelete(ResourceOwner owner);
+extern void ResourceOwnerConcat(ResourceOwner target, ResourceOwner source);
 extern ResourceOwner ResourceOwnerGetParent(ResourceOwner owner);
 extern ResourceOwner ResourceOwnerGetNextChild(ResourceOwner owner);
 extern const char * ResourceOwnerGetName(ResourceOwner owner);
 extern ResourceOwner ResourceOwnerGetFirstChild(ResourceOwner owner);
+extern MemoryContext ResourceOwnerGetMemCxt(ResourceOwner owner);
 extern void ResourceOwnerNewParent(ResourceOwner owner, ResourceOwner newparent);
-extern void RegisterResourceReleaseCallback(ResourceReleaseCallback callback, void* arg);
-extern void UnregisterResourceReleaseCallback(ResourceReleaseCallback callback, const void* arg);
 
 /* support for buffer refcount management */
 extern void ResourceOwnerEnlargeBuffers(ResourceOwner owner);
 extern void ResourceOwnerRememberBuffer(ResourceOwner owner, Buffer buffer);
 extern void ResourceOwnerForgetBuffer(ResourceOwner owner, Buffer buffer);
+
+/* support for segment head buffer refcount management */
+extern void ResourceOwnerEnlargeSegmentBuffers(ResourceOwner owner);
+extern void ResourceOwnerRememberSegmentBuffer(ResourceOwner owner, Buffer buffer, SegmentDesc *seg_desc);
+extern void ResourceOwnerForgetSegmentBuffer(ResourceOwner owner, SegmentDesc *seg_desc);
 
 /* support for catcache refcount management */
 extern void ResourceOwnerEnlargeCatCacheRefs(ResourceOwner owner);
@@ -118,7 +125,7 @@ extern void ResourceOwnerForgetTupleDesc(ResourceOwner owner, TupleDesc tupdesc)
 /* support for snapshot refcount management */
 extern void ResourceOwnerEnlargeSnapshots(ResourceOwner owner);
 extern void ResourceOwnerRememberSnapshot(ResourceOwner owner, Snapshot snapshot);
-extern void ResourceOwnerForgetSnapshot(ResourceOwner owner, Snapshot snapshot);
+extern bool ResourceOwnerForgetSnapshot(ResourceOwner owner, Snapshot snapshot, bool ereport);
 extern void ResourceOwnerDecrementNsnapshots(ResourceOwner owner, void* queryDesc);
 extern void ResourceOwnerDecrementNPlanRefs(ResourceOwner owner, bool useResOwner);
 
@@ -158,4 +165,48 @@ extern void ResourceOwnerRememberGMemContext(ResourceOwner owner, MemoryContext 
 extern void ResourceOwnerForgetGMemContext(ResourceOwner owner, MemoryContext memcontext);
 extern void PrintGMemContextLeakWarning(MemoryContext memcontext);
 
+extern void ResourceOwnerMarkInvalid(ResourceOwner owner);
+extern bool ResourceOwnerIsValid(ResourceOwner owner);
+
+extern void ResourceOwnerReleaseAllPlanCacheRefs(ResourceOwner owner);
+
+extern void PrintPthreadRWlockLeakWarning(pthread_rwlock_t* pRWlock);
+/* support for local catcache tuple/list ref management */
+extern void ResourceOwnerEnlargeLocalCatCList(ResourceOwner owner);
+extern void ResourceOwnerRememberLocalCatCList(ResourceOwner owner, LocalCatCList* list);
+extern void ResourceOwnerForgetLocalCatCList(ResourceOwner owner, LocalCatCList* list);
+extern void ResourceOwnerEnlargeLocalCatCTup(ResourceOwner owner);
+extern void ResourceOwnerRememberLocalCatCTup(ResourceOwner owner, LocalCatCTup* tuple);
+extern LocalCatCTup* ResourceOwnerForgetLocalCatCTup(ResourceOwner owner, HeapTuple tuple);
+/* support for global catcache tuple/list ref management */
+extern void ResourceOwnerEnlargePthreadRWlock(ResourceOwner owner);
+extern void ResourceOwnerForgetPthreadRWlock(ResourceOwner owner, pthread_rwlock_t* pRWlock);
+extern void ResourceOwnerRememberPthreadRWlock(ResourceOwner owner, pthread_rwlock_t* pRWlock);
+extern void ResourceOwnerEnlargeGlobalCatCTup(ResourceOwner owner);
+extern void ResourceOwnerRememberGlobalCatCTup(ResourceOwner owner, GlobalCatCTup* tuple);
+extern void ResourceOwnerForgetGlobalCatCTup(ResourceOwner owner, GlobalCatCTup* tuple);
+extern void ResourceOwnerEnlargeGlobalCatCList(ResourceOwner owner);
+extern void ResourceOwnerRememberGlobalCatCList(ResourceOwner owner, GlobalCatCList* list);
+extern void ResourceOwnerForgetGlobalCatCList(ResourceOwner owner, GlobalCatCList* list);
+extern void ResourceOwnerEnlargeGlobalBaseEntry(ResourceOwner owner);
+extern void ResourceOwnerRememberGlobalBaseEntry(ResourceOwner owner, GlobalBaseEntry* entry);
+extern void ResourceOwnerForgetGlobalBaseEntry(ResourceOwner owner, GlobalBaseEntry* entry);
+extern void ResourceOwnerEnlargeGlobalDBEntry(ResourceOwner owner);
+extern void ResourceOwnerRememberGlobalDBEntry(ResourceOwner owner, GlobalSysDBCacheEntry* entry);
+extern void ResourceOwnerForgetGlobalDBEntry(ResourceOwner owner, GlobalSysDBCacheEntry* entry);
+extern void ResourceOwnerEnlargeGlobalIsExclusive(ResourceOwner owner);
+extern void ResourceOwnerRememberGlobalIsExclusive(ResourceOwner owner, volatile uint32 *isexclusive);
+extern void ResourceOwnerForgetGlobalIsExclusive(ResourceOwner owner, volatile uint32 *isexclusive);
+
+extern void ResourceOwnerReleaseRWLock(ResourceOwner owner, bool isCommit);
+extern void ResourceOwnerReleaseLocalCatCTup(ResourceOwner owner, bool isCommit);
+extern void ResourceOwnerReleaseLocalCatCList(ResourceOwner owner, bool isCommit);
+extern void ResourceOwnerReleaseRelationRef(ResourceOwner owner, bool isCommit);
+extern void ResourceOwnerReleasePartitionRef(ResourceOwner owner, bool isCommit);
+extern void ResourceOwnerReleaseGlobalCatCTup(ResourceOwner owner, bool isCommit);
+extern void ResourceOwnerReleaseGlobalCatCList(ResourceOwner owner, bool isCommit);
+extern void ResourceOwnerReleaseGlobalBaseEntry(ResourceOwner owner, bool isCommit);
+extern void ResourceOwnerReleaseGlobalDBEntry(ResourceOwner owner, bool isCommit);
+extern void ResourceOwnerReleaseGlobalIsExclusive(ResourceOwner owner, bool isCommit);
+extern bool CurrentResourceOwnerIsEmpty(ResourceOwner owner);
 #endif /* RESOWNER_H */

@@ -8,6 +8,7 @@
  * Portions Copyright (c) 2020 Huawei Technologies Co.,Ltd.
  * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
+ * Portions Copyright (c) 2021, openGauss Contributors
  *
  * IDENTIFICATION
  *	  src/gausskernel/storage/access/common/printtup.cpp
@@ -32,7 +33,7 @@
 #include "utils/builtins.h"
 #endif
 #include "distributelayer/streamProducer.h"
-#include "executor/execStream.h"
+#include "executor/exec/execStream.h"
 #include "access/heapam.h"
 
 static void printtup_startup(DestReceiver *self, int operation, TupleDesc typeinfo);
@@ -43,6 +44,10 @@ static void printtup_destroy(DestReceiver *self);
 
 static void SendRowDescriptionCols_2(StringInfo buf, TupleDesc typeinfo, List *targetlist, int16 *formats);
 static void SendRowDescriptionCols_3(StringInfo buf, TupleDesc typeinfo, List *targetlist, int16 *formats);
+static void writeString(StringInfo buf, const char *name, bool isWrite);
+#ifndef ENABLE_MULTIPLE_NODES
+static bool checkNeedUpperAndToUpper(char *dest, const char *source);
+#endif
 
 /* for stream send function */
 static void printBroadCastTuple(TupleTableSlot *tuple, DestReceiver *self);
@@ -543,8 +548,11 @@ static void SendRowDescriptionCols_3(StringInfo buf, TupleDesc typeinfo, List *t
     for (i = 0; i < natts; ++i) {
         Oid atttypid = attrs[i]->atttypid;
         int32 atttypmod = attrs[i]->atttypmod;
+        if (IsClientLogicType(atttypid) && atttypmod == -1) {
+            elog(DEBUG1, "client logic without original type is sent to client");
+        }
 
-        pq_writestring(buf, NameStr(attrs[i]->attname));
+        writeString(buf, NameStr(attrs[i]->attname), true);
 
 #ifdef PGXC
         /*
@@ -584,7 +592,7 @@ static void SendRowDescriptionCols_3(StringInfo buf, TupleDesc typeinfo, List *t
         pq_writeint32(buf, atttypmod);
 
         /*
-         * Send the type name from a Postgres-XC backend node.
+         * Send the type name from a openGauss backend node.
          * This preserves from OID inconsistencies as architecture is shared nothing.
          */
         /* Description: unified cn/dn cn/client  tupledesc data format under normal type. */
@@ -615,7 +623,7 @@ static void SendRowDescriptionCols_2(StringInfo buf, TupleDesc typeinfo, List *t
         Oid atttypid = attrs[i]->atttypid;
         int32 atttypmod = attrs[i]->atttypmod;
 
-        pq_sendstring(buf, NameStr(attrs[i]->attname));
+        writeString(buf, NameStr(attrs[i]->attname), false);
 
 #ifdef PGXC
         /*
@@ -635,7 +643,7 @@ static void SendRowDescriptionCols_2(StringInfo buf, TupleDesc typeinfo, List *t
         pq_sendint32(buf, atttypmod);
 
         /*
-         * Send the type name from a Postgres-XC backend node.
+         * Send the type name from a openGauss backend node.
          * This preserves from OID inconsistencies as architecture is shared nothing.
          */
         /* Description: unified cn/dn cn/client  tupledesc data format under normal type. */
@@ -646,6 +654,65 @@ static void SendRowDescriptionCols_2(StringInfo buf, TupleDesc typeinfo, List *t
         }
     }
 }
+
+/*
+ * Using pq_writestring in SendRowDescriptionCols_3 and pq_sendstring in SendRowDescriptionCols_2.
+ */
+static void writeString(StringInfo buf, const char *name, bool isWrite)
+{
+    char *res = (char *)name;
+
+#ifndef ENABLE_MULTIPLE_NODES
+    /*
+     * Uppercasing attribute name only works in ORA compatibility mode and centralized environment.
+     * If the letters is all lowercase, return the result after converting to uppercase.
+     */
+    char objectNameUppercase[NAMEDATALEN] = {'\0'};
+    if (u_sess->attr.attr_sql.sql_compatibility == A_FORMAT && u_sess->attr.attr_sql.uppercase_attribute_name &&
+        checkNeedUpperAndToUpper(objectNameUppercase, name)) {
+        res = objectNameUppercase;
+    }
+#endif
+
+    if (likely(isWrite)) {
+        pq_writestring(buf, res);
+    } else {
+        pq_sendstring(buf, res);
+    }
+}
+
+#ifndef ENABLE_MULTIPLE_NODES
+/*
+ * Check whether the letters is all lowercase. If yes, then needUpper is true.
+ * Use dest to save the result after converting to uppercase.
+ */
+static bool checkNeedUpperAndToUpper(char *dest, const char *source)
+{
+    size_t i = 0;
+    bool needUpper = true;
+    while (*source != '\0') {
+        int mblen = pg_mblen(source);
+        /*
+         * If mblen == 1, then need to further determine whether this single-byte character is an uppercase letter.
+         * Otherwise, copy directly from source to dest.
+         */
+        if (mblen == 1) {
+            /* this single-byte character is an uppercase letter, do not need upper. */
+            if (unlikely(isupper(*source))) {
+                needUpper = false;
+                break;
+            }
+            dest[i++] = toupper(*source++);
+        } else {
+            for (int j = 0; j < mblen; j++) {
+                dest[i++] = *source++;
+            }
+        }
+    }
+    dest[i] = '\0';
+    return needUpper;
+}
+#endif
 
 /*
  * Get the lookup info that printtup() needs

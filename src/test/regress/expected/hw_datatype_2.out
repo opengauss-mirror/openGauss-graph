@@ -64,6 +64,9 @@ INSERT INTO TEST_TINYINT VALUES (255,255);
 INSERT INTO TEST_TINYINT VALUES (-1,-1);
 ERROR:  tinyint out of range
 CONTEXT:  referenced column: id
+INSERT INTO TEST_TINYINT VALUES (1, -0.4);
+ERROR:  tinyint out of range
+CONTEXT:  referenced column: it
 INSERT INTO TEST_TINYINT VALUES (256,256);
 ERROR:  tinyint out of range
 CONTEXT:  referenced column: id

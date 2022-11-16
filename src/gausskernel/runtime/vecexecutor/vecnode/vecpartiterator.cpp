@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2020 Huawei Technologies Co.,Ltd.
+ * Portions Copyright (c) 2021, openGauss Contributors
  *
  * openGauss is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
@@ -23,8 +24,9 @@
 #include "postgres.h"
 #include "knl/knl_variable.h"
 
-#include "executor/execdebug.h"
+#include "executor/exec/execdebug.h"
 #include "vecexecutor/vecpartiterator.h"
+#include "executor/node/nodePartIterator.h"
 #include "executor/tuptable.h"
 #include "utils/memutils.h"
 #include "nodes/execnodes.h"
@@ -46,6 +48,7 @@ VecPartIteratorState* ExecInitVecPartIterator(VecPartIterator* node, EState* est
     state->ps.righttree = NULL;
     state->ps.subPlan = NULL;
     state->currentItr = -1;
+    state->subPartCurrentItr = -1;
     state->ps.ps_TupFromTlist = false;
     state->ps.ps_ProjInfo = NULL;
     state->ps.vectorized = true;
@@ -54,38 +57,9 @@ VecPartIteratorState* ExecInitVecPartIterator(VecPartIterator* node, EState* est
     return state;
 }
 
-static void init_vecscan_partition(VecPartIteratorState* node)
+static int GetVecscanPartitionNum(const PartIteratorState* node)
 {
-    int paramno = 0;
-    unsigned int itr_idx = 0;
     VecPartIterator* pi_node = (VecPartIterator*)node->ps.plan;
-    ParamExecData* param = NULL;
-
-    Assert(ForwardScanDirection == pi_node->direction || BackwardScanDirection == pi_node->direction);
-
-    /* set iterator parameter */
-    node->currentItr++;
-    itr_idx = node->currentItr;
-    if (BackwardScanDirection == pi_node->direction)
-        itr_idx = pi_node->itrs - itr_idx - 1;
-
-    paramno = pi_node->param->paramno;
-    param = &(node->ps.state->es_param_exec_vals[paramno]);
-    param->isnull = false;
-    param->value = (Datum)itr_idx;
-    node->ps.lefttree->chgParam = bms_add_member(node->ps.lefttree->chgParam, paramno);
-
-    /* reset the plan node so that next partition can be scanned */
-    VecExecReScan(node->ps.lefttree);
-}
-
-VectorBatch* ExecVecPartIterator(VecPartIteratorState* node)
-{
-    VectorBatch* result = NULL;
-    VecPartIterator* pi_node = (VecPartIterator*)node->ps.plan;
-    EState* state = node->ps.lefttree->state;
-    bool orig_early_free = state->es_skip_early_free;
-
     PlanState* noden = (PlanState*)node->ps.lefttree;
     int partitionScan;
     switch (nodeTag(noden)) {
@@ -97,18 +71,107 @@ VectorBatch* ExecVecPartIterator(VecPartIteratorState* node)
             partitionScan = ((TsStoreScanState*)noden)->part_id;
             break;
 #endif
+        case T_DfsIndexScanState:
+            partitionScan = ((DfsIndexScanState*)noden)->part_id;
+            break;
+        case T_CStoreIndexScanState:
+            partitionScan = ((CStoreIndexScanState*)noden)->part_id;
+            break;
+        case T_CStoreIndexCtidScanState:
+            partitionScan = ((CStoreIndexCtidScanState*)noden)->part_id;
+            break;
+        case T_CStoreIndexHeapScanState:
+            partitionScan = ((CStoreIndexHeapScanState*)noden)->part_id;
+            break;
+        case T_RowToVecState: {
+            ScanState* scanState = (ScanState*)noden->lefttree;
+            switch (nodeTag(scanState)) {
+                case T_SeqScanState:
+                case T_IndexScanState:
+                case T_IndexOnlyScanState:
+                case T_BitmapHeapScanState:
+                    partitionScan =  scanState->part_id;
+                    break;
+                default:
+                    partitionScan = pi_node->itrs;
+                    break;
+            }
+            break;
+        }
         default:
             partitionScan = pi_node->itrs;
             break;
     }
+    return partitionScan;
+}
 
+/* return: false means all patition finished */
+static bool InitVecscanPartition(VecPartIteratorState* node, int partitionScan)
+{
+    int paramno = 0;
+    unsigned int itr_idx = 0;
+    VecPartIterator* pi_node = (VecPartIterator*)node->ps.plan;
+    ParamExecData* param = NULL;
+    List* subPartLengthList = NULL;
+    PlanState* noden = NULL;
+
+    /* check sub partitions */
+    if (IsA(node->ps.lefttree, RowToVecState)) {
+        RowToVecState* rowToVecNode = (RowToVecState*)node->ps.lefttree;
+        noden = (PlanState*)rowToVecNode->ps.lefttree;
+        if (IsA(noden, ScanState) || IsA(noden, SeqScanState) || IsA(noden, IndexOnlyScanState) ||
+            IsA(noden, IndexScanState) || IsA(noden, BitmapHeapScanState) || IsA(noden, TidScanState)) {
+            subPartLengthList = ((ScanState *)noden)->subPartLengthList;
+        }
+    }
+
+    /* if there is no partition to scan, return false */
+    if (node->currentItr + 1 >= partitionScan) {
+        if (subPartLengthList != NIL) {
+            int subPartLength = (int)list_nth_int(subPartLengthList, node->currentItr);
+            if (node->subPartCurrentItr + 1 >= subPartLength) {
+                return false;
+            }
+        } else {
+            return false;
+        }
+    }
+
+    Assert(ForwardScanDirection == pi_node->direction || BackwardScanDirection == pi_node->direction);
+
+    /* set iterator parameter */
+    SetPartitionIteratorParamter(node, subPartLengthList);
+
+    itr_idx = node->currentItr;
+    if (BackwardScanDirection == pi_node->direction)
+        itr_idx = partitionScan - itr_idx - 1;
+
+    paramno = pi_node->param->paramno;
+    param = &(node->ps.state->es_param_exec_vals[paramno]);
+    param->isnull = false;
+    param->value = (Datum)itr_idx;
+    node->ps.lefttree->chgParam = bms_add_member(node->ps.lefttree->chgParam, paramno);
+
+    /* reset the plan node so that next partition can be scanned */
+    VecExecReScan(node->ps.lefttree);
+
+    return true;
+}
+
+VectorBatch* ExecVecPartIterator(VecPartIteratorState* node)
+{
+    VectorBatch* result = NULL;
+    EState* state = node->ps.lefttree->state;
+    bool orig_early_free = state->es_skip_early_free;
+
+    int partitionScan = GetVecscanPartitionNum(node);
     if (partitionScan == 0) {
         return NULL;
     }
 
     /* init first scanned partition */
     if (-1 == node->currentItr)
-        init_vecscan_partition(node);
+        InitVecscanPartition(node, partitionScan);
 
     /* For partition wise join, can not early free left tree's caching memory */
     state->es_skip_early_free = true;
@@ -119,11 +182,9 @@ VectorBatch* ExecVecPartIterator(VecPartIteratorState* node)
         return result;
 
     for (;;) {
-        /* if there is no partition to scan, return null */
-        if (node->currentItr >= partitionScan - 1)
+        if (!InitVecscanPartition(node, partitionScan)) {
             return NULL;
-
-        init_vecscan_partition(node);
+        }
 
         /* For partition wise join, can not early free left tree's caching memory */
         orig_early_free = state->es_skip_early_free;
@@ -150,13 +211,14 @@ void ExecReScanVecPartIterator(VecPartIteratorState* node)
     VecPartIterator* pi_node = NULL;
     int paramno = -1;
     ParamExecData* param = NULL;
-    VecPartIterator* piterator = NULL;
-
-    piterator = (VecPartIterator*)node->ps.plan;
+    int subPartParamno = -1;
+    ParamExecData* subPartParam = NULL;
 
     /* do nothing if there is no partition to scan */
-    if (0 == piterator->itrs)
+    int partitionScan = GetVecscanPartitionNum(node);
+    if (partitionScan == 0) {
         return;
+    }
 
     node->currentItr = -1;
 
@@ -166,6 +228,14 @@ void ExecReScanVecPartIterator(VecPartIteratorState* node)
     param->isnull = false;
     param->value = (Datum)0;
     node->ps.lefttree->chgParam = bms_add_member(node->ps.lefttree->chgParam, paramno);
+
+    node->subPartCurrentItr = -1;
+
+    subPartParamno = pi_node->param->subPartParamno;
+    subPartParam = &(node->ps.state->es_param_exec_vals[subPartParamno]);
+    subPartParam->isnull = false;
+    subPartParam->value = (Datum)0;
+    node->ps.lefttree->chgParam = bms_add_member(node->ps.lefttree->chgParam, subPartParamno);
 
     /*
      * if the pruning result isnot null, Reset the subplan node so

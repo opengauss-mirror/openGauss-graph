@@ -6,6 +6,7 @@
  * Portions Copyright (c) 2020 Huawei Technologies Co.,Ltd.
  * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
+ * Portions Copyright (c) 2021, openGauss Contributors
  *
  *
  * IDENTIFICATION
@@ -16,7 +17,8 @@
 #include "postgres.h"
 #include "knl/knl_variable.h"
 
-#include "executor/execStream.h"
+#include "executor/exec/execStream.h"
+#include "db4ai/db4ai_api.h"
 
 /*
  * Optimizer common function that return a plan node's plain text, we wrapper it from
@@ -65,6 +67,9 @@ void GetPlanNodePlainText(
         case T_RecursiveUnion:
             *pname = *sname = *pt_operation = "Recursive Union";
             break;
+        case T_StartWithOp:
+            *pname = *sname = *pt_operation = "StartWith Operator";
+            break;
         case T_BitmapAnd:
             *pname = *sname = "BitmapAnd";
             *pt_operation = "BITMAP AND";
@@ -74,6 +79,9 @@ void GetPlanNodePlainText(
             *pt_operation = "BITMAP OR";
             break;
         case T_NestLoop:
+#ifdef GS_GRAPH
+        case T_NestLoopVLE:
+#endif
             *pname = *sname = "Nested Loop";
             *pt_operation = "NESTED LOOPS";
             break;
@@ -444,7 +452,11 @@ void GetPlanNodePlainText(
             *pname = *sname = *pt_operation = "Row Adapter";
             break;
         case T_RowToVec:
-            *pname = *sname = *pt_operation = "Vector Adapter";
+            if (IsA(plan->lefttree, SeqScan) && ((SeqScan*)plan->lefttree)->scanBatchMode) {
+                *pname = *sname = *pt_operation = "Vector Adapter(type: BATCH MODE)";
+            } else {
+                *pname = *sname = *pt_operation = "Vector Adapter";
+            }
             break;
         case T_VecAppend:
             *pname = *sname = *pt_operation = "Vector Append";
@@ -477,11 +489,12 @@ void GetPlanNodePlainText(
             *pname = "Vector Merge";
             *sname = *pt_operation = "Vector Merge Join";
             break;
-        case T_GradientDescent:
-            *pname = *sname = *pt_options = "Gradient Descent";
-            break;
-        case T_KMeans:
-            *pname = *sname = *pt_options = "K-Means";
+        case T_TrainModel: {
+                TrainModel *ptrain = (TrainModel*)plan;
+                AlgorithmAPI *api = get_algorithm_api(ptrain->algorithm);
+                *pname = "Train Model";
+                *sname = *pt_operation = (char*) api->name;
+            }
             break;
         default:
             *pname = *sname = *pt_operation = "?\?\?";

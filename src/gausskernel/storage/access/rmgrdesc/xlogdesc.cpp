@@ -23,6 +23,7 @@
 #ifdef FRONTEND
 #include "common/fe_memutils.h"
 #endif
+#define CKPTPLUSLEN 112
 
 /*
  * GUC support
@@ -35,6 +36,54 @@ struct config_enum_entry wal_level_options[] = {
     { NULL, 0, false }
 };
 
+const char *xlog_type_name(uint8 subtype)
+{
+    uint8 info = subtype & ~XLR_INFO_MASK;
+    switch (info) {
+        case XLOG_CHECKPOINT_SHUTDOWN:
+            return "shutdown_checkpoint";
+            break;
+        case XLOG_CHECKPOINT_ONLINE:
+            return "online_checkpoint";
+            break;
+        case XLOG_NOOP:
+            return "noop";
+            break;
+        case XLOG_NEXTOID:
+            return "nextoid";
+            break;
+        case XLOG_SWITCH:
+            return "xlog switch";
+            break;
+        case XLOG_BACKUP_END:
+            return "backup end";
+            break;
+        case XLOG_PARAMETER_CHANGE:
+            return "parameter chage";
+            break;
+        case XLOG_RESTORE_POINT:
+            return "restore point";
+            break;
+        case XLOG_FPW_CHANGE:
+            return "restore point";
+            break;
+        case XLOG_END_OF_RECOVERY:
+            return "end of recovery";
+            break;
+        case XLOG_FPI_FOR_HINT:
+            return "fpi for hint";
+            break;
+        case XLOG_FPI:
+            return "fpi";
+            break;
+        case XLOG_DELAY_XLOG_RECYCLE:
+            return "delay recycle";
+            break;
+        default:
+            return "unkown type";
+    }
+}
+
 void xlog_desc(StringInfo buf, XLogReaderState *record)
 {
     char *rec = XLogRecGetData(record);
@@ -44,6 +93,7 @@ void xlog_desc(StringInfo buf, XLogReaderState *record)
     if (info == XLOG_CHECKPOINT_SHUTDOWN || info == XLOG_CHECKPOINT_ONLINE) {
         CheckPoint *checkpoint = (CheckPoint *)rec;
         CheckPointPlus *ckpt_plus = (CheckPointPlus *)rec;
+        CheckPointUndo *ckpt_undo = (CheckPointUndo *)rec;
         time_t time_tmp;
         char ckpttime_str[128];
         const char *strftime_fmt = "%c";
@@ -62,12 +112,14 @@ void xlog_desc(StringInfo buf, XLogReaderState *record)
                          "len %lu; next_csn %lu; recent_global_xmin %lu; "
                          "tli %u; fpw %s; xid " XID_FMT "; oid %u; multi %lu; offset " UINT64_FORMAT
                          "; "
-                         "oldest xid " XID_FMT " in DB %u; oldest running xid " XID_FMT "; %s at %s; remove_seg %X/%X",
+                         "oldest xid " XID_FMT " in DB %u; oldest running xid " XID_FMT "; "
+                         "oldest xid with epoch having undo " XID_FMT "; %s at %s; remove_seg %X/%X",
                          (uint32)(checkpoint->redo >> 32), (uint32)checkpoint->redo, ckpt_plus->length,
                          ckpt_plus->next_csn, ckpt_plus->recent_global_xmin, checkpoint->ThisTimeLineID,
                          checkpoint->fullPageWrites ? "true" : "false", checkpoint->nextXid, checkpoint->nextOid,
                          checkpoint->nextMulti, checkpoint->nextMultiOffset, checkpoint->oldestXid,
                          checkpoint->oldestXidDB, checkpoint->oldestActiveXid,
+                         (ckpt_plus->length > CKPTPLUSLEN)  ? ckpt_undo->oldestXidInUndo : 0,
                          (info == XLOG_CHECKPOINT_SHUTDOWN) ? "shutdown" : "online", ckpttime_str,
                          (uint32)(checkpoint->remove_seg >> 32), (uint32)checkpoint->remove_seg);
     } else if (info == XLOG_NOOP) {

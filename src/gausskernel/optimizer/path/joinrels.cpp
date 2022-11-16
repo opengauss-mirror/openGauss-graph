@@ -72,8 +72,9 @@ void join_search_one_level(PlannerInfo* root, int level)
      */
     foreach (r, joinrels[level - 1]) {
         RelOptInfo* old_rel = (RelOptInfo*)lfirst(r);
-
-        if (old_rel->joininfo != NIL || old_rel->has_eclass_joins || has_join_restriction(root, old_rel)) {
+        bool isTrue = old_rel->joininfo != NIL || old_rel->has_eclass_joins 
+                                               || has_join_restriction(root, old_rel);
+        if (isTrue) {
             /*
              * There are join clauses or join order restrictions relevant to
              * this rel, so consider joins between this rel and (only) those
@@ -561,7 +562,7 @@ RelOptInfo* make_join_rel(PlannerInfo* root, RelOptInfo* rel1, RelOptInfo* rel2)
     joinrelids = bms_union(rel1->relids, rel2->relids);
 
     /* Check validity and determine join type. */
-    if (!join_is_legal(root, rel1, rel2, joinrelids, &sjinfo, &reversed)) {
+    if (!join_is_legal(root, rel1, rel2, joinrelids, &sjinfo, &reversed)) {   // ����һ���п����� sjinfo ��Ϊ�ǿ�
         /* invalid join path */
         bms_free_ext(joinrelids);
         return NULL;
@@ -740,14 +741,31 @@ RelOptInfo* make_join_rel(PlannerInfo* root, RelOptInfo* rel1, RelOptInfo* rel2)
             add_paths_to_joinrel(root, joinrel, rel1, rel2, JOIN_ANTI, sjinfo, restrictlist);
             add_paths_to_joinrel(root, joinrel, rel2, rel1, JOIN_RIGHT_ANTI, sjinfo, restrictlist);
             break;
-        default: {
-            /* other values not expected here */
-            ereport(ERROR,
-                (errmodule(MOD_OPT),
-                    errcode(ERRCODE_UNRECOGNIZED_NODE_TYPE),
-                    errmsg("unrecognized join type when make a join rel: %d", (int)sjinfo->jointype)));
-        } break;
+#ifdef GS_GRAPH
+        case JOIN_VLE:
+            if (is_dummy_rel(rel1) || is_dummy_rel(rel2) ||
+                    restriction_is_constant_false(restrictlist, false))
+            {
+                mark_dummy_rel(joinrel);
+				break;
+            }
+			add_paths_to_joinrel_for_vle(root, joinrel, rel1, rel2, sjinfo, restrictlist);
+			break;
+        case JOIN_CYPHER_DELETE:
+			if (is_dummy_rel(rel1) ||
+				restriction_is_constant_false(restrictlist, true))
+			{
+				mark_dummy_rel(joinrel);
+				break;
+			}
+			if (restriction_is_constant_false(restrictlist, false) &&
+				bms_is_subset(rel2->relids, sjinfo->syn_righthand))
+				mark_dummy_rel(rel2);
+			add_paths_for_cdelete(root, joinrel, rel1, rel2, sjinfo->jointype, sjinfo, restrictlist);
+			break;
+#endif /* GS_GRAPH */
     }
+
 
     bms_free_ext(joinrelids);
 
@@ -767,7 +785,8 @@ RelOptInfo* make_join_rel(PlannerInfo* root, RelOptInfo* rel1, RelOptInfo* rel2)
          * We remove the useless RelOptInfo and then try other join path if the current level 
          * is not the top level.
          */
-        if (ENABLE_PRED_PUSH_ALL(root) && root->join_cur_level < list_length(root->join_rel_level[1])) {
+        if (ENABLE_PRED_PUSH_ALL(root) && root->join_rel_level && 
+            root->join_cur_level < list_length(root->join_rel_level[1])) {
             remove_join_rel(root, joinrel);
             return NULL;
         } else {

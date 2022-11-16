@@ -123,6 +123,9 @@ inline void remove_model_by_oid(Oid model_oid)
     ScanKeyData skey[1];
     SysScanDesc scan;
 
+    if (t_thrd.proc->workingVersionNum < 92366)
+        return;
+
     ScanKeyInit(&skey[0], ObjectIdAttributeNumber, BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(model_oid));
 
     rel = heap_open(ModelRelationId, RowExclusiveLock);

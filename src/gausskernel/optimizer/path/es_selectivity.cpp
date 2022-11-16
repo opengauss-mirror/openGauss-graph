@@ -20,6 +20,7 @@
 #include "catalog/pg_statistic.h"
 #include "optimizer/cost.h"
 #include "optimizer/pathnode.h"
+#include "optimizer/var.h"
 #include "utils/guc.h"
 #include "utils/lsyscache.h"
 #include "nodes/print.h"
@@ -30,6 +31,7 @@ const int TOW_MEMBERS = 2;
 
 ES_SELECTIVITY::ES_SELECTIVITY()
     : es_candidate_list(NULL),
+      es_candidate_saved(NULL),
       unmatched_clause_group(NULL),
       root(NULL),
       sjinfo(NULL),
@@ -40,6 +42,63 @@ ES_SELECTIVITY::ES_SELECTIVITY()
 
 ES_SELECTIVITY::~ES_SELECTIVITY()
 {}
+
+bool ES_SELECTIVITY::ContainIndexCols(const es_candidate* es, const IndexOptInfo* index) const
+{
+    for (int pos = 0; pos < index->ncolumns; pos++) {
+        int indexAttNum = index->indexkeys[pos];
+        /* 
+         * Notice: indexAttNum can be negative. Some indexAttNums of junk column may be negative 
+         * since they are located before the first visible column. for example, the indexAttNum 
+         * of 'oid' column in system table 'pg_class' is -2.
+         */
+        if (indexAttNum >= 0 && !bms_is_member(indexAttNum, es->left_attnums))
+            return false;
+    }
+
+    return true;
+}
+
+bool ES_SELECTIVITY::MatchUniqueIndex(const es_candidate* es) const
+{
+    ListCell* lci = NULL;
+    foreach (lci, es->left_rel->indexlist) {
+        IndexOptInfo* indexToMatch = (IndexOptInfo*)lfirst(lci);
+        if (indexToMatch->relam == BTREE_AM_OID && indexToMatch->unique 
+            && ContainIndexCols(es, indexToMatch)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+/* 
+ * check whether the equality constraints match an unique index. 
+ * We know the result only has one row if finding a matched unique index.
+ */
+void ES_SELECTIVITY::CalSelWithUniqueIndex(Selectivity &result)
+{
+    List* es_candidate_used = NULL;
+    ListCell* l = NULL;
+    foreach(l, es_candidate_list) {
+        es_candidate* temp = (es_candidate*)lfirst(l);
+        if (temp->tag == ES_EQSEL && MatchUniqueIndex(temp) && 
+            temp->left_rel && temp->left_rel->tuples >= 1.0) {
+            result *= 1.0 / temp->left_rel->tuples;
+            es_candidate_used = lappend(es_candidate_used, temp);
+        }
+    }
+
+    /* 
+     * Finally, we need to delete es_candidates which have already used. The rests es_candidates 
+     * will calculate with statistic info.
+     */
+    es_candidate_saved = es_candidate_list;
+    es_candidate_list = list_difference_ptr(es_candidate_list, es_candidate_used);
+
+    list_free(es_candidate_used);
+}
 
 /*
  * @brief        Main entry for using extended statistic to calculate selectivity
@@ -61,6 +120,12 @@ Selectivity ES_SELECTIVITY::calculate_selectivity(PlannerInfo* root_input, List*
     } else {
         group_clauselist(origin_clauses);
     }
+
+    /*
+     * Before reading statistic, We check whether the equality constraints match an 
+     * unique index. We know the result only has one row if finding a matched unique index.
+     */
+    CalSelWithUniqueIndex(result);
 
     /* read statistic */
     read_statistic();
@@ -90,6 +155,8 @@ Selectivity ES_SELECTIVITY::calculate_selectivity(PlannerInfo* root_input, List*
                 break;
         }
     }
+
+    es_candidate_list = es_candidate_saved;
 
     /* free memory, but unmatched_clause_group need to be free manually */
     clear();
@@ -589,7 +656,7 @@ static bool ClauseIsLegal(es_type type, const Node* left, const Node* right, int
     /* check clause type */
     switch (type) {
         case ES_EQSEL:
-            if (!IsA(left, Const) && !IsA(right, Const))
+            if (!IsA(left, Const) && !IsA(right, Const) && !IsA(left, Param) && !IsA(right, Param))
                 return false;
             else if (IsA(left, Const) && ((Const*)left)->constisnull)
                 return false;
@@ -791,6 +858,43 @@ static inline bool IsUnsupportedCases(const EquivalenceClass* ec)
 }
 
 /*
+ * @brief       pre-check the es candidate item is or not in current equivalence class.
+ * @return      bool, true or false.
+ */
+bool ES_SELECTIVITY::IsEsCandidateInEqClass(es_candidate *es, EquivalenceClass *ec)
+{
+    if (es == NULL || ec == NULL) {
+        return false;
+    }
+
+    /* Quickly ignore any that don't cover the join */
+    if (!bms_is_subset(es->relids, ec->ec_relids)) {
+        return false;
+    }
+
+    foreach_cell (lc, ec->ec_members) {
+        EquivalenceMember *em = (EquivalenceMember *)lfirst(lc);
+        Var *emVar = (Var *)LocateOpExprLeafVar((Node *)em->em_expr);
+
+        if (emVar == NULL) {
+            continue;
+        }
+
+        if (emVar->varattno <= 0) {
+            continue;
+        }
+
+        /* left or right branch of join es occurs in the current equivalencen member, so the ec is valid. */
+        if ((bms_equal(es->left_relids, em->em_relids) && bms_is_member(emVar->varattno, es->left_attnums)) ||
+            (bms_equal(es->right_relids, em->em_relids) && bms_is_member(emVar->varattno, es->right_attnums))) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+/*
  * @brief       try to find a substitude clause building from equivalence classes
  * @return    true when find a substitude clause; false when find nothing
  */
@@ -810,8 +914,8 @@ bool ES_SELECTIVITY::try_equivalence_class(es_candidate* es)
         if (IsUnsupportedCases(ec))
             continue;
 
-        /* We can quickly ignore any that don't cover the join, too */
-        if (!bms_is_subset(es->relids, ec->ec_relids))
+        /* ignore ec which does not contain the es info. */
+        if (!IsEsCandidateInEqClass(es, ec))
             continue;
 
         Bitmapset* tmpset = bms_copy(ec->ec_relids);
@@ -1251,7 +1355,7 @@ int ES_SELECTIVITY::read_attnum(Node* node) const
         attnum = var->varattno;
         if (attnum <= 0)
             attnum = -1;
-    } else if (IsA(node, Const))
+    } else if (IsA(node, Const) || IsA(node, Param))
         attnum = 0;
 
     return attnum;

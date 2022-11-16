@@ -17,22 +17,31 @@
 #include "replication/replicainternal.h"
 #include "access/xlogdefs.h"
 #include "access/redo_statistic_msg.h"
-#include "../common/config/cm_config.h"
+#include "common/config/cm_config.h"
 #include <vector>
 #include <string>
 
 #define CM_MAX_SENDER_NUM 2
-#define LOGIC_CLUSTER_NUMBER (32 + 1)  ////max 32 logic + 1 elastic group
+#define LOGIC_CLUSTER_NUMBER (32 + 1)  // max 32 logic + 1 elastic group
 #define CM_LOGIC_CLUSTER_NAME_LEN 64
 #define CM_MSG_ERR_INFORMATION_LENGTH 1024
+#ifndef MAX_INT32
 #define MAX_INT32 (2147483600)
+#endif
 #define CN_INFO_NUM 8
 #define RESERVE_NUM 160
 #define RESERVE_NUM_USED 4
 #define MAX_SYNC_STANDBY_LIST 1024
+#define REMAIN_LEN 20
 
 using std::string;
 using std::vector;
+
+const uint32 g_barrierSlotVersion = 92380;
+const uint32 g_hadrKeyCn = 92381;
+
+const int32 FAILED_SYNC_DATA = 0;
+const int32 SUCCESS_SYNC_DATA = 1;
 
 /*
  * Symbols in the following enum are usd in cluster_msg_map_string defined in cm_misc.cpp.
@@ -130,9 +139,9 @@ typedef enum CM_MessageType {
     MSG_CM_AGENT_GS_GUC = 74,
     MSG_AGENT_CM_GS_GUC_ACK = 75,
     MSG_CM_CTL_SWITCHOVER_INCOMPLETE_ACK = 76,
-    MSG_CM_CM_TIMELINE = 77, /*when restart cluster , cmserver primary and standy timeline*/
+    MSG_CM_CM_TIMELINE = 77, /* when restart cluster , cmserver primary and standy timeline */
     MSG_CM_BUILD_DOING = 78,
-    MSG_AGENT_CM_ETCD_CURRENT_TIME = 79, /*etcd clock monitoring message*/
+    MSG_AGENT_CM_ETCD_CURRENT_TIME = 79, /* etcd clock monitoring message */
     MSG_CM_QUERY_INSTANCE_STATUS = 80,
     MSG_CM_SERVER_TO_AGENT_CONN_CHECK = 81,
     MSG_CTL_CM_GET_DATANODE_RELATION = 82, /* depracated for the removal of quick switchover */
@@ -165,6 +174,21 @@ typedef enum CM_MessageType {
     MSG_CM_CTL_BACKUP_OPEN = 109,
     MSG_CM_AGENT_DN_SYNC_LIST = 110,
     MSG_AGENT_CM_DN_SYNC_LIST = 111,
+    MSG_CTL_CM_SWITCHOVER_FAST = 112,
+    MSG_CM_AGENT_SWITCHOVER_FAST = 113,
+    MSG_CTL_CM_RELOAD = 114,
+    MSG_CM_CTL_RELOAD_ACK = 115,
+    MSG_CM_CTL_INVALID_COMMAND_ACK = 116,
+    MSG_AGENT_CM_CN_OBS_STATUS = 117,
+    MSG_CM_AGENT_NOTIFY_CN_RECOVER = 118,
+    MSG_CM_AGENT_FULL_BACKUP_CN_OBS = 119,
+    MSG_AGENT_CM_BACKUP_STATUS_ACK = 120,
+    MSG_CM_AGENT_REFRESH_OBS_DEL_TEXT = 121,
+    MSG_AGENT_CM_INSTANCE_BARRIER_NEW = 122,
+    MSG_CTL_CM_GLOBAL_BARRIER_QUERY_NEW = 123,
+    MSG_CM_CTL_GLOBAL_BARRIER_DATA_BEGIN_NEW = 124,
+    MSG_CM_AGENT_DATANODE_INSTANCE_BARRIER = 125,
+    MSG_CM_AGENT_COORDINATE_INSTANCE_BARRIER = 126,
 } CM_MessageType;
 
 #define UNDEFINED_LOCKMODE 0
@@ -182,6 +206,9 @@ typedef enum CM_MessageType {
 #define INSTANCE_ROLE_DELETED 7
 #define INSTANCE_ROLE_DELETING 8
 #define INSTANCE_ROLE_READONLY 9
+#define INSTANCE_ROLE_OFFLINE 10
+#define INSTANCE_ROLE_MAIN_STANDBY 11
+#define INSTANCE_ROLE_CASCADE_STANDBY 12
 
 #define INSTANCE_ROLE_FIRST_INIT 1
 #define INSTANCE_ROLE_HAVE_INIT 2
@@ -240,13 +267,15 @@ const int INSTANCE_WALSNDSTATE_UNKNOWN = 6;
 #define SWITCHOVER_EXECING 3
 #define SWITCHOVER_PARTLY_SUCCESS 4
 #define SWITCHOVER_ABNORMAL 5
+#define INVALID_COMMAND 6
+
 
 #define UNKNOWN_BAD_REASON 0
 #define PORT_BAD_REASON 1
 #define NIC_BAD_REASON 2
 #define DISC_BAD_REASON 3
 #define STOPPED_REASON 4
-#define CN_DELETEED_REASON 5
+#define CN_DELETED_REASON 5
 
 #define KERBEROS_STATUS_UNKNOWN 0
 #define KERBEROS_STATUS_NORMAL 1
@@ -255,10 +284,18 @@ const int INSTANCE_WALSNDSTATE_UNKNOWN = 6;
 
 #define HOST_LENGTH 32
 #define BARRIERLEN 40
+#define MAX_SLOT_NAME_LEN 64
+#define MAX_BARRIER_SLOT_COUNT 5
 // the length of cm_serer sync msg  is 9744, msg type is MSG_CM_CM_REPORT_SYNC
 #define CM_MSG_MAX_LENGTH (12288 * 2)
 
 #define CMAGENT_NO_CCN "NoCentralNode"
+
+#define OBS_DEL_VERSION_V1 (1)
+#define DEL_TEXT_HEADER_LEN_V1 (10)  // version(4->V%3d) + delCount(4->C%3d) + '\n' + '\0'
+#define CN_BUILD_TASK_ID_MAX_LEN   (21)      // cnId(4) + cmsId(4) + time(12->yyMMddHH24mmss) + 1
+#define MAX_OBS_CN_COUNT   (64)
+#define MAX_OBS_DEL_TEXT_LEN  (CN_BUILD_TASK_ID_MAX_LEN * MAX_OBS_CN_COUNT + DEL_TEXT_HEADER_LEN_V1)
 
 extern int g_gtm_phony_dead_times;
 extern int g_dn_phony_dead_times[CM_MAX_DATANODE_PER_NODE];
@@ -346,6 +383,44 @@ typedef struct ctl_to_cm_query {
     int relation;
 } ctl_to_cm_query;
 
+#define NOTIFY_MSG_RESERVED (32)
+
+typedef struct Cm2AgentNotifyCnRecoverByObs_t {
+    int msg_type;
+    uint32 instanceId;
+    bool changeKeyCn;
+    uint32 syncCnId;
+    char slotName[MAX_SLOT_NAME_LEN];
+} Cm2AgentNotifyCnRecoverByObs;
+
+typedef struct Cm2AgentBackupCn2Obs_t {
+    int msg_type;
+    uint32 instanceId;
+    char slotName[MAX_SLOT_NAME_LEN];
+    char taskIdStr[CN_BUILD_TASK_ID_MAX_LEN];
+} Cm2AgentBackupCn2Obs;
+
+typedef struct Agent2CMBackupStatusAck_t {
+    int msg_type;
+    uint32 node;
+    uint32 instanceId;
+    char slotName[MAX_SLOT_NAME_LEN];
+    char taskIdStr[CN_BUILD_TASK_ID_MAX_LEN];
+    int32 status;
+} Agent2CMBackupStatusAck;
+
+typedef struct Cm2AgentRefreshObsDelText_t {
+    int msg_type;
+    uint32 instanceId;
+    char slotName[MAX_SLOT_NAME_LEN];
+    char obsDelCnText[MAX_OBS_DEL_TEXT_LEN];
+} Cm2AgentRefreshObsDelText;
+
+typedef struct ctl_to_cm_notify {
+    CM_MessageType msg_type;
+    ctlToCmNotifyDetail detail;
+} ctl_to_cm_notify;
+
 typedef struct ctl_to_cm_disable_cn {
     int msg_type;
     uint32 instanceId;
@@ -403,6 +478,24 @@ typedef enum synchronous_standby_mode {
     Any3Az1Az2,     /* ANY 3(az1, az2) */
     First3Az1Az2    /* FIRST 3(az1, az2) */
 } synchronous_standby_mode;
+
+typedef enum {
+    CLUSTER_PRIMARY = 0,
+    CLUSTER_OBS_STANDBY = 1,
+    CLUSTER_STREAMING_STANDBY = 2
+} ClusterRole;
+
+typedef enum {
+    DISASTER_RECOVERY_NULL = 0,
+    DISASTER_RECOVERY_OBS = 1,
+    DISASTER_RECOVERY_STREAMING = 2
+} DisasterRecoveryType;
+
+typedef enum {
+    INSTALL_TYPE_DEFAULT = 0,
+    INSTALL_TYPE_SHARE_STORAGE = 1,
+    INSTALL_TYPE_STREAMING = 2
+}ClusterInstallType;
 
 typedef struct ctl_to_cm_set {
     int msg_type;
@@ -499,6 +592,8 @@ typedef struct CmToAgentGsGucSyncList {
     uint32 groupIndex;
     DatanodeSyncList dnSyncList;
     int instanceNum;
+    // remain
+    int remain[REMAIN_LEN];
 } CmToAgentGsGucSyncList;
 
 typedef struct cm_to_agent_notify {
@@ -566,6 +661,20 @@ typedef struct agent_to_cm_notify_cn_feedback {
     bool status;       /* notify command exec status */
     int notifyCount;
 } agent_to_cm_notify_cn_feedback;
+
+typedef struct BackupInfo_t {
+    uint32 localKeyCnId;
+    uint32 obsKeyCnId;
+    char slotName[MAX_SLOT_NAME_LEN];
+    char obsDelCnText[MAX_OBS_DEL_TEXT_LEN];
+} BackupInfo;
+
+typedef struct Agent2CmBackupInfoRep_t {
+    int msg_type;
+    uint32 instanceId; /* coordinator instance id */
+    uint32 slotCount;
+    BackupInfo backupInfos[MAX_BARRIER_SLOT_COUNT];
+} Agent2CmBackupInfoRep;
 
 typedef struct cm_to_agent_restart {
     int msg_type;
@@ -638,6 +747,14 @@ typedef struct cm_hotpatch_ret_msg {
     char msg[MAX_LENGTH_HP_RETURN_MSG];
 } cm_hotpatch_ret_msg;
 
+typedef struct cm_to_agent_barrier_info {
+    int msg_type;
+    uint32 node;
+    uint32 instanceId;
+    char queryBarrier[BARRIERLEN];
+    char targetBarrier[BARRIERLEN];
+} cm_to_agent_barrier_info;
+
 #define IP_LEN 64
 #define MAX_REPL_CONNINFO_LEN 256
 #define MAX_REBUILD_REASON_LEN 256
@@ -674,10 +791,22 @@ const int cn_inactive = 2;
 #define INSTANCE_HA_DATANODE_BUILD_REASON_UNKNOWN 7
 #define INSTANCE_HA_DATANODE_BUILD_REASON_USER_PASSWD_INVALID 8
 #define INSTANCE_HA_DATANODE_BUILD_REASON_CONNECTING 9
+#define INSTANCE_HA_DATANODE_BUILD_REASON_DCF_LOG_LOSS 10
 
 #define UNKNOWN_LEVEL 0
 
 typedef uint64 XLogRecPtr;
+
+typedef enum CM_DCF_ROLE {
+    DCF_ROLE_UNKNOWN = 0,
+    DCF_ROLE_LEADER,
+    DCF_ROLE_FOLLOWER,
+    DCF_ROLE_PASSIVE,
+    DCF_ROLE_LOGGER,
+    DCF_ROLE_PRE_CANDIDATE,
+    DCF_ROLE_CANDIDATE,
+    DCF_ROLE_CEIL,
+} DCF_ROLE;
 
 typedef struct agent_to_cm_coordinate_barrier_status_report {
     int msg_type;
@@ -688,10 +817,40 @@ typedef struct agent_to_cm_coordinate_barrier_status_report {
     char global_barrierId[BARRIERLEN];
     char global_achive_barrierId[BARRIERLEN];
     char barrierID [BARRIERLEN];
+    char query_barrierId[BARRIERLEN];
     uint64 barrierLSN;
     uint64 archive_LSN;
     uint64 flush_LSN;
+    bool is_barrier_exist;
 }agent_to_cm_coordinate_barrier_status_report;
+
+typedef struct GlobalBarrierItem_t {
+    char slotname[MAX_SLOT_NAME_LEN];
+    char globalBarrierId[BARRIERLEN];
+    char globalAchiveBarrierId[BARRIERLEN];
+} GlobalBarrierItem;
+
+typedef struct GlobalBarrierStatus_t {
+    int slotCount;
+    GlobalBarrierItem globalBarriers[MAX_BARRIER_SLOT_COUNT];
+} GlobalBarrierStatus;
+
+typedef struct LocalBarrierStatus_t {
+    uint64 ckptRedoPoint;
+    uint64 barrierLSN;
+    uint64 archiveLSN;
+    uint64 flushLSN;
+    char barrierID[BARRIERLEN];
+} LocalBarrierStatus;
+
+typedef struct Agent2CmBarrierStatusReport_t {
+    int msg_type;
+    uint32 node;
+    uint32 instanceId;
+    int instanceType;
+    LocalBarrierStatus localStatus;
+    GlobalBarrierStatus globalStatus;
+} Agent2CmBarrierStatusReport;
 
 typedef struct agent_to_cm_datanode_barrier_status_report {
     int msg_type;
@@ -812,7 +971,6 @@ typedef struct agent_to_cm_coordinate_status_report_old {
     int phony_dead_times;
 } agent_to_cm_coordinate_status_report_old;
 
-
 typedef struct agent_to_cm_coordinate_status_report {
     int msg_type;
     uint32 node;
@@ -829,7 +987,8 @@ typedef struct agent_to_cm_coordinate_status_report {
     bool cleanDropCnFlag;
     bool isCnDnDisconnected;
     uint32 cn_active_info[CN_INFO_NUM];
-    char resevered[RESERVE_NUM];
+    int buildReason;
+    char resevered[RESERVE_NUM - RESERVE_NUM_USED];
     int cn_restart_counts;
     int phony_dead_times;
 } agent_to_cm_coordinate_status_report;
@@ -850,8 +1009,9 @@ typedef struct agent_to_cm_coordinate_status_report_v1 {
     bool cleanDropCnFlag;
     bool isCnDnDisconnected;
     uint32 cn_active_info[CN_INFO_NUM];
+    int buildReason;
     int cn_dn_disconnect_times;
-    char resevered[RESERVE_NUM - RESERVE_NUM_USED];
+    char resevered[RESERVE_NUM - (2 * RESERVE_NUM_USED)];
     int cn_restart_counts;
     int phony_dead_times;
 } agent_to_cm_coordinate_status_report_v1;
@@ -887,6 +1047,7 @@ typedef struct AgentToCmserverDnSyncList {
     int instanceType;
     char dnSynLists[DN_SYNC_LEN];
     // remain
+    int remain[REMAIN_LEN];
     char remainStr[DN_SYNC_LEN];
 } AgentToCmserverDnSyncList;
 
@@ -922,17 +1083,38 @@ typedef struct agent_to_cm_heartbeat {
     int cluster_status_request;
 } agent_to_cm_heartbeat;
 
+typedef struct DnStatus_t {
+    CM_MessageType barrierMsgType;
+    agent_to_cm_datanode_status_report reportMsg;
+    union {
+        agent_to_cm_coordinate_barrier_status_report barrierMsg;
+        Agent2CmBarrierStatusReport barrierMsgNew;
+    };
+} DnStatus;
+
+typedef struct DnSyncListInfo_t {
+    pthread_rwlock_t lk_lock;
+    AgentToCmserverDnSyncList dnSyncListMsg;
+} DnSyncListInfo;
+
+typedef struct CnStatus_t {
+    CM_MessageType barrierMsgType;
+    agent_to_cm_coordinate_status_report reportMsg;
+    Agent2CmBackupInfoRep backupMsg;
+    union {
+        agent_to_cm_coordinate_barrier_status_report barrierMsg;
+        Agent2CmBarrierStatusReport barrierMsgNew;
+    };
+} CnStatus;
+
 typedef struct coordinate_status_info {
     pthread_rwlock_t lk_lock;
-    agent_to_cm_coordinate_status_report report_msg;
-    agent_to_cm_coordinate_barrier_status_report barrier_msg;
+    CnStatus cnStatus;
 } coordinate_status_info;
 
 typedef struct datanode_status_info {
     pthread_rwlock_t lk_lock;
-    agent_to_cm_datanode_status_report report_msg;
-    agent_to_cm_coordinate_barrier_status_report barrier_msg;
-    AgentToCmserverDnSyncList dnSyncListMsg;
+    DnStatus dnStatus;
 } datanode_status_info;
 
 typedef struct gtm_status_info {
@@ -1019,15 +1201,16 @@ typedef struct cm_instance_command_status {
     int pengding_command;
     int time_out;
     int role_changed;
-    int heat_beat;
+    volatile int heat_beat;
     int arbitrate_delay_time_out;
     int arbitrate_delay_set;
     int local_arbitrate_delay_role;
     int peerl_arbitrate_delay_role;
     int full_build;
     int notifyCnCount;
-    int keep_heartbeat_timeout;
+    volatile int keep_heartbeat_timeout;
     int sync_mode;
+    int maxSendTimes;
 } cm_instance_command_status;
 
 // need to keep consist with cm_to_ctl_instance_datanode_status
@@ -1050,12 +1233,16 @@ typedef struct cm_instance_datanode_report_status {
     int dn_restart_counts_in_hour;
     bool is_finish_redo_cmd_sent;
     uint64 ckpt_redo_point;
-    char barrierID [BARRIERLEN];
+    char barrierID[BARRIERLEN];
+    char query_barrierId[BARRIERLEN];
     uint64 barrierLSN;
     uint64 archive_LSN;
     uint64 flush_LSN;
     DatanodeSyncList dnSyncList;
+    int32 syncDone;
     uint32 arbiTime;
+    uint32 sendFailoverTimes;
+    bool is_barrier_exist;
 } cm_instance_datanode_report_status;
 
 typedef struct cm_instance_gtm_report_status {
@@ -1077,6 +1264,12 @@ typedef struct cm_notify_msg_status {
     uint32 gtmIdBroadCast;
 } cm_notify_msg_status;
 
+#define OBS_BACKUP_INIT         (0)    // not start
+#define OBS_BACKUP_PROCESSING   (1)
+#define OBS_BACKUP_COMPLETED    (2)
+#define OBS_BACKUP_FAILED       (3)
+#define OBS_BACKUP_UNKNOWN      (4)    // conn failed, can't get status, will do nothing until it change to other
+
 typedef struct cm_instance_coordinate_report_status {
     cm_coordinate_replconninfo status;
     int isdown;
@@ -1095,10 +1288,13 @@ typedef struct cm_instance_coordinate_report_status {
     int cma_fault_timeout_to_killcn;
     
     char barrierID [BARRIERLEN];
+    char query_barrierId[BARRIERLEN];
     uint64 barrierLSN;
     uint64 archive_LSN;
     uint64 flush_LSN;
     uint64 ckpt_redo_point;
+    bool is_barrier_exist;
+    int buildReason;
 } cm_instance_coordinate_report_status;
 
 typedef struct cm_instance_arbitrate_status {
@@ -1271,6 +1467,7 @@ typedef struct cm_to_ctl_balance_result {
 #define CM_STATUS_DEGRADE 4
 #define CM_STATUS_UNKNOWN 5
 #define CM_STATUS_NORMAL_WITH_CN_DELETED 6
+#define CM_STATUS_UNKNOWN_WITH_BINARY_DAMAGED (7)
 
 typedef struct cm_to_ctl_cluster_status {
     int msg_type;
@@ -1278,20 +1475,28 @@ typedef struct cm_to_ctl_cluster_status {
     bool is_all_group_mode_pending;
     int switchedCount;
     int node_id;
+    bool inReloading;
 } cm_to_ctl_cluster_status;
 
 typedef struct cm_to_ctl_cluster_global_barrier_info {
     int msg_type;
     char global_barrierId[BARRIERLEN];
     char global_achive_barrierId[BARRIERLEN];
-    char global_recovery_barrierId[BARRIERLEN];
+    char globalRecoveryBarrierId[BARRIERLEN];
 } cm_to_ctl_cluster_global_barrier_info;
+
+typedef struct cm2CtlGlobalBarrierNew_t {
+    int msg_type;
+    char globalRecoveryBarrierId[BARRIERLEN];
+    GlobalBarrierStatus globalStatus;
+} cm2CtlGlobalBarrierNew;
 
 typedef struct cm_to_ctl_logic_cluster_status {
     int msg_type;
     int cluster_status;
     bool is_all_group_mode_pending;
     int switchedCount;
+    bool inReloading;
 
     int logic_cluster_status[LOGIC_CLUSTER_NUMBER];
     bool logic_is_all_group_mode_pending[LOGIC_CLUSTER_NUMBER];
@@ -1398,12 +1603,15 @@ typedef uint32 ShortTransactionId;
 
 #define InvalidTerm (0)
 #define FirstTerm (1)
+#define TermIsInvalid(term) ((term) == InvalidTerm)
 
 #define XLByteLT_W_TERM(a_term, a_logptr, b_term, b_logptr) \
     (((a_term) < (b_term)) || (((a_term) == (b_term)) && ((a_logptr) < (b_logptr))))
 #define XLByteLE_W_TERM(a_term, a_logptr, b_term, b_logptr) \
     (((a_term) < (b_term)) || (((a_term) == (b_term)) && ((a_logptr) <= (b_logptr))))
 #define XLByteEQ_W_TERM(a_term, a_logptr, b_term, b_logptr) (((a_term) == (b_term)) && ((a_logptr) == (b_logptr)))
+#define XLByteWE_W_TERM(a_term, a_logptr, b_term, b_logptr) \
+    (((a_term) > (b_term)) || (((a_term) == (b_term)) && ((a_logptr) > (b_logptr))))
 
 #define CM_RESULT_COMM_ERROR (-2) /* Communication error */
 #define CM_RESULT_ERROR (-1)
@@ -1417,12 +1625,10 @@ typedef uint32 ShortTransactionId;
 
 typedef struct ResultDataPacked {
     char pad[CM_MSG_MAX_LENGTH];
-
 } ResultDataPacked;
 
 typedef union CM_ResultData {
     ResultDataPacked packed;
-
 } CM_ResultData;
 
 typedef struct CM_Result {
@@ -1432,7 +1638,15 @@ typedef struct CM_Result {
     CM_ResultData gr_resdata;
 } CM_Result;
 
-extern int query_gtm_status_wrapper(char pid_path[MAXPGPATH], agent_to_cm_gtm_status_report& agent_to_cm_gtm);
-extern int query_gtm_status_for_phony_dead(char pid_path[MAXPGPATH]);
+extern int query_gtm_status_wrapper(const char pid_path[MAXPGPATH], agent_to_cm_gtm_status_report& agent_to_cm_gtm);
+extern int query_gtm_status_for_phony_dead(const char pid_path[MAXPGPATH]);
+
+typedef struct CtlToCMReload {
+    int msgType;
+} CtlToCMReload;
+typedef struct CMToCtlReloadAck {
+    int msgType;
+    bool reloadOk;
+} CMToCtlReloadAck;
 
 #endif

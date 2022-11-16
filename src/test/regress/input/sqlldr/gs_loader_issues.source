@@ -1,0 +1,131 @@
+create table sqlldr_p4(sequence int,name VARCHAR2(20),con VARCHAR2(20))
+    partition by range(sequence)
+    (
+     partition p1 values less than (10),
+     partition p2 values less than (20),
+     partition p3 values less than (30),
+     partition p4 values less than (40),
+     partition p5 values less than (MAXVALUE)
+    );
+
+\! @abs_bindir@/gs_loader control=@abs_srcdir@/data/gs_loader_issue_TESTTABLE.ctl data=@abs_srcdir@/data/gs_loader_issue_TESTTABLE.csv port=@portstring@ db=regression passwd=gauss@123 rows=1000000 bindsize=1000000
+drop table sqlldr_p4;
+
+CREATE TABLE sqlldr_issue_001(
+    ID INTEGER,
+    NAME VARCHAR2(20),
+    CON VARCHAR2(20)
+);
+\! @abs_bindir@/gs_loader control=@abs_srcdir@/data/gs_loader_issue_001.ctl data=@abs_srcdir@/data/gs_loader_issue_001.csv port=@portstring@ db=regression passwd=gauss@123 discard=@abs_srcdir@/data/gs_loader_issue_001.dsc rows=1000000 bindsize=1000000
+select * from sqlldr_issue_001 order by 1,2,3;
+\! cat @abs_srcdir@/data/gs_loader_issue_001.dsc
+drop table sqlldr_issue_001;
+
+CREATE TABLE sqlldr_tb21(
+    ID INTEGER,
+    NAME VARCHAR2(20),
+    phonenumber number
+);
+\! @abs_bindir@/gs_loader control=@abs_srcdir@/data/gs_loader_issue_002.ctl data=@abs_srcdir@/data/gs_loader_issue_002.csv port=@portstring@ db=regression passwd=gauss@123 rows=1000000 bindsize=1000000
+select * from sqlldr_tb21 order by 1,2,3;
+select count(*) COUNT from sqlldr_tb21;
+select max(ID) MAX from sqlldr_tb21;
+drop table sqlldr_tb21;
+
+CREATE TABLE sqlldr_issue_permission(
+    ID INTEGER,
+    NAME VARCHAR2(20),
+    CON VARCHAR2(20)
+);
+
+\! chmod -r @abs_srcdir@/data/gs_loader_issue_permission.csv
+\! @abs_bindir@/gs_loader control=@abs_srcdir@/data/gs_loader_issue_permission.ctl data=@abs_srcdir@/data/gs_loader_issue_permission.csv port=@portstring@ db=regression passwd=gauss@123
+\! chmod +r @abs_srcdir@/data/gs_loader_issue_permission.csv
+
+\! chmod -r @abs_srcdir@/data/gs_loader_issue_permission.ctl
+\! @abs_bindir@/gs_loader control=@abs_srcdir@/data/gs_loader_issue_permission.ctl data=@abs_srcdir@/data/gs_loader_issue_permission.csv port=@portstring@ db=regression passwd=gauss@123
+\! chmod +r @abs_srcdir@/data/gs_loader_issue_permission.ctl
+
+CREATE TABLE sqlldr_issue_001(
+    ID INTEGER,
+    NAME VARCHAR2(20),
+    CON VARCHAR2(20)
+);
+\! @abs_bindir@/gs_loader control=@abs_srcdir@/data/gs_loader_issue_003.ctl data=@abs_srcdir@/data/gs_loader_issue_001.csv port=@portstring@ db=regression passwd=gauss@123 rows=1000000 bindsize=1000000
+select * from sqlldr_issue_001 order by 1,2,3;
+drop table sqlldr_issue_001;
+
+-- teardown
+drop table sqlldr_issue_permission;
+
+CREATE TABLE sqlldr_issue_options(
+    ID INTEGER,
+    NAME VARCHAR2(20),
+    CON VARCHAR2(20)
+);
+
+\! @abs_bindir@/gs_loader control=@abs_srcdir@/data/gs_loader_issue_options.ctl data=@abs_srcdir@/data/gs_loader_issue_options.csv port=@portstring@ db=regression passwd=gauss@123
+select * from sqlldr_issue_options;
+
+-- teardown
+drop table sqlldr_issue_options;
+
+CREATE TABLE sqlldr_issue_options(
+    ID INTEGER,
+    NAME VARCHAR2(20),
+    CON VARCHAR2(20)
+);
+
+\! @abs_bindir@/gs_loader control=@abs_srcdir@/data/gs_loader_issue_options2.ctl data=@abs_srcdir@/data/gs_loader_issue_options.csv port=@portstring@ db=regression passwd=gauss@123
+select * from sqlldr_issue_options;
+
+-- teardown
+drop table sqlldr_issue_options;
+
+CREATE TABLE sqlldr_issue_badfile(
+    ID INTEGER,
+    NAME VARCHAR2(20),
+    CON VARCHAR2(20)
+);
+
+\! @abs_bindir@/gs_loader control=@abs_srcdir@/data/gs_loader_issue_badfile.ctl data=@abs_srcdir@/data/gs_loader_issue_badfile.csv port=@portstring@ db=regression passwd=gauss@123
+select * from sqlldr_issue_badfile;
+
+-- teardown
+drop table sqlldr_issue_badfile;
+
+CREATE TABLE sqlldr_issue_infile(
+    ID INTEGER,
+    NAME VARCHAR2(20),
+    CON VARCHAR2(20)
+);
+
+\! @abs_bindir@/gs_loader control=@abs_srcdir@/data/gs_loader_issue_infile.ctl data=@abs_srcdir@/data/gs_loader_issue_infile.csv port=@portstring@ db=regression passwd=gauss@123
+select * from sqlldr_issue_infile;
+
+-- teardown
+drop table sqlldr_issue_infile;
+
+CREATE TABLE sqlldr_issue_login(
+    ID INTEGER,
+    NAME VARCHAR2(20),
+    CON VARCHAR2(20)
+);
+
+\! @abs_bindir@/gs_loader control=@abs_srcdir@/data/gs_loader_issue_login.ctl data=@abs_srcdir@/data/gs_loader_issue_login.csv -p @portstring@ -d regression passwd=gauss@123
+select * from sqlldr_issue_login;
+
+-- teardown
+drop table sqlldr_issue_login;
+
+CREATE TABLE sqlldr_issue_hide_passwd(
+    ID INTEGER,
+    NAME VARCHAR2(20),
+    CON VARCHAR2(20)
+);
+
+\! @abs_bindir@/gs_loader control=@abs_srcdir@/data/gs_loader_issue_hide_passwd.ctl data=@abs_srcdir@/data/gs_loader_issue_hide_passwd.csv -p @portstring@ -d regression -W gauss@123
+select * from sqlldr_issue_hide_passwd;
+
+-- teardown
+drop table sqlldr_issue_hide_passwd;

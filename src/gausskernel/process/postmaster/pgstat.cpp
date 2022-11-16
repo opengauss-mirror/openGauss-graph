@@ -14,6 +14,7 @@
  *
  * Portions Copyright (c) 2020 Huawei Technologies Co.,Ltd.
  *	Copyright (c) 2001-2012, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2021, openGauss Contributors
  *
  * IDENTIFICATION
  *	  src/gausskernel/process/postmaster/pgstat.cpp
@@ -41,6 +42,11 @@
 #include "catalog/pg_proc.h"
 #include "catalog/pg_partition.h"
 #include "catalog/pg_partition_fn.h"
+#ifdef GS_GRAPH
+#include "catalog/gs_graphmeta.h"
+#include "catalog/gs_graph_fn.h"
+#include "catalog/gs_graph.h"
+#endif /* GS_GRAPH */
 #include "commands/vacuum.h"
 #include "commands/user.h"
 #include "gaussdb_version.h"
@@ -57,8 +63,9 @@
 #include "postmaster/postmaster.h"
 #include "postmaster/pagewriter.h"
 #include "replication/catchup.h"
+#include "replication/walsender.h"
 #include "storage/backendid.h"
-#include "storage/fd.h"
+#include "storage/smgr/fd.h"
 #include "storage/ipc.h"
 #include "storage/latch.h"
 #include "storage/lmgr.h"
@@ -90,17 +97,12 @@
 #include "instruments/instr_slow_query.h"
 #include "instruments/instr_statement.h"
 #include "instruments/instr_handle_mgr.h"
+#include "catalog/indexing.h"
 
 #ifdef ENABLE_UT
 #define static
 #endif
 
-/* ----------
- * Paths for the statistics files (relative to installation's $PGDATA).
- * ----------
- */
-#define PGSTAT_STAT_PERMANENT_FILENAME "global/pgstat.stat"
-#define PGSTAT_STAT_PERMANENT_TMPFILE "global/pgstat.tmp"
 #define pg_stat_relation(flag) (InvalidOid == (flag))
 
 /* ----------
@@ -199,9 +201,17 @@ typedef struct TwoPhasePgStatRecord {
     PgStat_Counter tuples_inserted;    /* tuples inserted in xact */
     PgStat_Counter tuples_updated;     /* tuples updated in xact */
     PgStat_Counter tuples_deleted;     /* tuples deleted in xact */
+    PgStat_Counter tuples_inplace_updated;
     PgStat_Counter inserted_pre_trunc; /* tuples inserted prior to truncate */
     PgStat_Counter updated_pre_trunc;  /* tuples updated prior to truncate */
     PgStat_Counter deleted_pre_trunc;  /* tuples deleted prior to truncate */
+    PgStat_Counter inplace_updated_pre_trunc;
+    /* The following members with _accum suffix will not be erased by truncate */
+    PgStat_Counter tuples_inserted_accum;
+    PgStat_Counter tuples_updated_accum;
+    PgStat_Counter tuples_deleted_accum;
+    PgStat_Counter tuples_inplace_updated_accum;
+
     Oid t_id;                          /* table's OID */
     bool t_shared;                     /* is it a shared catalog? */
     bool t_truncated;                  /* was the relation truncated? */
@@ -390,6 +400,7 @@ static void pgstat_recv_deadlock(const PgStat_MsgDeadlock* msg);
 static void pgstat_recv_tempfile(PgStat_MsgTempFile* msg, int len);
 static void pgstat_recv_memReserved(const PgStat_MsgMemReserved* msg);
 static void pgstat_recv_autovac_stat(PgStat_MsgAutovacStat* msg, int len);
+static void PgstatRecvPrunestat(PgStat_MsgPrune* msg, int len);
 
 static void pgstat_send_badblock_stat(void);
 static void pgstat_recv_badblock_stat(PgStat_MsgBadBlock* msg, int len);
@@ -401,8 +412,6 @@ static void pgstat_recv_filestat(PgStat_MsgFile* msg, int len);
 static void prepare_calculate(SqlRTInfoArray* sql_rt_info, int* counter);
 static void pgstat_recv_sql_responstime(PgStat_SqlRT* msg, int len);
 
-void LWLockReportWaitStart(LWLock*);
-void LWLockReportWaitEnd(void);
 void initGlobalBadBlockStat();
 
 static void initMySessionStatEntry(void);
@@ -830,7 +839,7 @@ void pgstat_report_stat(bool force)
     regular_msg.m_nentries = 0;
     shared_msg.m_nentries = 0;
 
-    DEBUG_MOD_START_TIMER(MOD_AUTOVAC);
+    DEBUG_MOD_START_TIMER(MOD_PGSTAT);
 
     for (tsa = u_sess->stat_cxt.pgStatTabList; tsa != NULL; tsa = tsa->tsa_next) {
         /* count the length of u_sess->stat_cxt.pgStatTabList */
@@ -910,7 +919,7 @@ void pgstat_report_stat(bool force)
     /* send badblock statistics */
     pgstat_send_badblock_stat();
 
-    DEBUG_MOD_STOP_TIMER(MOD_AUTOVAC, "send collected usage statistics to collector");
+    DEBUG_MOD_STOP_TIMER(MOD_PGSTAT, "send collected usage statistics to collector");
 
     /* check the list' length and destroy it if needed */
     if (force_to_destory) {
@@ -1474,6 +1483,30 @@ void pgstat_report_vacuum(Oid tableoid, uint32 statFlag, bool shared, PgStat_Cou
 }
 
 /* ---------
+ * PgstatReportPrunestat() -
+ *
+ *	Tell the collector how many blocks we scanned and successfully pruned
+ * ---------
+ */
+void PgstatReportPrunestat(Oid tableoid, uint32 statFlag,
+                            bool shared, PgStat_Counter scanned,
+                            PgStat_Counter pruned)
+{
+    PgStat_MsgPrune msg;
+
+    if (g_instance.stat_cxt.pgStatSock == PGINVALID_SOCKET)
+        return;
+
+    pgstat_setheader(&msg.m_hdr, PGSTAT_MTYPE_PRUNESTAT);
+    msg.m_databaseid = shared ? InvalidOid : u_sess->proc_cxt.MyDatabaseId;
+    msg.m_tableoid = tableoid;
+    msg.m_statFlag = statFlag;
+    msg.m_scanned_blocks = scanned;
+    msg.m_pruned_blocks = pruned;
+    pgstat_send(&msg, sizeof(msg));
+}
+
+/* ---------
  * pgstat_report_data_changed() -
  *
  * Tell the collector about the table we just insert/delete/update/
@@ -1510,7 +1543,9 @@ void pgstat_report_sql_rt(uint64 UniqueSQLId, int64 start_time, int64 rt)
     }
     if (g_instance.stat_cxt.pgStatSock == PGINVALID_SOCKET || !u_sess->attr.attr_common.enable_instr_rt_percentile)
         return;
-
+    if (!PMstateIsRun()) {
+        return;
+    }
     pgstat_setheader(&msg.m_hdr, PGSTAT_MTYPE_RESPONSETIME);
     msg.sqlRT.UniqueSQLId = UniqueSQLId;
     msg.sqlRT.start_time = start_time;
@@ -1577,7 +1612,7 @@ void pgstat_report_analyze(Relation rel, PgStat_Counter livetuples, PgStat_Count
 
         for (trans = rel->pgstat_info->trans; trans; trans = trans->upper) {
             livetuples -= trans->tuples_inserted - trans->tuples_deleted;
-            deadtuples -= trans->tuples_updated + trans->tuples_deleted;
+            deadtuples -= (trans->tuples_updated - trans->tuples_inplace_updated) + trans->tuples_deleted;
         }
         /* count stuff inserted by already-aborted subxacts, too */
         deadtuples -= rel->pgstat_info->t_counts.t_delta_dead_tuples;
@@ -1843,7 +1878,7 @@ void pgstat_initstats(Relation rel)
 
     /* We only count stats for things that have storage */
     if (!(relkind == RELKIND_RELATION || relkind == RELKIND_MATVIEW || relkind == RELKIND_INDEX ||
-            relkind == RELKIND_GLOBAL_INDEX || relkind == RELKIND_TOASTVALUE || relkind == RELKIND_SEQUENCE)) {
+            relkind == RELKIND_GLOBAL_INDEX || relkind == RELKIND_TOASTVALUE || RELKIND_IS_SEQUENCE(relkind))) {
         rel->pgstat_info = NULL;
         return;
     }
@@ -2031,6 +2066,7 @@ void pgstat_count_heap_insert(Relation rel, int n)
             add_tabstat_xact_level(pgstat_info, nest_level);
 
         pgstat_info->trans->tuples_inserted += n;
+        pgstat_info->trans->tuples_inserted_accum += n;
     }
 }
 
@@ -2049,6 +2085,7 @@ void pgstat_count_heap_update(Relation rel, bool hot)
             add_tabstat_xact_level(pgstat_info, nest_level);
 
         pgstat_info->trans->tuples_updated++;
+        pgstat_info->trans->tuples_updated_accum++;
 
         /* t_tuples_hot_updated is nontransactional, so just advance it */
         if (hot)
@@ -2071,6 +2108,7 @@ void pgstat_count_heap_delete(Relation rel)
             add_tabstat_xact_level(pgstat_info, nest_level);
 
         pgstat_info->trans->tuples_deleted++;
+        pgstat_info->trans->tuples_deleted_accum++;
     }
 }
 
@@ -2088,6 +2126,7 @@ static void pgstat_truncate_save_counters(PgStat_TableXactStatus* trans)
         trans->inserted_pre_trunc = trans->tuples_inserted;
         trans->updated_pre_trunc = trans->tuples_updated;
         trans->deleted_pre_trunc = trans->tuples_deleted;
+        trans->inplace_updated_pre_trunc = trans->tuples_inplace_updated;
         trans->truncated = true;
     }
 }
@@ -2101,6 +2140,7 @@ static void pgstat_truncate_restore_counters(PgStat_TableXactStatus* trans)
         trans->tuples_inserted = trans->inserted_pre_trunc;
         trans->tuples_updated = trans->updated_pre_trunc;
         trans->tuples_deleted = trans->deleted_pre_trunc;
+        trans->tuples_inplace_updated = trans->inplace_updated_pre_trunc;
     }
 }
 
@@ -2122,6 +2162,31 @@ void pgstat_count_truncate(Relation rel)
         pgstat_info->trans->tuples_inserted = 0;
         pgstat_info->trans->tuples_updated = 0;
         pgstat_info->trans->tuples_deleted = 0;
+        pgstat_info->trans->tuples_inplace_updated = 0;
+    }
+}
+
+/*
+ * pgstat_count_uheap_update - count a tuple update inplace
+ */
+void
+PgstatCountHeapUpdateInplace(Relation rel)
+{
+    PgStat_TableStatus *pgstat_info = rel->pgstat_info;
+
+    if (pgstat_info != NULL) {
+        /* We have to log the effect at the proper transactional level */
+        int nest_level = GetCurrentTransactionNestLevel();
+
+        if (pgstat_info->trans == NULL || pgstat_info->trans->nest_level != nest_level) {
+            add_tabstat_xact_level(pgstat_info, nest_level);
+        }
+
+        /* increase, similar to pgstat_count_heap_update */
+        pgstat_info->trans->tuples_updated++;
+        pgstat_info->trans->tuples_updated_accum++;
+
+        pgstat_info->trans->tuples_inplace_updated++;
     }
 }
 
@@ -2157,6 +2222,7 @@ void pgstat_count_cu_update(Relation rel, int n)
 
         /* cstore and dfs don't have hot update chain */
         pgstat_info->trans->tuples_updated += n;
+        pgstat_info->trans->tuples_updated_accum += n;
     }
 }
 
@@ -2175,6 +2241,7 @@ void pgstat_count_cu_delete(Relation rel, int n)
             add_tabstat_xact_level(pgstat_info, nest_level);
 
         pgstat_info->trans->tuples_deleted += n;
+        pgstat_info->trans->tuples_deleted_accum += n;
     }
 }
 
@@ -2184,6 +2251,7 @@ static inline void init_tuplecount_truncate(PgStat_TableStatus* tabstat)
     tabstat->t_counts.t_tuples_inserted_post_truncate = 0;
     tabstat->t_counts.t_tuples_updated_post_truncate = 0;
     tabstat->t_counts.t_tuples_deleted_post_truncate = 0;
+    tabstat->t_counts.t_tuples_inplace_updated_post_truncate = 0;
     tabstat->t_counts.t_delta_live_tuples = 0;
     tabstat->t_counts.t_delta_dead_tuples = 0;
 }
@@ -2202,10 +2270,17 @@ void AtEOXact_PgStat(bool isCommit)
      * Count transaction commit or abort.  (We use counters, not just bools,
      * in case the reporting message isn't sent right away.)
      */
-    if (isCommit)
+    if (isCommit) {
         u_sess->stat_cxt.pgStatXactCommit++;
-    else
+    } else if (!AM_WAL_DB_SENDER) {
+        /*
+         * Walsender for logical decoding will not count rollback transaction
+         * any more. Logical decoding frequently starts and rollback transactions
+         * to access system tables and syscache, see ReorderBufferCommit()
+         * for more details.
+         */
         u_sess->stat_cxt.pgStatXactRollback++;
+    }
 
     pgstatCountTransactionCommit4SessionLevel(isCommit);
 
@@ -2231,9 +2306,10 @@ void AtEOXact_PgStat(bool isCommit)
             if (!isCommit)
                 pgstat_truncate_restore_counters(trans);
             /* count attempted actions regardless of commit/abort */
-            tabstat->t_counts.t_tuples_inserted += trans->tuples_inserted;
-            tabstat->t_counts.t_tuples_updated += trans->tuples_updated;
-            tabstat->t_counts.t_tuples_deleted += trans->tuples_deleted;
+            tabstat->t_counts.t_tuples_inserted += trans->tuples_inserted_accum;
+            tabstat->t_counts.t_tuples_updated += trans->tuples_updated_accum;
+            tabstat->t_counts.t_tuples_deleted += trans->tuples_deleted_accum;
+            tabstat->t_counts.t_tuples_inplace_updated += trans->tuples_inplace_updated_accum;
             if (isCommit) {
                 tabstat->t_counts.t_truncated = trans->truncated;
                 if (trans->truncated) {
@@ -2243,17 +2319,20 @@ void AtEOXact_PgStat(bool isCommit)
                     tabstat->t_counts.t_tuples_inserted_post_truncate += trans->tuples_inserted;
                     tabstat->t_counts.t_tuples_updated_post_truncate += trans->tuples_updated;
                     tabstat->t_counts.t_tuples_deleted_post_truncate += trans->tuples_deleted;
+                    tabstat->t_counts.t_tuples_inplace_updated_post_truncate += trans->tuples_inplace_updated;
                 }
                 /* insert adds a live tuple, delete removes one */
                 tabstat->t_counts.t_delta_live_tuples += trans->tuples_inserted - trans->tuples_deleted;
                 /* update and delete each create a dead tuple */
-                tabstat->t_counts.t_delta_dead_tuples += trans->tuples_updated + trans->tuples_deleted;
+                tabstat->t_counts.t_delta_dead_tuples +=
+                    (trans->tuples_updated - trans->tuples_inplace_updated) + trans->tuples_deleted;
                 /* insert, update, delete each count as one change event */
                 tabstat->t_counts.t_changed_tuples +=
                     trans->tuples_inserted + trans->tuples_updated + trans->tuples_deleted;
             } else {
                 /* inserted tuples are dead, deleted tuples are unaffected */
-                tabstat->t_counts.t_delta_dead_tuples += trans->tuples_inserted + trans->tuples_updated;
+                tabstat->t_counts.t_delta_dead_tuples +=
+                    trans->tuples_inserted + (trans->tuples_updated - trans->tuples_inplace_updated);
                 /* an aborted xact generates no changed_tuple events */
             }
             tabstat->trans = NULL;
@@ -2303,11 +2382,18 @@ void AtEOSubXact_PgStat(bool isCommit, int nestDepth)
                         trans->upper->tuples_inserted = trans->tuples_inserted;
                         trans->upper->tuples_updated = trans->tuples_updated;
                         trans->upper->tuples_deleted = trans->tuples_deleted;
+                        trans->upper->tuples_inplace_updated = trans->tuples_inplace_updated;
                     } else {
                         trans->upper->tuples_inserted += trans->tuples_inserted;
                         trans->upper->tuples_updated += trans->tuples_updated;
                         trans->upper->tuples_deleted += trans->tuples_deleted;
+                        trans->upper->tuples_inplace_updated += trans->tuples_inplace_updated;
                     }
+                    /* accumulated stats shall not be replaced */
+                    trans->upper->tuples_inserted_accum += trans->tuples_inserted_accum;
+                    trans->upper->tuples_updated_accum += trans->tuples_updated_accum;
+                    trans->upper->tuples_deleted_accum += trans->tuples_deleted_accum;
+                    trans->upper->tuples_inplace_updated_accum += trans->tuples_inplace_updated_accum;
                     tabstat->trans = trans->upper;
                     pfree(trans);
                 } else {
@@ -2334,11 +2420,13 @@ void AtEOSubXact_PgStat(bool isCommit, int nestDepth)
                 /* first restore values obliterated by truncate */
                 pgstat_truncate_restore_counters(trans);
                 /* count attempted actions regardless of commit/abort */
-                tabstat->t_counts.t_tuples_inserted += trans->tuples_inserted;
-                tabstat->t_counts.t_tuples_updated += trans->tuples_updated;
-                tabstat->t_counts.t_tuples_deleted += trans->tuples_deleted;
+                tabstat->t_counts.t_tuples_inserted += trans->tuples_inserted_accum;
+                tabstat->t_counts.t_tuples_updated += trans->tuples_updated_accum;
+                tabstat->t_counts.t_tuples_deleted += trans->tuples_deleted_accum;
+                tabstat->t_counts.t_tuples_inplace_updated += trans->tuples_inplace_updated_accum;
                 /* inserted tuples are dead, deleted tuples are unaffected */
-                tabstat->t_counts.t_delta_dead_tuples += trans->tuples_inserted + trans->tuples_updated;
+                tabstat->t_counts.t_delta_dead_tuples += 
+                    trans->tuples_inserted + (trans->tuples_updated - trans->tuples_inplace_updated);
                 tabstat->trans = trans->upper;
                 pfree(trans);
             }
@@ -2376,9 +2464,15 @@ void AtPrepare_PgStat(void)
             record.tuples_inserted = trans->tuples_inserted;
             record.tuples_updated = trans->tuples_updated;
             record.tuples_deleted = trans->tuples_deleted;
+            record.tuples_inplace_updated = trans->tuples_inplace_updated;
+            record.tuples_inserted_accum = trans->tuples_inserted_accum;
+            record.tuples_updated_accum = trans->tuples_updated_accum;
+            record.tuples_deleted_accum = trans->tuples_deleted_accum;
+            record.tuples_inplace_updated_accum = trans->tuples_inplace_updated_accum;
             record.inserted_pre_trunc = trans->inserted_pre_trunc;
             record.updated_pre_trunc = trans->updated_pre_trunc;
             record.deleted_pre_trunc = trans->deleted_pre_trunc;
+            record.inplace_updated_pre_trunc = trans->inplace_updated_pre_trunc;
             record.t_id = tabstat->t_id;
             record.t_shared = tabstat->t_shared;
             record.t_statFlag = tabstat->t_statFlag;
@@ -2439,9 +2533,10 @@ void pgstat_twophase_postcommit(TransactionId xid, uint16 info, void* recdata, u
     pgstat_info = get_tabstat_entry(rec->t_id, rec->t_shared, rec->t_statFlag);
 
     /* Same math as in AtEOXact_PgStat, commit case */
-    pgstat_info->t_counts.t_tuples_inserted += rec->tuples_inserted;
-    pgstat_info->t_counts.t_tuples_updated += rec->tuples_updated;
-    pgstat_info->t_counts.t_tuples_deleted += rec->tuples_deleted;
+    pgstat_info->t_counts.t_tuples_inserted += rec->tuples_inserted_accum;
+    pgstat_info->t_counts.t_tuples_updated += rec->tuples_updated_accum;
+    pgstat_info->t_counts.t_tuples_deleted += rec->tuples_deleted_accum;
+    pgstat_info->t_counts.t_tuples_inplace_updated += rec->tuples_inplace_updated_accum;
     pgstat_info->t_counts.t_truncated = rec->t_truncated;
     if (rec->t_truncated) {
         init_tuplecount_truncate(pgstat_info);
@@ -2450,9 +2545,11 @@ void pgstat_twophase_postcommit(TransactionId xid, uint16 info, void* recdata, u
         pgstat_info->t_counts.t_tuples_inserted_post_truncate += rec->tuples_inserted;
         pgstat_info->t_counts.t_tuples_updated_post_truncate += rec->tuples_updated;
         pgstat_info->t_counts.t_tuples_deleted_post_truncate += rec->tuples_deleted;
+        pgstat_info->t_counts.t_tuples_inplace_updated_post_truncate += rec->tuples_inplace_updated;
     }
     pgstat_info->t_counts.t_delta_live_tuples += rec->tuples_inserted - rec->tuples_deleted;
-    pgstat_info->t_counts.t_delta_dead_tuples += rec->tuples_updated + rec->tuples_deleted;
+    pgstat_info->t_counts.t_delta_dead_tuples += 
+        (rec->tuples_updated - rec->tuples_inplace_updated) + rec->tuples_deleted;
     pgstat_info->t_counts.t_changed_tuples += rec->tuples_inserted + rec->tuples_updated + rec->tuples_deleted;
 }
 
@@ -2475,11 +2572,14 @@ void pgstat_twophase_postabort(TransactionId xid, uint16 info, void* recdata, ui
         rec->tuples_inserted = rec->inserted_pre_trunc;
         rec->tuples_updated = rec->updated_pre_trunc;
         rec->tuples_deleted = rec->deleted_pre_trunc;
+        rec->tuples_inplace_updated = rec->inplace_updated_pre_trunc;
     }
-    pgstat_info->t_counts.t_tuples_inserted += rec->tuples_inserted;
-    pgstat_info->t_counts.t_tuples_updated += rec->tuples_updated;
-    pgstat_info->t_counts.t_tuples_deleted += rec->tuples_deleted;
-    pgstat_info->t_counts.t_delta_dead_tuples += rec->tuples_inserted + rec->tuples_updated;
+    pgstat_info->t_counts.t_tuples_inserted += rec->tuples_inserted_accum;
+    pgstat_info->t_counts.t_tuples_updated += rec->tuples_updated_accum;
+    pgstat_info->t_counts.t_tuples_deleted += rec->tuples_deleted_accum;
+    pgstat_info->t_counts.t_tuples_inplace_updated += rec->tuples_inplace_updated_accum;
+    pgstat_info->t_counts.t_delta_dead_tuples +=
+        rec->tuples_inserted + (rec->tuples_updated - rec->tuples_inplace_updated);
 }
 
 /* ----------
@@ -2773,9 +2873,9 @@ void CreateSharedBackendStatus(void)
         (char*)ShmemInitStruct("Backend Activity Buffer", t_thrd.shemem_ptr_cxt.BackendActivityBufferSize, &found);
 
     if (!found) {
-        rc = memset_s(
-            t_thrd.shemem_ptr_cxt.BackendActivityBuffer, t_thrd.shemem_ptr_cxt.BackendActivityBufferSize, 0, size);
-        securec_check(rc, "\0", "\0");
+        /* call MemsetHugeSize instead because the size may be larger than INT_MAX. */
+        MemsetHugeSize(
+            t_thrd.shemem_ptr_cxt.BackendActivityBuffer, t_thrd.shemem_ptr_cxt.BackendActivityBufferSize, 0);
 
         /* Initialize st_activity pointers. */
         buffer = t_thrd.shemem_ptr_cxt.BackendActivityBuffer;
@@ -2995,15 +3095,17 @@ void pgstat_bestart(void)
     } while ((beentry->st_changecount & 1) == 0);
 
     beentry->st_procpid = t_thrd.proc_cxt.MyProcPid;
-    if (!ENABLE_THREAD_POOL)
+    if (!ENABLE_THREAD_POOL) {
         beentry->st_sessionid = t_thrd.proc_cxt.MyProcPid;
-    else {
+    } else {
         if (IS_THREAD_POOL_WORKER && u_sess->session_id > 0)
             beentry->st_sessionid = u_sess->session_id;
         else
             beentry->st_sessionid = t_thrd.proc_cxt.MyProcPid;
     }
-
+    beentry->globalSessionId.sessionId = 0;
+    beentry->globalSessionId.nodeId = 0;
+    beentry->globalSessionId.seq = 0;
     beentry->st_proc_start_timestamp = proc_start_timestamp;
     beentry->st_activity_start_timestamp = 0;
     beentry->st_state_start_timestamp = 0;
@@ -3024,6 +3126,9 @@ void pgstat_bestart(void)
     beentry->st_activity[g_instance.attr.attr_common.pgstat_track_activity_query_size - 1] = '\0';
 
     beentry->st_queryid = 0;
+    beentry->st_unique_sql_key.unique_sql_id = 0;
+    beentry->st_unique_sql_key.user_id = 0;
+    beentry->st_unique_sql_key.cn_id = 0;
     beentry->st_tid = gettid();
     beentry->st_parent_sessionid = 0;
     beentry->st_thread_level = 0;
@@ -3033,6 +3138,7 @@ void pgstat_bestart(void)
     beentry->st_waitnode_count = 0;
     beentry->st_plannodeid = -1;
     beentry->st_numnodes = -1;
+    beentry->trace_cxt.trace_id[0] = '\0';
     /* Initialize wait event information. */
     beentry->st_waitevent = WAIT_EVENT_END;
     beentry->st_xid = 0;
@@ -3228,8 +3334,20 @@ static void pgstat_beshutdown_hook(int code, Datum arg)
 
     beentry->st_procpid = 0;   /* mark pid invalid */
     beentry->st_sessionid = 0; /* mark sessionid invalid */
+    beentry->globalSessionId.sessionId = 0;
+    beentry->globalSessionId.nodeId = 0;
+    beentry->globalSessionId.seq = 0;
 
-    pgstat_increment_changecount_after(beentry);
+    /*
+     * make sure st_changecount is an even before release it.
+     *
+     * In case some thread was interrupted by SIGTERM at any time with a mess st_changecount
+     * in PgBackendStatus, PgstatCollectorMain may hang-up in waiting its change to even and
+     * can not exit after receiving SIGTERM signal
+     */
+    do {
+        pgstat_increment_changecount_after(beentry);
+    } while ((beentry->st_changecount & 1) != 0);
 
     /*
      * handle below cases:
@@ -3288,7 +3406,20 @@ void pgstat_beshutdown_session(int ctrl_index)
         pgstat_increment_changecount_before(beentry);
         beentry->st_procpid = 0;   /* mark pid invalid */
         beentry->st_sessionid = 0; /* mark sessionid invalid */
-        pgstat_increment_changecount_after(beentry);
+        beentry->globalSessionId.sessionId = 0;
+        beentry->globalSessionId.nodeId = 0;
+        beentry->globalSessionId.seq = 0;
+
+        /*
+         * make sure st_changecount is an even before release it.
+         *
+         * In case some thread was interrupted by SIGTERM at any time with a mess st_changecount
+         * in PgBackendStatus, PgstatCollectorMain may hang-up in waiting its change to even and
+         * can not exit after receiving SIGTERM signal
+         */
+        do {
+            pgstat_increment_changecount_after(beentry);
+        } while ((beentry->st_changecount & 1) != 0);
 
         /*
          * pgstat_beshutdown_session will be called in thread pool mode:
@@ -3407,9 +3538,29 @@ void pgstat_report_activity(BackendState state, const char* cmd_str)
     beentry->st_state_start_timestamp = current_timestamp;
 
     if (cmd_str != NULL) {
-        rc = memcpy_s(
-            (char*)beentry->st_activity, g_instance.attr.attr_common.pgstat_track_activity_query_size, cmd_str, len);
-        securec_check(rc, "\0", "\0");
+        char *mask_string = NULL;
+        if (len == g_instance.attr.attr_common.pgstat_track_activity_query_size - 1 &&
+            t_thrd.mem_cxt.mask_password_mem_cxt != NULL) {
+            /* mask the cmd_str when the cmd_str is truncated. */
+            mask_string = maskPassword(cmd_str);
+        }
+
+        /* If mask successfully, store the mask_string. Otherwise, the cmd_str is recorded. */
+        if (mask_string == NULL) {
+            rc = memcpy_s((char*)beentry->st_activity, g_instance.attr.attr_common.pgstat_track_activity_query_size,
+                cmd_str, len);
+            securec_check(rc, "\0", "\0");
+        } else {
+            int copy_len = strlen(mask_string);
+            if (len < copy_len) {
+                copy_len = len;
+            }
+            rc = memcpy_s((char*)beentry->st_activity, g_instance.attr.attr_common.pgstat_track_activity_query_size,
+                mask_string, copy_len);
+            securec_check(rc, "\0", "\0");
+            pfree(mask_string);
+        }
+
         beentry->st_activity[len] = '\0';
         beentry->st_activity_start_timestamp = start_timestamp;
     }
@@ -3508,6 +3659,39 @@ void pgstat_report_xact_timestamp(TimestampTz tstamp)
     pgstat_increment_changecount_after(beentry);
 }
 
+void pgstat_report_global_session_id(GlobalSessionId globalSessionId)
+{
+#ifndef ENABLE_MULTIPLE_NODES
+    return;
+#endif
+    volatile PgBackendStatus* beentry = t_thrd.shemem_ptr_cxt.MyBEEntry;
+
+    if (IS_PGSTATE_TRACK_UNDEFINE || globalSessionId.sessionId == 0)
+        return;
+    pgstat_increment_changecount_before(beentry);
+    beentry->globalSessionId.sessionId = globalSessionId.sessionId;
+    beentry->globalSessionId.nodeId = globalSessionId.nodeId;
+    beentry->globalSessionId.seq = globalSessionId.seq;
+    pgstat_increment_changecount_after(beentry);
+}
+
+void pgstat_report_unique_sql_id(bool resetUniqueSql)
+{
+    volatile PgBackendStatus* beentry = t_thrd.shemem_ptr_cxt.MyBEEntry;
+
+    if (IS_PGSTATE_TRACK_UNDEFINE)
+        return;
+    if (resetUniqueSql) {
+        beentry->st_unique_sql_key.unique_sql_id = 0;
+        beentry->st_unique_sql_key.cn_id = 0;
+        beentry->st_unique_sql_key.user_id = 0;
+    } else {
+        beentry->st_unique_sql_key.unique_sql_id = u_sess->unique_sql_cxt.unique_sql_id;
+        beentry->st_unique_sql_key.cn_id = u_sess->unique_sql_cxt.unique_sql_cn_id;
+        beentry->st_unique_sql_key.user_id = u_sess->unique_sql_cxt.unique_sql_user_id;
+    }
+}
+
 void pgstat_report_queryid(uint64 queryid)
 {
     volatile PgBackendStatus* beentry = t_thrd.shemem_ptr_cxt.MyBEEntry;
@@ -3521,14 +3705,18 @@ void pgstat_report_queryid(uint64 queryid)
      * protocol.  The update must appear atomic in any case.
      */
     beentry->st_queryid = queryid;
-    if (queryid == 0) {
-        beentry->st_unique_sql_key.unique_sql_id = 0;
-        beentry->st_unique_sql_key.cn_id = 0;
-        beentry->st_unique_sql_key.user_id = 0;
-    } else {
-        beentry->st_unique_sql_key.unique_sql_id = u_sess->unique_sql_cxt.unique_sql_id;
-        beentry->st_unique_sql_key.cn_id = u_sess->unique_sql_cxt.unique_sql_cn_id;
-        beentry->st_unique_sql_key.user_id = u_sess->unique_sql_cxt.unique_sql_user_id;
+}
+
+void pgstat_report_trace_id(knl_u_trace_context *trace_cxt, bool is_report_trace_id)
+{
+    volatile PgBackendStatus* beentry = t_thrd.shemem_ptr_cxt.MyBEEntry;
+    if (IS_PGSTATE_TRACK_UNDEFINE)
+        return;
+    if (is_report_trace_id) {
+        errno_t rc =
+            memcpy_s((void*)beentry->trace_cxt.trace_id, MAX_TRACE_ID_SIZE, trace_cxt->trace_id,
+                     strlen(trace_cxt->trace_id) + 1);
+        securec_check(rc, "\0", "\0");
     }
 }
 
@@ -4145,29 +4333,9 @@ const char* pgstat_get_wait_event(uint32 wait_event_info)
     return event_name;
 }
 
-/*
- * Report start of wait event for light-weight locks.
- *
- * This function will be used by all the light-weight lock calls which
- * needs to wait to acquire the lock.  This function distinguishes wait
- * event based on lock id.
- */
-void LWLockReportWaitStart(LWLock* lock)
-{
-    pgstat_report_waitevent(PG_WAIT_LWLOCK | lock->tranche);
-}
-
 void LWLockReportWaitFailed(LWLock* lock)
 {
     pgstat_report_wait_lock_failed(PG_WAIT_LWLOCK | lock->tranche);
-}
-
-/*
- * Report end of wait event for light-weight locks.
- */
-void LWLockReportWaitEnd(void)
-{
-    pgstat_report_waitevent(WAIT_EVENT_END);
 }
 
 /* ----------
@@ -4379,8 +4547,38 @@ const char* pgstat_get_wait_io(WaitEventIO w)
         case WAIT_EVENT_LOGCTRL_SLEEP:
             event_name = "LOGCTRL_SLEEP";
             break;
+        case WAIT_EVENT_COMPRESS_ADDRESS_FILE_FLUSH:
+            event_name = "PCA_FLUSH";
+            break;
+        case WAIT_EVENT_COMPRESS_ADDRESS_FILE_SYNC:
+            event_name = "PCA_SYNC";
+            break;
             /* no default case, so that compiler will warn */
         case IO_EVENT_NUM:
+            break;
+        case WAIT_EVENT_UNDO_FILE_PREFETCH:
+            event_name = "UndoFilePrefetch";
+            break;
+        case WAIT_EVENT_UNDO_FILE_READ:
+            event_name = "UndoFileRead";
+            break;
+        case WAIT_EVENT_UNDO_FILE_WRITE:
+            event_name = "UndoFileWrite";
+            break;
+        case WAIT_EVENT_UNDO_FILE_SYNC:
+            event_name = "UndoFileSync";
+            break;
+        case WAIT_EVENT_UNDO_FILE_EXTEND:
+            event_name = "UndoFileExtend";
+            break;
+        case WAIT_EVENT_UNDO_FILE_UNLINK:
+            event_name = "UndoFileUnlink";
+            break;
+        case WAIT_EVENT_UNDO_META_SYNC:
+            event_name = "UndoMetaSync";
+            break;
+        default:
+            event_name = "unknown wait event";
             break;
     }
     return event_name;
@@ -4621,6 +4819,92 @@ ThreadId* pgstat_get_stmttag_write_entry(int* num)
     return threads;
 }
 
+/*
+ * @Description: get pid from status entries by application name.
+ * @IN num: application name
+ * @OUT num: entries count
+ * @Return: all node status which names are 'application name'
+ */
+PgBackendStatusNode* pgstat_get_backend_status_by_appname(const char* appName, int* resultEntryNum)
+{
+    int idx = 0;
+
+    /* Initialize result number to 0, in case of return NULL directly */
+    if (resultEntryNum != NULL) {
+        *resultEntryNum = 0;
+    }
+
+    /* If BackendStatusArray is NULL, we will get it from other thread */
+    if (t_thrd.shemem_ptr_cxt.BackendStatusArray == NULL) {
+        if (PgBackendStatusArray != NULL) {
+            t_thrd.shemem_ptr_cxt.BackendStatusArray = PgBackendStatusArray;
+        } else {
+            return NULL;
+        }
+    }
+
+    /* Get all status entries, which procpid or sessionid is valid */
+    uint32 numBackends = 0;
+    PgBackendStatusNode* node = gs_stat_read_current_status(&numBackends);
+
+    /* If all entries procpid or sessionid are invalid, get numBackends is 0 and should return directly */
+    if (numBackends == 0) {
+        FreeBackendStatusNodeMemory(node);
+        return NULL;
+    }
+
+    /* This function is not under PgstatCollectorMain, this pointer is NULL */
+    Assert(!u_sess->stat_cxt.pgStatRunningInCollector);
+
+    /* Initialize head pointer, all nodes struct form to a list. This list does not match wich appname */
+    PgBackendStatusNode* otherNodeList = (PgBackendStatusNode*)palloc(sizeof(PgBackendStatusNode));
+    PgBackendStatusNode* otherNodeListHead = otherNodeList;
+    otherNodeList->data = NULL;
+    otherNodeList->next = NULL;
+    /* Initialize head pointer, all nodes struct form to a list, This list matches wich appname */
+    PgBackendStatusNode* resultNodeList = (PgBackendStatusNode*)palloc(sizeof(PgBackendStatusNode));
+    PgBackendStatusNode* resultNodeListHead = resultNodeList;
+    resultNodeList->data = NULL;
+    resultNodeList->next = NULL;
+
+    while (node != NULL) {
+        PgBackendStatus* beentry = node->data;
+
+        /* If the backend thread is valid and application name of beentry equals to appName, record this thread pid */
+        if (beentry != NULL) {
+            if (beentry->st_appname == NULL || beentry->st_tid < 0 || strcmp(beentry->st_appname, appName) != 0) {
+                /* Node name does not match wich appname, link this pointer to otherNodeList */
+                otherNodeList->next = node;
+                otherNodeList = otherNodeList->next;
+                node = node->next;
+                continue;
+            }
+
+            /* Node name matches appname, link this pointer to resultNodeList and return */
+            resultNodeList->next = node;
+            resultNodeList = resultNodeList->next;
+            idx++;
+        } else {
+            /* If beentry is NULL, should link this pointer to otherNodeList in order to free memory */
+            otherNodeList->next = node;
+            otherNodeList = otherNodeList->next;
+        }
+        node = node->next;
+    }
+    /* Must set tail pointer's next to NULL to separate node list to otherNodeList and resultNodeList */
+    otherNodeList->next = NULL;
+    resultNodeList->next = NULL;
+
+    if (resultEntryNum != NULL) {
+        *resultEntryNum = idx;
+    }
+
+    /* Because we have separate node list to other two lists, so just free the first list here. */
+    FreeBackendStatusNodeMemory(otherNodeListHead);
+
+    return resultNodeListHead;
+}
+
 /* ----------
  * pgstat_get_backend_current_activity() -
  *
@@ -4820,7 +5104,7 @@ void pgstat_cancel_invalid_gtm_conn(void)
                 ereport(WARNING, (errmsg("could not send signal to thread %lu: %m", beentry->st_procpid)));
             else
                 ereport(LOG,
-                    (errmsg("Success to send SIGUSR2 to postgres thread: %lu in "
+                    (errmsg("Success to send SIGUSR2 to openGauss thread: %lu in "
                             "pgstat_cancel_invalid_gtm_conn",
                         beentry->st_procpid)));
         }
@@ -5223,6 +5507,10 @@ void PgstatCollectorMain()
                     pgstat_recv_cleanup_hotkeys((PgStat_MsgCleanupHotkeys*)&msg, len);
                     break;
 
+                case PGSTAT_MTYPE_PRUNESTAT:
+                    PgstatRecvPrunestat((PgStat_MsgPrune*)&msg, len);
+                    break;
+
                 default:
                     break;
             }
@@ -5390,6 +5678,7 @@ static PgStat_StatTabEntry* pgstat_get_tab_entry(
         result->tuples_updated = 0;
         result->tuples_deleted = 0;
         result->tuples_hot_updated = 0;
+        result->tuples_inplace_updated = 0;
         result->n_live_tuples = 0;
         result->n_dead_tuples = 0;
         result->changes_since_analyze = 0;
@@ -5408,6 +5697,8 @@ static PgStat_StatTabEntry* pgstat_get_tab_entry(
         result->autovac_analyze_count = 0;
         result->autovac_status = 0;
         result->data_changed_timestamp = 0;
+        result->success_prune_cnt = 0;
+        result->total_prune_cnt = 0;
     }
 
     return result;
@@ -5505,6 +5796,22 @@ static void pgstat_write_statsfile(bool permanent)
         fputc('d', fpout);
     }
 
+    if (g_instance.repair_cxt.global_repair_bad_block_stat != NULL) {
+        LWLockAcquire(RepairBadBlockStatHashLock, LW_SHARED);
+        HASH_SEQ_STATUS repairStat;
+        BadBlockEntry* repairEntry;
+        // write the bad page information recorded in global_repair_bad_block_stat.
+        hash_seq_init(&repairStat, g_instance.repair_cxt.global_repair_bad_block_stat);
+        while ((repairEntry = (BadBlockEntry*)hash_seq_search(&repairStat)) != NULL) {
+            fputc('R', fpout);
+            rc = fwrite(repairEntry, sizeof(BadBlockEntry), 1, fpout);
+            (void)rc; /* we'll check for error with ferror */
+        }
+        LWLockRelease(RepairBadBlockStatHashLock);
+        // Use 'r' as the terminator
+        fputc('r', fpout);
+    }
+
     /*
      * No more output to be done. Close the temp file and replace the old
      * pgstat.stat with it.  The ferror() check replaces testing for error
@@ -5572,6 +5879,8 @@ static HTAB* pgstat_read_statsfile(Oid onlydb, bool permanent)
     PgStat_StatTabEntry tabbuf;
     PgStat_StatFuncEntry funcbuf;
     PgStat_StatFuncEntry* funcentry = NULL;
+    BadBlockEntry* repairEntry = NULL;
+    BadBlockEntry repairBuf;
     HASHCTL hash_ctl;
     HTAB* dbhash = NULL;
     HTAB* tabhash = NULL;
@@ -5779,6 +6088,34 @@ static HTAB* pgstat_read_statsfile(Oid onlydb, bool permanent)
                 rc = memcpy_s(funcentry, sizeof(PgStat_StatFuncEntry), &funcbuf, sizeof(funcbuf));
                 securec_check(rc, "", "");
                 break;
+            case 'R':
+
+                if (g_instance.repair_cxt.global_repair_bad_block_stat == NULL) {
+                    break;
+                }
+
+                if (fread(&repairBuf, 1, sizeof(BadBlockEntry), fpin) != sizeof(BadBlockEntry)) {
+                    ereport(u_sess->stat_cxt.pgStatRunningInCollector ? LOG : WARNING,
+                            (errmsg("corrupted statistics file \"%s\"", statfile)));
+                    goto done;
+                }
+                /*
+                 * Add to the DB hash
+                 */
+                repairEntry = (BadBlockEntry*)hash_search(g_instance.repair_cxt.global_repair_bad_block_stat,
+                    (void*)&(repairBuf.key), HASH_ENTER, &found);
+                if (found) {
+                    ereport(u_sess->stat_cxt.pgStatRunningInCollector ? LOG : WARNING,
+                            (errmsg("corrupted statistics file \"%s\"", statfile)));
+                }
+
+                rc = memcpy_s(repairEntry, sizeof(BadBlockEntry), &repairBuf, sizeof(BadBlockEntry));
+                securec_check(rc, "", "");
+
+                break;
+
+            case 'r':
+                break;
 
                 /*
                  * 'E'	The EOF marker of a complete stats file.
@@ -5917,8 +6254,8 @@ static void backend_read_statsfile(void)
             (errmsg("using stale statistics instead of current ones "
                     "because stats collector is not responding")));
 
-    /* Autovacuum launcher wants stats about all databases */
-    if (IsAutoVacuumLauncherProcess())
+    /* Autovacuum launcher and the global stats tracker want stats about all databases */
+    if (IsAutoVacuumLauncherProcess() || IsGlobalStatsTrackerProcess())
         u_sess->stat_cxt.pgStatDBHash = pgstat_read_statsfile(InvalidOid, false);
     else
         u_sess->stat_cxt.pgStatDBHash = pgstat_read_statsfile(u_sess->proc_cxt.MyDatabaseId, false);
@@ -6175,9 +6512,6 @@ static void pgstat_recv_inquiry(PgStat_MsgInquiry* msg, int len)
 
 static void inline init_tabentry_truncate(PgStat_StatTabEntry* tabentry, PgStat_TableEntry* tabmsg)
 {
-    tabentry->tuples_inserted = tabmsg->t_counts.t_tuples_inserted_post_truncate;
-    tabentry->tuples_updated = tabmsg->t_counts.t_tuples_updated_post_truncate;
-    tabentry->tuples_deleted = tabmsg->t_counts.t_tuples_deleted_post_truncate;
     tabentry->n_live_tuples = 0;
     tabentry->n_dead_tuples = 0;
 }
@@ -6240,14 +6574,15 @@ static void pgstat_recv_tabstat(PgStat_MsgTabstat* msg, int len)
             tabentry->numscans = tabmsg->t_counts.t_numscans;
             tabentry->tuples_returned = tabmsg->t_counts.t_tuples_returned;
             tabentry->tuples_fetched = tabmsg->t_counts.t_tuples_fetched;
-            if (tabmsg->t_counts.t_truncated) {
-                init_tabentry_truncate(tabentry, tabmsg);
-            } else {
-                tabentry->tuples_inserted = tabmsg->t_counts.t_tuples_inserted;
-                tabentry->tuples_updated = tabmsg->t_counts.t_tuples_updated;
-                tabentry->tuples_deleted = tabmsg->t_counts.t_tuples_deleted;
-            }
+            tabentry->tuples_inserted = tabmsg->t_counts.t_tuples_inserted;
+            tabentry->tuples_updated = tabmsg->t_counts.t_tuples_updated;
+            tabentry->tuples_deleted = tabmsg->t_counts.t_tuples_deleted;
+            tabentry->tuples_inplace_updated = tabmsg->t_counts.t_tuples_inplace_updated;
             tabentry->tuples_hot_updated = tabmsg->t_counts.t_tuples_hot_updated;
+            if (tabmsg->t_counts.t_truncated) {
+                tabentry->n_live_tuples = 0;
+                tabentry->n_dead_tuples = 0;
+            }
             tabentry->n_live_tuples = tabmsg->t_counts.t_delta_live_tuples;
             tabentry->n_dead_tuples = tabmsg->t_counts.t_delta_dead_tuples;
             tabentry->changes_since_analyze = tabmsg->t_counts.t_changed_tuples;
@@ -6267,6 +6602,8 @@ static void pgstat_recv_tabstat(PgStat_MsgTabstat* msg, int len)
             tabentry->autovac_analyze_count = 0;
             tabentry->autovac_status = 0;
             tabentry->data_changed_timestamp = 0;
+            tabentry->success_prune_cnt = 0;
+            tabentry->total_prune_cnt = 0;
         } else {
             /*
              * Otherwise add the values to the existing entry.
@@ -6274,15 +6611,16 @@ static void pgstat_recv_tabstat(PgStat_MsgTabstat* msg, int len)
             tabentry->numscans += tabmsg->t_counts.t_numscans;
             tabentry->tuples_returned += tabmsg->t_counts.t_tuples_returned;
             tabentry->tuples_fetched += tabmsg->t_counts.t_tuples_fetched;
+            tabentry->tuples_inserted += tabmsg->t_counts.t_tuples_inserted;
+            tabentry->tuples_updated += tabmsg->t_counts.t_tuples_updated;
+            tabentry->tuples_deleted += tabmsg->t_counts.t_tuples_deleted;
+            tabentry->tuples_inplace_updated += tabmsg->t_counts.t_tuples_inplace_updated;
+            tabentry->tuples_hot_updated += tabmsg->t_counts.t_tuples_hot_updated;
             /* If table was truncated, first reset the live/dead counters */
             if (tabmsg->t_counts.t_truncated) {
-                init_tabentry_truncate(tabentry, tabmsg);
-            } else {
-                tabentry->tuples_inserted += tabmsg->t_counts.t_tuples_inserted;
-                tabentry->tuples_updated += tabmsg->t_counts.t_tuples_updated;
-                tabentry->tuples_deleted += tabmsg->t_counts.t_tuples_deleted;
+                tabentry->n_live_tuples = 0;
+                tabentry->n_dead_tuples = 0;
             }
-            tabentry->tuples_hot_updated += tabmsg->t_counts.t_tuples_hot_updated;
             tabentry->n_live_tuples += tabmsg->t_counts.t_delta_live_tuples;
             tabentry->n_dead_tuples += tabmsg->t_counts.t_delta_dead_tuples;
             tabentry->changes_since_analyze += tabmsg->t_counts.t_changed_tuples;
@@ -6333,6 +6671,7 @@ static void pgstat_recv_tabstat(PgStat_MsgTabstat* msg, int len)
             tabentry->tuples_updated = tabmsg->t_counts.t_tuples_updated;
             tabentry->tuples_deleted = tabmsg->t_counts.t_tuples_deleted;
             tabentry->tuples_hot_updated = tabmsg->t_counts.t_tuples_hot_updated;
+            tabentry->tuples_inplace_updated = tabmsg->t_counts.t_tuples_inplace_updated;
             tabentry->n_live_tuples = tabmsg->t_counts.t_delta_live_tuples;
             tabentry->n_dead_tuples = tabmsg->t_counts.t_delta_dead_tuples;
             tabentry->changes_since_analyze = tabmsg->t_counts.t_changed_tuples;
@@ -6352,6 +6691,8 @@ static void pgstat_recv_tabstat(PgStat_MsgTabstat* msg, int len)
             tabentry->autovac_analyze_count = 0;
             tabentry->autovac_status = 0;
             tabentry->data_changed_timestamp = 0;
+            tabentry->success_prune_cnt = 0;
+            tabentry->total_prune_cnt = 0;
         } else {
             /*
              * Otherwise add the values to the existing entry.
@@ -6363,6 +6704,7 @@ static void pgstat_recv_tabstat(PgStat_MsgTabstat* msg, int len)
             tabentry->tuples_updated += tabmsg->t_counts.t_tuples_updated;
             tabentry->tuples_deleted += tabmsg->t_counts.t_tuples_deleted;
             tabentry->tuples_hot_updated += tabmsg->t_counts.t_tuples_hot_updated;
+            tabentry->tuples_inplace_updated += tabmsg->t_counts.t_tuples_inplace_updated;
             tabentry->n_live_tuples += tabmsg->t_counts.t_delta_live_tuples;
             tabentry->n_dead_tuples += tabmsg->t_counts.t_delta_dead_tuples;
             tabentry->changes_since_analyze += tabmsg->t_counts.t_changed_tuples;
@@ -6640,6 +6982,28 @@ static void pgstat_recv_vacuum(PgStat_MsgVacuum* msg, int len)
         tabentry->vacuum_count++;
     }
 }
+
+/* ----------
+ * PgstatRecvPrunestat() -
+ *
+ *	Process a pruning message
+ * ----------
+ */
+static void PgstatRecvPrunestat(PgStat_MsgPrune* msg, int len)
+{
+    PgStat_StatDBEntry* dbentry = NULL;
+    PgStat_StatTabEntry* tabentry = NULL;
+
+    /*
+     * Store the data in the table's hashtable entry.
+     */
+    dbentry = pgstat_get_db_entry(msg->m_databaseid, true);
+    tabentry = pgstat_get_tab_entry(dbentry, msg->m_tableoid, true, msg->m_statFlag);
+
+    tabentry->success_prune_cnt += msg->m_pruned_blocks;
+    tabentry->total_prune_cnt += msg->m_scanned_blocks;
+}
+
 
 /* ----------
  * pgstat_recv_data_changed() -
@@ -6983,15 +7347,15 @@ static void prepare_calculate(SqlRTInfoArray* sql_rt_info, int* counter)
     else
         sql_rt_info_count = sql_rt_info->sqlRTIndex;
 
+    *counter = 0;
     if (sql_rt_info_count == 0) {
         sql_rt_info->isFull = false;
-        *counter = sql_rt_info_count;
         LWLockRelease(PercentileLock);
         return;
     }
 
     if (u_sess->percentile_cxt.LocalsqlRT != NULL)
-        pfree(u_sess->percentile_cxt.LocalsqlRT);
+        pfree_ext(u_sess->percentile_cxt.LocalsqlRT);
 
     u_sess->percentile_cxt.LocalsqlRT = (SqlRTInfo*)MemoryContextAlloc(
         SESS_GET_MEM_CXT_GROUP(MEMORY_CONTEXT_DFX), sql_rt_info_count * sizeof(SqlRTInfo));
@@ -7022,13 +7386,13 @@ static void prepare_calculate_single(const SqlRTInfoArray* sql_rt_info, int* cou
         sql_rt_info_count = MAX_SQL_RT_INFO_COUNT;
     }
 
+    *counter = 0;
     if (sql_rt_info_count == 0) {
-        *counter = sql_rt_info_count;
         return;
     }
 
     if (u_sess->percentile_cxt.LocalsqlRT != NULL)
-        pfree(u_sess->percentile_cxt.LocalsqlRT);
+        pfree_ext(u_sess->percentile_cxt.LocalsqlRT);
 
     u_sess->percentile_cxt.LocalsqlRT = (SqlRTInfo*)MemoryContextAllocZero(
         SESS_GET_MEM_CXT_GROUP(MEMORY_CONTEXT_DFX), sql_rt_info_count * sizeof(SqlRTInfo));
@@ -7148,7 +7512,13 @@ void pgstat_initstats_partition(Partition part)
     }
 
     /* find or make the PgStat_TableStatus entry, and update link */
-    part->pd_pgstat_info = get_tabstat_entry(part_id, false, PartitionGetRelid(part));
+    Oid relid;
+    if (part->pd_part->parttype == PART_OBJ_TYPE_TABLE_SUB_PARTITION) {
+        relid = partid_get_parentid(part->pd_part->parentid);
+    } else {
+        relid = PartitionGetRelid(part);
+    }
+    part->pd_pgstat_info = get_tabstat_entry(part_id, false, relid);
 }
 
 /*
@@ -8134,6 +8504,10 @@ void initMySessionMemoryEntry(void)
 
 static void endMySessionMemoryEntry(int code, Datum arg)
 {
+
+    /* release the memory on mySessionMemoryEntry */
+    pgstat_release_session_memory_entry();
+
     /* mark my entry not active. */
     t_thrd.shemem_ptr_cxt.mySessionMemoryEntry->isValid = false;
 
@@ -8334,7 +8708,8 @@ void getSharedMemoryDetail(Tuplestorestate* tupStore, TupleDesc tupDesc)
  */
 void getThreadMemoryDetail(Tuplestorestate* tupStore, TupleDesc tupDesc, uint32* procIdx)
 {
-    uint32 max_thread_count = g_instance.proc_base->allProcCount - g_instance.attr.attr_storage.max_prepared_xacts;
+    uint32 max_thread_count = g_instance.proc_base->allProcCount -
+        g_instance.attr.attr_storage.max_prepared_xacts * NUM_TWOPHASE_PARTITIONS;
     volatile PGPROC* proc = NULL;
     uint32 idx = 0;
 
@@ -8969,6 +9344,30 @@ TableDistributionInfo* get_remote_stat_bgwriter(TupleDesc tuple_desc)
     return distribuion_info;
 }
 
+TableDistributionInfo* get_remote_stat_candidate(TupleDesc tuple_desc)
+{
+    StringInfoData buf;
+    TableDistributionInfo* distribuion_info = NULL;
+
+    /* the memory palloced here should be free outside where it was called. */
+    distribuion_info = (TableDistributionInfo*)palloc0(sizeof(TableDistributionInfo));
+
+    initStringInfo(&buf);
+
+    appendStringInfo(&buf,
+        "select                                                                     "
+        "node_name,candidate_slots,get_buf_from_list,get_buf_clock_sweep,           "
+        "seg_candidate_slots,seg_get_buf_from_list,seg_get_buf_clock_sweep          "
+        "from local_candidate_stat();                                               ");
+
+    /* send sql and parallel fetch distribution info from all data nodes */
+    distribuion_info->state = RemoteFunctionResultHandler(buf.data, NULL, NULL, true, EXEC_ON_ALL_NODES, true);
+    distribuion_info->slot = MakeSingleTupleTableSlot(tuple_desc);
+
+    return distribuion_info;
+}
+
+
 TableDistributionInfo* get_remote_single_flush_dw_stat(TupleDesc tuple_desc)
 {
     StringInfoData buf;
@@ -9003,7 +9402,7 @@ TableDistributionInfo* get_remote_stat_double_write(TupleDesc tuple_desc)
     appendStringInfo(&buf,
         "SELECT node_name, curr_dwn, curr_start_page, file_trunc_num, file_reset_num, "
         "total_writes, low_threshold_writes, high_threshold_writes, "
-        "total_pages, low_threshold_pages, high_threshold_pages "
+        "total_pages, low_threshold_pages, high_threshold_pages, file_id "
         "FROM local_double_write_stat();");
 
     /* send sql and parallel fetch distribution info from all data nodes */
@@ -9082,6 +9481,29 @@ TableDistributionInfo* get_recovery_stat(TupleDesc tuple_desc)
     return distribuion_info;
 }
 
+TableDistributionInfo* streaming_hadr_get_recovery_stat(TupleDesc tuple_desc)
+{
+    StringInfoData buf;
+    TableDistributionInfo* distribuion_info = NULL;
+
+    /* the memory palloced here should be free outside where it was called. */
+    distribuion_info = (TableDistributionInfo*)palloc0(sizeof(TableDistributionInfo));
+
+    initStringInfo(&buf);
+
+    appendStringInfo(&buf,
+        "SELECT hadr_sender_node_name, hadr_receiver_node_name, "
+        "source_ip, source_port, dest_ip, dest_port, current_rto, target_rto, current_rpo, target_rpo, "
+        "rto_sleep_time, rpo_sleep_time FROM "
+        "gs_hadr_local_rto_and_rpo_stat();");
+
+    /* send sql and parallel fetch distribution info from all data nodes */
+    distribuion_info->state = RemoteFunctionResultHandler(buf.data, NULL, NULL, true, EXEC_ON_ALL_NODES, true);
+    distribuion_info->slot = MakeSingleTupleTableSlot(tuple_desc);
+
+    return distribuion_info;
+}
+
 TableDistributionInfo* get_remote_node_xid_csn(TupleDesc tuple_desc)
 {
     StringInfoData buf;
@@ -9100,6 +9522,34 @@ TableDistributionInfo* get_remote_node_xid_csn(TupleDesc tuple_desc)
 
     return distribuion_info;
 }
+
+#ifdef ENABLE_MULTIPLE_NODES
+TableDistributionInfo* get_remote_index_status(TupleDesc tuple_desc, const char *schname, const char *idxname)
+{
+    StringInfoData buf;
+    TableDistributionInfo* distribuion_info = NULL;
+
+    /* the memory palloced here should be free outside where it was called.*/
+    distribuion_info = (TableDistributionInfo*)palloc0(sizeof(TableDistributionInfo));
+
+    initStringInfo(&buf);
+
+    appendStringInfo(&buf, "select a.node_name::text, b.indisready, b.indisvalid from pg_index b "
+        "left join pgxc_node a on b.xc_node_id = a.node_id "
+        "where indexrelid = (select oid from pg_class where relnamespace = "
+        "(select oid from pg_namespace where nspname = %s) "
+        "and relname = %s);", quote_literal_cstr(schname), quote_literal_cstr(idxname));
+
+    /* send sql and parallel fetch distribution info from all nodes */
+    distribuion_info->state = RemoteFunctionResultHandler(buf.data, NULL, NULL, true, EXEC_ON_ALL_NODES, true);
+    distribuion_info->slot = MakeSingleTupleTableSlot(tuple_desc);
+
+    pfree_ext(buf.data);
+
+    return distribuion_info;
+}
+
+#endif
 
 /*
  * the whole process statistics of bad block
@@ -9205,6 +9655,7 @@ void addBadBlockStat(const RelFileNode* relfilenode, ForkNumber forknum)
     hash_key.relfilenode.dbNode = relfilenode->dbNode;
     hash_key.relfilenode.relNode = relfilenode->relNode;
     hash_key.relfilenode.bucketNode = relfilenode->bucketNode;
+    hash_key.relfilenode.opt = relfilenode->opt;
     hash_key.forknum = forknum;
 
     bool found = false;
@@ -9494,3 +9945,253 @@ void pgstat_reply_percentile_record()
     g_instance.stat_cxt.calculate_on_other_cn = false;
     pq_flush();
 }
+
+void pgstat_release_session_memory_entry()
+{
+    if (t_thrd.shemem_ptr_cxt.mySessionMemoryEntry != NULL) {
+        pfree_ext(t_thrd.shemem_ptr_cxt.mySessionMemoryEntry->query_plan);
+        t_thrd.shemem_ptr_cxt.mySessionMemoryEntry->plan_size = 0;
+        pfree_ext(t_thrd.shemem_ptr_cxt.mySessionMemoryEntry->query_plan_issue);
+    }
+}
+
+#ifdef GS_GRAPH
+typedef struct GsStat_SubXactStatus
+{
+	HTAB	   *htab;
+	int			nest_level;		/* subtransaction nest level */
+	struct GsStat_SubXactStatus *prev;	/* higher-level subxact if any */
+} GsStat_SubXactStatus;
+
+static GsStat_SubXactStatus *gsStatXactStack = NULL;
+static MemoryContext gsStatContext = NULL;
+#define GSSTAT_EDGE_HASH_SIZE	16
+/*
+ * get_gsstat_stack_level - add a new (sub)transaction stack entry if needed
+ */
+static GsStat_SubXactStatus *
+get_gsstat_stack_level(int nest_level)
+{
+	GsStat_SubXactStatus *xact_state;
+
+	xact_state = gsStatXactStack;
+	if (xact_state == NULL || xact_state->nest_level != nest_level)
+	{
+		HASHCTL	hash_ctl;
+
+		if (gsStatContext == NULL)
+		gsStatContext = AllocSetContextCreate(TopTransactionContext,
+					"GSGRAPHMETA context",
+					ALLOCSET_SMALL_SIZES);
+
+		/* push new subxactstatus to stack*/
+		xact_state = (GsStat_SubXactStatus *)
+			MemoryContextAlloc(gsStatContext,
+							   sizeof(GsStat_SubXactStatus));
+		xact_state->nest_level = nest_level;
+		xact_state->prev = gsStatXactStack;
+		gsStatXactStack = xact_state;
+
+		/* initialize */
+		memset(&hash_ctl, 0, sizeof(hash_ctl));
+		hash_ctl.keysize = sizeof(GsStat_key);
+		hash_ctl.entrysize = sizeof(GsStat_GraphMeta);
+		hash_ctl.hcxt = gsStatContext;
+
+		xact_state->htab = hash_create("edge statistic of sub xact",
+									   GSSTAT_EDGE_HASH_SIZE,
+									   &hash_ctl,
+									   HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	}
+	return xact_state;
+}
+
+
+void
+gsstat_count_edge_create(Graphid edge, Graphid start, Graphid end)
+{
+
+	int		nest_level;
+	bool	found;
+	Labid	edgelab;
+	Labid	startlab;
+	Labid	endlab;
+
+	GsStat_key				key;
+	GsStat_GraphMeta	   *graphmeta;
+	GsStat_SubXactStatus   *xact_state;
+
+	nest_level = GetCurrentTransactionNestLevel();
+	xact_state = get_gsstat_stack_level(nest_level);
+
+	edgelab = GraphidGetLabid(edge);
+	startlab = GraphidGetLabid(start);
+	endlab = GraphidGetLabid(end);
+
+	/* GsStat_key is 10 byte but aligned to 12 byte.
+	 * So last 2 byte can have garbage value.
+	 * It must be cleaned before use.*/
+	memset(&key, 0, sizeof(key));
+	key.graph = get_graph_path_oid();
+	key.edge = edgelab;
+	key.start = startlab;
+	key.end = endlab;
+
+	graphmeta = (GsStat_GraphMeta *) hash_search(xact_state->htab,
+												 (void *) &key,
+												 HASH_ENTER, &found);
+	if (found)
+		graphmeta->edges_inserted++;
+	else
+	{
+		/* key is copied already */
+		graphmeta->edges_inserted = 1;
+		graphmeta->edges_deleted = 0;
+	}
+}
+
+void
+gsstat_count_edge_delete(Graphid edge, Graphid start, Graphid end)
+{
+	int		nest_level;
+	bool	found;
+
+	GsStat_key				key;
+	GsStat_GraphMeta	   *graphmeta;
+	GsStat_SubXactStatus   *xact_state;
+
+	nest_level = GetCurrentTransactionNestLevel();
+	xact_state = get_gsstat_stack_level(nest_level);
+
+	memset(&key, 0, sizeof(key));
+	key.graph = get_graph_path_oid();
+	key.edge = edge;
+	key.start = start;
+	key.end = end;
+
+	graphmeta = (GsStat_GraphMeta *) hash_search(xact_state->htab,
+												 (void *) &key,
+												 HASH_ENTER, &found);
+	if (found)
+		graphmeta->edges_deleted++;
+	else
+	{
+		/* key is copied already */
+		graphmeta->edges_inserted = 0;
+		graphmeta->edges_deleted = 1;
+	}
+}
+
+void
+gsstat_drop_vlabel(const char *vlab)
+{
+	Relation	gs_graphmeta;
+	HeapTuple	tup;
+	Oid			graph;
+	Labid		vlid;
+	ScanKeyData	key[2];
+	SysScanDesc	scan;
+
+	graph = get_graph_path_oid();
+	vlid = get_labname_labid(vlab, graph);
+
+	if (vlid == InvalidLabid)
+		elog(ERROR, "Cannot find VLABEL %s", vlab);
+
+	gs_graphmeta = heap_open(GraphMetaRelationId, RowExclusiveLock);
+
+	/* delete tuple which start = vid */
+	ScanKeyInit(&key[0],
+			Anum_gs_graphmeta_graph,
+			BTEqualStrategyNumber, F_OIDEQ,
+			ObjectIdGetDatum(graph));
+	ScanKeyInit(&key[1],
+			Anum_gs_graphmeta_start,
+			BTEqualStrategyNumber, F_INT2EQ,
+			Int16GetDatum(vlid));
+
+	scan = systable_beginscan(gs_graphmeta, GraphMetaStartIndexId,
+							  true, NULL, 2, key);
+
+	while (HeapTupleIsValid(tup = systable_getnext(scan)))
+		CatalogTupleDelete(gs_graphmeta, &tup->t_self);
+
+	systable_endscan(scan);
+
+	/* delete tuple which end = vid */
+	ScanKeyInit(&key[1],
+			Anum_gs_graphmeta_end,
+			BTEqualStrategyNumber, F_INT2EQ,
+			Int16GetDatum(vlid));
+
+	scan = systable_beginscan(gs_graphmeta, GraphMetaEndIndexId,
+							  true, NULL, 2, key);
+
+	while (HeapTupleIsValid(tup = systable_getnext(scan)))
+	{
+		Form_gs_graphmeta	metatup = (Form_gs_graphmeta) GETSTRUCT(tup);
+
+		/* The tuple with start = vid is already deleted just now. */
+		if (metatup->start != vlid)
+			CatalogTupleDelete(gs_graphmeta, &tup->t_self);
+	}
+
+	systable_endscan(scan);
+
+	heap_close(gs_graphmeta, RowExclusiveLock);
+}
+
+void
+gsstat_drop_elabel(const char *elab)
+{
+	Relation	gs_graphmeta;
+	CatCList   *tuplist;
+	Oid			graph;
+	Labid		elid;
+	int			i;
+
+	graph = get_graph_path_oid();
+	elid = get_labname_labid(elab, graph);
+
+	if (elid == InvalidLabid)
+		elog(ERROR, "Cannot find ELABEL %s", elab);
+
+	gs_graphmeta = heap_open(GraphMetaRelationId, RowExclusiveLock);
+
+	tuplist = SearchSysCacheList2(GRAPHMETAFULL, graph, elid);
+
+	for (i = 0; i < tuplist->n_members; i++)
+	{
+		HeapTuple	tup = &tuplist->systups[i]->tuple;
+
+		CatalogTupleDelete(gs_graphmeta, &tup->t_self);
+	}
+
+	ReleaseCatCacheList(tuplist);
+	heap_close(gs_graphmeta, RowExclusiveLock);
+}
+
+void
+gsstat_drop_graph(const char *graphname)
+{
+	Relation	gs_graphmeta;
+	CatCList   *tuplist;
+	Oid			graph;
+	int			i;
+
+	graph = get_graphname_oid(graphname);
+
+	gs_graphmeta = heap_open(GraphMetaRelationId, RowExclusiveLock);
+	tuplist = SearchSysCacheList1(GRAPHMETAFULL, graph);
+
+	for (i = 0; i < tuplist->n_members; i++)
+	{
+		HeapTuple	tup = &tuplist->systups[i]->tuple;
+
+		CatalogTupleDelete(gs_graphmeta, &tup->t_self);
+	}
+
+	ReleaseCatCacheList(tuplist);
+	heap_close(gs_graphmeta, RowExclusiveLock);
+}
+#endif /* GS_GRAPH */

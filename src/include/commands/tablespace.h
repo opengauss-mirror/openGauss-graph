@@ -19,6 +19,7 @@
 #include "nodes/parsenodes.h"
 #include "storage/dfs/dfs_connector.h"
 #include "workload/workload.h"
+#include "catalog/indexing.h"
 
 /* XLOG stuff */
 #define XLOG_TBLSPC_CREATE 0x00
@@ -53,7 +54,7 @@ class TableSpaceUsageManager {
 public:
     static int ShmemSize(void);
     static void Init(void);
-    static void IsExceedMaxsize(Oid tableSpaceOid, uint64 requestSize);
+    static void IsExceedMaxsize(Oid tableSpaceOid, uint64 requestSize, bool segment);
 
 private:
     static bool IsLimited(Oid tableSpaceOid, uint64* maxSize);
@@ -85,12 +86,17 @@ typedef struct TableSpaceOpts {
 } TableSpaceOpts;
 
 /* This definition is used when storage space is increasing, it includes two main functionalities:
- * 1. Check tablespace is exceed the specified size
+ * 1. Check tablespace is exceed the specified size. Skip segment-page storage because it does not
+ *    actually extend physical space.
  * 2. Increase the permanent space on users' record
  */
 #define STORAGE_SPACE_OPERATION(relation, requestSize)                                                         \
     {                                                                                                          \
-        TableSpaceUsageManager::IsExceedMaxsize(relation->rd_node.spcNode, requestSize);                       \
+        if (RelationIsSegmentTable(relation)) {                                                            \
+            TableSpaceUsageManager::IsExceedMaxsize(relation->rd_node.spcNode, 0, true);                       \
+        } else if (relation->rd_id != ClassOidIndexId) {                                                                                               \
+            TableSpaceUsageManager::IsExceedMaxsize(relation->rd_node.spcNode, requestSize, false);            \
+        }                                                                                                      \
         perm_space_increase(                                                                                   \
             relation->rd_rel->relowner, requestSize, RelationUsesSpaceType(relation->rd_rel->relpersistence)); \
     }
@@ -102,7 +108,7 @@ extern void AlterTableSpaceOwner(const char* name, Oid newOwnerId);
 extern void AlterTableSpaceOptions(AlterTableSpaceOptionsStmt* stmt);
 extern bool IsSpecifiedTblspc(Oid spcOid, const char* specifedTblspc);
 
-extern void TablespaceCreateDbspace(const RelFileNode rnode, bool isRedo);
+extern void TablespaceCreateDbspace(Oid spcNode, Oid dbNode, bool isRedo);
 
 extern Oid GetDefaultTablespace(char relpersistence);
 extern DataSpaceType RelationUsesSpaceType(char relpersistence);
@@ -131,6 +137,7 @@ extern void check_create_dir(char* location);
 
 extern void tblspc_redo(XLogReaderState* rptr);
 extern void tblspc_desc(StringInfo buf, XLogReaderState* record);
+extern const char* tblspc_type_name(uint8 subtype);
 extern uint64 pg_cal_tablespace_size_oid(Oid tblspcOid);
 extern Oid ConvertToPgclassRelTablespaceOid(Oid tblspc);
 extern Oid ConvertToRelfilenodeTblspcOid(Oid tblspc);

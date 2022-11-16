@@ -2,7 +2,7 @@
  *
  * pgarch.cpp
  *
- *	PostgreSQL WAL archiver
+ *	openGauss WAL archiver
  *
  *	All functions relating to archiver are included here
  *
@@ -24,6 +24,7 @@
  *
  * -------------------------------------------------------------------------
  */
+#define __STDC_FORMAT_MACROS
 #include "postgres.h"
 #include "knl/knl_variable.h"
 
@@ -33,6 +34,7 @@
 #include <sys/time.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <inttypes.h>
 
 #include "access/xlog.h"
 #include "access/xlog_internal.h"
@@ -41,13 +43,12 @@
 #include "postmaster/fork_process.h"
 #include "postmaster/pgarch.h"
 #include "postmaster/postmaster.h"
-#include "storage/fd.h"
+#include "storage/smgr/fd.h"
 #include "storage/copydir.h"
 #include "storage/ipc.h"
 #include "storage/latch.h"
 #include "storage/pg_shmem.h"
 #include "storage/pmsignal.h"
-#include "storage/proc.h"
 #include "utils/guc.h"
 #include "utils/ps_status.h"
 
@@ -58,8 +59,12 @@
 #include "replication/walsender_private.h"
 #include "replication/walsender.h"
 #include "pgxc/pgxc.h"
-#include "replication/obswalreceiver.h"
+#include "replication/archive_walreceiver.h"
 #include "replication/walreceiver.h"
+#include "access/obs/obs_am.h"
+#include "access/archive/archive_am.h"
+#include "replication/dcf_replication.h"
+
 /* ----------
  * Timer definitions.
  * ----------
@@ -85,26 +90,13 @@
 #define MIN_XFN_CHARS 16
 #define MAX_XFN_CHARS 40
 #define VALID_XFN_CHARS "0123456789ABCDEF.history.backup"
+#define ARCH_TIME_FOLDER "arch_time"
 
 #define NUM_ARCHIVE_RETRIES 3
 
 #define ARCHIVE_BUF_SIZE (1024 * 1024)
 
-/* 
- * Timeout interval for sending the status of the archive thread on the standby node
- */
-#define UPDATE_STATUS_WAIT 3000
-
-/* the status of archiver on standby */
-#define ARCHIVE_ON true
-#define ARCHIVE_OFF false
-
-#define STANDBY_ARCHIVE_XLOG_UPGRADE_VERSION 92299
-
-/* the interval of sending archive status is 1s. */
-#define SEND_ARCHIVE_STATUS_INTERVAL 1000000L
-
-NON_EXEC_STATIC void PgArchiverMain();
+NON_EXEC_STATIC void PgArchiverMain(knl_thread_arg* arg);
 static void pgarch_exit(SIGNAL_ARGS);
 static void ArchSigHupHandler(SIGNAL_ARGS);
 static void ArchSigTermHandler(SIGNAL_ARGS);
@@ -115,20 +107,16 @@ static void pgarch_ArchiverCopyLoop(void);
 static bool pgarch_archiveXlog(char* xlog);
 static bool pgarch_readyXlog(char* xlog, int xlog_length);
 static void pgarch_archiveDone(const char* xlog);
+static void archKill(int code, Datum arg);
+#ifndef ENABLE_LITE_MODE
 static void pgarch_archiveRoachForPitrStandby();
-static void CreateArchiveReadyFile();
 static bool pgarch_archiveRoachForPitrMaster(XLogRecPtr targetLsn);
 static bool pgarch_archiveRoachForCoordinator(XLogRecPtr targetLsn);
 static WalSnd* pgarch_chooseWalsnd(XLogRecPtr targetLsn);
 typedef bool(*doArchive)(XLogRecPtr);
 static void pgarch_ArchiverObsCopyLoop(XLogRecPtr flushPtr, doArchive fun);
-static void archKill(int code, Datum arg);
-static void initLastTaskLsn();
-static bool SendArchiveThreadStatusInternal(bool is_archive_activited);
-static void SendArchiveThreadStatus(bool status);
-static bool NotifyPrimaryArchiverActived(ThreadId* last_walrcv_pid, bool* sent_archive_status);
-static void NotifyPrimaryArchiverShutdown(bool sent_archive_status);
-static void ChangeArchiveTaskStatus2Done();
+static void InitArchiverLastTaskLsn(ArchiveSlotConfig* obs_archive_slot);
+#endif
 
 AlarmCheckResult DataInstArchChecker(Alarm* alarm, AlarmAdditionalParam* additionalParam)
 {
@@ -149,6 +137,15 @@ AlarmCheckResult DataInstArchChecker(Alarm* alarm, AlarmAdditionalParam* additio
         return ALM_ACR_Abnormal;
     }
 }
+
+void setObsArchLatch(const Latch* latch)
+{
+    /* use volatile pointer to prevent code rearrangement */
+    volatile WalRcvData *walrcv = t_thrd.walreceiverfuncs_cxt.WalRcv;
+    SpinLockAcquire(&walrcv->mutex);
+    walrcv->obsArchLatch = (Latch *)latch;
+    SpinLockRelease(&walrcv->mutex);
+}
 /* ------------------------------------------------------------
  * Public functions called from postmaster follow
  * ------------------------------------------------------------
@@ -164,7 +161,7 @@ AlarmCheckResult DataInstArchChecker(Alarm* alarm, AlarmAdditionalParam* additio
  *
  *	Note: if fail, we will be called again from the postmaster main loop.
  */
-ThreadId pgarch_start(void)
+ThreadId pgarch_start()
 {
     time_t curtime;
 
@@ -197,7 +194,7 @@ ThreadId pgarch_start(void)
  *	The argc/argv parameters are valid only in EXEC_BACKEND case.  However,
  *	since we don't use 'em, it hardly matters...
  */
-NON_EXEC_STATIC void PgArchiverMain()
+NON_EXEC_STATIC void PgArchiverMain(knl_thread_arg* arg)
 {
     IsUnderPostmaster = true; /* we are a postmaster subprocess now */
 
@@ -208,6 +205,8 @@ NON_EXEC_STATIC void PgArchiverMain()
     t_thrd.proc_cxt.MyProgName = "PgArchiver";
 
     t_thrd.myLogicTid = noProcLogicTid + PGARCH_LID;
+
+    t_thrd.arch.slot_name = pstrdup((char *)arg->payload);
 
     ereport(LOG, (errmsg("PgArchiver started")));
 
@@ -240,8 +239,10 @@ NON_EXEC_STATIC void PgArchiverMain()
      */
     init_ps_display("archiver process", "", "", "");
     setObsArchLatch(&t_thrd.arch.mainloop_latch);
-    SetStandbyArchLatch(&t_thrd.arch.mainloop_latch);
-    initLastTaskLsn();
+
+#ifndef ENABLE_LITE_MODE
+    InitArchiverLastTaskLsn(NULL);
+#endif
     pgarch_MainLoop();
 
     gs_thread_exit(0);
@@ -291,7 +292,6 @@ static void pgarch_waken(SIGNAL_ARGS)
     /* set flag that there is work to be done */
     t_thrd.arch.wakened = true;
     SetLatch(&t_thrd.arch.mainloop_latch);
-    ereport(DEBUG1, (errmsg("pgarch_waken")));
     errno = save_errno;
 }
 
@@ -335,9 +335,10 @@ static void pgarch_MainLoop(void)
     struct timeval last_copy_time;
     gettimeofday(&last_copy_time, NULL);
     bool time_to_stop = false;
+#ifndef ENABLE_LITE_MODE
     doArchive fun = NULL;
-    bool sent_archive_status = false;
-    ThreadId last_walrcv_pid = 0;
+    const int millitosec = 1000;
+#endif
 
     /*
      * We run the copy loop immediately upon entry, in case there are
@@ -346,7 +347,7 @@ static void pgarch_MainLoop(void)
      * timeout before doing more.
      */
     t_thrd.arch.wakened = true;
-    ReplicationSlot *obs_archive_slot = NULL;
+    ArchiveSlotConfig *obs_archive_slot = NULL;
 
     if (XLogArchiveDestSet()) {
         VerifyDestDirIsEmptyOrCreate(u_sess->attr.attr_storage.XLogArchiveDest);
@@ -368,8 +369,7 @@ static void pgarch_MainLoop(void)
         if (t_thrd.arch.got_SIGHUP) {
             t_thrd.arch.got_SIGHUP = false;
             ProcessConfigFile(PGC_SIGHUP);
-            if (!XLogArchivingActive()) {
-                NotifyPrimaryArchiverShutdown(sent_archive_status);
+            if (!XLogArchivingActive() && getArchiveReplicationSlot() == NULL) {
                 ereport(LOG, (errmsg("PgArchiver exit")));
                 return;
             }
@@ -390,34 +390,32 @@ static void pgarch_MainLoop(void)
             else if ((unsigned int)(icurtime - t_thrd.arch.last_sigterm_time) >= (unsigned int)60)
                 break;
         }
+#ifndef ENABLE_LITE_MODE
         load_server_mode();
         if (IsServerModeStandby()) {
-            /*
-             * this step was used by standby to notify primary the archive thread is actived
-             */
-            if (obs_archive_slot == NULL && t_thrd.proc->workingVersionNum >= STANDBY_ARCHIVE_XLOG_UPGRADE_VERSION &&
-                !NotifyPrimaryArchiverActived(&last_walrcv_pid, &sent_archive_status)) {
-                pg_usleep(SEND_ARCHIVE_STATUS_INTERVAL);
-                continue;
+            
+            ArchiveTaskStatus *archive_task_status = NULL;
+            archive_task_status = find_archive_task_status(&t_thrd.arch.archive_task_idx);
+            if (archive_task_status == NULL) {
+                ereport(ERROR,
+                    (errmsg("pgarch_Archive main loop failed because could not get an archive task status.")));
             }
             /* if we should do pitr archive, for standby */
-            volatile unsigned int *pitr_task_status = &g_instance.archive_obs_cxt.pitr_task_status;
+            volatile unsigned int *pitr_task_status = &archive_task_status->pitr_task_status;
             if (unlikely(pg_atomic_read_u32(pitr_task_status) == PITR_TASK_GET)) {
                 pgarch_archiveRoachForPitrStandby();
                 pg_atomic_write_u32(pitr_task_status, PITR_TASK_DONE);
-            }
-
-            /* if we should do archive by standby, we should create a .ready file*/
-            volatile unsigned int* arch_task_status = &g_instance.archive_standby_cxt.arch_task_status;
-            if (unlikely(pg_atomic_read_u32(arch_task_status) == ARCH_TASK_GET)) {
-                CreateArchiveReadyFile();
+                update_archive_start_end_location_file(archive_task_status->archive_task.targetLsn,
+                    TIME_GET_MILLISEC(last_copy_time));
             }
         }
+#endif
 
         /* Do what we're here for */
         if (t_thrd.arch.wakened || time_to_stop) {
             t_thrd.arch.wakened = false;
-            obs_archive_slot = getObsReplicationSlot();
+#ifndef ENABLE_LITE_MODE
+            obs_archive_slot = getArchiveReplicationSlot();
             if (obs_archive_slot != NULL && !IsServerModeStandby()) {
                 gettimeofday(&curtime, NULL);
                 const long time_diff = TIME_GET_MILLISEC(curtime) -  t_thrd.arch.last_arch_time;
@@ -427,29 +425,58 @@ static void pgarch_MainLoop(void)
                 XLogRecPtr replayPtr;
                 bool got_recptr = false;
                 bool amSync = false;
-                if (IS_PGXC_COORDINATOR) {
+                int retryTimes = 3;
+                /* FlushPtr <= ConsensusPtr on DCF mode */
+                if (IS_PGXC_COORDINATOR || g_instance.attr.attr_storage.dcf_attr.enable_dcf) {
                     flushPtr = GetFlushRecPtr();
+                    if (g_instance.attr.attr_storage.dcf_attr.enable_dcf &&
+                        XLogRecPtrIsInvalid(t_thrd.arch.pitr_task_last_lsn) &&
+                        XLByteLE(OBS_XLOG_SLICE_BLOCK_SIZE, flushPtr))
+                        /* restart thread to init pitr_task_last_lsn from obs after DCF election */
+                        ereport(ERROR,
+                            (errmsg("Invalid pitr task last lsn on DCF mode.")));
                 } else {
-                    got_recptr = SyncRepGetSyncRecPtr(&receivePtr, &writePtr, &flushPtr, &replayPtr, &amSync, false);
-                    if (got_recptr != true) {
+                    if (t_thrd.arch.pitr_task_last_lsn == InvalidXLogRecPtr) {
+                        InitArchiverLastTaskLsn(obs_archive_slot);
+                        ereport(LOG, (errmsg("update arch thread last lsn because current node is not standby, "
+                            "and init last lsn is %08X%08X", (uint32)(t_thrd.arch.pitr_task_last_lsn >> 32),
+                            (uint32)t_thrd.arch.pitr_task_last_lsn)));
+                    }
+                    while (retryTimes--) {
+                        got_recptr =
+                            SyncRepGetSyncRecPtr(&receivePtr, &writePtr, &flushPtr, &replayPtr, &amSync, false);
+                        if (got_recptr == true) {
+                            break;
+                        } else {
+                            pg_usleep(1000000L);
+                        }
+                    }
+                    if (got_recptr == false) {
                         ereport(ERROR,
                             (errmsg("pgarch_ArchiverObsCopyLoop failed when call SyncRepGetSyncRecPtr")));
                     }
                 }
-                if (time_diff >= t_thrd.arch.task_wait_interval 
+
+                if (time_diff >= (u_sess->attr.attr_storage.archive_interval * millitosec)
                     || XLByteDifference(flushPtr, t_thrd.arch.pitr_task_last_lsn) >= OBS_XLOG_SLICE_BLOCK_SIZE) {
                     if (IS_PGXC_COORDINATOR) {
                         fun = &pgarch_archiveRoachForCoordinator;
                     } else {
                         fun = &pgarch_archiveRoachForPitrMaster;
+#ifndef ENABLE_MULTIPLE_NODES
+                        if (g_instance.attr.attr_storage.dcf_attr.enable_dcf)
+                            fun = &DcfArchiveRoachForPitrMaster;
+#endif
                     }
                     pgarch_ArchiverObsCopyLoop(flushPtr, fun);
-                    advanceObsSlot(flushPtr);
                 }
             } else {
+#endif
                 pgarch_ArchiverCopyLoop();
                 gettimeofday(&last_copy_time, NULL);
+#ifndef ENABLE_LITE_MODE
             }
+#endif
         }
 
         /*
@@ -465,7 +492,7 @@ static void pgarch_MainLoop(void)
                 wait_interval = t_thrd.arch.task_wait_interval;
                 last_time = t_thrd.arch.last_arch_time;
             } else {
-                wait_interval = IsServerModeStandby() ? t_thrd.arch.task_wait_interval : PGARCH_AUTOWAKE_INTERVAL;
+                wait_interval = PGARCH_AUTOWAKE_INTERVAL;
                 last_time = TIME_GET_MILLISEC(last_copy_time);
             }
             gettimeofday(&curtime, NULL);
@@ -502,16 +529,7 @@ static void pgarch_MainLoop(void)
          * or after completing one more archiving cycle after receiving
          * SIGUSR2.
          */
-    } while (PostmasterIsAlive() && XLogArchivingActive() && !time_to_stop);
-
-    /* 
-     * This step don't need to check the version number, because we have checked the version in the loop.
-     * 
-     * If the version number is bigger than STANDBY_ARCHIVE_XLOG_UPGRADE_VERSION and we notify the primary successfully
-     * in the loop, the sent_archive_status will be set to true. We don't need to send the archive status when
-     * the sent_archive_status is false, so we don't need to check the version number in this step.
-     */
-    NotifyPrimaryArchiverShutdown(sent_archive_status);
+    } while (PostmasterIsAlive() && !time_to_stop && (XLogArchivingActive() || getArchiveReplicationSlot() != NULL));
 }
 
 /*
@@ -565,14 +583,11 @@ static void pgarch_ArchiverCopyLoop(void)
             if (pgarch_archiveXlog(xlog)) {
                 /* successful */
                 pgarch_archiveDone(xlog);
-
-                /* archive xlog on standby success, we need to change the status of archive task. */
-                ChangeArchiveTaskStatus2Done();
                 break; /* out of inner retry loop */
             } else {
                 if (++failures >= NUM_ARCHIVE_RETRIES) {
                     ereport(WARNING,
-                        (errmsg("transaction log file \"%s\" could not be archived: too many failures", xlog)));
+                        (errmsg("xlog file \"%s\" could not be archived: too many failures", xlog)));
                     return; /* give up archiving for now */
                 }
                 pg_usleep(1000000L); /* wait a bit before retrying */
@@ -624,7 +639,7 @@ static bool PgarchArchiveXlogToDest(const char* xlog)
             while ((fileBytes = read(fdSrc, pbuff, sizeof(pbuff))) > 0) {
                 if (write(fdDest, pbuff, fileBytes) != fileBytes) {
                     close(fdSrc);
-                    ereport(FATAL, (errmsg_internal("could not write file\"%s\":%m\n", srcPath)));
+                    ereport(FATAL, (errmsg_internal("could not write file\"%s\":%m\n", destPath)));
                 }
                 (void)memset_s(pbuff, sizeof(pbuff), 0, sizeof(pbuff));
             }
@@ -655,7 +670,21 @@ static bool PgarchArchiveXlogToDest(const char* xlog)
     return false;
 }
 
+/*
+ * Update archived xlog LSN for barrier.
+ *
+ */
+static inline void UpdateArchivedLsn(XLogRecPtr targetLsn)
+{
+    ArchiveTaskStatus *archive_task_status = nullptr;
+    archive_task_status = find_archive_task_status(&t_thrd.arch.archive_task_idx);
+    if (archive_task_status == nullptr) {
+        return;
+    }
+    archive_task_status->archived_lsn = targetLsn;
+}
 
+#ifndef ENABLE_LITE_MODE
 /*
  * pgarch_ArchiverObsCopyLoop
  *
@@ -666,6 +695,8 @@ static void pgarch_ArchiverObsCopyLoop(XLogRecPtr flushPtr, doArchive fun)
     ereport(LOG,
         (errmsg("pgarch_ArchiverObsCopyLoop")));
     struct timeval tv;
+    long currTimestamp = 0;
+    const int millitosec = 1000;
     bool time_to_stop = false;
 
     /*
@@ -696,15 +727,16 @@ static void pgarch_ArchiverObsCopyLoop(XLogRecPtr flushPtr, doArchive fun)
          */
         if (t_thrd.arch.got_SIGHUP) {
             ProcessConfigFile(PGC_SIGHUP);
-            if (!XLogArchivingActive()) {
-                return;
-            }
             t_thrd.arch.got_SIGHUP = false;
         }
-        targetLsn = Min(t_thrd.arch.pitr_task_last_lsn + OBS_XLOG_SLICE_BLOCK_SIZE -
+        if (flushPtr == InvalidXLogRecPtr) {
+            targetLsn = t_thrd.arch.pitr_task_last_lsn + OBS_XLOG_SLICE_BLOCK_SIZE -
+                        (t_thrd.arch.pitr_task_last_lsn % OBS_XLOG_SLICE_BLOCK_SIZE) - 1;
+        } else {
+            targetLsn = Min(t_thrd.arch.pitr_task_last_lsn + OBS_XLOG_SLICE_BLOCK_SIZE -
                         (t_thrd.arch.pitr_task_last_lsn % OBS_XLOG_SLICE_BLOCK_SIZE) - 1,
                         flushPtr);
-
+        }
         /* The previous slice has been archived, switch to the next. */
         if (t_thrd.arch.pitr_task_last_lsn == targetLsn) {
             targetLsn = Min(targetLsn + OBS_XLOG_SLICE_BLOCK_SIZE, flushPtr);
@@ -712,21 +744,30 @@ static void pgarch_ArchiverObsCopyLoop(XLogRecPtr flushPtr, doArchive fun)
 
         if (fun(targetLsn) == false) {
             ereport(WARNING,
-                (errmsg("transaction log file \"%X/%X\" could not be archived: try again", 
+                (errmsg("xlog file \"%X/%X\" could not be archived: try again", 
                     (uint32)(targetLsn >> 32), (uint32)(targetLsn))));
             pg_usleep(1000000L); /* wait a bit before retrying */
         } else {
+            if (g_instance.roach_cxt.isXLogForceRecycled && !g_instance.roach_cxt.forceAdvanceSlotTigger) {
+                g_instance.roach_cxt.isXLogForceRecycled = false;
+                ereport(LOG, (errmsg("PgArch force advance slot success")));
+            }
             gettimeofday(&tv, NULL);
-            t_thrd.arch.last_arch_time = TIME_GET_MILLISEC(tv);
+            currTimestamp = TIME_GET_MILLISEC(tv);
             t_thrd.arch.pitr_task_last_lsn = targetLsn;
+            if (currTimestamp - t_thrd.arch.last_arch_time >
+                (u_sess->attr.attr_storage.archive_interval * millitosec)) {
+                AdvanceArchiveSlot(targetLsn);
+            }
+            t_thrd.arch.last_arch_time = currTimestamp;
+            UpdateArchivedLsn(targetLsn);
             ResetLatch(&t_thrd.arch.mainloop_latch);
             ereport(LOG,
                 (errmsg("pgarch_ArchiverObsCopyLoop time change to %ld", t_thrd.arch.last_arch_time)));
         }
-        /* reset result flag */
-        g_instance.archive_obs_cxt.pitr_finish_result = false;
     } while (XLByteLT(t_thrd.arch.pitr_task_last_lsn, flushPtr));
 }
+#endif
 
 /*
  * pgarch_archiveXlog
@@ -960,57 +1001,61 @@ static void pgarch_archiveDone(const char* xlog)
     char rlogready[MAXPGPATH];
     char rlogdone[MAXPGPATH];
 
-    StatusFilePath(rlogready, xlog, ".ready");
-    StatusFilePath(rlogdone, xlog, ".done");
+    StatusFilePath(rlogready, MAXPGPATH, xlog, ".ready");
+    StatusFilePath(rlogdone, MAXPGPATH, xlog, ".done");
     (void)durable_rename(rlogready, rlogdone, WARNING);
 }
 
+static void archKill(int code, Datum arg)
+{
+    setObsArchLatch(NULL);
+    ereport(LOG, (errmsg("arch thread shut down, slotName: %s", t_thrd.arch.slot_name)));
+    pfree_ext(t_thrd.arch.slot_name);
+    if (t_thrd.arch.archive_config != NULL && t_thrd.arch.archive_config->archive_config.conn_config != NULL) {
+        pfree_ext(t_thrd.arch.archive_config->archive_config.conn_config->obs_address);
+        pfree_ext(t_thrd.arch.archive_config->archive_config.conn_config->obs_bucket);
+        pfree_ext(t_thrd.arch.archive_config->archive_config.conn_config->obs_ak);
+        pfree_ext(t_thrd.arch.archive_config->archive_config.conn_config->obs_sk);
+    }
+}
+
+#ifndef ENABLE_LITE_MODE
 /*
  * pgarch_archiveRoachForPitrStandby
  * get signal from walreceiver, fork a roach process to archive xlog
 */
 static void pgarch_archiveRoachForPitrStandby()
 {
+    ArchiveTaskStatus *archive_task_status = NULL;
+    archive_task_status = find_archive_task_status(&t_thrd.arch.archive_task_idx);
+    if (archive_task_status == NULL) {
+        ereport(ERROR,
+            (errmsg("pgarch_archiveRoachForPitrStandby failed because could not get an archive task status.")));
+    }
     ereport(LOG,
-        (errmsg("pgarch_archiveRoachForPitrStandby %X/%X, term:%d, subterm:%d", 
-            (uint32)(g_instance.archive_obs_cxt.archive_task.targetLsn >> 32), (uint32)(g_instance.archive_obs_cxt.archive_task.targetLsn), 
-            g_instance.archive_obs_cxt.archive_task.term, g_instance.archive_obs_cxt.archive_task.sub_term)));
-    if (obs_replication_archive(&g_instance.archive_obs_cxt.archive_task) == 0) {
-        g_instance.archive_obs_cxt.pitr_finish_result = true;
+        (errmsg("pgarch_archiveRoachForPitrStandby %s : %X/%X, term:%d, subterm:%d", 
+            archive_task_status->slotname,
+            (uint32)(archive_task_status->archive_task.targetLsn >> 32), 
+            (uint32)(archive_task_status->archive_task.targetLsn), 
+            archive_task_status->archive_task.term, 
+            archive_task_status->archive_task.sub_term)));
+    if (archive_task_status->archive_task.targetLsn == InvalidXLogSegPtr) {
+        volatile unsigned int *pitr_task_status = &archive_task_status->pitr_task_status;
+        pg_atomic_write_u32(pitr_task_status, PITR_TASK_NONE);
+        ereport(LOG, (errmsg("PgArch standby receive invalid lsn for slot force advance")));
+    }
+    if (ArchiveReplicationAchiver(&archive_task_status->archive_task) == 0) {
+        archive_task_status->pitr_finish_result = true;
     } else {
         ereport(WARNING,
-            (errmsg("error when pgarch_archiveRoachForPitrStandby %X/%X, term:%d, subterm:%d", 
-                (uint32)(g_instance.archive_obs_cxt.archive_task.targetLsn >> 32), (uint32)(g_instance.archive_obs_cxt.archive_task.targetLsn), 
-                g_instance.archive_obs_cxt.archive_task.term, g_instance.archive_obs_cxt.archive_task.sub_term)));
-        g_instance.archive_obs_cxt.pitr_finish_result = false;
-    }
-}
-
-static void CreateArchiveReadyFile()
-{
-    char xlogfname[MAXFNAMELEN];
-    ereport(LOG,
-        (errmsg("CreateArchiveReadyFile %X/%X", (uint32)(g_instance.archive_standby_cxt.archive_task.targetLsn >> 32),
-                (uint32)(g_instance.archive_standby_cxt.archive_task.targetLsn))));
-    
-    XLogSegNo xlogSegno = 0;
-    XLByteToSeg(g_instance.archive_standby_cxt.archive_task.targetLsn, xlogSegno);
-    if (xlogSegno == InvalidXLogSegPtr) {
-        g_instance.archive_standby_cxt.arch_finish_result = false;
-        ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-                        errmsg("Invalid Lsn: %lu", g_instance.archive_standby_cxt.archive_task.targetLsn)));
-    }
-    XLogFileName(xlogfname, DEFAULT_TIMELINE_ID, xlogSegno);
-
-    char tempPath[PATH_MAX] = {0};
-    char srcPath[PATH_MAX + 1] = {0};
-    int rc = snprintf_s(tempPath, PATH_MAX, PATH_MAX - 1, XLOGDIR "/%s", xlogfname);
-    securec_check_ss(rc, "\0", "\0");
-    char* retVal = realpath(tempPath, srcPath);
-    if (retVal == NULL) {
-        ereport(WARNING, (errmsg_internal("realpath src %s failed:%m\n", tempPath)));
-    } else {
-        XLogArchiveNotify(xlogfname);
+            (errmsg("error when pgarch_archiveRoachForPitrStandby %s : %X/%X, term:%d, subterm:%d", 
+                archive_task_status->slotname,
+                (uint32)(archive_task_status->archive_task.targetLsn >> 32), 
+                (uint32)(archive_task_status->archive_task.targetLsn), 
+                archive_task_status->archive_task.term, 
+                archive_task_status->archive_task.sub_term)));
+        
+        archive_task_status->pitr_finish_result = false;
     }
 }
 
@@ -1020,10 +1065,28 @@ static void CreateArchiveReadyFile()
 */
 static bool pgarch_archiveRoachForPitrMaster(XLogRecPtr targetLsn)
 {
-    ResetLatch(&t_thrd.arch.mainloop_latch);
+    ArchiveTaskStatus *archive_task_status = NULL;
+    archive_task_status = find_archive_task_status(&t_thrd.arch.archive_task_idx);
+    if (archive_task_status == NULL) {
+        return false;
+    }
+    
+    archive_task_status->archive_task.targetLsn = targetLsn;
+    archive_task_status->archive_task.tli = get_controlfile_timeline();
+    archive_task_status->archive_task.term = Max(g_instance.comm_cxt.localinfo_cxt.term_from_file, 
+        g_instance.comm_cxt.localinfo_cxt.term_from_xlog);
+    if (g_instance.roach_cxt.forceAdvanceSlotTigger) {
+        archive_task_status->archive_task.targetLsn = InvalidXLogRecPtr;
+        g_instance.roach_cxt.forceAdvanceSlotTigger = false;
+        ereport(LOG, (errmsg("PgArch need force advance this time in primary")));
+    }
+    /* subterm update when walsender changed */
+    int rc = strcpy_s(archive_task_status->archive_task.slot_name, NAMEDATALEN, t_thrd.arch.slot_name);
+    securec_check(rc, "\0", "\0");
     ereport(LOG,
-        (errmsg("pgarch_archiveRoachForPitrMaster %X/%X", (uint32)(targetLsn >> 32), (uint32)(targetLsn))));
-    int rc;
+        (errmsg("%s : pgarch_archiveRoachForPitrMaster %X/%X", 
+            t_thrd.arch.slot_name, (uint32)(targetLsn >> 32), 
+            (uint32)(targetLsn))));
     WalSnd* walsnd = pgarch_chooseWalsnd(targetLsn);
     if (walsnd == NULL) {
         ereport(WARNING,
@@ -1031,12 +1094,12 @@ static bool pgarch_archiveRoachForPitrMaster(XLogRecPtr targetLsn)
                 (uint32)(targetLsn >> 32), (uint32)(targetLsn))));
         return false;
     }
-    walsnd->arch_latch = &t_thrd.arch.mainloop_latch;
-    pg_atomic_write_u32(&walsnd->archive_flag, 1);
+    archive_task_status->archiver_latch = &t_thrd.arch.mainloop_latch;
+    add_archive_task_to_list(t_thrd.arch.archive_task_idx, walsnd);
     SetLatch(&walsnd->latch);
+    ResetLatch(&t_thrd.arch.mainloop_latch);
     rc = WaitLatch(&t_thrd.arch.mainloop_latch,
-        WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH,
-        (long)t_thrd.arch.task_wait_interval);
+        WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH, 3000L);
 
     if (rc & WL_POSTMASTER_DEATH) {
         gs_thread_exit(1);
@@ -1045,10 +1108,11 @@ static bool pgarch_archiveRoachForPitrMaster(XLogRecPtr targetLsn)
         return false;
     }
     /*
-    * check targetLsn and g_instance.archive_obs_cxt.archive_task.targetLsn for deal message with wrong order
-    */
-    if (g_instance.archive_obs_cxt.pitr_finish_result == true 
-        && XLByteEQ(g_instance.archive_obs_cxt.archive_task.targetLsn, targetLsn)) {
+     * check targetLsn and g_instance.archive_obs_cxt.archive_task.targetLsn for deal message with wrong order
+     */
+    if (archive_task_status->pitr_finish_result == true 
+        && XLByteEQ(archive_task_status->archive_task.targetLsn, targetLsn)) {
+        archive_task_status->pitr_finish_result = false;
         return true;
     } else {
         return false;
@@ -1061,17 +1125,28 @@ static bool pgarch_archiveRoachForPitrMaster(XLogRecPtr targetLsn)
 */
 static bool pgarch_archiveRoachForCoordinator(XLogRecPtr targetLsn)
 {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    ArchiveTaskStatus *archive_task_status = NULL;
+    archive_task_status = find_archive_task_status(&t_thrd.arch.archive_task_idx);
+    if (archive_task_status == NULL) {
+        ereport(ERROR,
+            (errmsg("pgarch_archiveRoachForCoordinator failed because could not get an archive task status.")));
+    }
     ArchiveXlogMessage archive_xlog_info;
     archive_xlog_info.targetLsn = targetLsn;
     archive_xlog_info.term = 0;
     archive_xlog_info.sub_term = 0;
     archive_xlog_info.tli = 0;
-    if (obs_replication_archive(&archive_xlog_info) != 0) {
-        g_instance.archive_obs_cxt.pitr_finish_result = false;
+    if (ArchiveReplicationAchiver(&archive_xlog_info) != 0) {
+        archive_task_status->pitr_finish_result = false;
         ereport(WARNING,
-            (errmsg("error when pgarch_archiveRoachForCoordinator %X/%X, term:%d, subterm:%d", 
-                (uint32)(g_instance.archive_obs_cxt.archive_task.targetLsn >> 32), (uint32)(g_instance.archive_obs_cxt.archive_task.targetLsn), 
-                g_instance.archive_obs_cxt.archive_task.term, g_instance.archive_obs_cxt.archive_task.sub_term)));
+            (errmsg("error when pgarch_archiveRoachForCoordinator %s : %X/%X, term:%d, subterm:%d", 
+                archive_task_status->slotname,
+                (uint32)(archive_task_status->archive_task.targetLsn >> 32), 
+                (uint32)(archive_task_status->archive_task.targetLsn), 
+                archive_task_status->archive_task.term, 
+                archive_task_status->archive_task.sub_term)));
         ResetLatch(&t_thrd.arch.mainloop_latch);
         int rc;
         /* wait and try again */
@@ -1080,13 +1155,15 @@ static bool pgarch_archiveRoachForCoordinator(XLogRecPtr targetLsn)
         return false;
 
     } else {
-        g_instance.archive_obs_cxt.pitr_finish_result = true;
-        g_instance.archive_obs_cxt.archive_task.targetLsn = targetLsn;
+        archive_task_status->pitr_finish_result = true;
+        archive_task_status->archive_task.targetLsn = targetLsn;
+        update_archive_start_end_location_file(archive_task_status->archive_task.targetLsn,
+                    TIME_GET_MILLISEC(tv));
     }
     ereport(LOG,
-        (errmsg("pgarch_archiveRoachForPitrMaster %X/%X", (uint32)(targetLsn >> 32), (uint32)(targetLsn))));
+        (errmsg("pgarch_archiveRoachForCoordinator %X/%X", (uint32)(targetLsn >> 32), (uint32)(targetLsn))));
     
-    return g_instance.archive_obs_cxt.pitr_finish_result;
+    return archive_task_status->pitr_finish_result;
 }
 
 /* check if there is any wal sender alive. */
@@ -1098,9 +1175,8 @@ static WalSnd* pgarch_chooseWalsnd(XLogRecPtr targetLsn)
         walsnd = &t_thrd.walsender_cxt.WalSndCtl->walsnds[t_thrd.arch.sync_walsender_idx];
         SpinLockAcquire(&walsnd->mutex);
         if (walsnd->pid != 0 && ((walsnd->sendRole & SNDROLE_PRIMARY_STANDBY) == walsnd->sendRole) 
-            && !XLogRecPtrIsInvalid(walsnd->flush) && XLByteLE(targetLsn, walsnd->flush)) {
-            walsnd->arch_task_lsn = targetLsn;
-            walsnd->archive_obs_subterm = g_instance.archive_obs_cxt.sync_walsender_term;
+            && !XLogRecPtrIsInvalid(walsnd->flush) && XLByteLE(targetLsn, walsnd->flush) &&
+            walsnd->is_cross_cluster == false) {
             SpinLockRelease(&walsnd->mutex);
             return (WalSnd*)walsnd;
         }
@@ -1113,16 +1189,23 @@ static WalSnd* pgarch_chooseWalsnd(XLogRecPtr targetLsn)
 
         SpinLockAcquire(&walsnd->mutex);
 
-        if (walsnd->pid != 0 && ((walsnd->sendRole & SNDROLE_PRIMARY_STANDBY) == walsnd->sendRole)) {
+        if (walsnd->pid != 0 && ((walsnd->sendRole & SNDROLE_PRIMARY_STANDBY) == walsnd->sendRole) &&
+            walsnd->is_cross_cluster == false) {
             if (XLByteLE(targetLsn, walsnd->flush)) {
                 SpinLockRelease(&walsnd->mutex);
-                walsnd->arch_task_lsn = targetLsn;
+                ArchiveTaskStatus *archive_status = NULL;
+                archive_status = find_archive_task_status(t_thrd.arch.slot_name);
+                if (archive_status == NULL) {
+                    ereport(ERROR,
+                        (errmsg("pgarch_chooseWalsnd has change from %d to %d, but not find slot", 
+                            t_thrd.arch.sync_walsender_idx, i)));
+                }
                 t_thrd.arch.sync_walsender_idx = i;
-                g_instance.archive_obs_cxt.sync_walsender_term++;
+                g_instance.archive_obs_cxt.chosen_walsender_index = i;
+                archive_status->sync_walsender_term++;
                 ereport(LOG,
                     (errmsg("pgarch_chooseWalsnd has change from %d to %d , sub_term:%d", 
-                        t_thrd.arch.sync_walsender_idx, i, g_instance.archive_obs_cxt.sync_walsender_term)));
-                walsnd->archive_obs_subterm = g_instance.archive_obs_cxt.sync_walsender_term;
+                        t_thrd.arch.sync_walsender_idx, i, archive_status->sync_walsender_term)));
                 return (WalSnd*)walsnd;
             }
         }
@@ -1131,117 +1214,69 @@ static WalSnd* pgarch_chooseWalsnd(XLogRecPtr targetLsn)
     return NULL;
 }
 
-
-static void archKill(int code, Datum arg)
+static XLogRecPtr GetLastTaskLsnFromServer(ArchiveSlotConfig* obs_archive_slot)
 {
-    setObsArchLatch(NULL);
-    ereport(LOG, (errmsg("arch thread shut down")));
+    ArchiveXlogMessage obs_archive_info;
+    XLogRecPtr pitr_task_last_lsn;
+
+    if (archive_replication_get_last_xlog(&obs_archive_info, &obs_archive_slot->archive_config) == 0) {
+        pitr_task_last_lsn =  obs_archive_info.targetLsn;
+        ereport(LOG,
+            (errmsg("initLastTaskLsn update lsn to  %X/%X from server", (uint32)(pitr_task_last_lsn >> 32),
+            (uint32)(pitr_task_last_lsn))));
+    } else {
+        XLogRecPtr targetLsn = GetFlushRecPtr();
+        pitr_task_last_lsn = targetLsn - (targetLsn % XLogSegSize);
+        ereport(LOG,
+            (errmsg("initLastTaskLsn update lsn to  %X/%X from local", (uint32)(pitr_task_last_lsn >> 32),
+            (uint32)(pitr_task_last_lsn))));
+    }
+    return pitr_task_last_lsn;
 }
 
-static void initLastTaskLsn()
+static void InitArchiverLastTaskLsn(ArchiveSlotConfig* obs_archive_slot)
 {
     struct timeval tv;
     load_server_mode();
     gettimeofday(&tv,NULL);
-    XLogRecPtr targetLsn;
-    t_thrd.arch.last_arch_time = TIME_GET_MILLISEC(tv);
-    ReplicationSlot* obs_archive_slot = getObsReplicationSlot();
-    if (obs_archive_slot != NULL && !IsServerModeStandby()) {
-        ArchiveXlogMessage obs_archive_info;
-        if (obs_replication_get_last_xlog(&obs_archive_info) == 0) {
-            t_thrd.arch.pitr_task_last_lsn = obs_archive_info.targetLsn;
-            advanceObsSlot(t_thrd.arch.pitr_task_last_lsn);
-            ereport(LOG,
-                (errmsg("initLastTaskLsn update lsn to  %X/%X from obs", (uint32)(t_thrd.arch.pitr_task_last_lsn >> 32), 
-                    (uint32)(t_thrd.arch.pitr_task_last_lsn))));
+
+    if (obs_archive_slot == NULL) {
+        t_thrd.arch.last_arch_time = TIME_GET_MILLISEC(tv);
+        obs_archive_slot = getArchiveReplicationSlot();
+    }
+    volatile int *slot_idx = &t_thrd.arch.slot_idx;
+    if (obs_archive_slot != NULL && !IsServerModeStandby() && !RecoveryInProgress()) {
+        if (likely(*slot_idx != -1) && *slot_idx < g_instance.attr.attr_storage.max_replication_slots) {
+            ReplicationSlot *slot = &t_thrd.slot_cxt.ReplicationSlotCtl->replication_slots[*slot_idx];
+            SpinLockAcquire(&slot->mutex);
+            if (slot->in_use == true && slot->archive_config != NULL) {
+                /*
+                 * In old version(<92599), the last task lsn is initialized from archive server or current flush
+                 * position, but in new version is initialized from local slot.
+                 * During the upgrade, the local restart lsn may be 0, so initialize it with old version way.
+                 */
+                if (slot->data.restart_lsn == InvalidXLogRecPtr &&
+                    t_thrd.proc->workingVersionNum < PITR_INIT_VERSION_NUM) {
+                    SpinLockRelease(&slot->mutex);
+                    t_thrd.arch.pitr_task_last_lsn = GetLastTaskLsnFromServer(obs_archive_slot);
+                } else {
+                    t_thrd.arch.pitr_task_last_lsn = slot->data.restart_lsn;
+                    SpinLockRelease(&slot->mutex);
+                }
+            } else {
+                SpinLockRelease(&slot->mutex);
+                ereport(ERROR, (errcode_for_file_access(), errmsg("slot idx not valid, obs slot %X/%X not advance ",
+                    (uint32)(t_thrd.arch.pitr_task_last_lsn >> 32), (uint32)(t_thrd.arch.pitr_task_last_lsn))));
+            }
+            ereport(LOG, (errmsg("successful init archive slot %X/%X ",
+                (uint32)(t_thrd.arch.pitr_task_last_lsn >> 32), (uint32)(t_thrd.arch.pitr_task_last_lsn))));
         } else {
-            targetLsn = GetFlushRecPtr();
-            t_thrd.arch.pitr_task_last_lsn = targetLsn - (targetLsn % XLogSegSize);
-            advanceObsSlot(t_thrd.arch.pitr_task_last_lsn);
-            ereport(LOG,
-                (errmsg("initLastTaskLsn update lsn to  %X/%X from local", (uint32)(t_thrd.arch.pitr_task_last_lsn >> 32), 
-                    (uint32)(t_thrd.arch.pitr_task_last_lsn))));
+            ereport(WARNING, (errmsg("could not init archive slot cause slot index is invalid: %d", *slot_idx)));
         }
     } else {
-        targetLsn = GetFlushRecPtr();
-        t_thrd.arch.pitr_task_last_lsn = targetLsn - (targetLsn % XLogSegSize);
-        advanceObsSlot(t_thrd.arch.pitr_task_last_lsn);
-        ereport(LOG,
-            (errmsg("initLastTaskLsn update lsn to  %X/%X from local with not obs slot", (uint32)(t_thrd.arch.pitr_task_last_lsn >> 32), 
-                (uint32)(t_thrd.arch.pitr_task_last_lsn))));
+        ereport(WARNING, (errmsg("could not init archive slot cause current server mode is %d",
+            t_thrd.xlog_cxt.server_mode)));
     }
 }
 
-/*
- * This function is used to send the status of archiver
- */
-static void SendArchiveThreadStatus(bool status)
-{
-    if (!WalRcvIsOnline()) {
-        return;
-    }
-    while(!SendArchiveThreadStatusInternal(status)) {
-        ereport(WARNING,
-                (errcode(ERRCODE_WARNING),
-                    errmsg("Notifing primary to update archive status is failed.")));
-        pg_usleep(SEND_ARCHIVE_STATUS_INTERVAL);
-    }
-    ereport(LOG, (errmsg("Notifing primary to update archive status is success.")));
-}
-
-static bool SendArchiveThreadStatusInternal(bool is_archive_activited)
-{
-    ResetLatch(&t_thrd.arch.mainloop_latch);
-    g_instance.archive_standby_cxt.archive_enabled = is_archive_activited;
-    (void)gs_signal_send(g_instance.pid_cxt.WalReceiverPID, SIGUSR2);
-    g_instance.archive_standby_cxt.arch_latch = &t_thrd.arch.mainloop_latch;
-    int rc = WaitLatch(&t_thrd.arch.mainloop_latch,
-                        WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH,
-                        (long)(UPDATE_STATUS_WAIT));
-    if (rc & WL_POSTMASTER_DEATH) {
-        gs_thread_exit(1);
-    }
-    if (rc & WL_TIMEOUT) {
-        return false;
-    }
-    return true;
-}
-
-static bool NotifyPrimaryArchiverActived(ThreadId* last_walrcv_pid, bool* sent_archive_status)
-{
-    if (WalRcvIsOnline()) {
-        /* last_walrcv_pid is used to check whether the primary node is switched over. */
-        if (!(*sent_archive_status) || *last_walrcv_pid != g_instance.pid_cxt.WalReceiverPID) {
-            SendArchiveThreadStatus(ARCHIVE_ON);
-            *sent_archive_status = true;
-            *last_walrcv_pid = g_instance.pid_cxt.WalReceiverPID;
-            return true;
-        }
-        if (*sent_archive_status) {
-            return true;
-        }
-    }
-    *sent_archive_status = false;
-    return false;
-}
-
-static void NotifyPrimaryArchiverShutdown(bool sent_archive_status)
-{
-    if (sent_archive_status) {
-        SendArchiveThreadStatus(ARCHIVE_OFF);
-    }
-}
-
-static void ChangeArchiveTaskStatus2Done()
-{
-    if (IsServerModeStandby()) {
-        XLogRecPtr* standby_archive_start_point = &g_instance.archive_standby_cxt.standby_archive_start_point;
-        volatile unsigned int *arch_task_status = &g_instance.archive_standby_cxt.arch_task_status;
-        if (unlikely(pg_atomic_read_u32(arch_task_status) == ARCH_TASK_GET)) {
-            *standby_archive_start_point = g_instance.archive_standby_cxt.archive_task.targetLsn;
-            pg_memory_barrier();
-            g_instance.archive_standby_cxt.arch_finish_result = true;
-            pg_atomic_write_u32(arch_task_status, ARCH_TASK_DONE);
-        }
-    }
-}
+#endif

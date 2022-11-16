@@ -18,7 +18,7 @@
  * database is fully cached in RAM, it is reasonable to set them equal.)
  *
  * We also use a rough estimate "g_instance.cost_cxt.effective_cache_size" of the number of
- * disk pages in Postgres + OS-level disk cache.  (We can't simply use
+ * disk pages in openGauss + OS-level disk cache.  (We can't simply use
  * NBuffers for this purpose because that would ignore the effects of
  * the kernel's disk cache.)
  *
@@ -73,7 +73,7 @@
 #include "catalog/pg_proc.h"
 #include "executor/executor.h"
 #include "executor/hashjoin.h"
-#include "executor/nodeHash.h"
+#include "executor/node/nodeHash.h"
 #include "miscadmin.h"
 #include "nodes/nodeFuncs.h"
 #include "optimizer/bucketpruning.h"
@@ -91,13 +91,14 @@
 #include "parser/parsetree.h"
 #include "utils/dynahash.h"
 #include "utils/guc.h"
-#include "hll.h"
+#include "utils/hll_mpp.h"
 #include "utils/lsyscache.h"
 #include "utils/selfuncs.h"
 #include "utils/spccache.h"
 #include "utils/tuplesort.h"
 #include "catalog/pg_aggregate.h"
 #include "catalog/pg_operator.h"
+#include "catalog/pg_opfamily.h"
 #include "catalog/pg_proc.h"
 #include "vectorsonic/vsonichash.h"
 #include "pgxc/pgxc.h"
@@ -646,6 +647,39 @@ static void set_parallel_path_rows(Path* path)
 }
 
 /*
+ * cost_resultscan
+ *       Determines and returns the cost of scanning an RTE_RESULT relation.
+ */
+void cost_resultscan(Path *path, PlannerInfo *root,
+    RelOptInfo *baserel, ParamPathInfo *param_info)
+{
+    Cost            startup_cost = 0;
+    Cost            run_cost = 0;
+    QualCost        qpqual_cost;
+    Cost            cpu_per_tuple;
+
+    /* Should only be applied to RTE_RESULT base relations */
+    Assert(baserel->relid > 0);
+    Assert(baserel->rtekind == RTE_RESULT);
+
+    /* Mark the path with the correct row estimate */
+    if (param_info)
+        path->rows = param_info->ppi_rows;
+    else
+        path->rows = baserel->rows;
+
+    /* We charge qual cost plus cpu_tuple_cost */
+    get_restriction_qual_cost(root, baserel, param_info, &qpqual_cost);
+
+    startup_cost += qpqual_cost.startup;
+    cpu_per_tuple = DEFAULT_CPU_TUPLE_COST + qpqual_cost.per_tuple;
+    run_cost += cpu_per_tuple * baserel->tuples;
+
+    path->startup_cost = startup_cost;
+    path->total_cost = startup_cost + run_cost;
+}
+
+/*
  * cost_seqscan
  *	  Determines and returns the cost of scanning a relation sequentially.
  *	  The pruning ration for Partitioned table will be considered in set_plain_rel_size().
@@ -946,7 +980,7 @@ void cost_tsstorescan(Path *path, PlannerInfo *root, RelOptInfo *baserel)
  *
  * This mod will help the planner promotes index scan paths better.
  */
-double apply_random_page_cost_mod(double rand_page_cost, double seq_page_cost, int num_of_page)
+double apply_random_page_cost_mod(double rand_page_cost, double seq_page_cost, double num_of_page)
 {
     /*
      * Smooth out at num_of_page = 1000
@@ -1004,6 +1038,11 @@ static bool enable_parametrized_path(PlannerInfo* root, RelOptInfo* baserel, Pat
 {
     Assert(path != NULL);
 
+    if (!ENABLE_SQL_BETA_FEATURE(PREDPUSH_SAME_LEVEL)) {
+        /* sql beta feature is necessary */
+        return false;
+    }
+
     if (ENABLE_PRED_PUSH_FORCE(root) && is_predpush_dest(root, baserel->relids)) {
         if (path->param_info) {
             return !bms_is_subset(path->param_info->ppi_req_outer, predpush_candidates_same_level(root));
@@ -1014,6 +1053,9 @@ static bool enable_parametrized_path(PlannerInfo* root, RelOptInfo* baserel, Pat
 
     return false;
 }
+
+#define HEAP_PAGES_FETCHED(isUstore, pages_fetched, allvisfrac) \
+        (isUstore) ? 0.0 : ceil((pages_fetched) * (1.0 - (allvisfrac)))
 
 /*
  * cost_index
@@ -1037,6 +1079,7 @@ void cost_index(IndexPath* path, PlannerInfo* root, double loop_count)
 {
     IndexOptInfo* index = path->indexinfo;
     RelOptInfo* baserel = index->rel;
+    bool isUstore = baserel->is_ustore;
     bool indexonly = (path->path.pathtype == T_IndexOnlyScan);
     List* allclauses = NIL;
     Cost startup_cost = 0;
@@ -1144,6 +1187,8 @@ void cost_index(IndexPath* path, PlannerInfo* root, double loop_count)
      * We use the measured fraction of the entire heap that is all-visible,
      * which might not be particularly relevant to the subset of the heap
      * that this query will fetch; but it's not clear how to do better.
+     * For ustore, there is visibility info in index so we will not need to
+     * fetch any heap pages for index-only scan.
      * ----------
      */
 
@@ -1164,7 +1209,7 @@ void cost_index(IndexPath* path, PlannerInfo* root, double loop_count)
             tuples_fetched * loop_count, (BlockNumber)baserel->pages, (double)index->pages, root, ispartitionedindex);
 
         if (indexonly)
-            pages_fetched = ceil(pages_fetched * (1.0 - baserel->allvisfrac));
+            pages_fetched = HEAP_PAGES_FETCHED(isUstore, pages_fetched, baserel->allvisfrac);
 
         /* Apply cost mod */
         spc_random_page_cost = RANDOM_PAGE_COST(use_modded_cost, old_random_page_cost, \
@@ -1193,7 +1238,7 @@ void cost_index(IndexPath* path, PlannerInfo* root, double loop_count)
             pages_fetched * loop_count, (BlockNumber)baserel->pages, (double)index->pages, root, ispartitionedindex);
 
         if (indexonly)
-            pages_fetched = ceil(pages_fetched * (1.0 - baserel->allvisfrac));
+            pages_fetched = HEAP_PAGES_FETCHED(isUstore, pages_fetched, baserel->allvisfrac);
 
         /* Apply cost mod after new pages fetched */
         spc_random_page_cost = RANDOM_PAGE_COST(use_modded_cost, old_random_page_cost, \
@@ -1214,7 +1259,7 @@ void cost_index(IndexPath* path, PlannerInfo* root, double loop_count)
             tuples_fetched, (BlockNumber)baserel->pages, (double)index->pages, root, ispartitionedindex);
 
         if (indexonly)
-            pages_fetched = ceil(pages_fetched * (1.0 - baserel->allvisfrac));
+            pages_fetched = HEAP_PAGES_FETCHED(isUstore, pages_fetched, baserel->allvisfrac);
 
         /* Apply cost mod */
         spc_random_page_cost = RANDOM_PAGE_COST(use_modded_cost, old_random_page_cost, \
@@ -1232,7 +1277,7 @@ void cost_index(IndexPath* path, PlannerInfo* root, double loop_count)
         pages_fetched = ceil(indexSelectivity * (double)baserel->pages);
 
         if (indexonly)
-            pages_fetched = ceil(pages_fetched * (1.0 - baserel->allvisfrac));
+            pages_fetched = HEAP_PAGES_FETCHED(isUstore, pages_fetched, baserel->allvisfrac);
 
         if (pages_fetched > 0) {
             /* Apply cost mod after new pages fetched */
@@ -1245,6 +1290,13 @@ void cost_index(IndexPath* path, PlannerInfo* root, double loop_count)
         } else {
             min_IO_cost = 0;
         }
+        
+        /*
+         * When database keep running without vacuum, the number of relpages may inflate quickly 
+         * and finally cause min_IO_cost overestimated. So, adjust min_IO_cost to ensure 
+         * min_IO_cost < max_IO_cost.
+         */
+        min_IO_cost = Min(min_IO_cost, max_IO_cost);
 
         ereport(DEBUG2,
             (errmodule(MOD_OPT),
@@ -1253,6 +1305,7 @@ void cost_index(IndexPath* path, PlannerInfo* root, double loop_count)
     }
 
     min_IO_cost = Min(min_IO_cost, max_IO_cost);
+
     /*
      * Now interpolate based on estimated index order correlation to get total
      * disk I/O cost for main table accesses.
@@ -1488,10 +1541,9 @@ void cost_bitmap_heap_scan(
     double pages_fetched;
     double spc_seq_page_cost, spc_random_page_cost;
     double T;
-    bool ispartitionedindex = path->parent->isPartitionedTable;
-    bool partition_index_unusable = false;
-    bool containGlobalOrLocalIndex = false;
-    bool disable_path = enable_parametrized_path(root, baserel, (Path*)path);
+    bool disable_path = (!u_sess->attr.attr_sql.enable_bitmapscan) ||
+        enable_parametrized_path(root, baserel, (Path*)path);
+    bool canCrossBucket = (baserel->bucketInfo == NULL);
 
     /* Should only be applied to base relations */
     AssertEreport(IsA(baserel, RelOptInfo),
@@ -1515,18 +1567,24 @@ void cost_bitmap_heap_scan(
      * Here not support bitmap index unusable.If the bitmap path contains unusable index paths, set enable_bitmapscan to
      * off. So it will go partition full/partial unusable index scan ,if index path is selected.
      */
-    if (ispartitionedindex) {
-        if (!check_bitmap_heap_path_index_unusable(bitmapqual, baserel))
-            partition_index_unusable = true;
+    if (path->parent->isPartitionedTable) {
+        if (!check_bitmap_heap_path_index_unusable(bitmapqual, baserel)) {
+            disable_path = true;
+        }
         
-        /* If the bitmap path contains Global partition index OR local partition index, set enable_bitmapscan to off */
+        /* If the bitmap path contains both global and local partition index, set enable_bitmapscan to off */
         if (CheckBitmapHeapPathContainGlobalOrLocal(bitmapqual)) {
-            containGlobalOrLocalIndex = true;
+            disable_path = true;
         }
     }
 
-    if (!u_sess->attr.attr_sql.enable_bitmapscan || partition_index_unusable || containGlobalOrLocalIndex ||
-        baserel->bucketInfo != NULL || disable_path) {
+    /* If the bitmap path contains both crossbucket and non-crossbucket index, set enable_bitmapscan to off */
+    if (baserel->bucketInfo != NULL && CheckBitmapHeapPathIsCrossbucket(bitmapqual)) {
+        canCrossBucket = true;
+    }
+    disable_path |= (!canCrossBucket);  /* Disable path if cannot crossbucket */
+
+    if (disable_path) {
         startup_cost += g_instance.cost_cxt.disable_cost;
     }
 
@@ -1559,7 +1617,7 @@ void cost_bitmap_heap_scan(
             (BlockNumber)baserel->pages,
             get_indexpath_pages(bitmapqual),
             root,
-            ispartitionedindex);
+            path->parent->isPartitionedTable);
 
         pages_fetched /= loop_count;
     } else {
@@ -1570,6 +1628,13 @@ void cost_bitmap_heap_scan(
          */
         pages_fetched = (2.0 * T * tuples_fetched) / (2.0 * T + tuples_fetched);
     }
+
+    ereport(DEBUG2,
+        (errmodule(MOD_OPT),
+            errmsg("Computing IndexScanCost: pagesFetched: %lf, tuples_fetched: %lf, indexSelectivity: %lf,"
+                   " indexTotalCost: %lf, loopCount: %lf, T: %lf",
+                pages_fetched, tuples_fetched, indexSelectivity, indexTotalCost, loop_count, T)));
+
     if (pages_fetched >= T) {
         pages_fetched = T;
     } else {
@@ -1605,14 +1670,19 @@ void cost_bitmap_heap_scan(
     cpu_per_tuple = u_sess->attr.attr_sql.cpu_tuple_cost + qpqual_cost.per_tuple;
 
     run_cost += cpu_per_tuple * tuples_fetched;
+    ereport(DEBUG2,
+        (errmodule(MOD_OPT),
+            errmsg("Computing IndexScanCost: startupCost: %lf, runCost: %lf",
+                startup_cost, run_cost)));
 
     path->startup_cost = startup_cost;
     path->total_cost = startup_cost + run_cost;
     path->stream_cost = 0;
 
-    if (!u_sess->attr.attr_sql.enable_bitmapscan || partition_index_unusable || disable_path)
+    if (disable_path) {
         path->total_cost *=
             (g_instance.cost_cxt.disable_cost_enlarge_factor * g_instance.cost_cxt.disable_cost_enlarge_factor);
+    }
 }
 
 /*
@@ -2754,8 +2824,13 @@ void cost_limit(Plan* plan, Plan* lefttree, int64 offset_est, int64 count_est)
  * 'sjinfo' is extra info about the join for selectivity estimation
  * 'semifactors' contains valid data if jointype is SEMI or ANTI
  */
+#ifdef GS_GRAPH
+void initial_cost_nestloop(PlannerInfo* root, JoinCostWorkspace* workspace, JoinType jointype, Path* outer_path,
+    Path* inner_path, JoinPathExtraData *extra, SpecialJoinInfo* sjinfo, SemiAntiJoinFactors* semifactors, int dop)
+#else
 void initial_cost_nestloop(PlannerInfo* root, JoinCostWorkspace* workspace, JoinType jointype, Path* outer_path,
     Path* inner_path, SpecialJoinInfo* sjinfo, SemiAntiJoinFactors* semifactors, int dop)
+#endif
 {
     Cost startup_cost = 0;
     Cost run_cost = 0;
@@ -2787,7 +2862,12 @@ void initial_cost_nestloop(PlannerInfo* root, JoinCostWorkspace* workspace, Join
     inner_run_cost = inner_path->total_cost - inner_path->startup_cost;
     inner_rescan_run_cost = inner_rescan_total_cost - inner_rescan_start_cost;
 
-    if (jointype == JOIN_SEMI || jointype == JOIN_ANTI) {
+#ifdef GS_GRAPH
+    if (jointype == JOIN_SEMI || jointype == JOIN_ANTI || extra->inner_unique) 
+#else
+    if (jointype == JOIN_SEMI || jointype == JOIN_ANTI) 
+#endif
+    {
         double outer_matched_rows;
         Selectivity inner_scan_frac;
 
@@ -2857,8 +2937,13 @@ void initial_cost_nestloop(PlannerInfo* root, JoinCostWorkspace* workspace, Join
  * 'sjinfo' is extra info about the join for selectivity estimation
  * 'semifactors' contains valid data if path->jointype is SEMI or ANTI
  */
+#ifdef GS_GRAPH
+void final_cost_nestloop(PlannerInfo* root, NestPath* path, JoinCostWorkspace* workspace, JoinPathExtraData* extra,
+    SpecialJoinInfo* sjinfo, SemiAntiJoinFactors* semifactors, bool hasalternative, int dop)
+#else
 void final_cost_nestloop(PlannerInfo* root, NestPath* path, JoinCostWorkspace* workspace, SpecialJoinInfo* sjinfo,
     SemiAntiJoinFactors* semifactors, bool hasalternative, int dop)
+#endif
 {
     Path* outer_path = path->outerjoinpath;
     Path* inner_path = path->innerjoinpath;
@@ -2896,7 +2981,11 @@ void final_cost_nestloop(PlannerInfo* root, NestPath* path, JoinCostWorkspace* w
         startup_cost += g_instance.cost_cxt.disable_cost;
 
     /* cost of source data */
+#ifdef GS_GRAPH
+    if (path->jointype == JOIN_SEMI || path->jointype == JOIN_ANTI || extra->inner_unique) {
+#else
     if (path->jointype == JOIN_SEMI || path->jointype == JOIN_ANTI) {
+#endif
         double outer_matched_rows = workspace->outer_matched_rows;
         Selectivity inner_scan_frac = workspace->inner_scan_frac;
 
@@ -2925,7 +3014,20 @@ void final_cost_nestloop(PlannerInfo* root, NestPath* path, JoinCostWorkspace* w
             run_cost += (outer_path_rows - outer_matched_rows) * inner_rescan_run_cost;
             ntuples += (outer_path_rows - outer_matched_rows) * inner_path_rows;
         }
-    } else {
+    } 
+#ifdef GS_GRAPH
+    else if (path->jointype == JOIN_VLE)
+	{
+		SpecialJoinInfo *sjinfo = sjinfo;
+		int			base = (sjinfo->min_hops > 0) ? 1 : 0;
+		int			max_hops = (sjinfo->max_hops == -1) ? 10 : sjinfo->max_hops;
+		int			inner_loop_cnt = max_hops - base;
+
+		ntuples = outer_path_rows +
+				  outer_path_rows * inner_path_rows * inner_loop_cnt;
+	}
+#endif    
+    else {
         /* Normal-case source costs were included in preliminary estimate */
         /* Compute number of tuples processed (not number emitted!) */
         ntuples = outer_path_rows * inner_path_rows;
@@ -3041,7 +3143,7 @@ void initial_cost_mergejoin(PlannerInfo* root, JoinCostWorkspace* workspace, Joi
         opathkey = (PathKey*)linitial(opathkeys);
         ipathkey = (PathKey*)linitial(ipathkeys);
         /* debugging check */
-        if (opathkey->pk_opfamily != ipathkey->pk_opfamily ||
+        if (!OpFamilyEquals(opathkey->pk_opfamily, ipathkey->pk_opfamily) ||
             opathkey->pk_eclass->ec_collation != ipathkey->pk_eclass->ec_collation ||
             opathkey->pk_strategy != ipathkey->pk_strategy || opathkey->pk_nulls_first != ipathkey->pk_nulls_first)
             ereport(ERROR,
@@ -3207,15 +3309,20 @@ void initial_cost_mergejoin(PlannerInfo* root, JoinCostWorkspace* workspace, Joi
  * of the cost calculations, which are not all that cheap.	Since the choice
  * will not affect output pathkeys or startup cost, only total cost, there is
  * no possibility of wanting to keep both paths.  So it seems best to make
- * the decision here and record it in the path's materialize_inner field.
+ * the decision here and record it in the path's skip_mark_restore and materialize_inner field.
  *
  * 'path' is already filled in except for the rows and cost fields and
- *		materialize_inner
+ *		skip_mark_restore and materialize_inner
  * 'workspace' is the result from initial_cost_mergejoin
  * 'sjinfo' is extra info about the join for selectivity estimation
  */
+#ifdef GS_GRAPH
+void final_cost_mergejoin(PlannerInfo* root, MergePath* path, JoinCostWorkspace* workspace, JoinPathExtraData *extra, 
+    SpecialJoinInfo* sjinfo, bool hasalternative)
+#else
 void final_cost_mergejoin(
     PlannerInfo* root, MergePath* path, JoinCostWorkspace* workspace, SpecialJoinInfo* sjinfo, bool hasalternative)
+#endif
 {
     Path* outer_path = path->jpath.outerjoinpath;
     Path* inner_path = path->jpath.innerjoinpath;
@@ -3265,6 +3372,23 @@ void final_cost_mergejoin(
     qp_qual_cost.startup -= merge_qual_cost.startup;
     qp_qual_cost.per_tuple -= merge_qual_cost.per_tuple;
 
+#ifdef GS_GRAPH    
+    /*
+	 * With a SEMI or ANTI join, or if the innerrel is known unique, the
+	 * executor will stop scanning for matches after the first match.  When
+	 * all the joinclauses are merge clauses, this means we don't ever need to
+	 * back up the merge, and so we can skip mark/restore overhead.
+	 */
+	if ((path->jpath.jointype == JOIN_SEMI ||
+		 path->jpath.jointype == JOIN_ANTI ||
+		 extra->inner_unique) &&
+		(list_length(path->jpath.joinrestrictinfo) ==
+		 list_length(path->path_mergeclauses)))
+		path->skip_mark_restore = true;
+	else
+		path->skip_mark_restore = false;
+#endif
+
     /*
      * Get approx # tuples passing the mergequals.	We use approx_tuple_count
      * here because we need an estimate done with JOIN_INNER semantics.
@@ -3297,7 +3421,11 @@ void final_cost_mergejoin(
      * The whole issue is moot if we are working from a unique-ified outer
      * input.
      */
+#ifdef GS_GRAPH
+    if (IsA(outer_path, UniquePath) || path->skip_mark_restore)
+#else
     if (IsA(outer_path, UniquePath))
+#endif
         rescannedtuples = 0;
     else {
         rescannedtuples = mergejointuples - inner_path_rows;
@@ -3344,6 +3472,14 @@ void final_cost_mergejoin(
      */
     if (u_sess->attr.attr_sql.enable_material && mat_inner_cost < bare_inner_cost)
         path->materialize_inner = true;
+
+#ifdef GS_GRAPH
+    /*
+	 * If we don't need mark/restore at all, we don't need materialization.
+	 */
+	else if (path->skip_mark_restore)
+		path->materialize_inner = false;
+#endif
 
     /*
      * Even if materializing doesn't look cheaper, we *must* do it if the
@@ -3446,7 +3582,8 @@ MergeScanSelCache* cached_scansel(PlannerInfo* root, RestrictInfo* rinfo, PathKe
     /* Do we have this result already? */
     foreach (lc, rinfo->scansel_cache) {
         cache = (MergeScanSelCache*)lfirst(lc);
-        if (cache->opfamily == pathkey->pk_opfamily && cache->collation == pathkey->pk_eclass->ec_collation &&
+        if (OpFamilyEquals(cache->opfamily, pathkey->pk_opfamily) &&
+            cache->collation == pathkey->pk_eclass->ec_collation &&
             cache->strategy == pathkey->pk_strategy && cache->nulls_first == pathkey->pk_nulls_first)
             return cache;
     }
@@ -3769,8 +3906,13 @@ Selectivity compute_bucket_size(PlannerInfo* root, RestrictInfo* restrictinfo, d
  * 'sjinfo' is extra info about the join for selectivity estimation
  * 'semifactors' contains valid data if path->jointype is SEMI or ANTI
  */
+#ifdef GS_GRAPH
+void final_cost_hashjoin(PlannerInfo* root, HashPath* path, JoinCostWorkspace* workspace, JoinPathExtraData *extra,
+    SpecialJoinInfo* sjinfo, SemiAntiJoinFactors* semifactors, bool hasalternative, int dop)
+#else
 void final_cost_hashjoin(PlannerInfo* root, HashPath* path, JoinCostWorkspace* workspace, SpecialJoinInfo* sjinfo,
     SemiAntiJoinFactors* semifactors, bool hasalternative, int dop)
+#endif
 {
     Path* outer_path = path->jpath.outerjoinpath;
     Path* inner_path = path->jpath.innerjoinpath;
@@ -4036,7 +4178,11 @@ void final_cost_hashjoin(PlannerInfo* root, HashPath* path, JoinCostWorkspace* w
     qp_qual_cost.per_tuple -= hash_qual_cost.per_tuple;
 
     /* CPU costs */
+#ifdef GS_GRAPH
+    if (path->jpath.jointype == JOIN_SEMI || path->jpath.jointype == JOIN_ANTI || extra->inner_unique) {
+#else
     if (path->jpath.jointype == JOIN_SEMI || path->jpath.jointype == JOIN_ANTI) {
+#endif
         double outer_matched_rows;
         Selectivity inner_scan_frac;
 
@@ -4247,6 +4393,7 @@ void final_cost_hashjoin(PlannerInfo* root, HashPath* path, JoinCostWorkspace* w
     path->jpath.path.startup_cost = startup_cost;
     path->jpath.path.total_cost = startup_cost + run_cost;
     path->jpath.path.stream_cost = inner_path->stream_cost;
+    path->joinRows = hashjointuples;
 
     if (!u_sess->attr.attr_sql.enable_hashjoin && hasalternative)
         path->jpath.path.total_cost *= g_instance.cost_cxt.disable_cost_enlarge_factor;
@@ -4730,7 +4877,7 @@ static void get_restriction_qual_cost(
 
 /*
  * compute_semi_anti_join_factors
- *	  Estimate how much of the inner input a SEMI or ANTI join
+ *	  Estimate how much of the inner input a SEMI or ANTI, (GS_GRAPH: or inner_unique) join
  *	  can be expected to scan.
  *
  * In a hash or nestloop SEMI/ANTI join, the executor will stop scanning
@@ -4744,7 +4891,7 @@ static void get_restriction_qual_cost(
  * Input parameters:
  *	outerrel: outer relation under consideration
  *	innerrel: inner relation under consideration
- *	jointype: must be JOIN_SEMI or JOIN_ANTI
+ *	jointype: must be JOIN_SEMI or JOIN_ANTI (GS_GRAPH: if not JOIN_SEMI or JOIN_ANTI, we assume it's inner_unique)
  *	sjinfo: SpecialJoinInfo relevant to this join
  *	restrictlist: join quals
  * Output parameters:
@@ -4761,11 +4908,12 @@ void compute_semi_anti_join_factors(PlannerInfo* root, RelOptInfo* outerrel, Rel
     ListCell* l = NULL;
 
     /* Should only be called in these cases */
+#ifndef GS_GRAPH
     AssertEreport(jointype == JOIN_SEMI || jointype == JOIN_ANTI,
         MOD_OPT,
         "Only JOIN_SEMI or JOIN_ANTI can be supported"
         "when estimating how much of the inner input a SEMI or ANTI join can be expected to scan.");
-
+#endif
     /*
      * In an ANTI join, we must ignore clauses that are "pushed down", since
      * those won't affect the match logic.  In a SEMI join, we do not
@@ -5073,6 +5221,28 @@ void set_baserel_size_estimates(PlannerInfo* root, RelOptInfo* rel)
 }
 
 /*
+ * set_result_size_estimates
+ *             Set the size estimates for an RTE_RESULT base relation
+ *
+ * The rel's targetlist and restrictinfo list must have been constructed
+ * already.
+ *
+ * We set the same fields as set_baserel_size_estimates.
+ */
+void set_result_size_estimates(PlannerInfo *root, RelOptInfo *rel)
+{
+    /* Should only be applied to RTE_RESULT base relations */
+    Assert(rel->relid > 0);
+    Assert(planner_rt_fetch(rel->relid, root)->rtekind == RTE_RESULT);
+
+    /* RTE_RESULT always generates a single row, natively */
+    rel->tuples = 1;
+
+    /* Now estimate number of output rows, etc */
+    set_baserel_size_estimates(root, rel);
+}
+
+/*
  * get_parameterized_baserel_size
  *		Make a size estimate for a parameterized scan of a base relation.
  *
@@ -5289,6 +5459,19 @@ static double calc_joinrel_size_estimate(PlannerInfo* root, double outer_rows, d
         case JOIN_INNER:
             nrows = outer_rows * inner_rows * jselec;
             break;
+#ifdef GS_GRAPH
+        case JOIN_VLE:
+			{
+				int base = (sjinfo->min_hops > 0) ? 1 : 0;
+				int max_hops = (sjinfo->max_hops == -1) ? 10 : sjinfo->max_hops;
+				int inner_loop_cnt = max_hops - base;
+
+				nrows = outer_rows + outer_rows * inner_rows * inner_loop_cnt;
+			}
+			break;
+        case JOIN_CYPHER_MERGE:
+		case JOIN_CYPHER_DELETE:
+#endif        
         case JOIN_LEFT:
             nrows = outer_rows * inner_rows * jselec;
             if (nrows < outer_rows)
@@ -5637,6 +5820,12 @@ void set_rel_width(PlannerInfo* root, RelOptInfo* rel)
                     ispartition = true;
                 }
 
+                if (rte->isContainSubPartition) {
+                    Assert(OidIsValid(rte->partitionOid));
+                    targetid = rte->subpartitionOid;
+                    ispartition = true;
+                }
+
                 item_width = get_attavgwidth(targetid, var->varattno, ispartition);
                 if (item_width > 0) {
                     rel->attr_widths[ndx] = item_width;
@@ -5699,6 +5888,11 @@ void set_rel_width(PlannerInfo* root, RelOptInfo* rel)
                     MOD_OPT,
                     "The partitionOid is invalid when setting the estimated output width of a base relation.");
                 partid = rte->partitionOid;
+            }
+
+            if (rte->isContainSubPartition) {
+                Assert(OidIsValid(rte->partitionOid));
+                partid = rte->subpartitionOid;
             }
 
             /* Real relation, so estimate true tuple width */
@@ -6143,6 +6337,9 @@ static Cost get_subqueryscan_stream_cost(Plan* subplan)
 
         case T_NestLoop:
         case T_VecNestLoop:
+#ifdef GS_GRAPH
+        case T_NestLoopVLE:
+#endif        
             stream_cost = get_subqueryscan_stream_cost(subplan->righttree);
             break;
 

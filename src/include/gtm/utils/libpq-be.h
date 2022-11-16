@@ -99,6 +99,7 @@ typedef struct Port {
 
 } Port;
 
+
 /* TCP keepalives configuration. These are no-ops on an AF_UNIX socket. */
 
 typedef enum { GTM_UNUSED_LISTEN_SOCKET = 0, GTM_SERVICE_LISTEN_SOCKET, GTM_HA_LISTEN_SOCKET } GTM_ListenSocketType;

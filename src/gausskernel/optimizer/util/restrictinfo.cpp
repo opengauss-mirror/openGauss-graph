@@ -528,8 +528,9 @@ List* extract_actual_clauses(List* restrictinfo_list, bool pseudoconstant)
         AssertEreport(IsA(rinfo, RestrictInfo), MOD_OPT, "");
 
         /* we consider the qual is real if  pseudoconstant is true and clause_relids is non-null. */
-        if ((rinfo->pseudoconstant == pseudoconstant) && (!pseudoconstant || bms_is_empty(rinfo->clause_relids)))
+        if ((rinfo->pseudoconstant == pseudoconstant) && (!pseudoconstant || bms_is_empty(rinfo->clause_relids))) {
             result = lappend(result, rinfo->clause);
+        }
     }
     return result;
 }

@@ -84,7 +84,7 @@ typedef enum { DML_PRIVS_INDEX = 0, DDL_PRIVS_INDEX } PRIVS_INDEX;
 
 /*
  * Definitions for convenient access to Acl (array of AclItem).
- * These are standard PostgreSQL arrays, but are restricted to have one
+ * These are standard openGauss arrays, but are restricted to have one
  * dimension and no nulls.	We also ignore the lower bound when reading,
  * and set it to one when writing.
  *
@@ -158,6 +158,7 @@ typedef ArrayType Acl;
 #define ACL_ALL_RIGHTS_FDW (ACL_USAGE)
 #define ACL_ALL_RIGHTS_FOREIGN_SERVER (ACL_USAGE)
 #define ACL_ALL_RIGHTS_FUNCTION (ACL_EXECUTE)
+#define ACL_ALL_RIGHTS_PACKAGE (ACL_EXECUTE)
 #define ACL_ALL_RIGHTS_LANGUAGE (ACL_USAGE)
 #define ACL_ALL_RIGHTS_LARGEOBJECT (ACL_SELECT | ACL_UPDATE)
 #define ACL_ALL_RIGHTS_NAMESPACE (ACL_USAGE | ACL_CREATE)
@@ -181,17 +182,19 @@ typedef ArrayType Acl;
 /* Bitmasks defining "all ddl rights" for each supported object type */
 #define ACL_ALL_DDL_RIGHTS_COLUMN (ACL_COMMENT)
 #define ACL_ALL_DDL_RIGHTS_RELATION (ACL_ALTER | ACL_DROP | ACL_COMMENT | ACL_INDEX | ACL_VACUUM)
+#define ACL_ALL_DDL_RIGHTS_VIEW (ACL_ALTER | ACL_DROP | ACL_COMMENT)
 #define ACL_ALL_DDL_RIGHTS_SEQUENCE (ACL_ALTER | ACL_DROP | ACL_COMMENT)
 #define ACL_ALL_DDL_RIGHTS_NODEGROUP (ACL_ALTER | ACL_DROP)
 #define ACL_ALL_DDL_RIGHTS_DATABASE (ACL_ALTER | ACL_DROP | ACL_COMMENT)
 #define ACL_ALL_DDL_RIGHTS_TABLESPACE (ACL_ALTER | ACL_DROP | ACL_COMMENT)
 #define ACL_ALL_DDL_RIGHTS_NAMESPACE (ACL_ALTER | ACL_DROP | ACL_COMMENT)
 #define ACL_ALL_DDL_RIGHTS_FUNCTION (ACL_ALTER | ACL_DROP | ACL_COMMENT)
+#define ACL_ALL_DDL_RIGHTS_PACKAGE  (ACL_ALTER | ACL_DROP | ACL_COMMENT)
 #define ACL_ALL_DDL_RIGHTS_TYPE (ACL_ALTER | ACL_DROP | ACL_COMMENT)
 #define ACL_ALL_DDL_RIGHTS_FOREIGN_SERVER (ACL_ALTER | ACL_DROP | ACL_COMMENT)
 #define ACL_ALL_DDL_RIGHTS_FDW (ACL_NO_DDL_RIGHTS)
 #define ACL_ALL_DDL_RIGHTS_DATA_SOURCE (ACL_NO_DDL_RIGHTS)
-#define ACL_ALL_DDL_RIGHTS_DIRECTORY (ACL_NO_DDL_RIGHTS)
+#define ACL_ALL_DDL_RIGHTS_DIRECTORY (ACL_ALTER | ACL_DROP)
 #define ACL_ALL_DDL_RIGHTS_LARGEOBJECT (ACL_NO_DDL_RIGHTS)
 #define ACL_ALL_DDL_RIGHTS_LANGUAGE (ACL_NO_DDL_RIGHTS)
 #define ACL_ALL_DDL_RIGHTS_DOMAIN (ACL_NO_DDL_RIGHTS)
@@ -239,6 +242,11 @@ typedef enum AclObjectKind {
     ACL_KIND_DIRECTORY,       /* pg_directory */
     ACL_KIND_COLUMN_SETTING,  /* column setting */
     ACL_KIND_GLOBAL_SETTING,  /* master client key */
+    ACL_KIND_PACKAGE,         /* pg_package */
+    ACL_KIND_PUBLICATION,     /* pg_publication */
+    ACL_KIND_SUBSCRIPTION,    /* pg_subscription */
+    ACL_KIND_GRAPH,				/* gs_graph */
+	ACL_KIND_LABEL,				/* gs_label */
     MAX_ACL_KIND              /* MUST BE LAST */
 } AclObjectKind;
 
@@ -258,7 +266,7 @@ extern void aclitemsort(Acl* acl);
 extern bool aclequal(const Acl* left_acl, const Acl* right_acl);
 
 extern AclMode aclmask(const Acl* acl, Oid roleid, Oid ownerId, AclMode mask, AclMaskHow how);
-extern AclMode aclmask_dbe_perf(const Acl* acl, Oid roleid, Oid ownerId, AclMode mask, AclMaskHow how);
+extern AclMode aclmask_without_sysadmin(const Acl* acl, Oid roleid, Oid ownerId, AclMode mask, AclMaskHow how);
 extern int aclmembers(const Acl* acl, Oid** roleids);
 
 extern bool has_privs_of_role(Oid member, Oid role);
@@ -270,8 +278,9 @@ extern Oid get_role_oid(const char* rolname, bool missing_ok);
 
 extern void select_best_grantor(
     Oid roleId, AclMode privileges, AclMode ddl_privileges, const Acl* acl, Oid ownerId,
-        Oid* grantorId, AclMode* grantOptions, AclMode* ddl_grantOptions, bool is_dbe_perf = false);
-
+        Oid* grantorId, AclMode* grantOptions, AclMode* ddl_grantOptions, bool is_dbe_perf = false,
+            bool isPgCatalog = false);
+extern List * roles_has_privs_of(Oid roleid);
 extern void initialize_acl(void);
 
 /*
@@ -284,6 +293,7 @@ extern Datum aclremove(PG_FUNCTION_ARGS);
 extern Datum aclcontains(PG_FUNCTION_ARGS);
 extern Datum makeaclitem(PG_FUNCTION_ARGS);
 extern Datum aclitem_eq(PG_FUNCTION_ARGS);
+extern Datum aclitem_eq_self(PG_FUNCTION_ARGS);
 extern Datum hash_aclitem(PG_FUNCTION_ARGS);
 extern Datum acldefault_sql(PG_FUNCTION_ARGS);
 extern Datum aclexplode(PG_FUNCTION_ARGS);
@@ -303,6 +313,7 @@ extern AclMode pg_class_aclmask(Oid table_oid, Oid roleid, AclMode mask, AclMask
 extern AclMode pg_database_aclmask(Oid db_oid, Oid roleid, AclMode mask, AclMaskHow how);
 extern AclMode pg_directory_aclmask(Oid dir_oid, Oid roleid, AclMode mask, AclMaskHow how);
 extern AclMode pg_proc_aclmask(Oid proc_oid, Oid roleid, AclMode mask, AclMaskHow how, bool check_nodegroup = true);
+extern AclMode pg_package_aclmask(Oid packageOid, Oid roleid, AclMode mask, AclMaskHow how);
 extern AclMode pg_language_aclmask(Oid lang_oid, Oid roleid, AclMode mask, AclMaskHow how);
 extern AclMode pg_largeobject_aclmask_snapshot(
     Oid lobj_oid, Oid roleid, AclMode mask, AclMaskHow how, Snapshot snapshot);
@@ -322,6 +333,7 @@ extern AclResult pg_class_aclcheck(Oid table_oid, Oid roleid, AclMode mode, bool
 extern AclResult pg_database_aclcheck(Oid db_oid, Oid roleid, AclMode mode);
 extern AclResult pg_directory_aclcheck(Oid dir_oid, Oid roleid, AclMode mode);
 extern AclResult pg_proc_aclcheck(Oid proc_oid, Oid roleid, AclMode mode, bool check_nodegroup = true);
+extern AclResult pg_package_aclcheck(Oid pkgOid, Oid roleid, AclMode mode, bool checkNodegroup = true);
 extern AclResult pg_language_aclcheck(Oid lang_oid, Oid roleid, AclMode mode);
 extern AclResult pg_largeobject_aclcheck_snapshot(Oid lang_oid, Oid roleid, AclMode mode, Snapshot snapshot);
 extern AclResult pg_namespace_aclcheck(Oid nsp_oid, Oid roleid, AclMode mode, bool check_nodegroup = true);
@@ -335,9 +347,9 @@ extern AclResult gs_sec_cmk_aclcheck(Oid key_oid, Oid roleid, AclMode mode, bool
 extern AclResult gs_sec_cek_aclcheck(Oid key_oid, Oid roleid, AclMode mode, bool check_nodegroup = false);
 
 extern void aclcheck_error(AclResult aclerr, AclObjectKind objectkind, const char* objectname);
-
+extern void aclcheck_error_msg(AclResult aclerr, AclObjectKind objectkind, const char *objectname, char *errstr,
+    int size);
 extern void aclcheck_error_col(AclResult aclerr, AclObjectKind objectkind, const char* objectname, const char* colname);
-
 extern void aclcheck_error_type(AclResult aclerr, Oid typeOid);
 
 /* ownercheck routines just return true (owner) or false (not) */
@@ -347,6 +359,7 @@ extern bool pg_oper_ownercheck(Oid oper_oid, Oid roleid);
 extern bool pg_proc_ownercheck(Oid proc_oid, Oid roleid);
 extern bool pg_language_ownercheck(Oid lan_oid, Oid roleid);
 extern bool pg_largeobject_ownercheck(Oid lobj_oid, Oid roleid);
+extern bool pg_package_ownercheck(Oid package_oid, Oid roleid);
 extern bool pg_namespace_ownercheck(Oid nsp_oid, Oid roleid);
 extern bool pg_tablespace_ownercheck(Oid spc_oid, Oid roleid);
 extern bool pg_opclass_ownercheck(Oid opc_oid, Oid roleid);
@@ -375,4 +388,12 @@ extern bool is_role_independent(Oid roleid);
 extern bool is_role_iamauth(Oid roleid);
 extern bool independent_priv_aclcheck(AclMode mask, char relkind);
 extern bool is_trust_language(Oid lang_oid);
+extern Acl* allocacl(int n);
+extern bool pg_publication_ownercheck(Oid pub_oid, Oid roleid);
+extern bool pg_subscription_ownercheck(Oid sub_oid, Oid roleid);
+#ifdef GS_GRAPH
+extern bool gs_graph_ownercheck(Oid graphid, Oid roleid);
+extern bool gs_label_ownercheck(Oid laboid, Oid roleid);
+#endif /* GS_GRAPH */
+
 #endif /* ACL_H */

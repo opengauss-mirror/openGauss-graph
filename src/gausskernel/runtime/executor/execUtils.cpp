@@ -6,6 +6,7 @@
  * Portions Copyright (c) 2020 Huawei Technologies Co.,Ltd.
  * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
+ * Portions Copyright (c) 2021, openGauss Contributors
  *
  *
  * IDENTIFICATION
@@ -43,15 +44,18 @@
 #include "knl/knl_variable.h"
 
 #include "access/relscan.h"
+#include "access/sysattr.h"
 #include "access/transam.h"
+#include "access/tableam.h"
 #include "catalog/index.h"
 #include "catalog/heap.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_partition_fn.h"
-#include "executor/execdebug.h"
+#include "executor/exec/execdebug.h"
 #include "nodes/nodeFuncs.h"
 #include "parser/parsetree.h"
 #include "storage/lmgr.h"
+#include "storage/tcap.h"
 #include "utils/memutils.h"
 #include "utils/snapmgr.h"
 #include "utils/partitionmap.h"
@@ -65,7 +69,9 @@ static bool index_recheck_constraint(
     Relation index, Oid* constr_procs, Datum* existing_values, const bool* existing_isnull, Datum* new_values);
 static void ShutdownExprContext(ExprContext* econtext, bool isCommit);
 static bool check_violation(Relation heap, Relation index, IndexInfo *indexInfo, ItemPointer tupleid, Datum *values,
-    const bool *isnull, EState *estate, bool newIndex, bool errorOK, CheckWaitMode waitMode, ItemPointer conflictTid);
+                            const bool *isnull, EState *estate, bool newIndex, bool errorOK, CheckWaitMode waitMode,
+                            ConflictInfoData *conflictInfo, Oid partoid = InvalidOid, int2 bucketid = InvalidBktId,
+                            Oid *conflictPartOid = NULL, int2 *conflictBucketid = NULL);
 
 /* ----------------------------------------------------------------
  *				 Executor state and memory management functions
@@ -83,7 +89,7 @@ static bool check_violation(Relation heap, Relation index, IndexInfo *indexInfo,
  * CurrentMemoryContext.
  * ----------------
  */
-EState* CreateExecutorState(void)
+EState* CreateExecutorState(MemoryContext saveCxt)
 {
     EState* estate = NULL;
     MemoryContext qcontext;
@@ -92,11 +98,15 @@ EState* CreateExecutorState(void)
     /*
      * Create the per-query context for this Executor run.
      */
-    qcontext = AllocSetContextCreate(CurrentMemoryContext,
-        "ExecutorState",
-        ALLOCSET_DEFAULT_MINSIZE,
-        ALLOCSET_DEFAULT_INITSIZE,
-        ALLOCSET_DEFAULT_MAXSIZE);
+    if (saveCxt != NULL) {
+        qcontext = saveCxt;
+    } else {
+        qcontext = AllocSetContextCreate(CurrentMemoryContext,
+            "ExecutorState",
+            ALLOCSET_DEFAULT_MINSIZE,
+            ALLOCSET_DEFAULT_INITSIZE,
+            ALLOCSET_DEFAULT_MAXSIZE);
+    }
 
     /*
      * Make the EState node within the per-query context.  This way, we don't
@@ -139,9 +149,11 @@ EState* CreateExecutorState(void)
     estate->es_const_query_cxt = qcontext; /* context query context, it will not be changed */
 
     estate->es_tupleTable = NIL;
+    estate->es_epqTupleSlot = NULL;
 
     estate->es_rowMarks = NIL;
 
+    estate->es_modifiedRowHash = NIL;
     estate->es_processed = 0;
     estate->es_last_processed = 0;
     estate->es_lastoid = InvalidOid;
@@ -1213,6 +1225,249 @@ void ExecCloseIndices(ResultRelInfo* resultRelInfo)
      */
 }
 
+/*
+ * Copied from ExecInsertIndexTuples
+ */
+void ExecDeleteIndexTuples(TupleTableSlot* slot, ItemPointer tupleid, EState* estate,
+    Relation targetPartRel, Partition p, const Bitmapset *modifiedIdxAttrs, const bool inplaceUpdated)
+{
+    ResultRelInfo* resultRelInfo = NULL;
+    int numIndices;
+    RelationPtr relationDescs;
+    Relation heapRelation;
+    IndexInfo** indexInfoArray;
+    ExprContext* econtext = NULL;
+    Datum values[INDEX_MAX_KEYS];
+    bool isnull[INDEX_MAX_KEYS];
+    Relation actualheap;
+    bool ispartitionedtable = false;
+    List* partitionIndexOidList = NIL;
+
+    resultRelInfo = estate->es_result_relation_info;
+
+    numIndices = resultRelInfo->ri_NumIndices;
+    if (numIndices == 0) {
+        return;
+    }
+
+    if (slot->tts_nvalid == 0) {
+        tableam_tslot_getallattrs(slot);
+    }
+
+    if (slot->tts_nvalid == 0) {
+        elog(ERROR, "no values in slot when trying to delete index tuple");
+    }
+
+    /*
+     * Get information from the result relation info structure.
+     */
+    relationDescs = resultRelInfo->ri_IndexRelationDescs;
+    indexInfoArray = resultRelInfo->ri_IndexRelationInfo;
+    heapRelation = resultRelInfo->ri_RelationDesc;
+
+    /*
+     * We will use the EState's per-tuple context for evaluating predicates
+     * and index expressions (creating it if it's not already there).
+     */
+    econtext = GetPerTupleExprContext(estate);
+
+    /* Arrange for econtext's scan tuple to be the tuple under test */
+    econtext->ecxt_scantuple = slot;
+
+    if (RELATION_IS_PARTITIONED(heapRelation)) {
+        Assert(PointerIsValid(targetPartRel));
+
+        ispartitionedtable = true;
+
+        actualheap = targetPartRel;
+
+        if (p == NULL || p->pd_part == NULL) {
+            return;
+        }
+        if (!p->pd_part->indisusable) {
+            numIndices = 0;
+        }
+    } else {
+        actualheap = heapRelation;
+    }
+
+    if (!RelationIsUstoreFormat(heapRelation))
+        return;
+
+    /*
+     * for each index, form and insert the index tuple
+     */
+    for (int i = 0; i < numIndices; i++) {
+        Relation indexRelation = relationDescs[i];
+        IndexInfo* indexInfo = NULL;
+        Oid partitionedindexid = InvalidOid;
+        Oid indexpartitionid = InvalidOid;
+        Relation actualindex = NULL;
+        Partition indexpartition = NULL;
+
+        if (indexRelation == NULL) {
+            continue;
+        }
+
+        indexInfo = indexInfoArray[i];
+
+        /* If the index is marked as read-only, ignore it */
+        /* XXXX: ???? */
+        if (!indexInfo->ii_ReadyForInserts) {
+            continue;
+        }
+
+        /* modifiedIdxAttrs != NULL means updating, not every index are affected */
+        if (inplaceUpdated && modifiedIdxAttrs != NULL) {
+            /* Collect attribute Bitmapset of this index, and compare with modifiedIdxAttrs */
+            Bitmapset *indexattrs = IndexGetAttrBitmap(indexRelation, indexInfo);
+            bool overlap = bms_overlap(indexattrs, modifiedIdxAttrs);
+
+            bms_free(indexattrs);
+            if (!overlap) {
+                continue; /* related columns are not modified */
+            }
+        }
+
+        /* The GPI index insertion is the same as that of a common table */
+        if (ispartitionedtable && !RelationIsGlobalIndex(indexRelation)) {
+            partitionedindexid = RelationGetRelid(indexRelation);
+            if (!PointerIsValid(partitionIndexOidList)) {
+                partitionIndexOidList = PartitionGetPartIndexList(p);
+                // no local indexes available
+                if (!PointerIsValid(partitionIndexOidList)) {
+                    return;
+                }
+            }
+
+            indexpartitionid = searchPartitionIndexOid(partitionedindexid, partitionIndexOidList);
+
+            searchFakeReationForPartitionOid(estate->esfRelations,
+                                             estate->es_query_cxt,
+                                             indexRelation,
+                                             indexpartitionid,
+                                             actualindex,
+                                             indexpartition,
+                                             RowExclusiveLock);
+            // skip unusable index
+            if (indexpartition != NULL && indexpartition->pd_part != NULL && !indexpartition->pd_part->indisusable) {
+                continue;
+            }
+        } else {
+            actualindex = indexRelation;
+        }
+        /* please adapt hash bucket for ustore here. Ref ExecInsertIndexTuples() */
+
+        /* Check for partial index */
+        if (indexInfo->ii_Predicate != NIL) {
+            List* predicate = NIL;
+
+            /*
+             * If predicate state not set up yet, create it (in the estate's
+             * per-query context)
+             */
+            predicate = indexInfo->ii_PredicateState;
+            if (predicate == NIL) {
+                predicate = (List*)ExecPrepareExpr((Expr*)indexInfo->ii_Predicate, estate);
+                indexInfo->ii_PredicateState = predicate;
+            }
+
+            /* Skip this index-update if the predicate isn't satisfied */
+            if (!ExecQual(predicate, econtext, false)) {
+                continue;
+            }
+        }
+
+        /*
+         * FormIndexDatum fills in its values and isnull parameters with the
+         * appropriate values for the column(s) of the index.
+         */
+        FormIndexDatum(indexInfo, slot, estate, values, isnull);
+
+        index_delete(actualindex, values, isnull, tupleid);
+    }
+
+    list_free_ext(partitionIndexOidList);
+}
+
+void ExecUHeapDeleteIndexTuplesGuts(
+    TupleTableSlot* oldslot, Relation rel, ModifyTableState* node, ItemPointer tupleid,
+    ExecIndexTuplesState exec_index_tuples_state, Bitmapset *modifiedIdxAttrs, bool inplaceUpdated)
+{
+    Assert(oldslot);
+    if (node != NULL && node->mt_upsert->us_action == UPSERT_UPDATE) {
+        ExecDeleteIndexTuples(node->mt_upsert->us_existing,
+                              tupleid,
+                              exec_index_tuples_state.estate, exec_index_tuples_state.targetPartRel,
+                              exec_index_tuples_state.p,
+                              modifiedIdxAttrs,
+                              inplaceUpdated);
+    } else {
+        UHeapTuple tmpUtup = ExecGetUHeapTupleFromSlot(oldslot); // materialize the tuple
+        tmpUtup->table_oid = RelationGetRelid(rel);
+        ExecDeleteIndexTuples(oldslot,
+                              tupleid,
+                              exec_index_tuples_state.estate, exec_index_tuples_state.targetPartRel,
+                              exec_index_tuples_state.p,
+                              modifiedIdxAttrs,
+                              inplaceUpdated);
+    }
+}
+
+/* purely for reducing cyclomatic complexity */
+static inline bool GetPartiionIndexOidList(List **oidlist_ptr, Partition part)
+{
+    Assert(oidlist_ptr != NULL);
+
+    if (!PointerIsValid(*oidlist_ptr)) {
+        *oidlist_ptr = PartitionGetPartIndexList(part);
+        if (!PointerIsValid(*oidlist_ptr)) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+static inline bool CheckForPartialIndex(IndexInfo* indexInfo, EState* estate, ExprContext* econtext)
+{
+    List* predicate = indexInfo->ii_PredicateState;
+
+    if (indexInfo->ii_Predicate != NIL) {
+        /*
+         * If predicate state not set up yet, create it (in the estate's
+         * per-query context)
+         */
+        if (predicate == NIL) {
+            predicate = (List*)ExecPrepareExpr((Expr*)indexInfo->ii_Predicate, estate);
+            indexInfo->ii_PredicateState = predicate;
+        }
+
+        /* Skip this index-update if the predicate isn't satisfied */
+        if (!ExecQual(predicate, econtext, false)) {
+            return false;
+        }
+    }
+
+    /*
+     * If indexInfo->ii_Predicate == NIL, just return true to caller to proceed.
+     */
+    return true;
+}
+
+static inline void SetInfoForUpsertGPI(bool isgpi, Relation *actualHeap, Relation *parentRel, bool *isgpiResult,
+                                       Oid *partoid, int2 *bktid)
+{
+    if (isgpi) {
+        *actualHeap = *parentRel;
+        *isgpiResult = true;
+        *partoid = InvalidOid;
+        *bktid = InvalidBktId;
+    } else {
+        *isgpiResult = false;
+    }
+}
+
 /* ----------------------------------------------------------------
  *     ExecCheckIndexConstraints
  *
@@ -1227,8 +1482,9 @@ void ExecCloseIndices(ResultRelInfo* resultRelInfo)
  *     before insertion.
  * ----------------------------------------------------------------
  */
-bool ExecCheckIndexConstraints(TupleTableSlot* slot, EState* estate,
-    Relation targetRel, Partition p, int2 bucketId, ItemPointer conflictTid)
+bool ExecCheckIndexConstraints(TupleTableSlot *slot, EState *estate, Relation targetRel, Partition p, bool *isgpiResult,
+                               int2 bucketId, ConflictInfoData *conflictInfo, Oid *conflictPartOid,
+                               int2 *conflictBucketid)
 {
     ResultRelInfo* resultRelInfo = NULL;
     RelationPtr relationDescs = NULL;
@@ -1242,9 +1498,13 @@ bool ExecCheckIndexConstraints(TupleTableSlot* slot, EState* estate,
     bool isnull[INDEX_MAX_KEYS];
     ItemPointerData invalidItemPtr;
     bool isPartitioned = false;
+    bool containGPI;
     List* partitionIndexOidList = NIL;
+    Oid partoid;
+    int2 bktid;
+    errno_t rc;
 
-    ItemPointerSetInvalid(conflictTid);
+    ItemPointerSetInvalid(&conflictInfo->conflictTid);
     ItemPointerSetInvalid(&invalidItemPtr);
 
     /*
@@ -1255,14 +1515,18 @@ bool ExecCheckIndexConstraints(TupleTableSlot* slot, EState* estate,
     relationDescs = resultRelInfo->ri_IndexRelationDescs;
     indexInfoArray = resultRelInfo->ri_IndexRelationInfo;
     heapRelationDesc = resultRelInfo->ri_RelationDesc;
+    containGPI = resultRelInfo->ri_ContainGPI;
     actualHeap = targetRel;
+
+    rc = memset_s(isnull, sizeof(isnull), 0, sizeof(isnull));
+    securec_check(rc, "", "");
 
     if (RELATION_IS_PARTITIONED(heapRelationDesc)) {
         Assert(p != NULL && p->pd_part != NULL);
         isPartitioned = true;
 
-        if (!p->pd_part->indisusable) {
-            return false;
+        if (!p->pd_part->indisusable && !containGPI) {
+            return true;
         }
     }
 
@@ -1291,6 +1555,9 @@ bool ExecCheckIndexConstraints(TupleTableSlot* slot, EState* estate,
         if (indexRelation == NULL)
             continue;
 
+        bool isgpi = RelationIsGlobalIndex(indexRelation);
+        bool iscbi = RelationIsCrossBucketIndex(indexRelation);
+
         indexInfo = indexInfoArray[i];
 
         if (!indexInfo->ii_Unique && !indexInfo->ii_ExclusionOps)
@@ -1304,19 +1571,16 @@ bool ExecCheckIndexConstraints(TupleTableSlot* slot, EState* estate,
             ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
                              errmsg("INSERT ON DUPLICATE KEY UPDATE does not support deferrable"
                                     " unique constraints/exclusion constraints.")));
-
         /*
          * We consider a partitioned table with a global index as a normal table,
          * because conflicts can be between multiple partitions.
          */
-        if (isPartitioned && !RelationIsGlobalIndex(indexRelation)) {
+        if (isPartitioned && !isgpi) {
             partitionedindexid = RelationGetRelid(indexRelation);
-            if (!PointerIsValid(partitionIndexOidList)) {
-                partitionIndexOidList = PartitionGetPartIndexList(p);
-                if (!PointerIsValid(partitionIndexOidList)) {
-                    // no local indexes available
-                    return false;
-                }
+
+            if (!GetPartiionIndexOidList(&partitionIndexOidList, p)) {
+                /* no local indexes available */
+                return true;
             }
 
             indexpartitionid = searchPartitionIndexOid(partitionedindexid, partitionIndexOidList);
@@ -1336,38 +1600,29 @@ bool ExecCheckIndexConstraints(TupleTableSlot* slot, EState* estate,
             actualIndex = indexRelation;
         }
 
-        if (bucketId != InvalidBktId) {
+        if (bucketId != InvalidBktId && !iscbi) {
             searchHBucketFakeRelation(estate->esfRelations, estate->es_query_cxt, actualIndex, bucketId, actualIndex);
         }
 
         /* Check for partial index */
-        if (indexInfo->ii_Predicate != NIL) {
-            List* predicate;
-
-            /*
-             * If predicate state not set up yet, create it (in the estate's
-             * per-query context)
-             */
-            predicate = indexInfo->ii_PredicateState;
-            if (predicate == NIL) {
-                predicate = (List*)ExecPrepareExpr((Expr*)indexInfo->ii_Predicate, estate);
-                indexInfo->ii_PredicateState = predicate;
-            }
-
-            /* Skip this index-update if the predicate isn't satisfied */
-            if (!ExecQual(predicate, econtext, false)) {
-                continue;
-            }
+        if (!CheckForPartialIndex(indexInfo, estate, econtext)) {
+            continue;
         }
 
         /*
-        * FormIndexDatum fills in its values and isnull parameters with the
-        * appropriate values for the column(s) of the index.
-        */
+         * FormIndexDatum fills in its values and isnull parameters with the
+         * appropriate values for the column(s) of the index.
+         */
         FormIndexDatum(indexInfo, slot, estate, values, isnull);
 
-        satisfiesConstraint = check_violation(actualHeap, actualIndex, indexInfo, &invalidItemPtr, values, isnull,
-            estate, false, true, CHECK_WAIT, conflictTid);
+        partoid = (isgpi ? p->pd_id : InvalidOid);
+        bktid = (iscbi ? bucketId : InvalidBktId);
+
+        SetInfoForUpsertGPI(isgpi, &actualHeap, &heapRelationDesc, isgpiResult, &partoid, &bktid);
+
+        satisfiesConstraint =
+            check_violation(actualHeap, actualIndex, indexInfo, &invalidItemPtr, values, isnull, estate, false, true,
+                            CHECK_WAIT, conflictInfo, partoid, bktid, conflictPartOid, conflictBucketid);
         if (!satisfiesConstraint) {
             return false;
         }
@@ -1397,7 +1652,8 @@ bool ExecCheckIndexConstraints(TupleTableSlot* slot, EState* estate,
  * ----------------------------------------------------------------
  */
 List* ExecInsertIndexTuples(TupleTableSlot* slot, ItemPointer tupleid, EState* estate,
-    Relation targetPartRel, Partition p, int2 bucketId, bool* conflict)
+    Relation targetPartRel, Partition p, int2 bucketId, bool* conflict,
+    Bitmapset *modifiedIdxAttrs, bool inplaceUpdated)
 {
     List* result = NIL;
     ResultRelInfo* resultRelInfo = NULL;
@@ -1487,6 +1743,18 @@ List* ExecInsertIndexTuples(TupleTableSlot* slot, ItemPointer tupleid, EState* e
             continue;
         }
 
+        /* modifiedIdxAttrs != NULL means updating, not every index are affected */
+        if (inplaceUpdated && modifiedIdxAttrs != NULL) {
+            /* Collect attribute Bitmapset of this index, and compare with modifiedIdxAttrs */
+            Bitmapset *indexattrs = IndexGetAttrBitmap(indexRelation, indexInfo);
+            bool overlap = bms_overlap(indexattrs, modifiedIdxAttrs);
+
+            bms_free(indexattrs);
+            if (!overlap) {
+                continue; /* related columns are not modified */
+            }
+        }
+
         /* The GPI index insertion is the same as that of a common table */
         if (ispartitionedtable && !RelationIsGlobalIndex(indexRelation)) {
             partitionedindexid = RelationGetRelid(indexRelation);
@@ -1514,7 +1782,7 @@ List* ExecInsertIndexTuples(TupleTableSlot* slot, ItemPointer tupleid, EState* e
         } else {
             actualindex = indexRelation;
         }
-        if (bucketId != InvalidBktId) {
+        if (bucketId != InvalidBktId && !RelationIsCrossBucketIndex(indexRelation)) {
             searchHBucketFakeRelation(estate->esfRelations, estate->es_query_cxt, actualindex, bucketId, actualindex);
         }
 
@@ -1557,7 +1825,7 @@ List* ExecInsertIndexTuples(TupleTableSlot* slot, ItemPointer tupleid, EState* e
         if (!indexRelation->rd_index->indisunique) {
             checkUnique = UNIQUE_CHECK_NO;
         } else if (conflict != NULL) {
-            checkUnique = UNIQUE_CHECK_PARTIAL;
+            checkUnique = UNIQUE_CHECK_UPSERT;
         } else if (indexRelation->rd_index->indimmediate) {
             checkUnique = UNIQUE_CHECK_YES;
         } else {
@@ -1589,7 +1857,7 @@ List* ExecInsertIndexTuples(TupleTableSlot* slot, ItemPointer tupleid, EState* e
                 actualheap, actualindex, indexInfo, tupleid, values, isnull, estate, false, errorOK);
         }
 
-        if ((checkUnique == UNIQUE_CHECK_PARTIAL || indexInfo->ii_ExclusionOps != NULL) && !satisfiesConstraint) {
+        if ((IndexUniqueCheckNoError(checkUnique) || indexInfo->ii_ExclusionOps != NULL) && !satisfiesConstraint) {
             /*
              * The tuple potentially violates the uniqueness or exclusion
              * constraint, so make a note of the index so that we can re-check
@@ -1638,15 +1906,45 @@ bool check_exclusion_constraint(Relation heap, Relation index, IndexInfo* indexI
         estate, newIndex, errorOK, errorOK ? CHECK_NOWAIT : CHECK_WAIT, NULL);
 }
 
-bool check_violation(Relation heap, Relation index, IndexInfo* indexInfo, ItemPointer tupleid, Datum* values,
-    const bool* isnull, EState* estate, bool newIndex, bool errorOK, CheckWaitMode waitMode, ItemPointer conflictTid)
+static inline IndexScanDesc scan_handler_idx_beginscan_wrapper(Relation parentheap, Relation heap, Relation index,
+    Snapshot snapshot, int nkeys, int norderbys, ScanState* scan_state)
+{
+    IndexScanDesc index_scan;
+    if (RelationIsCrossBucketIndex(index) && RELATION_OWN_BUCKET(parentheap)) {
+        /* for cross-bucket index, pass parent relation to construct HBktIdxScanDesc */
+        index_scan = scan_handler_idx_beginscan(parentheap, index, snapshot, nkeys, norderbys, scan_state);
+        HBktIdxScanDesc hpscan = (HBktIdxScanDesc)index_scan;
+        /* then set scan scope to target heap */
+        hpscan->currBktHeapRel = hpscan->currBktIdxScan->heapRelation = heap;
+        /* also make sure the target heap won't be released at the end of the scan */
+        hpscan->rs_rd = heap;
+    } else {
+        index_scan = scan_handler_idx_beginscan(heap, index, snapshot, nkeys, norderbys, scan_state);
+    }
+
+    return index_scan;
+}
+
+static inline bool index_scan_need_recheck(IndexScanDesc scan)
+{
+    if (RELATION_OWN_BUCKET(scan->indexRelation)) {
+        return ((HBktIdxScanDesc)scan)->currBktIdxScan->xs_recheck;
+    }
+
+    return scan->xs_recheck;
+}
+
+bool check_violation(Relation heap, Relation index, IndexInfo *indexInfo, ItemPointer tupleid, Datum *values,
+                     const bool *isnull, EState *estate, bool newIndex, bool errorOK, CheckWaitMode waitMode,
+                     ConflictInfoData *conflictInfo, Oid partoid, int2 bucketid, Oid *conflictPartOid,
+                     int2 *conflictBucketid)
 {
     Oid* constr_procs = indexInfo->ii_ExclusionProcs;
     uint16* constr_strats = indexInfo->ii_ExclusionStrats;
     Oid* index_collations = index->rd_indcollation;
     int indnkeyatts = IndexRelationGetNumberOfKeyAttributes(index);
     IndexScanDesc index_scan;
-    HeapTuple tup;
+    Tuple tup;
     ScanKeyData scankeys[INDEX_MAX_KEYS];
     SnapshotData DirtySnapshot;
     int i;
@@ -1655,6 +1953,7 @@ bool check_violation(Relation heap, Relation index, IndexInfo* indexInfo, ItemPo
     ExprContext* econtext = NULL;
     TupleTableSlot* existing_slot = NULL;
     TupleTableSlot* save_scantuple = NULL;
+    Relation parentheap;
 
     /*
      * If any of the input values are NULL, the constraint check is assumed to
@@ -1691,8 +1990,7 @@ bool check_violation(Relation heap, Relation index, IndexInfo* indexInfo, ItemPo
      * to this slot.  Be sure to save and restore caller's value for
      * scantuple.
      */
-    existing_slot = MakeSingleTupleTableSlot(RelationGetDescr(heap));
-
+    existing_slot = MakeSingleTupleTableSlot(RelationGetDescr(heap), false, heap->rd_tam_type);
     econtext = GetPerTupleExprContext(estate);
     save_scantuple = econtext->ecxt_scantuple;
     econtext->ecxt_scantuple = existing_slot;
@@ -1704,10 +2002,14 @@ bool check_violation(Relation heap, Relation index, IndexInfo* indexInfo, ItemPo
 retry:
     conflict = false;
     found_self = false;
-    index_scan = (IndexScanDesc)index_beginscan(heap, index, &DirtySnapshot, indnkeyatts, 0);
-    index_rescan(index_scan, scankeys, indnkeyatts, NULL, 0);
 
-    while ((tup = index_getnext(index_scan, ForwardScanDirection)) != NULL) {
+    /* purely for reducing cyclomatic complexity */
+    parentheap = estate->es_result_relation_info->ri_RelationDesc;
+    index_scan = scan_handler_idx_beginscan_wrapper(parentheap, heap, index, &DirtySnapshot, indnkeyatts, 0, NULL);
+    scan_handler_idx_rescan_local(index_scan, scankeys, indnkeyatts, NULL, 0);
+    index_scan->isUpsert = true;
+
+    while ((tup = scan_handler_idx_getnext(index_scan, ForwardScanDirection, partoid, bucketid)) != NULL) {
         TransactionId xwait;
         Datum existing_values[INDEX_MAX_KEYS];
         bool existing_isnull[INDEX_MAX_KEYS];
@@ -1717,7 +2019,8 @@ retry:
         /*
          * Ignore the entry for the tuple we're trying to check.
          */
-        if (ItemPointerIsValid(tupleid) && ItemPointerEquals(tupleid, &tup->t_self)) {
+        ItemPointer item = TUPLE_IS_UHEAP_TUPLE(tup) ? &((UHeapTuple)tup)->ctid : &((HeapTuple)tup)->t_self;
+        if (ItemPointerIsValid(tupleid) && ItemPointerEquals(tupleid, item)) {
             if (found_self) /* should not happen */
                 ereport(ERROR,
                     (errcode(ERRCODE_FETCH_DATA_FAILED),
@@ -1733,12 +2036,12 @@ retry:
         (void)ExecStoreTuple(tup, existing_slot, InvalidBuffer, false);
         FormIndexDatum(indexInfo, existing_slot, estate, existing_values, existing_isnull);
 
-        bool is_scan = index_scan->xs_recheck &&
+        bool is_scan = index_scan_need_recheck(index_scan) &&
             !index_recheck_constraint(index, constr_procs, existing_values, existing_isnull, values);
         /* If lossy indexscan, must recheck the condition */
         if (is_scan) {
             /* tuple doesn't actually match, so no conflict */
-            continue; 
+            continue;
         }
 
         /*
@@ -1753,7 +2056,7 @@ retry:
         xwait = TransactionIdIsValid(DirtySnapshot.xmin) ? DirtySnapshot.xmin : DirtySnapshot.xmax;
 
         if (TransactionIdIsValid(xwait) && waitMode == CHECK_WAIT) {
-            index_endscan(index_scan);
+            scan_handler_idx_endscan(index_scan);
 
             /* for speculative insertion (INSERT ON DUPLICATE KEY UPDATE),
              * we only need to wait the speculative token lock to be release,
@@ -1765,6 +2068,25 @@ retry:
             goto retry;
         }
 
+        /* Determine whether the index column of the scanned tuple is the same
+         * as that of the tuple to be inserted. If not, the tuple pointed to by
+         * the item has been modified by other transactions. Check again for any conflicts.
+         */
+        for (int i=0; i < indnkeyatts; i++) {
+            if (existing_isnull[i] != isnull[i]) {
+                conflict = false;
+                scan_handler_idx_endscan(index_scan);
+                goto retry;
+            }
+            if (!existing_isnull[i] &&
+                !DatumGetBool(FunctionCall2Coll(&scankeys[i].sk_func, scankeys[i].sk_collation,
+                                existing_values[i], values[i]))) {
+                conflict = false;
+                scan_handler_idx_endscan(index_scan);
+                goto retry;
+            }
+        }
+
         /*
          * We have a definite conflict (or a potential one, but the caller
          * didn't want to wait). If we're not supposed to raise error, just
@@ -1772,8 +2094,12 @@ retry:
          */
         if (errorOK) {
             conflict = true;
-            if (conflictTid != NULL)
-                *conflictTid = tup->t_self;
+            if (conflictInfo != NULL) {
+                conflictInfo->conflictTid = *item;
+                conflictInfo->conflictXid = tableam_tops_get_conflictXid(heap, tup);
+            }
+            *conflictPartOid = TUPLE_IS_UHEAP_TUPLE(tup) ? ((UHeapTuple)tup)->table_oid : ((HeapTuple)tup)->t_tableOid;
+            *conflictBucketid = TUPLE_IS_UHEAP_TUPLE(tup) ? ((UHeapTuple)tup)->t_bucketId : ((HeapTuple)tup)->t_bucketId;
             break;
         }
 
@@ -1783,7 +2109,7 @@ retry:
          */
         error_new = BuildIndexValueDescription(index, values, isnull);
         error_existing = BuildIndexValueDescription(index, existing_values, existing_isnull);
-        newIndex ? 
+        newIndex ?
             ereport(ERROR,
                 (errcode(ERRCODE_EXCLUSION_VIOLATION),
                     errmsg("could not create exclusion constraint \"%s\" when trying to build a new index",
@@ -1799,7 +2125,7 @@ retry:
                         : errdetail("Key conflicts with existing key.")));
     }
 
-    index_endscan(index_scan);
+    scan_handler_idx_endscan(index_scan);
 
     /*
      * Ordinarily, at this point the search should have found the originally
@@ -1883,6 +2209,7 @@ void RegisterExprContextCallback(ExprContext* econtext, ExprContextCallbackFunct
 
     ecxt_callback->function = function;
     ecxt_callback->arg = arg;
+    ecxt_callback->resowner = t_thrd.utils_cxt.CurrentResourceOwner;
 
     /* link to front of list for appropriate execution order */
     ecxt_callback->next = econtext->ecxt_callbacks;
@@ -1938,15 +2265,29 @@ static void ShutdownExprContext(ExprContext* econtext, bool isCommit)
     /*
      * Call each callback function in reverse registration order.
      */
-    while ((ecxt_callback = econtext->ecxt_callbacks) != NULL) {
-        econtext->ecxt_callbacks = ecxt_callback->next;
-        if (isCommit)
-            (*ecxt_callback->function)(ecxt_callback->arg);
-        pfree_ext(ecxt_callback);
+    ResourceOwner oldOwner = t_thrd.utils_cxt.CurrentResourceOwner;
+    PG_TRY();
+    {
+        while ((ecxt_callback = econtext->ecxt_callbacks) != NULL) {
+            econtext->ecxt_callbacks = ecxt_callback->next;
+            if (isCommit) {
+                t_thrd.utils_cxt.CurrentResourceOwner = ecxt_callback->resowner;
+                (*ecxt_callback->function)(ecxt_callback->arg);
+            }
+            pfree_ext(ecxt_callback);
+        }
     }
+    PG_CATCH();
+    {
+        t_thrd.utils_cxt.CurrentResourceOwner = oldOwner;
+        PG_RE_THROW();
+    }
+    PG_END_TRY();
+    t_thrd.utils_cxt.CurrentResourceOwner = oldOwner;
 
     MemoryContextSwitchTo(oldcontext);
 }
+
 
 int PthreadMutexLock(ResourceOwner owner, pthread_mutex_t* mutex, bool trace)
 {
@@ -1985,4 +2326,107 @@ int PthreadMutexUnlock(ResourceOwner owner, pthread_mutex_t* mutex, bool trace)
     RESUME_INTERRUPTS();
 
     return ret;
+}
+
+int PthreadRWlockTryRdlock(ResourceOwner owner, pthread_rwlock_t* rwlock)
+{
+    if (owner) {
+        ResourceOwnerEnlargePthreadRWlock(owner);
+    }
+    bool ret;
+    HOLD_INTERRUPTS();
+    ret = pthread_rwlock_tryrdlock(rwlock);
+    if (ret == 0) {
+        if (owner) {
+            ResourceOwnerRememberPthreadRWlock(owner, rwlock);
+        } else {
+            START_CRIT_SECTION();
+        }
+    }
+    RESUME_INTERRUPTS();
+    return ret;
+}
+
+void PthreadRWlockRdlock(ResourceOwner owner, pthread_rwlock_t* rwlock)
+{
+    if (owner) {
+        ResourceOwnerEnlargePthreadRWlock(owner);
+    }
+    HOLD_INTERRUPTS();
+    int ret = pthread_rwlock_rdlock(rwlock);
+    Assert(ret == 0);
+    if (ret != 0) {
+        ereport(ERROR,
+            (errcode(ERRCODE_LOCK_NOT_AVAILABLE), errmsg("aquire rdlock failed")));
+    }
+    if (owner) {
+        ResourceOwnerRememberPthreadRWlock(owner, rwlock);
+    } else {
+        START_CRIT_SECTION();
+    }
+    RESUME_INTERRUPTS();
+}
+
+int PthreadRWlockTryWrlock(ResourceOwner owner, pthread_rwlock_t* rwlock)
+{
+    if (owner) {
+        ResourceOwnerEnlargePthreadRWlock(owner);
+    }
+    HOLD_INTERRUPTS();
+    int ret = pthread_rwlock_trywrlock(rwlock);
+    if (ret == 0) {
+        if (owner) {
+            ResourceOwnerRememberPthreadRWlock(owner, rwlock);
+        } else {
+            START_CRIT_SECTION();
+        }
+    }
+    RESUME_INTERRUPTS();
+    return ret;
+}
+
+void PthreadRWlockWrlock(ResourceOwner owner, pthread_rwlock_t* rwlock)
+{
+    if (owner) {
+        ResourceOwnerEnlargePthreadRWlock(owner);
+    }
+    HOLD_INTERRUPTS();
+    int ret = pthread_rwlock_wrlock(rwlock);
+    Assert(ret == 0);
+    if (ret != 0) {
+        ereport(ERROR,
+            (errcode(ERRCODE_LOCK_NOT_AVAILABLE), errmsg("aquire wrlock failed")));
+    }
+    if (owner) {
+        ResourceOwnerRememberPthreadRWlock(owner, rwlock);
+    } else {
+        START_CRIT_SECTION();
+    }
+    RESUME_INTERRUPTS();
+}
+void PthreadRWlockUnlock(ResourceOwner owner, pthread_rwlock_t* rwlock)
+{
+    HOLD_INTERRUPTS();
+    int ret = pthread_rwlock_unlock(rwlock);
+    Assert(ret == 0);
+    if (ret != 0) {
+        ereport(ERROR,
+            (errcode(ERRCODE_LOCK_NOT_AVAILABLE), errmsg("release rwlock failed")));
+    }
+    if (owner) {
+        ResourceOwnerForgetPthreadRWlock(owner, rwlock);
+    } else {
+        END_CRIT_SECTION();
+    }
+    RESUME_INTERRUPTS();
+}
+
+void PthreadRwLockInit(pthread_rwlock_t* rwlock, pthread_rwlockattr_t *attr)
+{
+    int ret = pthread_rwlock_init(rwlock, attr);
+    Assert(ret == 0);
+    if (ret != 0) {
+        ereport(ERROR,
+            (errcode(ERRCODE_INITIALIZE_FAILED), errmsg("init rwlock failed")));
+    }
 }

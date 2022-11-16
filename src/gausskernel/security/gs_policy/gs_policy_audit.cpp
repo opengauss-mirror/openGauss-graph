@@ -53,6 +53,8 @@ LoadPolicyAccessPtr load_policy_access_hook = NULL;
 LoadPolicyPrivilegesPtr load_policy_privileges_hook = NULL;
 LoadPolicyFilterPtr load_policy_filter_hook = NULL;
 THR_LOCAL LightUnifiedAuditExecutorPtr light_unified_audit_executor_hook = NULL;
+OpFusionUnifiedAuditExecutorPtr opfusion_unified_audit_executor_hook = NULL;
+OpFusionUnifiedAuditFlushLogsPtr opfusion_unified_audit_flush_logs_hook = NULL;
 
 static const char* privileges_type[] = { "alter", "analyze", "comment", "create", "drop", "grant", "revoke",
                                          "set", "show", "login_any", "login_failure", "login_success", "logout"};
@@ -593,7 +595,7 @@ void create_audit_policy(CreateAuditPolicyStmt *stmt)
         } else {
             send_manage_message(AUDIT_FAILED);
             ereport(ERROR,
-                    (errcode(ERRCODE_WRONG_OBJECT_TYPE),
+                    (errcode(ERRCODE_DUPLICATE_POLICY),
                      errmsg("%s policy already exists, create failed", policy_name)));
         }
         return;

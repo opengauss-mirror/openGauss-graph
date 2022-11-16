@@ -6,6 +6,7 @@
  * Portions Copyright (c) 2020 Huawei Technologies Co.,Ltd.
  * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
+ * Portions Copyright (c) 2021, openGauss Contributors
  *
  *
  * IDENTIFICATION
@@ -29,11 +30,13 @@
 #include "access/visibilitymap.h"
 #include "access/tableam.h"
 #include "catalog/pg_partition_fn.h"
-#include "executor/execdebug.h"
-#include "executor/nodeIndexonlyscan.h"
-#include "executor/nodeIndexscan.h"
+#include "commands/cluster.h"
+#include "executor/exec/execdebug.h"
+#include "executor/node/nodeIndexonlyscan.h"
+#include "executor/node/nodeIndexscan.h"
 #include "storage/buf/bufmgr.h"
 #include "storage/predicate.h"
+#include "storage/tcap.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/rel_gs.h"
@@ -50,9 +53,9 @@ static void ExecInitNextIndexPartitionForIndexScanOnly(IndexOnlyScanState* node)
  *		Release VM buffer pin, if any.
  * ----------------------------------------------------------------
  */
-static void ReleaseNodeVMBuffer(IndexOnlyScanState* node)
+static inline void ReleaseNodeVMBuffer(IndexOnlyScanState* node)
 {
-    if (node->ioss_VMBuffer != InvalidBuffer) {
+    if (node != NULL && (node->ioss_VMBuffer != InvalidBuffer)) {
         ReleaseBuffer(node->ioss_VMBuffer);
         node->ioss_VMBuffer = InvalidBuffer;
     }
@@ -62,7 +65,7 @@ static void ReleaseNodeVMBuffer(IndexOnlyScanState* node)
  *		ExecGPIGetNextPartRelation
  * ----------------------------------------------------------------
  */
-static bool ExecGPIGetNextPartRelation(IndexOnlyScanState* node, IndexScanDesc indexScan)
+bool ExecGPIGetNextPartRelation(IndexOnlyScanState* node, IndexScanDesc indexScan)
 {
     if (IndexScanNeedSwitchPartRel(indexScan)) {
         /* Release VM buffer pin, if any. */
@@ -74,6 +77,29 @@ static bool ExecGPIGetNextPartRelation(IndexOnlyScanState* node, IndexScanDesc i
         indexScan->heapRelation = indexScan->xs_gpi_scan->fakePartRelation;
     }
 
+    return true;
+}
+
+bool ExecCBIFixHBktRel(IndexScanDesc indexScan, Buffer *vmbuffer)
+{
+    Assert(indexScan != NULL);
+    if (unlikely(RELATION_OWN_BUCKET(indexScan->indexRelation))) {
+        HBktIdxScanDesc hpScan = (HBktIdxScanDesc)indexScan;
+        if (cbi_scan_need_fix_hbkt_rel(hpScan->currBktIdxScan)) {
+            /* 
+             * Release VM buffer pin, if any. Ensure IndexOnlyScan to obtain
+             * the right visibility map after swapping the bucket relation.
+             */
+            if (vmbuffer != NULL && *vmbuffer != InvalidBuffer) {
+                ReleaseBuffer(*vmbuffer);
+                *vmbuffer = InvalidBuffer;
+            }
+
+            if (!cbi_scan_fix_hbkt_rel(hpScan)) {
+                return false;
+            }
+        }
+    }
     return true;
 }
 
@@ -90,7 +116,10 @@ static TupleTableSlot* IndexOnlyNext(IndexOnlyScanState* node)
     ScanDirection direction;
     IndexScanDesc scandesc;
     TupleTableSlot* slot = NULL;
+    TupleTableSlot* tmpslot = NULL;
     ItemPointer tid;
+    bool isVersionScan = TvIsVersionScan(&node->ss);
+    bool isUHeap = false;
 
     /*
      * extract necessary information from index scan node
@@ -107,6 +136,9 @@ static TupleTableSlot* IndexOnlyNext(IndexOnlyScanState* node)
     scandesc = node->ioss_ScanDesc;
     econtext = node->ss.ps.ps_ExprContext;
     slot = node->ss.ss_ScanTupleSlot;
+    isUHeap = RelationIsUstoreFormat(node->ss.ss_currentRelation);
+    tmpslot = MakeSingleTupleTableSlot(RelationGetDescr(scandesc->heapRelation),
+        false, scandesc->heapRelation->rd_tam_type);
 
     /*
      * OK, now that we have what we need, fetch the next tuple.
@@ -136,14 +168,48 @@ static TupleTableSlot* IndexOnlyNext(IndexOnlyScanState* node)
         if (!ExecGPIGetNextPartRelation(node, indexScan)) {
             continue;
         }
-        if (!visibilitymap_test(indexScan->heapRelation, ItemPointerGetBlockNumber(tid), &node->ioss_VMBuffer)) {
+        if (!ExecCBIFixHBktRel(scandesc, &node->ioss_VMBuffer)) {
+            continue;
+        }
+
+        if (isUHeap) {
+            /* ustore with multi-version ubtree only recheck IndexTuple when xs_recheck_itup is set */
+            if (indexScan->xs_recheck_itup) {
+                node->ioss_HeapFetches++;
+                if (!IndexFetchUHeap(indexScan, tmpslot)) {
+                    continue; /* this TID indicate no visible tuple */
+                }
+                if (!RecheckIndexTuple(indexScan, tmpslot)) {
+                    continue; /* the visible version not match the IndexTuple */
+                }
+            }
+        } else if (isVersionScan ||
+            !visibilitymap_test(indexScan->heapRelation, ItemPointerGetBlockNumber(tid), &node->ioss_VMBuffer)) {
+            /* IMPORTANT: We ALWAYS visit the heap to check visibility in VERSION SCAN. */
             /*
              * Rats, we have to visit the heap to check visibility.
              */
             node->ioss_HeapFetches++;
-            tuple = scan_handler_idx_fetch_heap(scandesc);
-            if (tuple == NULL)
+            if (!IndexFetchSlot(indexScan, slot, isUHeap)) {
+#ifdef DEBUG_INPLACE
+                /* Now ustore does not support hash bucket table */
+                Assert(indexScan == scandesc);
+                /* Record whether the invisible heap tuple is all dead or not */
+                if (indexScan->kill_prior_tuple)
+                    INPLACEHEAPSTAT_COUNT_INDEX_FETCH_TUPLE(INPLACEHEAP_TUPLE_INVISIBLE_ALL_DEAD);
+                else
+                    INPLACEHEAPSTAT_COUNT_INDEX_FETCH_TUPLE(INPLACEHEAP_TUPLE_INVISIBLE_NOT_ALL_DEAD);
+#endif
                 continue; /* no visible tuple, try next index entry */
+            }
+
+#ifdef DEBUG_INPLACE
+            Assert(indexScan == scandesc);
+            Assert(!indexScan->kill_prior_tuple);
+            /* Record Heap Tuple is visible */
+            INPLACEHEAPSTAT_COUNT_INDEX_FETCH_TUPLE(INPLACEHEAP_TUPLE_VISIBLE);
+#endif
+
 
             /*
              * Only MVCC snapshots are supported here, so there should be no
@@ -193,7 +259,7 @@ static TupleTableSlot* IndexOnlyNext(IndexOnlyScanState* node)
          */
         if (tuple == NULL)
             PredicateLockPage(indexScan->heapRelation, ItemPointerGetBlockNumber(tid), estate->es_snapshot);
-
+        ExecDropSingleTupleTableSlot(tmpslot);
         return slot;
     }
 
@@ -201,6 +267,7 @@ static TupleTableSlot* IndexOnlyNext(IndexOnlyScanState* node)
      * if we get here it means the index scan failed so we are at the end of
      * the scan..
      */
+    ExecDropSingleTupleTableSlot(tmpslot);
     return ExecClearTuple(slot);
 }
 
@@ -347,7 +414,100 @@ void ExecReScanIndexOnlyScan(IndexOnlyScanState* node)
 
     ExecScanReScan(&node->ss);
 }
+#ifdef GS_GRAPH
+static IndexScanContext *getCurrentContext(IndexOnlyScanState *node, bool create)
+{
+	IndexScanContext *ctx;
 
+	if (dlist_has_next(&node->ctxs_head, node->prev_ctx_node))
+	{
+		dlist_node *ctx_node;
+
+		ctx_node = dlist_next_node(&node->ctxs_head, node->prev_ctx_node);
+		ctx = dlist_container(IndexScanContext, list, ctx_node);
+	}
+	else if (create)
+	{
+		ctx = (IndexScanContext*)palloc(sizeof(*ctx));
+		ctx->chgParam = NULL;
+		ctx->scanDesc = NULL;
+
+		dlist_push_tail(&node->ctxs_head, &ctx->list);
+	}
+	else
+	{
+		ctx = NULL;
+	}
+
+	return ctx;
+}
+void ExecNextIndexOnlyScanContext(IndexOnlyScanState *node)
+{
+	IndexScanContext *ctx;
+
+	/* store the current context */
+	ctx = getCurrentContext(node, true);
+	ctx->chgParam = node->ss.ps.chgParam;
+	ctx->scanDesc = node->ioss_ScanDesc;
+
+	/* make the current context previous context */
+	node->prev_ctx_node = &ctx->list;
+
+	ctx = getCurrentContext(node, false);
+	if (ctx == NULL)
+	{
+		/* if there is no current context, initialize the current scan */
+		node->ss.ps.chgParam = NULL;
+		node->ioss_ScanDesc = NULL;
+	}
+	else
+	{
+		/* if there is the current context already, use it */
+
+		Assert(ctx->chgParam == NULL);
+		node->ss.ps.chgParam = NULL;
+
+		/* ctx->scanDesc can be NULL if ss_skipLabelScan */
+		node->ioss_ScanDesc = ctx->scanDesc;
+	}
+}
+
+void ExecPrevIndexOnlyScanContext(IndexOnlyScanState *node)
+{
+	IndexScanContext *ctx;
+	dlist_node *ctx_node;
+
+	/*
+	 * Store the current ioss_ScanDesc. It will be reused when the current scan
+	 * is re-scanned next time.
+	 */
+	ctx = getCurrentContext(node, true);
+
+	/* if chgParam is not NULL, free it now */
+	if (node->ss.ps.chgParam != NULL)
+	{
+		bms_free(node->ss.ps.chgParam);
+		node->ss.ps.chgParam = NULL;
+	}
+
+	ctx->chgParam = NULL;
+	ctx->scanDesc = node->ioss_ScanDesc;
+
+	/* make the previous scan current scan */
+	ctx_node = node->prev_ctx_node;
+	Assert(ctx_node != &node->ctxs_head.head);
+
+	if (dlist_has_prev(&node->ctxs_head, ctx_node))
+		node->prev_ctx_node = dlist_prev_node(&node->ctxs_head, ctx_node);
+	else
+		node->prev_ctx_node = &node->ctxs_head.head;
+
+	/* restore */
+	ctx = dlist_container(IndexScanContext, list, ctx_node);
+	node->ss.ps.chgParam = ctx->chgParam;
+	node->ioss_ScanDesc = ctx->scanDesc;
+}
+#endif
 /* ----------------------------------------------------------------
  *		ExecEndIndexOnlyScan
  * ----------------------------------------------------------------
@@ -386,6 +546,33 @@ void ExecEndIndexOnlyScan(IndexOnlyScanState* node)
     (void)ExecClearTuple(node->ss.ps.ps_ResultTupleSlot);
     (void)ExecClearTuple(node->ss.ss_ScanTupleSlot);
 
+#ifdef GS_GRAPH
+    if (!dlist_is_empty(&node->ctxs_head))
+	{
+		dlist_node *ctx_node;
+		IndexScanContext *ctx;
+		dlist_mutable_iter iter;
+
+		/* indexScanDesc is the most recent value. Ignore the first context. */
+		ctx_node = dlist_pop_head_node(&node->ctxs_head);
+		ctx = dlist_container(IndexScanContext, list, ctx_node);
+		pfree(ctx);
+
+		dlist_foreach_modify(iter, &node->ctxs_head)
+		{
+			dlist_delete(iter.cur);
+
+			ctx = dlist_container(IndexScanContext, list, iter.cur);
+
+			if (ctx->scanDesc != NULL)
+				index_endscan(ctx->scanDesc);
+
+			pfree(ctx);
+		}
+	}
+	node->prev_ctx_node = &node->ctxs_head.head;
+#endif
+
     /*
      * close the index relation (no-op if we didn't open it)
      */
@@ -409,11 +596,19 @@ void ExecEndIndexOnlyScan(IndexOnlyScanState* node)
             Assert(PointerIsValid(node->ss.ss_currentPartition));
             releaseDummyRelation(&(node->ss.ss_currentPartition));
 
-            /* close index partition */
-            releasePartitionList(node->ioss_RelationDesc, &(node->ioss_IndexPartitionList), NoLock);
+            Oid heapOid = node->ioss_RelationDesc->rd_index->indrelid;
+            Relation heapRelation = heap_open(heapOid, AccessShareLock);
+            if (RelationIsSubPartitioned(heapRelation)) {
+                releaseSubPartitionList(node->ioss_RelationDesc, &(node->ioss_IndexPartitionList), NoLock);
+                releaseSubPartitionList(node->ss.ss_currentRelation, &(node->ss.subpartitions), NoLock);
+            } else {
+                /* close index partition */
+                releasePartitionList(node->ioss_RelationDesc, &(node->ioss_IndexPartitionList), NoLock);
 
-            /* close table partition */
-            releasePartitionList(node->ss.ss_currentRelation, &(node->ss.partitions), NoLock);
+                /* close table partition */
+                releasePartitionList(node->ss.ss_currentRelation, &(node->ss.partitions), NoLock);
+            }
+            heap_close(heapRelation, AccessShareLock);
         }
     }
 
@@ -461,6 +656,7 @@ IndexOnlyScanState* ExecInitIndexOnlyScan(IndexOnlyScan* node, EState* estate, i
     Relation currentRelation;
     bool relistarget = false;
     TupleDesc tupDesc;
+    Snapshot scanSnap;
 
     /*
      * create state structure
@@ -606,6 +802,12 @@ IndexOnlyScanState* ExecInitIndexOnlyScan(IndexOnlyScan* node, EState* estate, i
     }
 
     /*
+     * Choose user-specified snapshot if TimeCapsule clause exists, otherwise 
+     * estate->es_snapshot instead.
+     */
+    scanSnap = TvChooseScanSnap(indexstate->ioss_RelationDesc, &node->scan, &indexstate->ss);
+
+    /*
      * Initialize scan descriptor.
      * If the index is an non-partitioned index, initialize the table realtion that the index
      * is on. If the is an partitioned index, make the corresponding relation by the
@@ -630,14 +832,35 @@ IndexOnlyScanState* ExecInitIndexOnlyScan(IndexOnlyScan* node, EState* estate, i
                 indexstate->ss.ss_currentPartition =
                     partitionGetRelation(indexstate->ss.ss_currentRelation, currentpartition);
 
+                if (RelationIsSubPartitioned(indexstate->ss.ss_currentRelation)) {
+                    List *currentindexlist = (List *)list_nth(indexstate->ioss_IndexPartitionList, 0);
+                    currentindex = (Partition)list_nth(currentindexlist, 0);
+                } else {
+                    currentindex = (Partition)list_nth(indexstate->ioss_IndexPartitionList, 0);
+                }
                 /* construct a dummy index relation with the first table partition for following scan */
-                currentindex = (Partition)list_nth(indexstate->ioss_IndexPartitionList, 0);
                 indexstate->ioss_CurrentIndexPartition =
                     partitionGetRelation(indexstate->ioss_RelationDesc, currentindex);
 
+                /*
+                 * Verify if a DDL operation that froze all tuples in the relation
+                 * occured after taking the snapshot.
+                 */
+                if (RelationIsUstoreFormat(indexstate->ss.ss_currentPartition)) {
+                    TransactionId relfrozenxid64 = InvalidTransactionId;
+                    getPartitionRelxids(indexstate->ss.ss_currentPartition, &relfrozenxid64);
+                    if (TransactionIdPrecedes(FirstNormalTransactionId, scanSnap->xmax) &&
+                        !TransactionIdIsCurrentTransactionId(relfrozenxid64) &&
+                        TransactionIdPrecedes(scanSnap->xmax, relfrozenxid64)) {
+                        ereport(ERROR,
+                                (errcode(ERRCODE_SNAPSHOT_INVALID),
+                                 (errmsg("Snapshot too old."))));
+                    }
+                }
+
                 indexstate->ioss_ScanDesc = scan_handler_idx_beginscan(indexstate->ss.ss_currentPartition,
                     indexstate->ioss_CurrentIndexPartition,
-                    estate->es_snapshot,
+                    scanSnap,
                     indexstate->ioss_NumScanKeys,
                     indexstate->ioss_NumOrderByKeys,
                     (ScanState*)indexstate);
@@ -645,11 +868,27 @@ IndexOnlyScanState* ExecInitIndexOnlyScan(IndexOnlyScan* node, EState* estate, i
         }
     } else {
         /*
+         * Verify if a DDL operation that froze all tuples in the relation
+         * occured after taking the snapshot.
+         */
+        if (RelationIsUstoreFormat(currentRelation)) {
+            TransactionId relfrozenxid64 = InvalidTransactionId;
+            getRelationRelxids(currentRelation, &relfrozenxid64);
+            if (TransactionIdPrecedes(FirstNormalTransactionId, scanSnap->xmax) &&
+                !TransactionIdIsCurrentTransactionId(relfrozenxid64) &&
+                TransactionIdPrecedes(scanSnap->xmax, relfrozenxid64)) {
+                ereport(ERROR,
+                        (errcode(ERRCODE_SNAPSHOT_INVALID),
+                         (errmsg("Snapshot too old."))));
+            }
+        }
+
+        /*
          * Initialize scan descriptor.
          */
         indexstate->ioss_ScanDesc = scan_handler_idx_beginscan(currentRelation,
             indexstate->ioss_RelationDesc,
-            estate->es_snapshot,
+            scanSnap,
             indexstate->ioss_NumScanKeys,
             indexstate->ioss_NumOrderByKeys,
             (ScanState*)indexstate);
@@ -677,6 +916,11 @@ IndexOnlyScanState* ExecInitIndexOnlyScan(IndexOnlyScan* node, EState* estate, i
         indexstate->ss.ps.stubType = PST_Scan;
     }
 
+#ifdef GS_GRAPH
+    dlist_init(&indexstate->ctxs_head);
+	indexstate->prev_ctx_node = &indexstate->ctxs_head.head;
+#endif
+
     /*
      * all done.
      */
@@ -698,11 +942,16 @@ static void ExecInitNextIndexPartitionForIndexScanOnly(IndexOnlyScanState* node)
 {
     Partition currentpartition = NULL;
     Relation currentpartitionrel = NULL;
+    List *subPartList = NIL;
+    Partition currentSubPartition = NULL;
+    Relation currentSubPartitionRel = NULL;
     Partition currentindexpartition = NULL;
     Relation currentindexpartitionrel = NULL;
     IndexOnlyScan* plan = NULL;
     int paramno = -1;
     ParamExecData* param = NULL;
+    int subPartParamno = -1;
+    ParamExecData* subPartParam = NULL;
 
     if (BufferIsValid(node->ioss_VMBuffer)) {
         ReleaseBuffer(node->ioss_VMBuffer);
@@ -715,6 +964,8 @@ static void ExecInitNextIndexPartitionForIndexScanOnly(IndexOnlyScanState* node)
     paramno = plan->scan.plan.paramno;
     param = &(node->ss.ps.state->es_param_exec_vals[paramno]);
     node->ss.currentSlot = (int)param->value;
+    subPartParamno = plan->scan.plan.subparamno;
+    subPartParam = &(node->ss.ps.state->es_param_exec_vals[subPartParamno]);
 
     /* construct a dummy table relation with the next table partition*/
     currentpartition = (Partition)list_nth(node->ss.partitions, node->ss.currentSlot);
@@ -725,8 +976,23 @@ static void ExecInitNextIndexPartitionForIndexScanOnly(IndexOnlyScanState* node)
     releaseDummyRelation(&(node->ss.ss_currentPartition));
     node->ss.ss_currentPartition = currentpartitionrel;
 
-    /* construct a dummy index relation with the next index partition*/
-    currentindexpartition = (Partition)list_nth(node->ioss_IndexPartitionList, node->ss.currentSlot);
+    Oid heapOid = node->ioss_RelationDesc->rd_index->indrelid;
+    Relation heapRelation = heap_open(heapOid, AccessShareLock);
+    if (RelationIsSubPartitioned(heapRelation)) {
+        /* construct a dummy table relation with the next table subpartition */
+        subPartList = (List*)list_nth(node->ss.subpartitions, node->ss.currentSlot);
+        currentSubPartition = (Partition)list_nth(subPartList, (int)subPartParam->value);
+        currentSubPartitionRel = partitionGetRelation(currentpartitionrel, currentSubPartition);
+        releaseDummyRelation(&currentpartitionrel);
+        node->ss.ss_currentPartition = currentSubPartitionRel;
+        /* construct a dummy index relation with the next index subpartition */
+        List *subPartIndexList = (List *)list_nth(node->ioss_IndexPartitionList, node->ss.currentSlot);
+        currentindexpartition = (Partition)list_nth(subPartIndexList, (int)subPartParam->value);
+    } else {
+        /* construct a dummy index relation with the next index partition*/
+        currentindexpartition = (Partition)list_nth(node->ioss_IndexPartitionList, node->ss.currentSlot);
+    }
+
     currentindexpartitionrel = partitionGetRelation(node->ioss_RelationDesc, currentindexpartition);
 
     /* update scan-related index partition with the relation construced before */
@@ -747,6 +1013,7 @@ static void ExecInitNextIndexPartitionForIndexScanOnly(IndexOnlyScanState* node)
         node->ioss_NumScanKeys,
         node->ioss_OrderByKeys,
         node->ioss_NumOrderByKeys);
+    heap_close(heapRelation, AccessShareLock);
 
 }
 
@@ -796,9 +1063,9 @@ void ExecInitPartitionForIndexOnlyScan(IndexOnlyScanState* indexstate, EState* e
             resultPlan = plan->scan.pruningInfo;
         }
         if (resultPlan->ls_rangeSelectedPartitions != NULL) {
-            indexstate->part_id = resultPlan->ls_rangeSelectedPartitions->length;
+            indexstate->ss.part_id = resultPlan->ls_rangeSelectedPartitions->length;
         } else {
-            indexstate->part_id = 0;
+            indexstate->ss.part_id = 0;
         }
         
         ListCell* cell = NULL;
@@ -813,26 +1080,67 @@ void ExecInitPartitionForIndexOnlyScan(IndexOnlyScanState* indexstate, EState* e
             tablepartitionid = getPartitionOidFromSequence(currentRelation, partSeq);
             tablepartition = partitionOpen(currentRelation, tablepartitionid, lock);
             indexstate->ss.partitions = lappend(indexstate->ss.partitions, tablepartition);
+            if (RelationIsSubPartitioned(currentRelation)) {
+                ListCell *lc = NULL;
+                SubPartitionPruningResult *subPartPruningResult =
+                    GetSubPartitionPruningResult(resultPlan->ls_selectedSubPartitions, partSeq);
+                if (subPartPruningResult == NULL) {
+                    continue;
+                }
+                List *subpartList = subPartPruningResult->ls_selectedSubPartitions;
+                List *subIndexList = NIL;
+                List *subPartList = NIL;
+                Relation tablepartrel = partitionGetRelation(currentRelation, tablepartition);
+                foreach (lc, subpartList) {
+                    int subpartSeq = lfirst_int(lc);
+                    Oid subpartitionid = getPartitionOidFromSequence(tablepartrel, subpartSeq);
+                    Partition subpart = partitionOpen(tablepartrel, subpartitionid, AccessShareLock);
+                    subPartList = lappend(subPartList, subpart);
 
-            /* get index partition and add it to a list for following scan */
-            partitionIndexOidList = PartitionGetPartIndexList(tablepartition);
-            Assert(PointerIsValid(partitionIndexOidList));
-            if (!PointerIsValid(partitionIndexOidList)) {
-                ereport(ERROR,
-                    (errcode(ERRCODE_WRONG_OBJECT_TYPE),
-                        errmsg("no local indexes found for partition %s", PartitionGetPartitionName(tablepartition))));
-            }
-            indexpartitionid = searchPartitionIndexOid(indexid, partitionIndexOidList);
-            list_free_ext(partitionIndexOidList);
+                    partitionIndexOidList = PartitionGetPartIndexList(subpart);
+                    Assert(PointerIsValid(partitionIndexOidList));
+                    if (!PointerIsValid(partitionIndexOidList)) {
+                    ereport(ERROR,
+                            (errcode(ERRCODE_WRONG_OBJECT_TYPE), errmsg("no local indexes found for partition %s",
+                                                                        PartitionGetPartitionName(subpart))));
+                    }
+                    indexpartitionid = searchPartitionIndexOid(indexid, partitionIndexOidList);
+                    indexpartition = partitionOpen(indexstate->ioss_RelationDesc, indexpartitionid, AccessShareLock);
+                    list_free_ext(partitionIndexOidList);
 
-            indexpartition = partitionOpen(indexstate->ioss_RelationDesc, indexpartitionid, lock);
-            if (indexpartition->pd_part->indisusable == false) {
-                ereport(ERROR,
-                    (errcode(ERRCODE_INDEX_CORRUPTED),
-                        errmsg("can't initialize index-only scans using unusable local index \"%s\"",
-                            PartitionGetPartitionName(indexpartition))));
+                    if (indexpartition->pd_part->indisusable == false) {
+                        ereport(ERROR, (errcode(ERRCODE_INDEX_CORRUPTED),
+                                        errmsg("can't initialize index-only scans using unusable local index \"%s\"",
+                                               PartitionGetPartitionName(indexpartition))));
+                    }
+                    subIndexList = lappend(subIndexList, indexpartition);
+                }
+                releaseDummyRelation(&tablepartrel);
+                partitionClose(currentRelation, tablepartition, lock);
+                indexstate->ss.subPartLengthList =
+                    lappend_int(indexstate->ss.subPartLengthList, list_length(subPartList));
+                indexstate->ss.subpartitions = lappend(indexstate->ss.subpartitions, subPartList);
+                indexstate->ioss_IndexPartitionList = lappend(indexstate->ioss_IndexPartitionList, subIndexList);
+            } else {
+                /* get index partition and add it to a list for following scan */
+                partitionIndexOidList = PartitionGetPartIndexList(tablepartition);
+                Assert(PointerIsValid(partitionIndexOidList));
+                if (!PointerIsValid(partitionIndexOidList)) {
+                    ereport(ERROR,
+                            (errcode(ERRCODE_WRONG_OBJECT_TYPE), errmsg("no local indexes found for partition %s",
+                                                                        PartitionGetPartitionName(tablepartition))));
+                }
+                indexpartitionid = searchPartitionIndexOid(indexid, partitionIndexOidList);
+                list_free_ext(partitionIndexOidList);
+
+                indexpartition = partitionOpen(indexstate->ioss_RelationDesc, indexpartitionid, lock);
+                if (indexpartition->pd_part->indisusable == false) {
+                    ereport(ERROR, (errcode(ERRCODE_INDEX_CORRUPTED),
+                                    errmsg("can't initialize index-only scans using unusable local index \"%s\"",
+                                           PartitionGetPartitionName(indexpartition))));
+                }
+                indexstate->ioss_IndexPartitionList = lappend(indexstate->ioss_IndexPartitionList, indexpartition);
             }
-            indexstate->ioss_IndexPartitionList = lappend(indexstate->ioss_IndexPartitionList, indexpartition);
         }
     }
 }

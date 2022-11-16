@@ -28,7 +28,7 @@
 #include "access/printtup.h"
 #include "distributelayer/streamMain.h"
 #include "distributelayer/streamProducer.h"
-#include "executor/execStream.h"
+#include "executor/exec/execStream.h"
 #include "executor/executor.h"
 #include "knl/knl_variable.h"
 #include "libpq/libpq.h"
@@ -39,6 +39,7 @@
 #include "storage/ipc.h"
 #include "storage/pmsignal.h"
 #include "storage/proc.h"
+#include "storage/procarray.h"
 #include "tcop/tcopprot.h"
 #include "threadpool/threadpool.h"
 #include "utils/memtrack.h"
@@ -86,12 +87,11 @@ int StreamMain()
     int curTryCounter;
     int* oldTryCounter = NULL;
     if (sigsetjmp(local_sigjmp_buf, 1) != 0) {
-        t_thrd.int_cxt.ignoreBackendSignal = false;
+        /* reset signal block flag for threadpool worker */
+        ResetInterruptCxt();
         if (g_threadPoolControler) {
             g_threadPoolControler->GetSessionCtrl()->releaseLockIfNecessary();
         }
-        /* reset STP thread local valueables */
-        stp_reset_opt_values();
 
         gstrace_tryblock_exit(true, oldTryCounter);
         HandleStreamSigjmp();
@@ -123,10 +123,13 @@ int StreamMain()
             pgstat_report_activity(STATE_IDLE, NULL);
             pgstat_report_waitstatus(STATE_WAIT_COMM);
             t_thrd.threadpool_cxt.stream->WaitMission();
+            Assert(CheckMyDatabaseMatch());
             pgstat_report_waitstatus(STATE_WAIT_UNDEFINED);
         }
 
         pgstat_report_queryid(u_sess->debug_query_id);
+        pgstat_report_unique_sql_id(false);
+        pgstat_report_global_session_id(u_sess->globalSessionId);
         pgstat_report_smpid(u_sess->stream_cxt.smp_id);
         timeInfoRecordStart();
 
@@ -199,7 +202,7 @@ static void InitStreamPath()
     /* Compute paths, if we didn't inherit them from postmaster */
     if (my_exec_path[0] == '\0') {
         if (find_my_exec("postgres", my_exec_path) < 0)
-            ereport(FATAL, (errmsg("postgres: could not locate my own executable path")));
+            ereport(FATAL, (errmsg("openGauss: could not locate my own executable path")));
     }
 
     if (t_thrd.proc_cxt.pkglib_path[0] == '\0')
@@ -240,7 +243,8 @@ static void InitStreamResource()
         ALLOCSET_DEFAULT_INITSIZE,
         ALLOCSET_DEFAULT_MAXSIZE);
 
-    t_thrd.utils_cxt.TopResourceOwner = ResourceOwnerCreate(NULL, "stream thread", MEMORY_CONTEXT_EXECUTOR);
+    t_thrd.utils_cxt.TopResourceOwner = ResourceOwnerCreate(NULL, "stream thread",
+        THREAD_GET_MEM_CXT_GROUP(MEMORY_CONTEXT_EXECUTOR));
     t_thrd.utils_cxt.CurrentResourceOwner = t_thrd.utils_cxt.TopResourceOwner;
 
     if (t_thrd.mem_cxt.postmaster_mem_cxt) {
@@ -259,6 +263,7 @@ void ExtractProduerInfo()
     u_sess->exec_cxt.need_track_resource = u_sess->stream_cxt.producer_obj->getExplainTrack();
     u_sess->stream_cxt.producer_obj->getUniqueSQLKey(&u_sess->unique_sql_cxt.unique_sql_id,
         &u_sess->unique_sql_cxt.unique_sql_user_id, &u_sess->unique_sql_cxt.unique_sql_cn_id);
+    u_sess->stream_cxt.producer_obj->getGlobalSessionId(&u_sess->globalSessionId);
 
     WLMGeneralParam *g_wlm_params =  &u_sess->wlm_cxt->wlm_params;
     errno_t ret = sprintf_s(u_sess->wlm_cxt->control_group, 
@@ -323,6 +328,9 @@ static void HandleStreamSigjmp()
 
     /* Since not using PG_TRY, must reset error stack by hand */
     t_thrd.log_cxt.error_context_stack = NULL;
+
+    t_thrd.log_cxt.call_stack = NULL;
+    
     /* reset buffer strategy flag */
     t_thrd.storage_cxt.is_btree_split = false;
     
@@ -358,6 +366,9 @@ static void HandleStreamSigjmp()
 
     AbortCurrentTransaction();
 
+    /* release resource held by lsc */
+    AtEOXact_SysDBCache(false);
+
     LWLockReleaseAll();
 
     if (u_sess->stream_cxt.producer_obj != NULL) {
@@ -392,14 +403,13 @@ static void execute_stream_plan(StreamProducer* producer)
     PlannedStmt* planstmt = producer->getPlan();
     CommandDest dest = producer->getDest();
     bool save_log_statement_stats = u_sess->attr.attr_common.log_statement_stats;
-    bool was_logged = false;
     bool isTopLevel = false;
     const char* commandTag = NULL;
     char completionTag[COMPLETION_TAG_BUFSIZE];
     Portal portal = NULL;
     DestReceiver* receiver = NULL;
     int16 format;
-    char msec_str[32];
+    char msec_str[PRINTF_DST_MAX];
 
     t_thrd.postgres_cxt.debug_query_string = planstmt->query_string;
     pgstat_report_activity(STATE_RUNNING, t_thrd.postgres_cxt.debug_query_string);
@@ -489,9 +499,9 @@ static void execute_stream_plan(StreamProducer* producer)
     /*
      * Emit duration logging if appropriate.
      */
-    switch (check_log_duration(msec_str, was_logged)) {
+    switch (check_log_duration(msec_str, false)) {
         case 1:
-            ereport(LOG, (errmsg("duration: %s ms", msec_str), errhidestmt(true)));
+            Assert(false);
             break;
         case 2:
             ereport(LOG,
@@ -571,6 +581,9 @@ void ResetStreamEnv()
     u_sess->stream_cxt.in_waiting_quit = false;
     u_sess->stream_cxt.enter_sync_point = false;
     t_thrd.pgxc_cxt.GlobalNetInstr = NULL;
+#ifndef ENABLE_MULTIPLE_NODES
+    u_sess->opt_cxt.query_dop = u_sess->attr.attr_sql.query_dop_tmp;
+#endif
 
     /*
      * When gaussdb backend running in Query or Operator level, we are going to use global
@@ -696,6 +709,9 @@ ThreadId ApplyStreamThread(StreamProducer *producer)
                    producer->getKey().smpIdentifier);
     } else {
         producer->setChildSlot(AssignPostmasterChildSlot());
+        if (producer->getChildSlot() == -1) {
+            return InvalidTid;
+        }
         tid = initialize_util_thread(STREAM_WORKER, producer);
     }
 
@@ -734,21 +750,24 @@ void StreamExit()
 
     AtProcExit_Buffers(0, 0);
     ShutdownPostgres(0, 0);
-    AtProcExit_Files(0, 0);
+    if(!EnableLocalSysCache()) {
+        AtProcExit_Files(0, 0);
+    }
     StreamQuitAndClean(0, 0);
 
     RestoreStream();
 
-    /* release memory context and reset flags. */
-    MemoryContextReset(u_sess->syscache_cxt.SysCacheMemCxt);
-
-    errno_t rc = EOK;
-    rc = memset_s(u_sess->syscache_cxt.SysCache, sizeof(CatCache*) * SysCacheSize,
-                  0, sizeof(CatCache*) * SysCacheSize);
-    securec_check(rc, "\0", "\0");
-    rc = memset_s(u_sess->syscache_cxt.SysCacheRelationOid, sizeof(Oid) * SysCacheSize,
-                  0, sizeof(Oid) * SysCacheSize);
-    securec_check(rc, "\0", "\0");
+    if (!EnableLocalSysCache()) {
+        /* release memory context and reset flags. */
+        MemoryContextReset(u_sess->syscache_cxt.SysCacheMemCxt);
+        errno_t rc = EOK;
+        rc = memset_s(u_sess->syscache_cxt.SysCache, sizeof(CatCache*) * SysCacheSize,
+                    0, sizeof(CatCache*) * SysCacheSize);
+        securec_check(rc, "\0", "\0");
+        rc = memset_s(u_sess->syscache_cxt.SysCacheRelationOid, sizeof(Oid) * SysCacheSize,
+                    0, sizeof(Oid) * SysCacheSize);
+        securec_check(rc, "\0", "\0");
+    }
 
     /* release statement_cxt */
     if (t_thrd.proc_cxt.MyBackendId != InvalidBackendId) {

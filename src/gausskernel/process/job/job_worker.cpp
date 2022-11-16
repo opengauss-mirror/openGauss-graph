@@ -231,6 +231,9 @@ void JobExecuteWorkerMain()
         /* Flush any leaked data in the top-level context */
         MemoryContextResetAndDeleteChildren(t_thrd.mem_cxt.msg_mem_cxt);
 
+        /* release resource held by lsc */
+        AtEOXact_SysDBCache(false);
+
         LWLockReleaseAll();
         if (t_thrd.utils_cxt.CurrentResourceOwner) {
             ResourceOwnerRelease(t_thrd.utils_cxt.CurrentResourceOwner, RESOURCE_RELEASE_BEFORE_LOCKS, false, true);
@@ -332,7 +335,8 @@ void JobExecuteWorkerMain()
      * Create a resource owner to keep track of our resources (currently only
      * buffer pins).
      */
-    t_thrd.utils_cxt.CurrentResourceOwner = ResourceOwnerCreate(NULL, "Job Worker", MEMORY_CONTEXT_EXECUTOR);
+    t_thrd.utils_cxt.CurrentResourceOwner = ResourceOwnerCreate(NULL, "Job Worker",
+        THREAD_GET_MEM_CXT_GROUP(MEMORY_CONTEXT_EXECUTOR));
 
     /* Get classified list of node Oids for syschronise th job info. */
     exec_init_poolhandles();

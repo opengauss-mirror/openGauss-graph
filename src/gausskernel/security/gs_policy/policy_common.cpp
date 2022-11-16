@@ -61,7 +61,6 @@
 LoadLabelsPtr load_labels_hook = NULL;
 CheckPolicyPrivilegesForLabelPtr check_audit_policy_privileges_for_label_hook = NULL;
 CheckPolicyAccessForLabelPtr check_audit_policy_access_for_label_hook = NULL;
-IsLabelsHasBoundObjectPtr check_labels_has_object_hook = NULL;
 CheckPolicyActionsForLabelPtr check_masking_policy_actions_for_label_hook = NULL;
 IsMaskingHasObjPtr isMaskingHasObj_hook = NULL;
 IsLabelExistPtr verify_label_hook = NULL;
@@ -203,10 +202,20 @@ static bool verify_function_name(Oid namespaceId, const char *funcname)
     }
 
     bool is_found = false;
-    CatCList *catlist = SearchSysCacheList1(PROCNAMEARGSNSP, CStringGetDatum(funcname));
+
+    CatCList   *catlist = NULL;
+#ifndef ENABLE_MULTIPLE_NODES
+    if (t_thrd.proc->workingVersionNum < 92470) {
+        catlist = SearchSysCacheList1(PROCNAMEARGSNSP, CStringGetDatum(funcname));
+    } else {
+        catlist = SearchSysCacheList1(PROCALLARGS, CStringGetDatum(funcname));
+    }
+#else
+    catlist = SearchSysCacheList1(PROCNAMEARGSNSP, CStringGetDatum(funcname));
+#endif
     if (catlist != NULL) {
         for (int i = 0; i < catlist->n_members && !is_found; ++i) {
-            HeapTuple    proctup = &catlist->members[i]->tuple;
+            HeapTuple    proctup = t_thrd.lsc_cxt.FetchTupleFromCatCList(catlist, i);
             Form_pg_proc procform = (Form_pg_proc) GETSTRUCT(proctup);
             if (procform != NULL && procform->pronamespace == namespaceId) {
                 Oid funcid = HeapTupleGetOid(proctup);
@@ -388,7 +397,7 @@ static void check_column_type_exists(RangeVar *rel, Relation relation)
 {
     Oid relid = get_relation_id(rel, true);
     /* Create resource label on temp table is not allowed. */
-    if (g_instance.role != VDATANODE) {
+    if (g_instance.role != VDATANODE && OidIsValid(relid)) {
         verify_temp_table(relid, rel->schemaname, relation, true);
     }
 
@@ -461,23 +470,6 @@ static void verify_label_resource(const char *label_item_type, RangeVar *rel, Re
         default:
             break;
     }
-}
-
-/*
- * verfy_label_has_column
- */
-bool verfy_label_has_column(RangeVar *rel, GsPolicyFQDN *fqdn,
-    const gs_stl::gs_set<gs_stl::gs_string> *labels)
-{
-    if (!fqdn_get_name("column", fqdn, rel)) {
-        return false;
-    }
-    /* check column in labels */
-    if (check_labels_has_object_hook != NULL) {
-        return check_labels_has_object_hook(fqdn, labels, isMaskingHasObj_hook);
-    }
-    /* data node */
-    return true;
 }
 
 /*
@@ -625,7 +617,7 @@ void create_policy_label(CreatePolicyLabelStmt *stmt)
             ereport(NOTICE, (errmsg("%s label already defined, skipping", label_name)));
         } else {
             send_manage_message(AUDIT_FAILED);
-            ereport(ERROR, (errcode(ERRCODE_WRONG_OBJECT_TYPE), errmsg("%s label already defined", label_name)));
+            ereport(ERROR, (errcode(ERRCODE_DUPLICATE_LABEL), errmsg("%s label already defined", label_name)));
         }
         return;
     }
@@ -1007,7 +999,7 @@ void drop_policy_label(DropPolicyLabelStmt *stmt)
     Relation labels_relation;
 
     foreach(label_obj, stmt->label_names) {
-        const char *label_name = (const char *)(((Value*)lfirst(label_obj))->val.str);
+        const char* label_name = (const char *)(((Value*)lfirst(label_obj))->val.str);
 
         char buff[MAX_MSG_BUFF_SIZE] = {0};
         char user_name[USERNAME_LEN] = {0};

@@ -71,6 +71,8 @@ typedef struct StandardChunkHeader {
 #ifdef MEMORY_CONTEXT_CHECKING
     /* when debugging memory usage, also store actual requested size */
     Size requested_size;
+#endif
+#ifdef MEMORY_CONTEXT_TRACK
     const char* file;
     int line;
 #endif
@@ -84,6 +86,7 @@ extern MemoryContext AdioSharedContext;
 extern MemoryContext ProcSubXidCacheContext;
 extern MemoryContext PmTopMemoryContext;
 extern MemoryContext StreamInfoContext;
+extern PGDLLIMPORT MemoryContext TopTransactionContext;
 
 extern THR_LOCAL PGDLLIMPORT MemoryContext ErrorContext;
 
@@ -106,6 +109,7 @@ extern void MemoryContextStats(MemoryContext context);
 extern void MemoryContextSeal(MemoryContext context);
 extern void MemoryContextUnSeal(MemoryContext context);
 extern void MemoryContextUnSealChildren(MemoryContext context);
+extern void MemoryContextAllowInCriticalSection(MemoryContext context, bool allow);
 
 #ifdef MEMORY_CONTEXT_CHECKING
 extern void MemoryContextCheck(MemoryContext context, bool own_by_session);
@@ -154,6 +158,8 @@ extern MemoryContext AllocSetContextCreate(MemoryContext parent, const char* nam
 #define ALLOCSET_SMALL_MINSIZE 0
 #define ALLOCSET_SMALL_INITSIZE (1 * 1024)
 #define ALLOCSET_SMALL_MAXSIZE (8 * 1024)
+#define ALLOCSET_SMALL_SIZES \
+	ALLOCSET_SMALL_MINSIZE, ALLOCSET_SMALL_INITSIZE, ALLOCSET_SMALL_MAXSIZE
 
 /* default grow ratio for sort and materialize when it spreads */
 #define DEFAULT_GROW_RATIO 2.0

@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2020 Huawei Technologies Co.,Ltd.
+ * Portions Copyright (c) 2021, openGauss Contributors
  *
  * openGauss is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
@@ -80,6 +81,7 @@ typedef struct knl_session_attr_sql {
     bool enable_remotegroup;
     bool enable_remotesort;
     bool enable_remotelimit;
+    bool enable_startwith_debug;
     bool gtm_backup_barrier;
     bool explain_allow_multinode;
     bool enable_stream_operator;
@@ -138,7 +140,10 @@ typedef struct knl_session_attr_sql {
     int Geqo_effort;
     int Geqo_pool_size;
     int Geqo_generations;
-    int g_default_log2m;
+    int hll_default_log2m;
+    int hll_default_log2explicit;
+    int hll_default_log2sparse;
+    int hll_duplicate_check;
     int g_default_regwidth;
     int g_default_sparseon;
     int g_max_sparse;
@@ -207,13 +212,33 @@ typedef struct knl_session_attr_sql {
     int opfusion_debug_mode;
     double cost_weight_index;
     double default_limit_rows;
+
     int sql_beta_feature;
     /* hypo index */
     bool enable_hypo_index;
     bool hypopg_is_explain;
+
+    bool mot_allow_index_on_nullable_column;
+    bool enable_default_ustore_table;
+    char* ustore_attr;
+#ifdef ENABLE_UT
+    char* ustore_unit_test;
+#endif
+    bool create_index_concurrently;
+    /* db4ai.snapshots */
+    char* db4ai_snapshot_mode;
+    char* db4ai_snapshot_version_delimiter;
+    char* db4ai_snapshot_version_separator;
+    int pldebugger_timeout;
+
+#ifndef ENABLE_MULTIPLE_NODES
+    bool uppercase_attribute_name;
+#endif
+    int vectorEngineStrategy;
 #ifndef ENABLE_MULTIPLE_NODES
     bool enable_custom_parser;
 #endif
+    bool b_sql_plugin;
 } knl_session_attr_sql;
 
 #endif /* SRC_INCLUDE_KNL_KNL_SESSION_ATTR_SQL */

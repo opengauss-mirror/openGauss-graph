@@ -32,6 +32,9 @@ typedef struct pgFile_t
     char   *rel_path;        /* relative path of the file */
     char   *linked;            /* path of the linked file */
     bool    is_datafile;    /* true if the file is PostgreSQL data file */
+    bool compressedFile;    /* true if the file is the openGauss compressed file */
+    uint16 compressedChunkSize;       /* chunk size of compressed file */
+    uint8 compressedAlgorithm;         /* algorithm of comrpessed file */
     Oid        tblspcOid;        /* tblspcOid extracted from path, if applicable */
     Oid        dbOid;            /* dbOid extracted from path, if applicable */
     Oid        relOid;            /* relOid extracted from path, if applicable */
@@ -458,8 +461,8 @@ typedef struct BackupPageHeader2
     XLByteToSeg(xlrp, logSegNo, wal_segsz_bytes)
 #define GetXLogRecPtr(segno, offset, wal_segsz_bytes, dest) \
     XLogSegNoOffsetToRecPtr(segno, offset, wal_segsz_bytes, dest)
-#define GetXLogFileName(fname, tli, logSegNo, wal_segsz_bytes) \
-    XLogFileName(fname, tli, logSegNo, wal_segsz_bytes)
+#define GetXLogFileName(fname, len, tli, logSegNo, wal_segsz_bytes) \
+    XLogFileName(fname, len, tli, logSegNo, wal_segsz_bytes)
 #define IsInXLogSeg(xlrp, logSegNo, wal_segsz_bytes) \
     XLByteInSeg(xlrp, logSegNo, wal_segsz_bytes)
 
@@ -473,8 +476,8 @@ typedef struct BackupPageHeader2
     XLByteToSeg(xlrp, logSegNo)
 #define GetXLogRecPtr(segno, offset, wal_segsz_bytes, dest) \
     XLogSegNoOffsetToRecPtr(segno, offset, dest)
-#define GetXLogFileName(fname, tli, logSegNo, wal_segsz_bytes) \
-    XLogFileName(fname, tli, logSegNo)
+#define GetXLogFileName(fname, len, tli, logSegNo, wal_segsz_bytes) \
+    XLogFileName(fname, len, tli, logSegNo )
 #define IsInXLogSeg(xlrp, logSegNo, wal_segsz_bytes) \
     XLByteInSeg(xlrp, logSegNo)
 

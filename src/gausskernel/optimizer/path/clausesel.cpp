@@ -43,6 +43,7 @@
  */
 typedef struct RangeQueryClause {
     struct RangeQueryClause* next; /* next in linked list */
+    Expr* clause;                  /* the second clause for range-query */
     Node* var;                     /* The common variable of the clauses */
     bool have_lobound;             /* found a low-bound clause yet? */
     bool have_hibound;             /* found a high-bound clause yet? */
@@ -184,6 +185,7 @@ Selectivity clauselist_selectivity(
             rinfo = (RestrictInfo*)clause;
             if (rinfo->pseudoconstant) {
                 s1 = s1 * s2;
+                rinfo->clause->selec = s2;
                 continue;
             }
             clause = (Node*)rinfo->clause;
@@ -211,20 +213,26 @@ Selectivity clauselist_selectivity(
                     break;
                 default:
                     /* Just merge the selectivity in generically */
-                    if ((uint32)u_sess->attr.attr_sql.cost_param & COST_ALTERNATIVE_CONJUNCT)
+                    if ((uint32)u_sess->attr.attr_sql.cost_param & COST_ALTERNATIVE_CONJUNCT) {
                         s1 = MIN(s1, s2);
-                    else
+                        expr->xpr.selec = s1;
+                    } else {
                         s1 = s1 * s2;
+                        expr->xpr.selec = s2;
+                    }
                     break;
             }
             continue;
         }
 
         /* Not the right form, so treat it generically. */
-        if ((uint32)u_sess->attr.attr_sql.cost_param & COST_ALTERNATIVE_CONJUNCT)
+        if ((uint32)u_sess->attr.attr_sql.cost_param & COST_ALTERNATIVE_CONJUNCT) {
             s1 = MIN(s1, s2);
-        else
+            expr->xpr.selec = s1;
+        } else {
             s1 = s1 * s2;
+            expr->xpr.selec = s2;
+        }
     }
 
     /*
@@ -276,12 +284,16 @@ Selectivity clauselist_selectivity(
             }
             /* Merge in the selectivity of the pair of clauses */
             s1 *= s2;
+            rqlist->clause->selec = s2;
         } else {
             /* Only found one of a pair, merge it in generically */
-            if (rqlist->have_lobound)
+            if (rqlist->have_lobound) {
                 s1 *= rqlist->lobound;
-            else
+                rqlist->clause->selec = rqlist->lobound;
+            } else {
                 s1 *= rqlist->hibound;
+                rqlist->clause->selec = rqlist->hibound;
+            }
         }
         varlist = lappend(varlist, rqlist->var);
         /* release storage and advance */
@@ -365,6 +377,7 @@ static void addRangeClause(RangeQueryClause** rqlist, Node* clause, bool varonle
                     rqelem->hibound = s2;
             }
         }
+        rqelem->clause = (Expr*)clause;
         return;
     }
 
@@ -380,6 +393,8 @@ static void addRangeClause(RangeQueryClause** rqlist, Node* clause, bool varonle
         rqelem->have_hibound = true;
         rqelem->hibound = s2;
     }
+    rqelem->clause = (Expr*)clause;
+    rqelem->clause->selec = s2;
     rqelem->next = *rqlist;
     *rqlist = rqelem;
 }
@@ -715,7 +730,7 @@ static List* switch_arg_items(Node* funExpr, Const* cnst, Oid* eqlOprOid, Oid* i
             bool outer_is_stream_support = false;
             ResourceOwner currentOwner = t_thrd.utils_cxt.CurrentResourceOwner;
             ResourceOwner tempOwner = ResourceOwnerCreate(t_thrd.utils_cxt.CurrentResourceOwner, "SwitchArgItems",
-                MEMORY_CONTEXT_OPTIMIZER);
+                THREAD_GET_MEM_CXT_GROUP(MEMORY_CONTEXT_OPTIMIZER));
             t_thrd.utils_cxt.CurrentResourceOwner = tempOwner;
 
             if (IS_PGXC_COORDINATOR) {
@@ -884,6 +899,19 @@ static void get_vardata_for_filter_or_semijoin(
     }
 }
 
+void getVardataFromScalarArray(Node* node, get_vardata_for_filter_or_semijoin_context* context)
+{
+    Node* left = NULL;
+    if (RatioType_Join == context->ratiotype) {
+        bool join_is_reversed = false;
+        get_join_variables(context->root, ((ScalarArrayOpExpr*)node)->args, context->sjinfo, 
+            &context->semijoin_vardata1, &context->semijoin_vardata2, &join_is_reversed);
+    } else {
+        left = (Node*)linitial(((ScalarArrayOpExpr*)node)->args);
+        examine_variable(context->root, left, context->varRelid, &context->filter_vardata);
+    }
+}
+
 /*
  * get_vardata_for_filter_or_semijoin_walker: get vardata walker for clause.
  *
@@ -926,12 +954,8 @@ static bool get_vardata_for_filter_or_semijoin_walker(Node* node, get_vardata_fo
 
         if (RatioType_Join == context->ratiotype) {
             bool join_is_reversed = false;
-            get_join_variables(context->root,
-                opclause->args,
-                context->sjinfo,
-                &context->semijoin_vardata1,
-                &context->semijoin_vardata2,
-                &join_is_reversed);
+            get_join_variables(context->root, opclause->args, context->sjinfo, &context->semijoin_vardata1,
+                &context->semijoin_vardata2, &join_is_reversed);
             return true;
         } else {
             Oid eqlOprOid = 0;
@@ -952,8 +976,7 @@ static bool get_vardata_for_filter_or_semijoin_walker(Node* node, get_vardata_fo
                 context->root, args, context->varRelid, &context->filter_vardata, &other, &varonleft);
         }
     } else if (IsA(node, ScalarArrayOpExpr)) {
-        left = (Node*)linitial(((ScalarArrayOpExpr*)node)->args);
-        examine_variable(context->root, left, context->varRelid, &context->filter_vardata);
+        getVardataFromScalarArray(node, context);
         return true;
     } else if (IsA(node, RowCompareExpr)) {
         args = list_make2(linitial(((RowCompareExpr*)node)->largs), linitial(((RowCompareExpr*)node)->rargs));

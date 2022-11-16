@@ -5,6 +5,7 @@
  *
  * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
+ * Portions Copyright (c) 2021, openGauss Contributors
  *
  *
  * IDENTIFICATION
@@ -24,10 +25,12 @@
 #include "catalog/pg_synonym.h"
 #include "catalog/pg_type.h"
 #include "commands/defrem.h"
+#include "commands/tablecmds.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
 #include "optimizer/clauses.h"
 #include "optimizer/tlist.h"
+#include "optimizer/planner.h"
 #include "parser/analyze.h"
 #include "parser/parsetree.h"
 #include "parser/parse_clause.h"
@@ -37,10 +40,14 @@
 #include "parser/parse_oper.h"
 #include "parser/parse_relation.h"
 #include "parser/parse_target.h"
+#include "parser/parse_type.h"
+#include "parser/parse_cte.h"
 #include "pgxc/pgxc.h"
 #include "rewrite/rewriteManip.h"
+#include "storage/tcap.h"
 #include "utils/guc.h"
 #include "utils/lsyscache.h"
+#include "utils/partitionkey.h"
 #include "utils/rel.h"
 #include "utils/rel_gs.h"
 #include "utils/syscache.h"
@@ -62,6 +69,7 @@ static RangeTblEntry* transformCTEReference(ParseState* pstate, RangeVar* r, Com
 static RangeTblEntry* transformRangeSubselect(ParseState* pstate, RangeSubselect* r);
 static RangeTblEntry* transformRangeFunction(ParseState* pstate, RangeFunction* r);
 static TableSampleClause* transformRangeTableSample(ParseState* pstate, RangeTableSample* rts);
+static TimeCapsuleClause* transformRangeTimeCapsule(ParseState* pstate, RangeTimeCapsule* rtc);
 
 static void setNamespaceLateralState(List *l_namespace, bool lateral_only, bool lateral_ok);
 static Node* buildMergedJoinVar(ParseState* pstate, JoinType jointype, Var* l_colvar, Var* r_colvar);
@@ -121,11 +129,18 @@ static RangeTblRef* transformItem(ParseState* pstate, RangeTblEntry* rte, RangeT
  * The range table may grow still further when we transform the expressions
  * in the query's quals and target list. (This is possible because in
  * POSTQUEL, we allowed references to relations not specified in the
- * from-clause.  PostgreSQL keeps this extension to standard SQL.)
+ * from-clause.  openGauss keeps this extension to standard SQL.)
  */
 void transformFromClause(ParseState* pstate, List* frmList, bool isFirstNode, bool isCreateView)
 {
     ListCell* fl = NULL;
+
+    /*
+     * copy original fromClause for future start with rewrite
+     */
+    if (pstate->p_addStartInfo) {
+        pstate->sw_fromClause = (List *)copyObject(frmList);
+    }
 
     /*
      * The grammar will have produced a list of RangeVars, RangeSubselects,
@@ -206,6 +221,19 @@ int setTargetTable(ParseState* pstate, RangeVar* relation, bool inh, bool alsoSo
      * Now build an RTE.
      */
     rte = addRangeTableEntryForRelation(pstate, pstate->p_target_relation, relation->alias, inh, false);
+
+    /* IUD contain partition. */
+    if (relation->ispartition) {
+        rte->isContainPartition = true;
+        rte->partitionOid = getPartitionOidForRTE(rte, relation, pstate, pstate->p_target_relation);
+    }
+    /* IUD contain subpartition. */
+    if (relation->issubpartition) {
+        rte->isContainSubPartition = true;
+        rte->subpartitionOid =
+            GetSubPartitionOidForRTE(rte, relation, pstate, pstate->p_target_relation, &rte->partitionOid);
+    }
+
     pstate->p_target_rangetblentry = rte;
 
     /* assume new rte is at end */
@@ -223,6 +251,15 @@ int setTargetTable(ParseState* pstate, RangeVar* relation, bool inh, bool alsoSo
         !u_sess->attr.attr_common.IsInplaceUpgrade && IsSystemRelation(pstate->p_target_relation) &&
         (strcmp(RelationGetRelationName(pstate->p_target_relation), "pg_authid") == 0 ||
         strcmp(RelationGetRelationName(pstate->p_target_relation), "gs_global_config") == 0)) {
+        ereport(ERROR,
+            (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+                errmsg("permission denied: \"%s\" is a system catalog",
+                    RelationGetRelationName(pstate->p_target_relation))));
+    }
+
+    /* Restrict DML privileges to gs_global_chain which stored history and consistent message like hash. */
+    if (IsUnderPostmaster && !u_sess->attr.attr_common.IsInplaceUpgrade && IsSystemRelation(pstate->p_target_relation)
+        && strcmp(RelationGetRelationName(pstate->p_target_relation), "gs_global_chain") == 0) {
         ereport(ERROR,
             (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
                 errmsg("permission denied: \"%s\" is a system catalog",
@@ -466,7 +503,7 @@ static RangeTblEntry* transformCTEReference(ParseState* pstate, RangeVar* r, Com
 {
     RangeTblEntry* rte = NULL;
 
-    if (r->ispartition) {
+    if (r->ispartition || r->issubpartition) {
         ereport(
             ERROR, (errcode(ERRCODE_UNDEFINED_TABLE), errmsg("relation \"%s\" is not partitioned table", r->relname)));
     }
@@ -548,7 +585,11 @@ static RangeTblEntry* transformRangeFunction(ParseState* pstate, RangeFunction* 
      * don't need save/restore logic here.)
      */
     Assert(!pstate->p_lateral_active);
+#ifdef GS_GRAPH
+    pstate->p_lateral_active = true;
+#else
     pstate->p_lateral_active = r->lateral;
+#endif
 
     /*
      * Transform the raw expression.
@@ -681,6 +722,37 @@ static TableSampleClause* transformRangeTableSample(ParseState* pstate, RangeTab
     return tablesample;
 }
 
+
+/*
+ * Description: Transform a TABLECAPSULE clause
+ * 			Caller has already transformed rtc->relation, we just have to validate
+ * 			the remaining fields and create a TimeCapsuleClause node.
+ *
+ * Parameters:
+ *	@in pstate: state information used during parse analysis.
+ * 	@in rts: TABLECAPSULE appearing in a raw FROM clause.
+ *
+ * Return: TABLECAPSULE appearing in a transformed FROM clause.
+ */
+static TimeCapsuleClause* transformRangeTimeCapsule(ParseState* pstate, RangeTimeCapsule* rtc)
+{
+    TimeCapsuleClause* timeCapsule;
+
+    if (rtc->tvver == NULL) {
+        ereport(ERROR,
+            (errcode(ERRCODE_UNDEFINED_OBJECT),
+                errmsg("timecapsule value must be specified"),
+                parser_errposition(pstate, rtc->location)));
+    }
+
+    timeCapsule = makeNode(TimeCapsuleClause);
+
+    timeCapsule->tvver = TvTransformVersionExpr(pstate, rtc->tvtype, rtc->tvver);
+    timeCapsule->tvtype = rtc->tvtype;
+
+    return timeCapsule;
+}
+
 /*
  * transformFromClauseItem -
  *	  Transform a FROM-clause item, adding any required entries to the
@@ -741,14 +813,41 @@ Node* transformFromClauseItem(ParseState* pstate, Node* n, RangeTblEntry** top_r
         }
 
         rtr = transformItem(pstate, rte, top_rte, top_rti, relnamespace);
+
+        /* add startinfo if needed */
+        if (pstate->p_addStartInfo) {
+            AddStartWithTargetRelInfo(pstate, n, rte, rtr);
+        }
+
         return (Node*)rtr;
     } else if (IsA(n, RangeSubselect)) {
         /* sub-SELECT is like a plain relation */
         RangeTblRef* rtr = NULL;
         RangeTblEntry* rte = NULL;
+        Node *sw_backup = NULL;
+
+        if (pstate->p_addStartInfo) {
+            /*
+             * In start with case we should back up SubselectStmt for further
+             * SW Rewrite.
+             * */
+            sw_backup = (Node *)copyObject(n);
+        }
 
         rte = transformRangeSubselect(pstate, (RangeSubselect*)n);
         rtr = transformItem(pstate, rte, top_rte, top_rti, relnamespace);
+
+        /* add startinfo if needed */
+        if (pstate->p_addStartInfo) {
+            AddStartWithTargetRelInfo(pstate, sw_backup, rte, rtr);
+
+            /*
+             * (RangeSubselect*)n is mainly related to RTE during whole transform as pointer,
+             * so anything fixed on sw_backup could also fix back to (RangeSubselect*)n.
+             * */
+            ((RangeSubselect*)n)->alias->aliasname = ((RangeSubselect*)sw_backup)->alias->aliasname;
+        }
+
         return (Node*)rtr;
     } else if (IsA(n, RangeFunction)) {
         /* function is like a plain relation */
@@ -788,11 +887,36 @@ Node* transformFromClauseItem(ParseState* pstate, Node* n, RangeTblEntry** top_r
         if (REL_COL_ORIENTED != rte->orientation && REL_ROW_ORIENTED != rte->orientation) {
             ereport(ERROR,
                 (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-                    (errmsg("TABLESAMPLE clause only support relation of oriented-row and oriented-column."))));
+                    (errmsg("TABLESAMPLE clause only support relation of oriented-row, oriented-column and oriented-inplace."))));
         }
 
         /* Transform TABLESAMPLE details and attach to the RTE */
         rte->tablesample = transformRangeTableSample(pstate, rts);
+        return (Node*)rtr;
+    } else if (IsA(n, RangeTimeCapsule)) {
+        /* TABLECAPSULE clause (wrapping some other valid FROM NODE) */
+        RangeTimeCapsule* rtc = (RangeTimeCapsule *)n;
+        Node* rel = NULL;
+        RangeTblRef* rtr = NULL;
+        RangeTblEntry* rte = NULL;
+
+        /* Recursively transform the contained relation. */
+        rel = transformFromClauseItem(pstate, rtc->relation, top_rte, top_rti, NULL, NULL, relnamespace);
+        if (unlikely(rel == NULL)) {
+            ereport(
+                ERROR, (errmodule(MOD_OPT), errcode(ERRCODE_UNEXPECTED_NULL_VALUE),
+                errmsg("Range table with timecapsule clause should not be null")));
+        }
+
+        /* Currently, grammar could only return a RangeVar as contained rel */
+        Assert(IsA(rel, RangeTblRef));
+        rtr = (RangeTblRef*)rel;
+        rte = rt_fetch(rtr->rtindex, pstate->p_rtable);
+
+        TvCheckVersionScan(rte);
+
+        /* Transform TABLECAPSULE details and attach to the RTE */
+        rte->timecapsule = transformRangeTimeCapsule(pstate, rtc);
         return (Node*)rtr;
     } else if (IsA(n, JoinExpr)) {
         /* A newfangled join expression */
@@ -844,7 +968,11 @@ Node* transformFromClauseItem(ParseState* pstate, Node* n, RangeTblEntry** top_r
          * NB: this coding relies on the fact that list_concat is not
          * destructive to its second argument.
          */
+#ifdef GS_GRAPH
+        lateral_ok = (j->jointype == JOIN_INNER || j->jointype == JOIN_LEFT || j->jointype == JOIN_VLE);
+#else
         lateral_ok = (j->jointype == JOIN_INNER || j->jointype == JOIN_LEFT);
+#endif
         setNamespaceLateralState(l_relnamespace, true, lateral_ok);
         sv_relnamespace_length = list_length(pstate->p_relnamespace);
         pstate->p_relnamespace = list_concat(pstate->p_relnamespace,
@@ -862,7 +990,7 @@ Node* transformFromClauseItem(ParseState* pstate, Node* n, RangeTblEntry** top_r
 
         /*
          * Check for conflicting refnames in left and right subtrees. Must do
-         * this because higher levels will assume I hand back a self-
+         * this because higher levels will assume I hand back a self
          * consistent namespace subtree.
          */
         checkNameSpaceConflicts(pstate, l_relnamespace, r_relnamespace);
@@ -1228,6 +1356,10 @@ static Node* buildMergedJoinVar(ParseState* pstate, JoinType jointype, Var* l_co
             res_node = (Node*)c;
             break;
         }
+#ifdef GS_GRAPH
+        case JOIN_CYPHER_MERGE:
+		case JOIN_CYPHER_DELETE:
+#endif        
         default:
             ereport(
                 ERROR, (errcode(ERRCODE_UNRECOGNIZED_NODE_TYPE), errmsg("unrecognized join type: %d", (int)jointype)));
@@ -1340,7 +1472,7 @@ static void checkExprIsVarFree(ParseState* pstate, Node* n, const char* construc
  * This function supports the old SQL92 ORDER BY interpretation, where the
  * expression is an output column name or number.  If we fail to find a
  * match of that sort, we fall through to the SQL99 rules.	For historical
- * reasons, Postgres also allows this interpretation for GROUP BY, though
+ * reasons, openGauss also allows this interpretation for GROUP BY, though
  * the standard never did.	However, for GROUP BY we prefer a SQL99 match.
  * This function is *not* used for WINDOW definitions.
  *
@@ -1367,7 +1499,7 @@ static TargetEntry* findTargetlistEntrySQL92(ParseState* pstate, Node* node, Lis
      *	  targetlist entries: according to SQL92, an identifier in GROUP BY
      *	  is a reference to a column name exposed by FROM, not to a target
      *	  list column.	However, many implementations (including pre-7.0
-     *	  PostgreSQL) accept this anyway.  So for GROUP BY, we look first
+     *	  openGauss) accept this anyway.  So for GROUP BY, we look first
      *	  to see if the identifier matches any FROM column name, and only
      *	  try for a targetlist name if it doesn't.  This ensures that we
      *	  adhere to the spec in the case where the name could be both.
@@ -2660,4 +2792,403 @@ static Node* transformFrameOffset(ParseState* pstate, int frameOptions, Node* cl
     checkExprIsVarFree(pstate, node, constructName);
 
     return node;
+}
+
+typedef struct
+{
+	int			sublevels_up;
+} find_agg_context;
+
+typedef struct
+{
+	int			sublevels_up;
+} find_var_context;
+
+
+static bool
+find_var_walker(Node *node, find_var_context *ctx)
+{
+	if (node == NULL)
+		return false;
+
+	if (IsA(node, Var))
+		return ((int) ((Var *) node)->varlevelsup == ctx->sublevels_up);
+
+	if (IsA(node, Query))
+	{
+		bool		result;
+
+		ctx->sublevels_up++;
+		result = query_tree_walker((Query *) node, (bool (*)())find_var_walker, ctx, 0);
+		ctx->sublevels_up--;
+
+		return result;
+	}
+
+	return expression_tree_walker(node, (bool (*)())find_var_walker, ctx);
+}
+
+
+static bool
+add_expr_to_group_exprs(Expr *expr, List **group_exprs)
+{
+	ListCell *le;
+
+	/* check duplication */
+	foreach(le, *group_exprs)
+	{
+		Expr	   *gexpr = (Expr* )lfirst(le);
+
+		if (equal(gexpr, expr))
+			return false;
+	}
+
+	*group_exprs = lappend(*group_exprs, expr);
+	return true;
+}
+
+static bool
+find_agg_walker(Node *node, find_agg_context *ctx)
+{
+	if (node == NULL)
+		return false;
+
+	if (IsA(node, Aggref))
+	{
+		Aggref	   *agg = (Aggref *) node;
+		int			agglevelsup = (int) agg->agglevelsup;
+
+		if (agglevelsup == ctx->sublevels_up)
+		{
+			find_var_context fvctx;
+
+			fvctx.sublevels_up = ctx->sublevels_up;
+			if (find_var_walker((Node *) agg->args, &fvctx))
+				return true;
+			if (find_var_walker((Node *) agg->aggdirectargs, &fvctx))
+				return true;
+
+			return false;
+		}
+
+		if (agglevelsup > ctx->sublevels_up)
+			return false;
+	}
+
+	if (IsA(node, Query))
+	{
+		bool		result;
+
+		ctx->sublevels_up++;
+		result = query_tree_walker((Query *) node, (bool (*)())find_agg_walker, ctx, 0);
+		ctx->sublevels_up--;
+
+		return result;
+	}
+
+	return expression_tree_walker(node, (bool (*)())find_agg_walker, ctx);
+}
+
+List *
+generateGroupClause(ParseState *pstate, List **targetlist, List *sortClause)
+{
+	ListCell   *lt;
+	TargetEntry *te;
+	List	   *group_exprs = NIL;
+	ListCell   *le;
+	List	   *group = NIL;
+
+	if (!pstate->p_hasAggs)
+		return NIL;
+
+	foreach(lt, *targetlist)
+	{
+		find_agg_context factx;
+
+		te = (TargetEntry*)lfirst(lt);
+
+		factx.sublevels_up = 0;
+		if (find_agg_walker((Node *) te->expr, &factx))
+		{
+			if (!IsA(te->expr, Aggref))
+			{
+				ereport(ERROR,
+						(errcode(ERRCODE_SYNTAX_ERROR),
+						 errmsg("aggregate must exist solely"),
+						 parser_errposition(pstate,
+											exprLocation((Node *) te->expr))));
+				return NIL;
+			}
+		}
+		else
+		{
+			find_var_context fvctx;
+
+			/*
+			 * If `te->expr` does not have aggregate functions and
+			 * it is not a constant expression, add it to GROUP BY.
+			 */
+
+			fvctx.sublevels_up = 0;
+			if (find_var_walker((Node *) te->expr, &fvctx))
+				add_expr_to_group_exprs(te->expr, &group_exprs);
+		}
+	}
+
+	foreach(le, group_exprs)
+	{
+		Expr	   *gexpr = (Expr*)lfirst(le);
+		bool		done;
+		ListCell   *ls;
+
+		/*
+		 * See findTargetlistEntrySQL99()
+		 */
+
+		/* find the TargetEntry which exactly has this expression */
+		foreach(lt, *targetlist)
+		{
+			Node	   *expr;
+
+			te = (TargetEntry*)lfirst(lt);
+
+			expr = strip_implicit_coercions((Node *) te->expr);
+			if (equal(expr, gexpr))
+				break;
+		}
+
+		/* not found, make one and add it to the target list */
+		if (lt == NULL)
+		{
+			te = makeTargetEntry((Expr*)copyObject(gexpr),
+								 (AttrNumber) pstate->p_next_resno++,
+								 NULL, true);
+
+			*targetlist = lappend(*targetlist, te);
+		}
+
+		/*
+		 * See transformGroupClauseExpr()
+		 */
+
+		if (targetIsInSortList(te, InvalidOid, group))
+			continue;
+
+		done = false;
+		foreach(ls, sortClause)
+		{
+			SortGroupClause *sc = (SortGroupClause*)lfirst(ls);
+
+			if (sc->tleSortGroupRef == te->ressortgroupref)
+			{
+				group = lappend(group, copyObject(sc));
+				done = true;
+				break;
+			}
+		}
+		if (done)
+			continue;
+
+		group = addTargetToGroupList(pstate, te, group, *targetlist, -1, false);
+	}
+
+	return group;
+}
+
+
+/*
+ * transformOnConflictArbiter -
+ *		transform arbiter expressions in an ON CONFLICT clause.
+ *
+ * Transformed expressions used to infer one unique index relation to serve as
+ * an ON CONFLICT arbiter.  Partial unique indexes may be inferred using WHERE
+ * clause from inference specification clause.
+ */
+// void
+// transformOnConflictArbiter(ParseState *pstate,
+// 						   OnConflictClause *onConflictClause,
+// 						   List **arbiterExpr, Node **arbiterWhere,
+// 						   Oid *constraint)
+// {
+// 	InferClause *infer = onConflictClause->infer;
+
+// 	*arbiterExpr = NIL;
+// 	*arbiterWhere = NULL;
+// 	*constraint = InvalidOid;
+
+// 	if (onConflictClause->action == ONCONFLICT_UPDATE && !infer)
+// 		ereport(ERROR,
+// 				(errcode(ERRCODE_SYNTAX_ERROR),
+// 				 errmsg("ON CONFLICT DO UPDATE requires inference specification or constraint name"),
+// 				 errhint("For example, ON CONFLICT (column_name)."),
+// 				 parser_errposition(pstate,
+// 									exprLocation((Node *) onConflictClause))));
+
+// 	/*
+// 	 * To simplify certain aspects of its design, speculative insertion into
+// 	 * system catalogs is disallowed
+// 	 */
+// 	if (IsCatalogRelation(pstate->p_target_relation))
+// 		ereport(ERROR,
+// 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+// 				 errmsg("ON CONFLICT is not supported with system catalog tables"),
+// 				 parser_errposition(pstate,
+// 									exprLocation((Node *) onConflictClause))));
+
+// 	/* Same applies to table used by logical decoding as catalog table */
+// 	if (RelationIsUsedAsCatalogTable(pstate->p_target_relation))
+// 		ereport(ERROR,
+// 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+// 				 errmsg("ON CONFLICT is not supported on table \"%s\" used as a catalog table",
+// 						RelationGetRelationName(pstate->p_target_relation)),
+// 				 parser_errposition(pstate,
+// 									exprLocation((Node *) onConflictClause))));
+
+// 	/* ON CONFLICT DO NOTHING does not require an inference clause */
+// 	if (infer)
+// 	{
+// 		List	   *save_namespace;
+
+// 		/*
+// 		 * While we process the arbiter expressions, accept only non-qualified
+// 		 * references to the target table. Hide any other relations.
+// 		 */
+// 		save_namespace = pstate->p_namespace;
+// 		pstate->p_namespace = NIL;
+// 		addRTEtoQuery(pstate, pstate->p_target_rangetblentry,
+// 					  false, false, true);
+
+// 		if (infer->indexElems)
+// 			*arbiterExpr = resolve_unique_index_expr(pstate, infer,
+// 													 pstate->p_target_relation);
+
+// 		/*
+// 		 * Handling inference WHERE clause (for partial unique index
+// 		 * inference)
+// 		 */
+// 		if (infer->whereClause)
+// 			*arbiterWhere = transformExpr(pstate, infer->whereClause,
+// 										  EXPR_KIND_INDEX_PREDICATE);
+
+// 		pstate->p_namespace = save_namespace;
+
+// 		/*
+// 		 * If the arbiter is specified by constraint name, get the constraint
+// 		 * OID and mark the constrained columns as requiring SELECT privilege,
+// 		 * in the same way as would have happened if the arbiter had been
+// 		 * specified by explicit reference to the constraint's index columns.
+// 		 */
+// 		if (infer->conname)
+// 		{
+// 			Oid			relid = RelationGetRelid(pstate->p_target_relation);
+// 			RangeTblEntry *rte = pstate->p_target_rangetblentry;
+// 			Bitmapset  *conattnos;
+
+// 			conattnos = get_relation_constraint_attnos(relid, infer->conname,
+// 													   false, constraint);
+
+// 			/* Make sure the rel as a whole is marked for SELECT access */
+// 			rte->requiredPerms |= ACL_SELECT;
+// 			/* Mark the constrained columns as requiring SELECT access */
+// 			rte->selectedCols = bms_add_members(rte->selectedCols, conattnos);
+// 		}
+// 	}
+
+// 	/*
+// 	 * It's convenient to form a list of expressions based on the
+// 	 * representation used by CREATE INDEX, since the same restrictions are
+// 	 * appropriate (e.g. on subqueries).  However, from here on, a dedicated
+// 	 * primnode representation is used for inference elements, and so
+// 	 * assign_query_collations() can be trusted to do the right thing with the
+// 	 * post parse analysis query tree inference clause representation.
+// 	 */
+// }
+
+static List *
+resolve_unique_index_expr(ParseState *pstate, InferClause *infer,
+						  Relation heapRel)
+{
+	List	   *result = NIL;
+	ListCell   *l;
+
+	foreach(l, infer->indexElems)
+	{
+		IndexElem  *ielem = (IndexElem *) lfirst(l);
+		InferenceElem *pInfer = makeNode(InferenceElem);
+		Node	   *parse;
+
+		/*
+		 * Raw grammar re-uses CREATE INDEX infrastructure for unique index
+		 * inference clause, and so will accept opclasses by name and so on.
+		 *
+		 * Make no attempt to match ASC or DESC ordering or NULLS FIRST/NULLS
+		 * LAST ordering, since those are not significant for inference
+		 * purposes (any unique index matching the inference specification in
+		 * other regards is accepted indifferently).  Actively reject this as
+		 * wrong-headed.
+		 */
+		if (ielem->ordering != SORTBY_DEFAULT)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_COLUMN_REFERENCE),
+					 errmsg("ASC/DESC is not allowed in ON CONFLICT clause"),
+					 parser_errposition(pstate,
+										exprLocation((Node *) infer))));
+		if (ielem->nulls_ordering != SORTBY_NULLS_DEFAULT)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_COLUMN_REFERENCE),
+					 errmsg("NULLS FIRST/LAST is not allowed in ON CONFLICT clause"),
+					 parser_errposition(pstate,
+										exprLocation((Node *) infer))));
+
+		if (!ielem->expr)
+		{
+			/* Simple index attribute */
+			ColumnRef  *n;
+
+			/*
+			 * Grammar won't have built raw expression for us in event of
+			 * plain column reference.  Create one directly, and perform
+			 * expression transformation.  Planner expects this, and performs
+			 * its own normalization for the purposes of matching against
+			 * pg_index.
+			 */
+			n = makeNode(ColumnRef);
+			n->fields = list_make1(makeString(ielem->name));
+			/* Location is approximately that of inference specification */
+			n->location = infer->location;
+			parse = (Node *) n;
+		}
+		else
+		{
+			/* Do parse transformation of the raw expression */
+			parse = (Node *) ielem->expr;
+		}
+
+		/*
+		 * transformExpr() should have already rejected subqueries,
+		 * aggregates, and window functions, based on the EXPR_KIND_ for an
+		 * index expression.  Expressions returning sets won't have been
+		 * rejected, but don't bother doing so here; there should be no
+		 * available expression unique index to match any such expression
+		 * against anyway.
+		 */
+		pInfer->expr = transformExpr(pstate, parse);
+
+		/* Perform lookup of collation and operator class as required */
+		if (!ielem->collation)
+			pInfer->infercollid = InvalidOid;
+		else
+			pInfer->infercollid = LookupCollation(pstate, ielem->collation,
+												  exprLocation(pInfer->expr));
+
+		if (!ielem->opclass)
+			pInfer->inferopclass = InvalidOid;
+		else
+			pInfer->inferopclass = get_opclass_oid(BTREE_AM_OID,
+												   ielem->opclass, false);
+
+		result = lappend(result, pInfer);
+	}
+
+	return result;
 }

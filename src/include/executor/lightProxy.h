@@ -62,7 +62,8 @@ typedef enum LightUnSupportType {
     FOREIGN_UNSUPPORT,
     STATEMENT_UNSUPPORT,
     USERTYPE_UNSUPPORT,
-    MAX_UNSUPPORT_TYPE
+    NODE_NAME_UNSUPPORT,
+    MAX_UNSUPPORT_TYPE,
 } LightUnSupportType;
 
 /* like in RemoteQueryState */
@@ -84,6 +85,8 @@ struct lightProxyMsgCtl {
     lightProxyErrData* errData;
 
     int* process_count;
+    uint64 relhash;
+    bool has_relhash;
 
 #ifdef LPROXY_DEBUG
     char* stmt_name;

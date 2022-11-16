@@ -60,6 +60,10 @@
 #include "mb/pg_wchar.h"
 #include "pg_config_paths.h"
 
+#ifdef ENABLE_UT
+#define static
+#endif
+
 static int pqPutMsgBytes(const void* buf, size_t len, PGconn* conn);
 static int pqSendSome(PGconn* conn, int len);
 static int pqSocketCheck(PGconn* conn, int forRead, int forWrite, time_t end_time);
@@ -989,7 +993,7 @@ int pqWaitTimed(int forRead, int forWrite, PGconn* conn, time_t finish_time)
     if (result == 0) {
         printfPQExpBuffer(&conn->errorMessage,
             libpq_gettext("wait %s:%s timeout expired\n"),
-            conn->pghost, conn->pgport);
+            PQhost(conn), PQport(conn));
         return EOF;
     }
 

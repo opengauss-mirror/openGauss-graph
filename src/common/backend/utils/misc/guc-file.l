@@ -17,7 +17,7 @@
 
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
-#include "storage/fd.h"
+#include "storage/smgr/fd.h"
 #include "utils/guc.h"
 
 
@@ -46,7 +46,6 @@ enum {
 };
 
 /* flex fails to supply a prototype for yylex, so provide one */
-/*int GUC_yylex(void);*/
 int GUC_yylex(void * parse_scan);
 
 
@@ -291,7 +290,7 @@ ProcessConfigFile(GucContext context)
 		int		scres;
 
 		/* In SIGHUP cases in the postmaster, we want to report changes */
-		if (context == PGC_SIGHUP && !IsUnderPostmaster)
+		if (context == PGC_SIGHUP && (!IsUnderPostmaster || (strcmp(item->name, "upgrade_mode") == 0 && t_thrd.proc != NULL)))
 		{
 			const char *preval = GetConfigOption(item->name, true, false);
 
@@ -370,6 +369,9 @@ ProcessConfigFile(GucContext context)
 
 		if (pre_value)
 			pfree(pre_value);
+	}
+	if (EnableGlobalSysCache()) {
+		g_instance.global_sysdbcache.UpdateGSCConfig(g_instance.attr.attr_memory.global_syscache_threshold);
 	}
 
 	/* Remember when we last successfully loaded the config file. */

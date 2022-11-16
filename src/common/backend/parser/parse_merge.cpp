@@ -49,9 +49,6 @@ static List* transformUpdateTargetList(ParseState* pstate, List* origTlist);
 static void checkUpdateOnJoinKey(
     ParseState* pstate, MergeWhenClause* clause, List* join_var_list, bool is_insert_update);
 static void checkUpdateOnDistributeKey(RangeTblEntry* rte, List* targetlist);
-static bool contain_subquery(Node* clause);
-static bool contain_subquery_walker(Node* node, void* context);
-static void check_sublink_in_action(List* mergeActionList, bool is_insert_update);
 static void check_source_table_replicated(Node* source_relation);
 static void check_target_table_columns(ParseState* pstate, bool is_insert_update);
 static bool checkTargetTableReplicated(RangeTblEntry* rte);
@@ -640,11 +637,8 @@ void fix_merge_stmt_for_insert_update(ParseState* pstate, MergeStmt* stmt)
     fill_join_expr(pstate, stmt);
 }
 
-void setExtraUpdatedCols(ParseState* pstate)
+void setExtraUpdatedCols(RangeTblEntry* target_rte, TupleDesc tupdesc)
 {
-    TupleDesc tupdesc = pstate->p_target_relation->rd_att;
-    RangeTblEntry* target_rte = pstate->p_target_rangetblentry;
-
     /*
      * Record in extraUpdatedCols generated columns referencing updated base
      * columns.
@@ -748,7 +742,7 @@ static List* transformUpdateTargetList(ParseState* pstate, List* origTlist)
             (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("UPDATE target count mismatch --- internal error")));
     }
 
-    setExtraUpdatedCols(pstate);
+    setExtraUpdatedCols(pstate->p_target_rangetblentry, pstate->p_target_relation->rd_att);
 
     return tlist;
 }
@@ -841,6 +835,80 @@ static Query* tryTransformMergeInsertStmt(ParseState* pstate, MergeStmt* stmt)
     /* free the parse state no matter we found correct insert query or not */
     free_parsestate(insert_pstate);
     return insert_query;
+}
+#ifdef ENABLE_MULTIPLE_NODES
+static bool contain_subquery_walker(Node* node, void* context)
+{
+    if (node == NULL) {
+        return false;
+    }
+    if (IsA(node, SubLink)) {
+        return true;
+    }
+    return expression_tree_walker(node, (bool (*)())contain_subquery_walker, (void*)context);
+}
+
+static bool contain_subquery(Node* clause)
+{
+    return contain_subquery_walker(clause, NULL);
+}
+
+/*
+ * cannot have Subquery in action's qual and targetlist
+ * report error if we found any.
+ */
+static void check_sublink_in_action(List* mergeActionList, bool is_insert_update)
+{
+    ListCell* lc = NULL;
+    /* check action's qual and target list */
+    foreach (lc, mergeActionList) {
+        MergeAction* action = (MergeAction*)lfirst(lc);
+        if (contain_subquery((Node*)action->qual)) {
+            ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                    errmsg("Subquery in WHERE clauses are not yet supported for %s",
+                        is_insert_update ? "INSERT ... ON DUPLICATE KEY UPDATE" : "MERGE INTO")));
+        }
+        if (contain_subquery((Node*)action->targetList)) {
+            ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                    errmsg("Subquery in INSERT/UPDATE clauses are not yet supported for %s",
+                        is_insert_update ? "INSERT ... ON DUPLICATE KEY UPDATE" : "MERGE INTO")));
+        }
+    }
+}
+#endif
+
+/*
+ * get current namespace for columns in the range of relation, subquery
+ * param idx is the index in RTE collection only including relation, subquery
+ */
+List* get_varnamespace(ParseState* pstate, int idx = 0)
+{
+    List* result = NULL;
+    ListCell* lc = NULL;
+    int cur_idx = 1;
+    foreach (lc, pstate->p_rtable) {
+        RangeTblEntry* rte = (RangeTblEntry*)lfirst(lc);
+        if (rte->rtekind != RTE_RELATION && rte->rtekind != RTE_SUBQUERY) {
+            continue;
+        }
+
+        if (idx <= 0) {  // if id is a non-positive integer, all RTEs are obtained.
+            ParseNamespaceItem* tmp = makeNamespaceItem(rte, false, true);
+            result = lappend(result, tmp);
+            cur_idx += 1;
+            continue;
+        }
+
+        if (cur_idx == idx) {  // if the value of id is valid, the specified RTE will be obtained
+            ParseNamespaceItem* tmp = makeNamespaceItem(rte, false, true);
+            result = lappend(result, tmp);
+            break;
+        }
+        cur_idx += 1;
+    }
+    return result;
 }
 
 /*
@@ -1085,7 +1153,16 @@ Query* transformMergeStmt(ParseState* pstate, MergeStmt* stmt)
                 List* icolumns = NIL;
                 List* attrnos = NIL;
                 List* save_relnamespace = NIL;
+                List* save_varnamespace = NIL;
                 RangeTblEntry* sourceRelRTE = NULL;
+
+                /*
+                 * For MERGE INTO type SQL, in the RTE list, the object with index 1 is the target table, and the
+                 * object with index 2 is the source table (the index starts from 1).
+                 * For the insert scenario, var namespace needs to be specified as the source table.
+                 */
+                const unsigned int merge_source_rte_index = 2;
+                List* tmp_varnamespace = get_varnamespace(pstate, merge_source_rte_index);
 
                 /*
                  * Assume that the top-level join RTE is at the end.
@@ -1098,8 +1175,9 @@ Query* transformMergeStmt(ParseState* pstate, MergeStmt* stmt)
                  * source relation.
                  */
                 save_relnamespace = pstate->p_relnamespace;
+                save_varnamespace = pstate->p_varnamespace;
                 pstate->p_relnamespace = list_make1(makeNamespaceItem(sourceRelRTE, false, true));
-
+                pstate->p_varnamespace = tmp_varnamespace;
                 /*
                  * Transform the when condition.
                  *
@@ -1108,6 +1186,7 @@ Query* transformMergeStmt(ParseState* pstate, MergeStmt* stmt)
                  * WHEN MATCHED or WHEN NOT MATCHED actions to execute.
                  */
                 action->qual = transformWhereClause(pstate, mergeWhenClause->condition, "WHEN");
+                pstate->p_varnamespace = save_varnamespace;
 
                 pstate->p_is_insert = true;
 
@@ -1150,9 +1229,11 @@ Query* transformMergeStmt(ParseState* pstate, MergeStmt* stmt)
                      * If td_compatible_truncation equal true and no foreign table found,
                      * the auto truncation funciton should be enabled.
                      */
+
                     if (u_sess->attr.attr_sql.sql_compatibility == C_FORMAT && pstate->p_target_relation != NULL &&
                         !RelationIsForeignTable(pstate->p_target_relation) &&
                         !RelationIsStream(pstate->p_target_relation)) {
+
                         if (u_sess->attr.attr_sql.td_compatible_truncation) {
                             pstate->p_is_td_compatible_truncation = true;
                         } else {
@@ -1196,6 +1277,12 @@ Query* transformMergeStmt(ParseState* pstate, MergeStmt* stmt)
             case CMD_UPDATE: {
                 List* set_clause_list_copy = mergeWhenClause->targetList;
 
+                List* save_varnamespace = NIL;
+                List* tmp_varnamespace = get_varnamespace(pstate);
+                save_varnamespace = pstate->p_varnamespace;
+                pstate->p_varnamespace = tmp_varnamespace;
+                pstate->use_level = true;
+
                 /*
                  * Transform the when condition.
                  *
@@ -1204,6 +1291,8 @@ Query* transformMergeStmt(ParseState* pstate, MergeStmt* stmt)
                  * WHEN MATCHED or WHEN NOT MATCHED actions to execute.
                  */
                 action->qual = transformWhereClause(pstate, mergeWhenClause->condition, "WHEN");
+                pstate->p_varnamespace = save_varnamespace;
+                pstate->use_level = false;
 
                 fixResTargetListWithTableNameRef(pstate->p_target_relation, stmt->relation, set_clause_list_copy);
                 mergeWhenClause->targetList = set_clause_list_copy;
@@ -1221,10 +1310,10 @@ Query* transformMergeStmt(ParseState* pstate, MergeStmt* stmt)
 
         mergeActionList = lappend(mergeActionList, action);
     }
-
+#ifdef ENABLE_MULTIPLE_NODES
     /* we don't support subqueries in action */
     check_sublink_in_action(mergeActionList, stmt->is_insert_update);
-
+#endif
     /* cannot reference system column */
     check_system_column_reference(join_var_list, mergeActionList, stmt->is_insert_update);
 
@@ -1291,6 +1380,11 @@ Query* transformMergeStmt(ParseState* pstate, MergeStmt* stmt)
 
             /* save it */
             qry->upsertQuery = insert_query;
+
+            if (rte->is_ustore) {
+                ereport(ERROR, ((errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                                  errmsg("INSERT ON DUPLICATE KEY UPDATE is not supported on ustore."))));
+            }
         }
     }
 
@@ -1610,48 +1704,6 @@ static void checkUpdateOnDistributeKey(RangeTblEntry* rte, List* targetlist)
                             (errmsg("Distributed key column can't be updated in current version")))));
                 }
             }
-        }
-    }
-}
-
-static bool contain_subquery(Node* clause)
-{
-    return contain_subquery_walker(clause, NULL);
-}
-
-static bool contain_subquery_walker(Node* node, void* context)
-{
-    if (node == NULL) {
-        return false;
-    }
-    if (IsA(node, SubLink)) {
-        return true;
-    }
-    return expression_tree_walker(node, (bool (*)())contain_subquery_walker, (void*)context);
-}
-
-/*
- * cannot have Subquery in action's qual and targetlist
- * report error if we found any.
- */
-static void check_sublink_in_action(List* mergeActionList, bool is_insert_update)
-{
-    ListCell* lc = NULL;
-    /* check action's qual and target list */
-    foreach (lc, mergeActionList) {
-        MergeAction* action = (MergeAction*)lfirst(lc);
-
-        if (contain_subquery((Node*)action->qual)) {
-            ereport(ERROR,
-                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-                    errmsg("Subquery in WHERE clauses are not yet supported for %s",
-                        is_insert_update ? "INSERT ... ON DUPLICATE KEY UPDATE" : "MERGE INTO")));
-        }
-        if (contain_subquery((Node*)action->targetList)) {
-            ereport(ERROR,
-                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-                    errmsg("Subquery in INSERT/UPDATE clauses are not yet supported for %s",
-                        is_insert_update ? "INSERT ... ON DUPLICATE KEY UPDATE" : "MERGE INTO")));
         }
     }
 }

@@ -1,7 +1,7 @@
 /* -------------------------------------------------------------------------
  *
  * numeric.c
- *	  An exact numeric data type for the Postgres database system
+ *	  An exact numeric data type for the openGauss database system
  *
  * Original coding 1998, Jan Wieck.  Heavily revised 2003, Tom Lane.
  *
@@ -160,7 +160,6 @@ static void zero_var(NumericVar* var);
 
 static const char* set_var_from_str(const char* str, const char* cp, NumericVar* dest);
 static void set_var_from_num(Numeric value, NumericVar* dest);
-static void init_var_from_num(Numeric num, NumericVar* dest);
 static void set_var_from_var(const NumericVar* value, NumericVar* dest);
 static char* get_str_from_var(NumericVar* var);
 static char* get_str_from_var_sci(NumericVar* var, int rscale);
@@ -168,7 +167,6 @@ static char* get_str_from_var_sci(NumericVar* var, int rscale);
 static void apply_typmod(NumericVar* var, int32 typmod);
 
 static int32 numericvar_to_int32(const NumericVar* var);
-static bool numericvar_to_int64(const NumericVar* var, int64* result);
 static double numeric_to_double_no_overflow(Numeric num);
 static double numericvar_to_double_no_overflow(NumericVar* var);
 
@@ -231,6 +229,22 @@ inline Datum bipickfun(Numeric leftc, Numeric rightc)
     Assert(func != NULL);
     /* call big integer fast calculate function */
     return func(leftc, rightc, NULL);
+}
+
+/*
+ * numeric_scale() -
+ *
+ *	Returns the scale, i.e. the count of decimal digits in the fractional part
+ */
+Datum
+numeric_scale(PG_FUNCTION_ARGS)
+{
+	Numeric		num = PG_GETARG_NUMERIC(0);
+
+	if (NUMERIC_IS_NAN(num))
+		PG_RETURN_NULL();
+
+	PG_RETURN_INT32(NUMERIC_DSCALE(num));
 }
 
 /* ----------------------------------------------------------------------
@@ -454,39 +468,32 @@ char* numeric_out_sci(Numeric num, int scale)
  *
  * Output function for numeric data type without trailing zeroes.
  */
-char *
-numeric_normalize(Numeric num)
+char *numeric_normalize(Numeric num)
 {
-   NumericVar  x;
-   char       *str;
-   int         orig, last;
+    NumericVar  x;
+    char       *str = NULL;
+    int         orig, last;
+    /*
+     * Handle NaN
+     */
+    if (NUMERIC_IS_NAN(num)) {
+        return pstrdup("NaN");
+    }
+    init_var_from_num(num, &x);
+    str = get_str_from_var(&x);
+    orig = last = strlen(str) - 1;
 
-   /*
-    * Handle NaN
-    */
-   if (NUMERIC_IS_NAN(num))
-       return pstrdup("NaN");
-
-   init_var_from_num(num, &x);
-
-   str = get_str_from_var(&x);
-
-   orig = last = strlen(str) - 1;
-
-   for (;;)
-   {
-       if (last == 0 || str[last] != '0')
-           break;
-
-       last--;
-   }
-
-   if (last > 0 && last != orig)
-       str[last] = '\0';
-
-   return str;
+    for (;;) {
+        if (last == 0 || str[last] != '0') {
+            break;
+        }
+        last--;
+    }
+    if (last > 0 && last != orig) {
+        str[last] = '\0';
+    }
+    return str;
 }
-
 
 /*
  *		numeric_recv			- converts external binary format to numeric
@@ -615,7 +622,7 @@ Datum numeric_transform(PG_FUNCTION_ARGS)
 /*
  * numeric() -
  *
- *	This is a special function called by the Postgres database system
+ *	This is a special function called by the openGauss database system
  *	before a value is stored in a tuple's attribute. The precision and
  *	scale of the attribute have to be applied on the value.
  */
@@ -1385,7 +1392,7 @@ static Datum numeric_abbrev_convert(Datum original_datum, SortSupport ssup)
      * This is to handle packed datums without needing a palloc/pfree cycle;
      * we keep and reuse a buffer large enough to handle any short datum.
      */
-    if (VARATT_IS_SHORT(original_varatt)) {
+    if (!VARATT_IS_HUGE_TOAST_POINTER(original_varatt) && VARATT_IS_SHORT(original_varatt)) {
         void* buf = nss->buf;
         Size sz = VARSIZE_SHORT(original_varatt) - VARHDRSZ_SHORT;
 
@@ -3078,6 +3085,10 @@ Datum numeric_int1(PG_FUNCTION_ARGS)
     /* Convert to variable format and thence to uint8 */
     init_var_from_num(num, &x);
 
+    if (x.sign == NUMERIC_NEG) {
+        ereport(ERROR, (errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE), errmsg("tinyint out of range")));
+    }
+
     if (!numericvar_to_int64(&x, &val))
         ereport(ERROR, (errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE), errmsg("tinyint out of range")));
 
@@ -4108,9 +4119,7 @@ static const char* set_var_from_str(const char* str, const char* cp, NumericVar*
 static void set_var_from_num(Numeric num, NumericVar* dest)
 {
     Assert(!NUMERIC_IS_BI(num));
-    int ndigits;
-
-    ndigits = NUMERIC_NDIGITS(num);
+    int ndigits = NUMERIC_NDIGITS(num);
 
     alloc_var(dest, ndigits);
 
@@ -4138,7 +4147,7 @@ static void set_var_from_num(Numeric num, NumericVar* dest)
  *	propagate to the original Numeric! It's OK to use it as the destination
  *	argument of one of the calculational functions, though.
  */
-static inline void init_var_from_num(Numeric num, NumericVar* dest)
+void init_var_from_num(Numeric num, NumericVar* dest)
 {
     Assert(!NUMERIC_IS_BI(num));
     dest->ndigits = NUMERIC_NDIGITS(num);
@@ -4172,6 +4181,40 @@ static void set_var_from_var(const NumericVar* value, NumericVar* dest)
     securec_check(rc, "\0", "\0");
     dest->buf = newbuf;
     dest->digits = newbuf + 1;
+}
+
+static void remove_tail_zero(char *ascii)
+{
+    if (!HIDE_TAILING_ZERO || ascii == NULL) {
+        return;
+    }
+    int len = 0;
+    bool is_decimal = false;
+    while (ascii[len] != '\0') {
+        if (ascii[len] == '.') {
+            is_decimal = true;
+        }
+        len++;
+    }
+    if (!is_decimal) {
+        return;
+    }
+    len--;
+    while (ascii[len] == '0') {
+        ascii[len] = '\0';
+        len--;
+    }
+    if (ascii[len] == '.') {
+        ascii[len] = '\0';
+        len--;
+    }
+    if (len == -1) {
+        len++;
+        ascii[len] = '0';
+        len++;
+        ascii[len] = '\0';
+    }
+    return;
 }
 
 /*
@@ -4304,6 +4347,7 @@ static char* get_str_from_var(NumericVar* var)
      * terminate the string and return it
      */
     *cp = '\0';
+    remove_tail_zero(str);
     return str;
 }
 
@@ -4568,7 +4612,7 @@ static void apply_typmod(NumericVar* var, int32 typmod)
  *
  * If overflow, return false (no error is raised).  Return true if okay.
  */
-static bool numericvar_to_int64(const NumericVar* var, int64* result)
+bool numericvar_to_int64(const NumericVar* var, int64* result)
 {
     NumericDigit* digits = NULL;
     int ndigits;
@@ -5665,7 +5709,7 @@ static int select_div_scale(NumericVar* var1, NumericVar* var2)
 
     /*
      * The result scale of a division isn't specified in any SQL standard. For
-     * PostgreSQL we select a result scale that will give at least
+     * openGauss we select a result scale that will give at least
      * NUMERIC_MIN_SIG_DIGITS significant digits, so that numeric gives a
      * result no less accurate than float8; but use a scale not less than
      * either input's display scale.
@@ -18516,7 +18560,7 @@ int convert_int128_to_short_numeric_byscale(_out_ char* outBuf, _in_ int128 v, _
  * @IN value: input numeric value.
  * @return: Numeric - Datum points to fast numeric format
  */
-Datum try_convert_numeric_normal_to_fast(Datum value)
+Datum try_convert_numeric_normal_to_fast(Datum value, ScalarVector *arr)
 {
     Numeric val = DatumGetNumeric(value);
 
@@ -18531,7 +18575,7 @@ Datum try_convert_numeric_normal_to_fast(Datum value)
     // should be ( whole_scale <= MAXINT64DIGIT)
     if (CAN_CONVERT_BI64(whole_scale)) {
         int64 result = convert_short_numeric_to_int64_byscale(val, numVar.dscale);
-        return makeNumeric64(result, numVar.dscale);
+        return makeNumeric64(result, numVar.dscale, arr);
     } else if (CAN_CONVERT_BI128(whole_scale)) {
         int128 result = 0;
         convert_short_numeric_to_int128_byscale(val, numVar.dscale, result);
@@ -18712,6 +18756,13 @@ Numeric convert_int64_to_numeric(int64 data, uint8 scale)
     return result;
 }
 
+static inline uint16 GetNHeader(NumericVar var)
+{
+    return (var.sign == NUMERIC_NEG ? (NUMERIC_SHORT | NUMERIC_SHORT_SIGN_MASK) : NUMERIC_SHORT) |
+        ((uint32)var.dscale << NUMERIC_SHORT_DSCALE_SHIFT) | (var.weight < 0 ? NUMERIC_SHORT_WEIGHT_SIGN_MASK : 0) |
+        ((uint32)var.weight & NUMERIC_SHORT_WEIGHT_MASK);
+}
+
 /*
  * @Description: This function convert big integer128 to
  *               short numeric
@@ -18870,10 +18921,7 @@ Numeric convert_int128_to_numeric(int128 data, int scale)
         securec_check(rc, "\0", "\0");
     }
 
-    result->choice.n_short.n_header =
-        (var.sign == NUMERIC_NEG ? (NUMERIC_SHORT | NUMERIC_SHORT_SIGN_MASK) : NUMERIC_SHORT) |
-        (var.dscale << NUMERIC_SHORT_DSCALE_SHIFT) | (var.weight < 0 ? NUMERIC_SHORT_WEIGHT_SIGN_MASK : 0) |
-        (var.weight & NUMERIC_SHORT_WEIGHT_MASK);
+    result->choice.n_short.n_header = GetNHeader(var);
 
     /* Check for overflow of int64 fields */
     Assert(NUMERIC_NDIGITS(result) == (unsigned int)(pre_digits + post_digits));
@@ -18969,4 +19017,197 @@ int32 get_ndigit_from_numeric(Numeric num)
     }
 
     return result;
+}
+
+
+/*
+ * Convert int16 value to numeric.
+ */
+void int128_to_numericvar(int128 val, NumericVar* var)
+{
+    uint128 uval, newuval;
+    NumericDigit* ptr = NULL;
+    int ndigits;
+
+    /* int128 can require at most 39 decimal digits; add one for safety */
+    alloc_var(var, 40 / DEC_DIGITS);
+    if (val < 0) {
+        var->sign = NUMERIC_NEG;
+        uval = -val;
+    } else {
+        var->sign = NUMERIC_POS;
+        uval = val;
+    }
+    var->dscale = 0;
+    if (val == 0) {
+        var->ndigits = 0;
+        var->weight = 0;
+        return;
+    }
+    ptr = var->digits + var->ndigits;
+    ndigits = 0;
+    do {
+        ptr--;
+        ndigits++;
+        newuval = uval / NBASE;
+        *ptr = uval - newuval * NBASE;
+        uval = newuval;
+    } while (uval);
+    var->digits = ptr;
+    var->ndigits = ndigits;
+    var->weight = ndigits - 1;
+}
+
+/*
+ * Convert numeric to int16, rounding if needed.
+ *
+ * If overflow, return false (no error is raised).  Return true if okay.
+ */
+static bool numericvar_to_int128(const NumericVar* var, int128* result)
+{
+    NumericDigit* digits = NULL;
+    int ndigits;
+    int weight;
+    int i;
+    int128 val;
+    bool neg = false;
+    NumericVar rounded;
+
+    /* Round to nearest integer */
+    init_var(&rounded);
+    set_var_from_var(var, &rounded);
+    round_var(&rounded, 0);
+
+    /* Check for zero input */
+    strip_var(&rounded);
+    ndigits = rounded.ndigits;
+    if (ndigits == 0) {
+        *result = 0;
+        free_var(&rounded);
+        return true;
+    }
+
+    /*
+     * For input like 10000000000, we must treat stripped digits as real. So
+     * the loop assumes there are weight+1 digits before the decimal point.
+     */
+    weight = rounded.weight;
+    Assert(weight >= 0 && ndigits <= weight + 1);
+
+    /*
+     * Construct the result. To avoid issues with converting a value
+     * corresponding to INT128_MIN (which can't be represented as a positive 64
+     * bit two's complement integer), accumulate value as a negative number.
+     */
+    digits = rounded.digits;
+    neg = (rounded.sign == NUMERIC_NEG);
+    val = -digits[0];
+    for (i = 1; i <= weight; i++) {
+        if (unlikely(pg_mul_s128_overflow(val, NBASE, &val))) {
+            free_var(&rounded);
+            return false;
+        }
+
+        if (i < ndigits) {
+            if (unlikely(pg_sub_s128_overflow(val, digits[i], &val))) {
+                free_var(&rounded);
+                return false;
+            }
+        }
+    }
+
+    free_var(&rounded);
+
+    if (!neg) {
+        if (unlikely(val == PG_INT128_MIN))
+            return false;
+        val = -val;
+    }
+    *result = val;
+
+    return true;
+}
+
+Datum int16_numeric(PG_FUNCTION_ARGS)
+{
+    int128 val = PG_GETARG_INT128(0);
+    Numeric res;
+    NumericVar result;
+
+    init_var(&result);
+
+    int128_to_numericvar(val, &result);
+
+    res = make_result(&result);
+
+    free_var(&result);
+
+    PG_RETURN_NUMERIC(res);
+}
+
+int128 numeric_int16_internal(Numeric num)
+{
+    int128 result = 0;
+    NumericVar x;
+    uint16 numFlags = NUMERIC_NB_FLAGBITS(num);
+
+    if (NUMERIC_FLAG_IS_NANORBI(numFlags)) {
+        /* Handle Big Integer */
+        if (NUMERIC_FLAG_IS_BI(numFlags))
+            num = makeNumericNormal(num);
+        /* XXX would it be better to return NULL? */
+        else
+            ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("cannot convert NaN to int128")));
+    }
+
+    /* Convert to variable format and thence to int8 */
+    init_var_from_num(num, &x);
+
+    if (!numericvar_to_int128(&x, &result))
+        ereport(ERROR, (errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE), errmsg("int128 out of range")));
+
+    return result;
+}
+
+Datum numeric_int16(PG_FUNCTION_ARGS)
+{
+    Numeric num = PG_GETARG_NUMERIC(0);
+    int128 result = numeric_int16_internal(num);
+    PG_RETURN_INT128(result);
+}
+
+Datum numeric_bool(PG_FUNCTION_ARGS)
+{
+    Numeric num = PG_GETARG_NUMERIC(0);
+    bool result = false;
+    char* tmp = DatumGetCString(DirectFunctionCall1(numeric_out, NumericGetDatum(num)));
+
+    if (strcmp(tmp, "0") != 0) {
+        result = true;
+    }
+
+    pfree_ext(tmp);
+
+    PG_RETURN_BOOL(result);
+}
+
+Datum bool_numeric(PG_FUNCTION_ARGS)
+{
+    int val = 1;
+    if (PG_GETARG_BOOL(0) == false) {
+        val = 0;
+    }
+
+    Numeric res;
+    NumericVar result;
+
+    init_var(&result);
+
+    int64_to_numericvar((int64)val, &result);
+
+    res = make_result(&result);
+
+    free_var(&result);
+
+    PG_RETURN_NUMERIC(res);
 }

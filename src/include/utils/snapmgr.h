@@ -1,7 +1,7 @@
 /* -------------------------------------------------------------------------
  *
  * snapmgr.h
- *	  POSTGRES snapshot manager
+ *	  openGauss snapshot manager
  *
  * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
@@ -18,12 +18,19 @@
 #include "access/transam.h"
 
 /* Static variables representing various special snapshot semantics */
+extern PGDLLIMPORT TransactionId TransactionXmin;
 extern THR_LOCAL PGDLLIMPORT SnapshotData SnapshotNowData;
 extern THR_LOCAL PGDLLIMPORT SnapshotData SnapshotSelfData;
 extern THR_LOCAL PGDLLIMPORT SnapshotData SnapshotAnyData;
 extern THR_LOCAL PGDLLIMPORT SnapshotData SnapshotToastData;
+#ifdef ENABLE_MULTIPLE_NODES
+extern THR_LOCAL PGDLLIMPORT SnapshotData SnapshotNowNoSyncData;
+#endif
 
 #define SnapshotNow (&SnapshotNowData)
+#ifdef ENABLE_MULTIPLE_NODES
+#define SnapshotNowNoSync (&SnapshotNowNoSyncData)
+#endif
 #define SnapshotSelf (&SnapshotSelfData)
 #define SnapshotAny (&SnapshotAnyData)
 #define SnapshotToast (&SnapshotToastData)
@@ -36,8 +43,12 @@ extern THR_LOCAL PGDLLIMPORT SnapshotData SnapshotToastData;
 
 extern bool XidVisibleInSnapshot(TransactionId xid, Snapshot snapshot, TransactionIdStatus *hintstatus,
                                                         Buffer buffer, bool *sync);
-extern bool XidVisibleInLocalSnapshot(TransactionId xid, Snapshot snapshot);
+extern bool UHeapXidVisibleInSnapshot(TransactionId xid, Snapshot snapshot, TransactionIdStatus *hintstatus,
+    Buffer buffer, bool *sync);
+extern bool XidVisibleInDecodeSnapshot(TransactionId xid, Snapshot snapshot,
+    TransactionIdStatus* hintstatus, Buffer buffer);
 extern bool CommittedXidVisibleInSnapshot(TransactionId xid, Snapshot snapshot, Buffer buffer);
+extern bool CommittedXidVisibleInDecodeSnapshot(TransactionId xid, Snapshot snapshot, Buffer buffer);
 extern bool IsXidVisibleInGtmLiteLocalSnapshot(TransactionId xid, Snapshot snapshot, TransactionIdStatus hint_status,
                                                                                     bool xmin_equal_xmax, Buffer buffer, bool *sync);
 /*
@@ -47,15 +58,20 @@ extern bool IsXidVisibleInGtmLiteLocalSnapshot(TransactionId xid, Snapshot snaps
  */
 #define InitDirtySnapshot(snapshotdata) ((snapshotdata).satisfies = SNAPSHOT_DIRTY)
 
+#define IsVersionMVCCSnapshot(snapshot) \
+    (((snapshot)->satisfies) == SNAPSHOT_VERSION_MVCC || \
+    ((snapshot)->satisfies) == SNAPSHOT_DELTA || \
+    ((snapshot)->satisfies) == SNAPSHOT_LOST)
+
 /* This macro encodes the knowledge of which snapshots are MVCC-safe */
 #define IsMVCCSnapshot(snapshot) \
-    ((((snapshot)->satisfies) == SNAPSHOT_MVCC) || (((snapshot)->satisfies) == SNAPSHOT_HISTORIC_MVCC))
+    ((((snapshot)->satisfies) == SNAPSHOT_MVCC) || (((snapshot)->satisfies) == SNAPSHOT_HISTORIC_MVCC) || \
+        (((snapshot)->satisfies) == SNAPSHOT_DECODE_MVCC) || IsVersionMVCCSnapshot(snapshot))
 
 extern Snapshot GetTransactionSnapshot(bool force_local_snapshot = false);
 extern Snapshot GetLatestSnapshot(void);
 extern Snapshot GetCatalogSnapshot();
 extern void SnapshotSetCommandId(CommandId curcid);
-extern Snapshot GetNonHistoricCatalogSnapshot(Oid relid);
 
 extern void PushActiveSnapshot(Snapshot snapshot);
 extern void PushCopiedSnapshot(Snapshot snapshot);
@@ -63,6 +79,8 @@ extern void UpdateActiveSnapshotCommandId(void);
 extern void PopActiveSnapshot(void);
 extern Snapshot GetActiveSnapshot(void);
 extern bool ActiveSnapshotSet(void);
+
+extern void FreeSnapshotDeepForce(Snapshot snap);
 
 extern Snapshot RegisterSnapshot(Snapshot snapshot);
 extern void UnregisterSnapshot(Snapshot snapshot);

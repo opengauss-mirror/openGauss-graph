@@ -67,4 +67,9 @@ extern bool is_func_distinct_unshippable(Oid funcid);
 
 extern bool lockNextvalWalker(Node* node, void* context);
 
+extern Node *raw_expression_tree_mutator(Node *node, Node *(*mutator) (Node*, void*),
+										 void *context);
+
+// extern Node* strip_implicit_coercions(Node *node);
+
 #endif /* NODEFUNCS_H */

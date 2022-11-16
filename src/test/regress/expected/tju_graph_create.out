@@ -1,0 +1,74 @@
+create graph test;
+NOTICE:  CREATE TABLE / PRIMARY KEY will create implicit index "gs_vertex_pkey" for table "gs_vertex"
+set graph_path=test;
+show graph_path;
+ graph_path 
+------------
+ test
+(1 row)
+
+drop graph test cascade;
+NOTICE:  drop cascades to 3 other objects
+DETAIL:  drop cascades to sequence test.gs_label_seq
+drop cascades to unrecognized object 8145 16399 0
+drop cascades to unrecognized object 8145 16413 0
+create graph test;
+NOTICE:  CREATE TABLE / PRIMARY KEY will create implicit index "gs_vertex_pkey" for table "gs_vertex"
+set graph_path=test;
+CREATE VLABEL person;
+NOTICE:  merging column "id" with inherited definition
+NOTICE:  merging column "properties" with inherited definition
+NOTICE:  CREATE TABLE / PRIMARY KEY will create implicit index "person_pkey" for table "person"
+CREATE VLABEL friend inherits (person);
+NOTICE:  merging column "id" with inherited definition
+NOTICE:  merging column "properties" with inherited definition
+NOTICE:  CREATE TABLE / PRIMARY KEY will create implicit index "friend_pkey" for table "friend"
+CREATE ELABEL knows;
+NOTICE:  merging column "id" with inherited definition
+NOTICE:  merging column "start" with inherited definition
+NOTICE:  merging column "end" with inherited definition
+NOTICE:  merging column "properties" with inherited definition
+CREATE ELABEL live_together;
+NOTICE:  merging column "id" with inherited definition
+NOTICE:  merging column "start" with inherited definition
+NOTICE:  merging column "end" with inherited definition
+NOTICE:  merging column "properties" with inherited definition
+CREATE ELABEL room_mate inherits (knows, live_together);
+NOTICE:  merging multiple inherited definitions of column "id"
+NOTICE:  merging multiple inherited definitions of column "start"
+NOTICE:  merging multiple inherited definitions of column "end"
+NOTICE:  merging multiple inherited definitions of column "properties"
+NOTICE:  merging column "id" with inherited definition
+NOTICE:  merging column "start" with inherited definition
+NOTICE:  merging column "end" with inherited definition
+NOTICE:  merging column "properties" with inherited definition
+DROP VLABEL friend;
+DROP ELABEL knows CASCADE;
+NOTICE:  drop cascades to unrecognized object 8145 16519 0
+CREATE VLABEL person;
+ERROR:  label "person" already exists
+CREATE VLABEL friend inherits (person);
+NOTICE:  merging column "id" with inherited definition
+NOTICE:  merging column "properties" with inherited definition
+NOTICE:  CREATE TABLE / PRIMARY KEY will create implicit index "friend_pkey" for table "friend"
+CREATE ELABEL knows;
+NOTICE:  merging column "id" with inherited definition
+NOTICE:  merging column "start" with inherited definition
+NOTICE:  merging column "end" with inherited definition
+NOTICE:  merging column "properties" with inherited definition
+CREATE ELABEL live_together;
+ERROR:  label "live_together" already exists
+CREATE ELABEL room_mate inherits (knows, live_together);
+NOTICE:  merging multiple inherited definitions of column "id"
+NOTICE:  merging multiple inherited definitions of column "start"
+NOTICE:  merging multiple inherited definitions of column "end"
+NOTICE:  merging multiple inherited definitions of column "properties"
+NOTICE:  merging column "id" with inherited definition
+NOTICE:  merging column "start" with inherited definition
+NOTICE:  merging column "end" with inherited definition
+NOTICE:  merging column "properties" with inherited definition
+cypher CREATE (:person {name: 'Tom'})-[:knows {fromdate:'2011-11-24'}]->(:person {name: 'Summer'});
+cypher CREATE (:person {name: 'Pat'})-[:knows {fromdate:'2013-12-25'}]->(:person {name: 'Nikki'});
+cypher CREATE (:person {name: 'Olive'})-[:knows {fromdate:'2015-01-26'}]->(:person {name: 'Todd'});
+cypher MATCH (p:Person {name: 'Tom'}),(k:Person{name: 'Pat'}) CREATE (p)-[:KNOWS {fromdate:'2017-02-27'} ]->(k);
+cypher MATCH (:person {name: 'Tom'})-[r:knows]->(:person {name: 'Summer'}) SET r.since = '2009-01-08';

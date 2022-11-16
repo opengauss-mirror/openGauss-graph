@@ -5,6 +5,7 @@
  * Routines to support SELinux labels (security context)
  *
  * Copyright (c) 2010-2012, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2021, openGauss Contributors
  *
  * -------------------------------------------------------------------------
  */
@@ -358,7 +359,7 @@ void sepgsql_init_client_label(void)
     /*
      * Set up dummy client label.
      *
-     * XXX - note that PostgreSQL launches background worker process like
+     * XXX - note that openGauss launches background worker process like
      * autovacuum without authentication steps. So, we initialize sepgsql_mode
      * with SEPGSQL_MODE_INTERNAL, and client_label with the security context
      * of server process. Later, it also launches background of user session.
@@ -680,7 +681,7 @@ static void exec_object_restorecon(struct selabel_handle* sehnd, Oid catalogId)
 
                 if (relForm->relkind == RELKIND_RELATION)
                     objtype = SELABEL_DB_TABLE;
-                else if (relForm->relkind == RELKIND_SEQUENCE)
+                else if (RELKIND_IS_SEQUENCE(relForm->relkind))
                     objtype = SELABEL_DB_SEQUENCE;
                 else if (relForm->relkind == RELKIND_VIEW || (relForm->relkind == RELKIND_CONTQUERY)
                     objtype = SELABEL_DB_VIEW;

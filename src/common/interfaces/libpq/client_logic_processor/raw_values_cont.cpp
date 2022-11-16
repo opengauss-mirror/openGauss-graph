@@ -289,12 +289,7 @@ bool RawValues::get_raw_values_from_consts_vec(const ExprPartsList *expr_parts_l
     int offset, RawValuesList *raw_values_list)
 {
     for (size_t i = 0; i < expr_parts_list->size(); i++) {
-        /*
-         * get rawbvalue from a.col1 = 'value' not a.col1 =b.col2
-         */
-        if (expr_parts_list->at(i)->column_refl == NULL && expr_parts_list->at(i)->column_refr == NULL) {
-            raw_values_list->add(get_raw_values_from_ExprParts(expr_parts_list->at(i), statement_data, offset));
-        }
+        raw_values_list->add(get_raw_values_from_ExprParts(expr_parts_list->at(i), statement_data, offset));
     }
     return true;
 }
@@ -344,7 +339,9 @@ bool RawValues::get_unprocessed_data(const RawValuesList *raw_values_list, const
             raw_value->m_processed_data_size <= 3) {
             return false;
         }
-        int x = strncmp((const char *)raw_value->m_processed_data + 1, (const char *)processed_data,
+
+        unsigned char offset = raw_value->m_is_param ? 0 : 1;
+        int x = strncmp((const char *)raw_value->m_processed_data + offset, (const char *)processed_data,
             raw_value->m_processed_data_size - 3);
         if (x == 0) {
             if (raw_value->m_data[0] == '\'') {

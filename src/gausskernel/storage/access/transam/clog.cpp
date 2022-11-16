@@ -1,6 +1,6 @@
 /*
  * clog.cpp
- *		PostgreSQL transaction-commit-log manager
+ *		openGauss transaction-commit-log manager
  *
  * This module replaces the old "pg_log" access code, which treated pg_log
  * essentially like a relation, in that it went through the regular buffer
@@ -38,13 +38,14 @@
 #include "access/clog.h"
 #include "access/slru.h"
 #include "access/transam.h"
+#include "access/twophase.h"
 #include "access/xlog.h"
 #include "access/xloginsert.h"
 #include "access/xlogutils.h"
 #include "miscadmin.h"
 #include "pgstat.h"
 #include "pg_trace.h"
-#include "storage/fd.h"
+#include "storage/smgr/fd.h"
 #include "storage/proc.h"
 #ifdef USE_ASSERT_CHECKING
 #include "utils/builtins.h"
@@ -654,6 +655,10 @@ void CLOGShmemInit(void)
     int rc = 0;
     char name[SLRU_MAX_NAME_LENGTH];
 
+    MemoryContext old = MemoryContextSwitchTo(THREAD_GET_MEM_CXT_GROUP(MEMORY_CONTEXT_DEFAULT));
+    t_thrd.shemem_ptr_cxt.ClogCtl = (SlruCtlData*)palloc0(NUM_CLOG_PARTITIONS * sizeof(SlruCtlData));
+    (void)MemoryContextSwitchTo(old);
+
     for (i = 0; i < NUM_CLOG_PARTITIONS; i++) {
         rc = sprintf_s(name, SLRU_MAX_NAME_LENGTH, "%s%d", "CLOG Ctl", i);
         securec_check_ss(rc, "", "");
@@ -813,7 +818,7 @@ void CheckPointCLOG(void)
     for (int i = 0; i < NUM_CLOG_PARTITIONS; i++) {
         flush_num += SimpleLruFlush(ClogCtl(i), true);
     }
-    g_instance.ckpt_cxt_ctl->ckpt_clog_flush_num += flush_num;
+    g_instance.ckpt_cxt_ctl->ckpt_view.ckpt_clog_flush_num += flush_num;
     TRACE_POSTGRESQL_CLOG_CHECKPOINT_DONE(true);
 }
 
@@ -1051,6 +1056,7 @@ void TruncateCLOG(TransactionId oldestXact)
 
     /* Now we can remove the old CLOG segment(s) */
     SimpleLruTruncate(ClogCtl(0), cutoffPage, NUM_CLOG_PARTITIONS);
+    DeleteObsoleteTwoPhaseFile(cutoffPage);
 
     ereport(LOG, (errmsg("Truncate CLOG at xid %lu", oldestXact)));
 }
@@ -1119,6 +1125,7 @@ void clog_redo(XLogReaderState *record)
         ClogCtl(pageno)->shared->latest_page_number = pageno;
 
         SimpleLruTruncate(ClogCtl(0), pageno, NUM_CLOG_PARTITIONS);
+        DeleteObsoleteTwoPhaseFile(pageno);
     } else
         ereport(PANIC, (errmsg("clog_redo: unknown op code %u", (uint32)info)));
 }
@@ -1230,7 +1237,7 @@ static int gs_fault_inject_impl(int64 fit_type, text *arg1, text *arg2, text *ar
     switch (fit_type) {
 #ifdef FAULT_INJECTION_TEST
         case FIT_CLOG_EXTEND_PAGE:
-            ret = FIT_clog_extend_page(conv_text2int(arg1), conv_text2int(arg2));
+            ret = FIT_clgaog_extend_page(conv_text2int(arg1), conv_text2int(arg2));
             break;
         case FIT_CLOG_READ_PAGE:
             ret = FIT_clog_read_page(conv_text2int(arg1), conv_text2int(arg2));

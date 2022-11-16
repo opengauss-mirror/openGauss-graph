@@ -42,11 +42,7 @@
 
 /* Configuration variables */
 #define MAX_GTM_HOST_NUM (8)
-#ifdef ENABLE_MULTIPLE_NODES
-#define GUC_MAX_REPLNODE_NUM (8)
-#else
-#define GUC_MAX_REPLNODE_NUM (9)
-#endif
+#define GUC_MAX_REPLNODE_NUM (19)
 
 #ifdef WIN32
 typedef unsigned __int64 GS_UINT64;
@@ -72,4 +68,8 @@ const int GTMOPTION_GTMFREE = 2;
 const int GTM_OLD_VERSION_NUM = 92061;
 const int SLOW_QUERY_VERSION = 92089;
 const int STATEMENT_TRACK_VERSION = 92277;
+const int DEFAULT_INDEX_KIND_NONE = 0;
+const int DEFAULT_INDEX_KIND_LOCAL = 1;
+const int DEFAULT_INDEX_KIND_GLOBAL = 2;
+const int GLOBAL_SESSION_ID_VERSION = 92407;
 #endif /* SRC_INCLUDE_KNL_KNL_GUC_COMMON_H_ */

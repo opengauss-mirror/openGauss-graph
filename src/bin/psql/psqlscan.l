@@ -90,6 +90,7 @@ typedef enum
     IDEN_NO,
     IDEN_SCROLL,
     IDEN_DETERMINISTIC,
+	IDEN_PACKAGE,
     IDEN_BUTT,
 }GramIdentify;
 
@@ -143,6 +144,7 @@ typedef struct PsqlScanStateData
 	int		butt_num;		/* identifier(not include identifier declared in enum GramIdentify) encountered number after DECLARE. 
 						   For sql like "Declare foo CURSOR XXX, butt_num is 1.
 						   Using this we can judge if the sql is a DECLARE CURSOR stmt */
+	bool		include_ora_comment; /* dont igore comment when ture, such as single line comment after function/procedure param */
 } PsqlScanStateData;
 
 static PsqlScanState cur_state;	/* current state while active */
@@ -192,6 +194,7 @@ static void init_gram_state(PsqlScanState state);
 static void analyze_state(const char* text,PsqlScanState state);
 static int upperstrcmp(const char *str1,const char *str2);
 static  GramIdentify keywordRead(const char* text);
+static bool IsTranscationTokens(char* yytext, char* token);
 
 #define YY_DECL int yylex(PsqlScanState lex_param)
 
@@ -489,11 +492,13 @@ other			.
 					 * Note that the whitespace rule includes both true
 					 * whitespace and single-line ("--" style) comments.
 					 * We suppress whitespace at the start of the query
-					 * buffer.  We also suppress all single-line comments,
+					 * buffer.  We also suppress all single-line comments
+					 * (except comments for function and procedure),
 					 * which is pretty dubious but is the historical
 					 * behavior.
 					 */
-					if (!(output_buf->len == 0 || yytext[0] == '-'))
+					if (!(output_buf->len == 0
+						|| (yytext[0] == '-' && (!cur_state->include_ora_comment))))
 						ECHO;
 				}
 
@@ -633,13 +638,13 @@ other			.
 					if (lex_param->begin_state == BEGIN_UNDEFINED)
 					{
 						/* For a transaction statement, all possible tokens after BEGIN are here */
-						if (strncasecmp(yytext, "transaction", strlen("transaction")) == 0 ||
-							 strncasecmp(yytext, "work", strlen("work")) == 0 ||
-							 strncasecmp(yytext, "isolation", strlen("isolation")) == 0 ||
-							 strncasecmp(yytext, "read", strlen("read")) == 0 ||
-							 strncasecmp(yytext, "deferrable", strlen("deferrable")) == 0 ||
-							 strncasecmp(yytext, "not", strlen("not")) == 0 ||
-							 strncasecmp(yytext, ";", strlen(";")) == 0)
+						if (IsTranscationTokens(yytext, "transaction") ||
+							IsTranscationTokens(yytext, "work") ||
+                            IsTranscationTokens(yytext, "isolation") ||
+                            IsTranscationTokens(yytext, "read") ||
+                            IsTranscationTokens(yytext, "deferrable") ||
+                            IsTranscationTokens(yytext, "not") ||
+							strncasecmp(yytext, ";", strlen(";")) == 0)
 							lex_param->begin_state = BEGIN_TRANSACTION;
 						else
 							lex_param->begin_state = BEGIN_ANOYBLOCK;
@@ -1845,7 +1850,6 @@ evaluate_backtick(void)
 			cmd_output.len--;
 		appendBinaryPQExpBuffer(output_buf, cmd_output.data, cmd_output.len);
 	}
-
 	termPQExpBuffer(&cmd_output);
 }
 
@@ -2038,6 +2042,23 @@ extract_substring(const char *txt, int len)
 	return result;
 }
 
+static bool IsTranscationTokens(char* yytext, char* token)
+{
+    int token_len = strlen(token);
+    if (strncasecmp(yytext, token, token_len) == 0) {
+        if (strlen(yytext) > token_len) {
+            if ((yytext[token_len] >= '0' && yytext[token_len] <= '9') ||
+                (yytext[token_len] >= 'a' && yytext[token_len] <= 'z') ||
+                (yytext[token_len] >= 'A' && yytext[token_len] <= 'Z') ||
+                yytext[token_len] == '_') {
+                return false;
+            }
+        }
+        return true;
+    }
+    return false;
+}
+
 /*
  * escape_variable --- process :'VARIABLE' or :"VARIABLE"
  *
@@ -2105,6 +2126,8 @@ init_gram_state(PsqlScanStateData* state)
 {
 	int  i = 0;
 
+	state->include_ora_comment = false;
+
 	for (; i < IDEN_BUTT ; i++)
 		state->gram_state[i] = false;
 }
@@ -2125,6 +2148,8 @@ keywordRead(const char* text)
 		return IDEN_REPLACE;
 	else if (!upperstrcmp(text, "procedure"))
 		return IDEN_PROCEDURE;
+    else if (!upperstrcmp(text, "package"))
+        return IDEN_PACKAGE;
 	else if (!upperstrcmp(text, "return"))
 		return IDEN_RETURN;
 	else if (!upperstrcmp(text, "returns"))
@@ -2194,6 +2219,7 @@ analyze_state(const char* text,PsqlScanStateData* state)
 			state->gram_state[IDEN_PROCEDURE] = true;
 			state->gram_state[IDEN_FUNCTION] = true;
 			state->gram_state[IDEN_TRIGGER] = true;
+			state->gram_state[IDEN_PACKAGE] = true;
 			state->count_to_read++;
 			break;
 		case IDEN_OR:
@@ -2203,21 +2229,31 @@ analyze_state(const char* text,PsqlScanStateData* state)
 		case IDEN_REPLACE:
 			state->gram_state[IDEN_PROCEDURE] = true;
 			state->gram_state[IDEN_FUNCTION] = true;
+			state->gram_state[IDEN_PACKAGE] = true;
 			state->gram_state[IDEN_TRIGGER] = true;
 			state->count_to_read++;
 			break;
 		case IDEN_PROCEDURE:
 			state->gram_state[IDEN_AS] = true;
 			state->gram_state[IDEN_IS] = true;
+			state->include_ora_comment = true;
 			state->count_to_read = -1;
 			break;
+        case IDEN_PACKAGE:
+            state->gram_state[IDEN_AS] = true;
+            state->gram_state[IDEN_IS] = true;
+            state->gram_state[IDEN_RETURN] = true;
+            state->gram_state[IDEN_RETURNS] = true;
+			state->include_ora_comment = true;
+            state->count_to_read = -1;
+            break;
 		case IDEN_RETURN:
                         /* when meet a RETURN, we can read max identify number is 7  */
                         /* for example:RETURN INTEGER RETURNS NULL ON NULL INPUT  */
 			state->gram_state[IDEN_AS] = true;
 			state->gram_state[IDEN_IS] = true;
 			state->gram_state[IDEN_DETERMINISTIC] = true;
-			state->count_to_read = 7;
+			state->count_to_read = -1;
 			break;
 		case IDEN_DETERMINISTIC:
                         /* when meet a DETERMINISTIC, we can read max identify number is 6  */
@@ -2231,11 +2267,13 @@ analyze_state(const char* text,PsqlScanStateData* state)
 		case IDEN_FUNCTION:
 			state->gram_state[IDEN_RETURN] = true;
 			state->gram_state[IDEN_RETURNS] = true;
+			state->include_ora_comment = true;
 			state->count_to_read = -1;
 			break;
 		case IDEN_AS:
 		case IDEN_IS:
 			state->count_to_read = 0;
+			state->include_ora_comment = false;
 			BEGIN(xp);
 			break;
 		case IDEN_TRIGGER:

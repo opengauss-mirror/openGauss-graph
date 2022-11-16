@@ -1,7 +1,7 @@
 /* -------------------------------------------------------------------------
  *
  * elog.h
- *	  POSTGRES error reporting/logging definitions.
+ *	  openGauss error reporting/logging definitions.
  *
  *
  * Portions Copyright (c) 2020 Huawei Technologies Co.,Ltd.
@@ -219,7 +219,7 @@ extern int errhint(const char* fmt, ...)
     } while (0)
 #else
 #define elog elog_start(__FILE__, __LINE__, PG_FUNCNAME_MACRO), elog_finish
-#endif /* PCLINT_CHECK */
+#endif
 
 extern void elog_start(const char* filename, int lineno, const char* funcname);
 extern void elog_finish(int elevel, const char* fmt, ...)

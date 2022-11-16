@@ -166,7 +166,7 @@ Datum btint84cmp(PG_FUNCTION_ARGS)
     int64 a = PG_GETARG_INT64(0);
     int32 b = PG_GETARG_INT32(1);
     if (a > b)
-        PG_RETURN_INT32(1);
+    PG_RETURN_INT32(1);
     else if (a == b)
         PG_RETURN_INT32(0);
     else

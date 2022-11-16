@@ -1,5 +1,5 @@
 /*
- * psql - the PostgreSQL interactive terminal
+ * psql - the openGauss interactive terminal
  *
  * Copyright (c) 2000-2012, PostgreSQL Global Development Group
  *
@@ -88,6 +88,7 @@ typedef struct printTableOpt {
     int encoding;                      /* character encoding */
     int env_columns;                   /* $COLUMNS on psql start, 0 is unset */
     int columns;                       /* target width for wrapped format */
+    bool feedback;                  /* don't output row counts, etc. */
 } printTableOpt;
 
 /*

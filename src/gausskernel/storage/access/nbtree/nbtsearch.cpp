@@ -1,7 +1,7 @@
 /* -------------------------------------------------------------------------
  *
  * nbtsearch.cpp
- *	  Search code for postgres btrees.
+ *	  Search code for openGauss btrees.
  *
  *
  * Portions Copyright (c) 2020 Huawei Technologies Co.,Ltd.
@@ -30,9 +30,9 @@
 #include "catalog/pg_proc.h"
 
 static bool _bt_readpage(IndexScanDesc scan, ScanDirection dir, OffsetNumber offnum);
-static void _bt_saveitem(BTScanOpaque so, int itemIndex, OffsetNumber offnum, IndexTuple itup, Oid partOid);
+static void _bt_saveitem(BTScanOpaque so, int itemIndex, OffsetNumber offnum, IndexTuple itup, Oid partOid,
+    int2 bucketid);
 static bool _bt_steppage(IndexScanDesc scan, ScanDirection dir);
-static Buffer _bt_walk_left(Relation rel, Buffer buf);
 static bool _bt_endpoint(IndexScanDesc scan, ScanDirection dir);
 static void _bt_check_natts_correct(const Relation index, Page page, OffsetNumber offnum);
 
@@ -59,6 +59,7 @@ static void _bt_check_natts_correct(const Relation index, Page page, OffsetNumbe
 BTStack _bt_search(Relation rel, int keysz, ScanKey scankey, bool nextkey, Buffer *bufP, int access, bool needStack)
 {
     BTStack stack_in = NULL;
+    int page_access = BT_READ;
 
     /* Get the root page to start with */
     *bufP = _bt_getroot(rel, access);
@@ -89,7 +90,7 @@ BTStack _bt_search(Relation rel, int keysz, ScanKey scankey, bool nextkey, Buffe
          * if the leaf page is split and we insert to the parent page).  But
          * this is a good opportunity to finish splits of internal pages too.
          */
-        *bufP = _bt_moveright(rel, *bufP, keysz, scankey, nextkey, (access == BT_WRITE), stack_in, BT_READ);
+        *bufP = _bt_moveright(rel, *bufP, keysz, scankey, nextkey, (access == BT_WRITE), stack_in, page_access);
 
         /* if this is a leaf page, we're done */
         page = BufferGetPage(*bufP);
@@ -125,12 +126,40 @@ BTStack _bt_search(Relation rel, int keysz, ScanKey scankey, bool nextkey, Buffe
             new_stack->bts_parent = stack_in;
         }
 
+		/*
+		 * Page level 1 is lowest non-leaf page level prior to leaves.  So, if
+		 * we're on the level 1 and asked to lock leaf page in write mode,
+		 * then lock next page in write mode, because it must be a leaf.
+		 */
+		if (opaque->btpo.level == 1 && access == BT_WRITE)
+			page_access = BT_WRITE;
+
         /* drop the read lock on the parent page, acquire one on the child */
-        *bufP = _bt_relandgetbuf(rel, *bufP, blkno, BT_READ);
+        *bufP = _bt_relandgetbuf(rel, *bufP, blkno, page_access);
 
         /* okay, all set to move down a level */
         stack_in = new_stack;
     }
+
+	/*
+	 * If we're asked to lock leaf in write mode, but didn't manage to, then
+	 * relock.  This should only happen when the root page is a leaf page (and
+	 * the only page in the index other than the metapage).
+	 */
+	if (access == BT_WRITE && page_access == BT_READ)
+	{
+		/* trade in our read lock for a write lock */
+		LockBuffer(*bufP, BUFFER_LOCK_UNLOCK);
+		LockBuffer(*bufP, BT_WRITE);
+
+		/*
+		 * Race -- the leaf page may have split after we dropped the read lock
+		 * but before we acquired a write lock.  If it has, we may need to
+		 * move right to its new sibling.  Do that.
+		 */
+		*bufP = _bt_moveright(rel, *bufP, keysz, scankey, nextkey, true, stack_in, BT_WRITE);
+	}
+
 
     return stack_in;
 }
@@ -931,6 +960,9 @@ bool _bt_first(IndexScanDesc scan, ScanDirection dir)
     if (scan->xs_want_ext_oid && GPIScanCheckPartOid(scan->xs_gpi_scan, currItem->partitionOid)) {
         GPISetCurrPartOid(scan->xs_gpi_scan, currItem->partitionOid);
     }
+    if (scan->xs_want_bucketid && cbi_scan_need_change_bucket(scan->xs_cbi_scan, currItem->bucketid)) {
+        cbi_set_bucketid(scan->xs_cbi_scan, currItem->bucketid);
+    }
 
     return true;
 }
@@ -990,6 +1022,10 @@ bool _bt_next(IndexScanDesc scan, ScanDirection dir)
         GPISetCurrPartOid(scan->xs_gpi_scan, currItem->partitionOid);
     }
 
+    if (scan->xs_want_bucketid && cbi_scan_need_change_bucket(scan->xs_cbi_scan, currItem->bucketid)) {
+        cbi_set_bucketid(scan->xs_cbi_scan, currItem->bucketid);
+    }
+
     return true;
 }
 
@@ -1022,15 +1058,13 @@ static bool _bt_readpage(IndexScanDesc scan, ScanDirection dir, OffsetNumber off
     AttrNumber PartitionOidAttr;
     Oid partOid = InvalidOid;
     Oid heapOid = IndexScanGetPartHeapOid(scan);
-    bool isnull = false;
+    int2 bucketid = InvalidBktId;
 
     tupdesc = RelationGetDescr(scan->indexRelation);
     PartitionOidAttr = IndexRelationGetNumberOfAttributes(scan->indexRelation);
 
     /* we must have the buffer pinned and locked */
     Assert(BufferIsValid(so->currPos.buf));
-    /* We've pinned the buffer, nobody can prune this buffer, check whether snapshot is valid. */
-    CheckSnapshotIsValidException(scan->xs_snapshot, "_bt_readpage");
 
     page = BufferGetPage(so->currPos.buf);
     opaque = (BTPageOpaqueInternal)PageGetSpecialPointer(page);
@@ -1056,14 +1090,12 @@ static bool _bt_readpage(IndexScanDesc scan, ScanDirection dir, OffsetNumber off
         while (offnum <= maxoff) {
             itup = _bt_checkkeys(scan, page, offnum, dir, &continuescan);
             if (itup != NULL) {
-                /* Get partition oid for global partition index */
-                isnull = false;
-                partOid = scan->xs_want_ext_oid
-                              ? DatumGetUInt32(index_getattr(itup, PartitionOidAttr, tupdesc, &isnull))
-                              : heapOid;
-                Assert(!isnull);
+                /* Get partition oid for global partition index. */
+                partOid = scan->xs_want_ext_oid ? index_getattr_tableoid(scan->indexRelation, itup) : heapOid;
+                /* Get bucketid for crossbucket index. */
+                bucketid = scan->xs_want_bucketid ? index_getattr_bucketid(scan->indexRelation, itup) : InvalidBktId;
                 /* tuple passes all scan key conditions, so remember it */
-                _bt_saveitem(so, itemIndex, offnum, itup, partOid);
+                _bt_saveitem(so, itemIndex, offnum, itup, partOid, bucketid);
                 itemIndex++;
             }
             if (!continuescan) {
@@ -1088,14 +1120,11 @@ static bool _bt_readpage(IndexScanDesc scan, ScanDirection dir, OffsetNumber off
         while (offnum >= minoff) {
             itup = _bt_checkkeys(scan, page, offnum, dir, &continuescan);
             if (itup != NULL) {
-                isnull = false;
-                partOid = scan->xs_want_ext_oid
-                              ? DatumGetUInt32(index_getattr(itup, PartitionOidAttr, tupdesc, &isnull))
-                              : heapOid;
-                Assert(!isnull);
+                partOid = scan->xs_want_ext_oid ? index_getattr_tableoid(scan->indexRelation, itup) : heapOid;
+                bucketid = scan->xs_want_bucketid ? index_getattr_bucketid(scan->indexRelation, itup) : InvalidBktId;
                 /* tuple passes all scan key conditions, so remember it */
                 itemIndex--;
-                _bt_saveitem(so, itemIndex, offnum, itup, partOid);
+                _bt_saveitem(so, itemIndex, offnum, itup, partOid, bucketid);
             }
             if (!continuescan) {
                 /* there can't be any more matches, so stop */
@@ -1116,13 +1145,16 @@ static bool _bt_readpage(IndexScanDesc scan, ScanDirection dir, OffsetNumber off
 }
 
 /* Save an index item into so->currPos.items[itemIndex] */
-static void _bt_saveitem(BTScanOpaque so, int itemIndex, OffsetNumber offnum, const IndexTuple itup, Oid partOid)
+static void _bt_saveitem(BTScanOpaque so, int itemIndex, OffsetNumber offnum, const IndexTuple itup, Oid partOid,
+    int2 bucketid)
 {
     BTScanPosItem *currItem = &so->currPos.items[itemIndex];
 
     currItem->heapTid = itup->t_tid;
     currItem->indexOffset = offnum;
     currItem->partitionOid = partOid;
+    currItem->bucketid = bucketid;
+
     if (so->currTuples) {
         Size itupsz = IndexTupleSize(itup);
 
@@ -1273,7 +1305,7 @@ static bool _bt_steppage(IndexScanDesc scan, ScanDirection dir)
  * to be half-dead; the caller should check that condition and step left
  * again if it's important.
  */
-static Buffer _bt_walk_left(Relation rel, Buffer buf)
+Buffer _bt_walk_left(Relation rel, Buffer buf)
 {
     Page page;
     BTPageOpaqueInternal opaque;
@@ -1534,6 +1566,10 @@ static bool _bt_endpoint(IndexScanDesc scan, ScanDirection dir)
 
     if (scan->xs_want_ext_oid && GPIScanCheckPartOid(scan->xs_gpi_scan, currItem->partitionOid)) {
         GPISetCurrPartOid(scan->xs_gpi_scan, currItem->partitionOid);
+    }
+
+    if (scan->xs_want_bucketid && cbi_scan_need_change_bucket(scan->xs_cbi_scan, currItem->bucketid)) {
+        cbi_set_bucketid(scan->xs_cbi_scan, currItem->bucketid);
     }
 
     return true;

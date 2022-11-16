@@ -124,10 +124,13 @@
 
 #include "access/xloginsert.h"
 #include "access/htup.h"
+#include "access/ustore/knl_upage.h"
+#include "access/ustore/knl_utuptoaster.h"
+#include "access/ustore/knl_uhio.h"
 #include "storage/buf/bufmgr.h"
-#include "storage/fd.h"
+#include "storage/smgr/fd.h"
 #include "storage/pagecompress.h"
-#include "storage/smgr.h"
+#include "storage/smgr/smgr.h"
 #include "utils/aiomem.h"
 #include "utils/guc.h"
 #include "utils/memutils.h"
@@ -140,6 +143,7 @@
 /* Max tuple number && size of one batch tuples */
 const int DEFAULTBUFFEREDTUPLES = 10000;
 const Size DEFAULTBUFFERSIZE = (4 * 1024 * 1024);
+static const int DEFAULT_SPECIAL_SIZE = 32;
 
 #define REWRITE_BUFFERS_QUEUE_COUNT 1024
 
@@ -156,6 +160,8 @@ typedef struct RewriteStateData {
     bool rs_use_wal;              /* must we WAL-log inserts? */
     TransactionId rs_oldest_xmin; /* oldest xmin used by caller to determine tuple visibility */
     TransactionId rs_freeze_xid;  /* Xid that will be used as freeze cutoff point */
+    MultiXactId	rs_freeze_multi;  /* MultiXactId that will be used as freeze
+                                   * cutoff point for multixacts */
 
     MemoryContext rs_cxt;        /* for hash tables and entries and tuples in them */
     HTAB *rs_unresolved_tups;    /* unmatched A tuples */
@@ -206,11 +212,15 @@ typedef OldToNewMappingData *OldToNewMapping;
 
 /* prototypes for internal functions */
 static void raw_heap_insert(RewriteState state, HeapTuple tup);
+static void RawUHeapInsert(RewriteState state, UHeapTuple tup);
 static void RawHeapCmprAndMultiInsert(RewriteState state, bool is_last);
-static void copyHeapTupleInfo(HeapTuple dest_tup, HeapTuple src_tup, TransactionId freeze_xid);
+static void copyHeapTupleInfo(HeapTuple dest_tup, HeapTuple src_tup, TransactionId freeze_xid, MultiXactId freeze_mxid);
+#ifndef ENABLE_LITE_MODE
 static void rewrite_page_list_write(RewriteState state);
+#endif
 static void rewrite_flush_page(RewriteState state, Page page);
 static void rewrite_end_flush_page(RewriteState state);
+static void rewrite_write_one_page(RewriteState state, Page page);
 
 /*
  * Begin a rewrite of a table
@@ -278,7 +288,9 @@ RewriteState begin_heap_rewrite(Relation old_heap, Relation new_heap, Transactio
      * even new_heap is a partitional relation, its rd_rel is copied from its pareent
      * relation. so don't worry the compress property about new_heap;
      */
-    state->rs_doCmprFlag = RowRelationIsCompressed(new_heap);
+    if (!RelationIsUstoreFormat(old_heap))
+        state->rs_doCmprFlag = RowRelationIsCompressed(new_heap);
+
     if (state->rs_doCmprFlag) {
         state->rs_compressor = New(rw_cxt) PageCompress(new_heap, rw_cxt);
         ADIO_RUN()
@@ -318,6 +330,50 @@ RewriteState begin_heap_rewrite(Relation old_heap, Relation new_heap, Transactio
     return state;
 }
 
+static void rewrite_write_one_page(RewriteState state, Page page)
+{
+    TdeInfo tde_info = {0};
+    if (RelationisEncryptEnable(state->rs_new_rel)) {
+        GetTdeInfoFromRel(state->rs_new_rel, &tde_info);
+    }
+    if (IsSegmentFileNode(state->rs_new_rel->rd_node)) {
+        Assert(state->rs_use_wal);
+        Buffer buf = ReadBuffer(state->rs_new_rel, P_NEW);
+#ifdef USE_ASSERT_CHECKING
+        BufferDesc *buf_desc = GetBufferDescriptor(buf - 1);
+        Assert(buf_desc->tag.blockNum == state->rs_blockno);
+#endif
+        LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+        XLogRecPtr xlog_ptr = log_newpage(&state->rs_new_rel->rd_node, MAIN_FORKNUM, state->rs_blockno, page, true, 
+                                          &tde_info);
+        errno_t rc = memcpy_s(BufferGetBlock(buf), BLCKSZ, page, BLCKSZ);
+        securec_check(rc, "\0", "\0");
+        PageSetLSN(BufferGetPage(buf), xlog_ptr);
+        MarkBufferDirty(buf);
+        UnlockReleaseBuffer(buf);
+    }  else {
+        /* check tablespace size limitation when extending new file. */
+        STORAGE_SPACE_OPERATION(state->rs_new_rel, BLCKSZ);
+
+        if (state->rs_use_wal) {
+            log_newpage(&state->rs_new_rel->rd_node, MAIN_FORKNUM, state->rs_blockno, page, true, &tde_info);
+        }
+
+        RelationOpenSmgr(state->rs_new_rel);
+
+        char *bufToWrite = NULL;
+        if (RelationisEncryptEnable(state->rs_new_rel)) {
+            bufToWrite = PageDataEncryptIfNeed(page, &tde_info, true);
+        } else {
+            bufToWrite = page;
+        }
+
+        PageSetChecksumInplace((Page)bufToWrite, state->rs_blockno);
+
+        rewrite_flush_page(state, (Page)bufToWrite);
+    }
+}
+
 /*
  * End a rewrite.
  *
@@ -339,19 +395,7 @@ void end_heap_rewrite(RewriteState state)
          */
         Page page = state->rs_cmprBuffer;
         if (!PageIsEmpty(page)) {
-            /* check tablespace size limitation when extending new file. */
-            STORAGE_SPACE_OPERATION(state->rs_new_rel, BLCKSZ);
-
-            if (state->rs_use_wal)
-                log_newpage(&state->rs_new_rel->rd_node, MAIN_FORKNUM, state->rs_blockno, page, true);
-
-            RelationOpenSmgr(state->rs_new_rel);
-
-            char *bufToWrite = PageDataEncryptIfNeed(page);
-
-            PageSetChecksumInplace((Page)bufToWrite, state->rs_blockno);
-
-            rewrite_flush_page(state, (Page)bufToWrite);
+            rewrite_write_one_page(state, page);
             state->rs_blockno++;
         }
         delete state->rs_compressor;
@@ -370,18 +414,7 @@ void end_heap_rewrite(RewriteState state)
 
     /* Write the last page, if any */
     if (state->rs_buffer_valid) {
-        /* check tablespace size limitation when extending new file. */
-        STORAGE_SPACE_OPERATION(state->rs_new_rel, BLCKSZ);
-
-        if (state->rs_use_wal)
-            (void)log_newpage(&state->rs_new_rel->rd_node, MAIN_FORKNUM, state->rs_blockno, state->rs_buffer, true);
-        RelationOpenSmgr(state->rs_new_rel);
-
-        char *bufToWrite = PageDataEncryptIfNeed(state->rs_buffer);
-
-        PageSetChecksumInplace((Page)bufToWrite, state->rs_blockno);
-
-        rewrite_flush_page(state, (Page)bufToWrite);
+        rewrite_write_one_page(state, state->rs_buffer);
     }
 
     rewrite_end_flush_page(state);
@@ -428,11 +461,11 @@ static bool CanWriteUpdatedTuple(RewriteState state, HeapTuple old_tuple, HeapTu
     /*
      * If the tuple has been updated, check the old-to-new mapping hash table.
      */
-    if (!(old_tuple->t_data->t_infomask & (HEAP_XMAX_INVALID | HEAP_IS_LOCKED)) &&
+    if (!((old_tuple->t_data->t_infomask & HEAP_XMAX_INVALID) || HeapTupleIsOnlyLocked(old_tuple)) &&
         !(ItemPointerEquals(&(old_tuple->t_self), &(old_tuple->t_data->t_ctid)))) {
         OldToNewMapping mapping = NULL;
 
-        hashkey.xmin = HeapTupleGetRawXmax(old_tuple);
+        hashkey.xmin = HeapTupleGetUpdateXid(old_tuple);
         hashkey.tid = old_tuple->t_data->t_ctid;
 
         mapping = (OldToNewMapping)hash_search(state->rs_old_new_tid_map, &hashkey, HASH_FIND, NULL);
@@ -480,6 +513,9 @@ static bool CanWriteUpdatedTuple(RewriteState state, HeapTuple old_tuple, HeapTu
  */
 void rewrite_heap_tuple(RewriteState state, HeapTuple old_tuple, HeapTuple new_tuple)
 {
+    Assert(TUPLE_IS_HEAP_TUPLE(old_tuple));
+    Assert(TUPLE_IS_HEAP_TUPLE(new_tuple));
+
     MemoryContext old_cxt;
     ItemPointerData old_tid;
     TidHashKey hashkey;
@@ -488,7 +524,7 @@ void rewrite_heap_tuple(RewriteState state, HeapTuple old_tuple, HeapTuple new_t
 
     old_cxt = MemoryContextSwitchTo(state->rs_cxt);
 
-    copyHeapTupleInfo(new_tuple, old_tuple, state->rs_freeze_xid);
+    copyHeapTupleInfo(new_tuple, old_tuple, state->rs_freeze_xid, state->rs_freeze_multi);
 
     if (!CanWriteUpdatedTuple<true>(state, old_tuple, new_tuple)) {
         /*
@@ -583,6 +619,41 @@ void rewrite_heap_tuple(RewriteState state, HeapTuple old_tuple, HeapTuple new_t
     (void)MemoryContextSwitchTo(old_cxt);
 }
 
+/*
+ * Add a uheap tuple to the new heap.
+ *
+ * Maintaining previous version's visibility information needs much more work,
+ * so for now, we freeze all the tuples.  We only get
+ * LIVE versions of the tuple as input.
+ *
+ * state                opaque state as returned by begin_heap_rewrite
+ * oldTuple    original tuple in the old heap
+ * newTuple    new, rewritten tuple to be inserted to new heap
+ */
+void
+RewriteUHeapTuple(RewriteState state,
+                                   UHeapTuple oldTuple, UHeapTuple newTuple)
+{
+        Assert(oldTuple->tupTableType == UHEAP_TUPLE);
+        Assert(newTuple->tupTableType == UHEAP_TUPLE);
+        MemoryContext old_cxt;
+
+        old_cxt = MemoryContextSwitchTo(state->rs_cxt);
+
+        /*
+         * As of now, we copy only LIVE tuples in UHeap, so we can mark them as
+         * frozen.
+         */
+        newTuple->disk_tuple->flag &= ~UHEAP_VIS_STATUS_MASK;
+        UHeapTupleHeaderSetTDSlot(newTuple->disk_tuple, UHEAPTUP_SLOT_FROZEN);
+
+        /* Insert the tuple and find out where it's put in new_heap */
+        RawUHeapInsert(state, newTuple);
+
+        MemoryContextSwitchTo(old_cxt);
+}
+
+
 bool use_heap_rewrite_memcxt(RewriteState state)
 {
     return state->rs_doCmprFlag;
@@ -593,7 +664,7 @@ MemoryContext get_heap_rewrite_memcxt(RewriteState state)
     return state->rs_cxt;
 }
 
-static void copyHeapTupleInfo(HeapTuple dest_tup, HeapTuple src_tup, TransactionId freeze_xid)
+static void copyHeapTupleInfo(HeapTuple dest_tup, HeapTuple src_tup, TransactionId freeze_xid, MultiXactId freeze_mxid)
 {
     /*
      * Copy the original tuple's visibility information into new_tuple.
@@ -616,7 +687,7 @@ static void copyHeapTupleInfo(HeapTuple dest_tup, HeapTuple src_tup, Transaction
      * While we have our hands on the tuple, we may as well freeze any
      * very-old xmin or xmax, so that future VACUUM effort can be saved.
      */
-    (void)heap_freeze_tuple(dest_tup, freeze_xid);
+    (void)heap_freeze_tuple(dest_tup, freeze_xid, freeze_mxid);
 
     /*
      * Invalid ctid means that ctid should point to the tuple itself. We'll
@@ -637,22 +708,25 @@ static void prepare_cmpr_buffer(RewriteState state, Size meta_size, const char *
      * total page will be logged and then written into heap disk.
      */
     if (!PageIsEmpty(page)) {
-        /* check tablespace size limitation when extending new file. */
-        STORAGE_SPACE_OPERATION(state->rs_new_rel, BLCKSZ);
+        if (IsSegmentFileNode(state->rs_new_rel->rd_node)) {
+            Assert(state->rs_use_wal);
 
-        /* xlog first. */
-        if (state->rs_use_wal)
-            (void)log_newpage(&state->rs_new_rel->rd_node, MAIN_FORKNUM, state->rs_blockno, page, true);
+            Buffer buf = ReadBuffer(state->rs_new_rel, P_NEW);
+#ifdef USE_ASSERT_CHECKING
+            BufferDesc *buf_desc = GetBufferDescriptor(buf - 1);
+            Assert(buf_desc->tag.blockNum == state->rs_blockno);
+#endif
+            LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+            XLogRecPtr xlog_ptr = log_newpage(&state->rs_new_rel->rd_node, MAIN_FORKNUM, state->rs_blockno, page, true);
 
-        /*
-         * Now write the page. We say isTemp = true even if it's not a
-         * temp table, because there's no need for smgr to schedule an
-         * fsync for this write; we'll do it ourselves in end_heap_rewrite.
-         */
-        RelationOpenSmgr(state->rs_new_rel);
-        char *bufToWrite = PageDataEncryptIfNeed(page);
-        PageSetChecksumInplace((Page)bufToWrite, state->rs_blockno);
-        rewrite_flush_page(state, (Page)bufToWrite);
+            errno_t rc = memcpy_s(BufferGetBlock(buf), BLCKSZ, page, BLCKSZ);
+            securec_check(rc, "\0", "\0");
+            PageSetLSN(BufferGetPage(buf), xlog_ptr);
+            MarkBufferDirty(buf);
+
+            UnlockReleaseBuffer(buf);
+        } 
+        rewrite_write_one_page(state, page);
         state->rs_blockno++;
     }
 
@@ -665,6 +739,7 @@ static void prepare_cmpr_buffer(RewriteState state, Size meta_size, const char *
 
     PageReinitWithDict(page, meta_size);
     Assert(PageIsCompressed(page) && (meta_data != NULL));
+
     rc = memcpy_s((char *)getPageDict(page), meta_size, meta_data, meta_size);
     securec_check(rc, "", "");
 }
@@ -780,7 +855,7 @@ void RewriteAndCompressTup(RewriteState state, HeapTuple old_tuple, HeapTuple ne
     errno_t rc = EOK;
 
     Assert(CurrentMemoryContext == state->rs_cxt);
-    copyHeapTupleInfo(new_tuple, old_tuple, state->rs_freeze_xid);
+    copyHeapTupleInfo(new_tuple, old_tuple, state->rs_freeze_xid, state->rs_freeze_multi);
 
     /*
      * Step 1: deal with updated tuples chain.
@@ -913,6 +988,7 @@ bool rewrite_heap_dead_tuple(RewriteState state, HeapTuple old_tuple)
     return false;
 }
 
+#ifndef ENABLE_LITE_MODE
 /*
  * @Description: vacuum full use this api to list write block by adio.   aioDescp->blockDesc.bufHdr = NULL; to figure
  * this is vacuum operate
@@ -1000,6 +1076,7 @@ void rewrite_page_list_write(RewriteState state)
 
     return;
 }
+#endif
 
 /*
  * @Description: rewrite flush page
@@ -1011,6 +1088,7 @@ void rewrite_page_list_write(RewriteState state)
  */
 static void rewrite_flush_page(RewriteState state, Page page)
 {
+#ifndef ENABLE_LITE_MODE
     /* check aio is ready, for init db in single mode, no aio thread */
     if (AioCompltrIsReady() && g_instance.attr.attr_storage.enable_adio_function) {
         /* pass null buffer to lower levels to use fallocate, systables do not use fallocate,
@@ -1057,8 +1135,11 @@ static void rewrite_flush_page(RewriteState state, Page page)
             }
         }
     } else {
+#endif
         smgrextend(state->rs_new_rel->rd_smgr, MAIN_FORKNUM, state->rs_blockno, (char *)page, true);
+#ifndef ENABLE_LITE_MODE
     }
+#endif
     return;
 }
 
@@ -1069,6 +1150,7 @@ static void rewrite_flush_page(RewriteState state, Page page)
  */
 static void rewrite_end_flush_page(RewriteState state)
 {
+#ifndef ENABLE_LITE_MODE
     /* check aio is ready, for init db in single mode, no aio thread */
     if (AioCompltrIsReady() && g_instance.attr.attr_storage.enable_adio_function) {
         if (state->rs_block_count > 0) {
@@ -1083,6 +1165,7 @@ static void rewrite_end_flush_page(RewriteState state)
                                     (int)(pg_atomic_read_u32(&state->rs_buffers_handler[i].state) & BUF_FLAG_MASK))));
         }
     }
+#endif
 }
 
 /*
@@ -1101,6 +1184,13 @@ static void raw_heap_insert(RewriteState state, HeapTuple tup)
     OffsetNumber newoff;
     HeapTuple heaptup;
     TransactionId xmin, xmax;
+
+    if (tup != NULL)
+        Assert(TUPLE_IS_HEAP_TUPLE(tup));
+    else {
+        ereport(DEBUG5, (errmodule(MOD_TBLSPC), errmsg("tuple is null")));
+        return;
+    }
 
     /*
      * If the new tuple is too big for storage or contains already toasted
@@ -1135,28 +1225,7 @@ static void raw_heap_insert(RewriteState state, HeapTuple tup)
     if (state->rs_buffer_valid) {
         page_free_space = PageGetHeapFreeSpace(page);
         if (len + save_free_space > page_free_space) {
-            /* Doesn't fit, so write out the existing page */
-            /* check tablespace size limitation when extending new file. */
-            STORAGE_SPACE_OPERATION(state->rs_new_rel, BLCKSZ);
-            /* XLOG stuff */
-            if (state->rs_use_wal) {
-                (void)log_newpage(&state->rs_new_rel->rd_node, MAIN_FORKNUM, state->rs_blockno, page, true);
-            }
-
-            /*
-             * Now write the page. We say isTemp = true even if it's not a
-             * temp table, because there's no need for smgr to schedule an
-             * fsync for this write; we'll do it ourselves in
-             * end_heap_rewrite.
-             */
-            RelationOpenSmgr(state->rs_new_rel);
-
-            char *bufToWrite = PageDataEncryptIfNeed(page);
-
-            PageSetChecksumInplace((Page)bufToWrite, state->rs_blockno);
-
-            rewrite_flush_page(state, (Page)bufToWrite);
-
+            rewrite_write_one_page(state, page);
             state->rs_blockno++;
             state->rs_buffer_valid = false;
         }
@@ -1169,6 +1238,16 @@ static void raw_heap_insert(RewriteState state, HeapTuple tup)
         phdr->pd_xid_base = u_sess->utils_cxt.RecentXmin - FirstNormalTransactionId;
         phdr->pd_multi_base = 0;
         state->rs_buffer_valid = true;
+        const char* algo = RelationGetAlgo(state->rs_new_rel);
+        if (RelationisEncryptEnable(state->rs_new_rel) || (algo && *algo != '\0')) {
+            /* 
+             * For the reason of saving TdeInfo,
+             * we need to move the pointer(pd_special) forward by the length of TdeInfo.
+             */
+            phdr->pd_upper -= sizeof(TdePageInfo);
+            phdr->pd_special -= sizeof(TdePageInfo);
+            PageSetTDE(page);
+        }
     }
 
     xmin = HeapTupleGetRawXmin(heaptup);
@@ -1205,4 +1284,107 @@ static void raw_heap_insert(RewriteState state, HeapTuple tup)
     /* If heaptup is a private copy, release it. */
     if (heaptup != tup)
         heap_freetuple(heaptup);
+}
+
+/*
+ * Insert a utuple to the new relation.  This has to track UHeapInsert
+ * and its subsidiary functions!
+ *
+ * t_self of the tuple is set to the new TID of the tuple.
+ */
+static void RawUHeapInsert(RewriteState state, UHeapTuple tup)
+{
+    Page page = state->rs_buffer;
+    Size pageFreeSpace, saveFreeSpace;
+    Size len;
+    OffsetNumber newoff;
+    UHeapTuple uheaptup = NULL;
+
+    if (tup != NULL)
+        Assert(tup->tupTableType == UHEAP_TUPLE);
+
+    /*
+     * If the new tuple is too big for storage or contains already toasted
+     * out-of-line attributes from some other relation, invoke the toaster.
+     *
+     * Note: below this point, UHeaptup is the data we actually intend to store
+     * into the relation; tup is the caller's original untoasted data.
+     */
+    if (state->rs_new_rel->rd_rel->relkind == RELKIND_TOASTVALUE) {
+        /* toast table entries should never be recursively toasted */
+        Assert(!UHeapTupleHasExternal(tup));
+        uheaptup = tup;
+    } else if (UHeapTupleHasExternal(tup) || tup->disk_tuple_size > UTOAST_TUPLE_THRESHOLD) {
+        uheaptup = UHeapToastInsertOrUpdate(state->rs_new_rel, tup, NULL,
+            UHEAP_INSERT_SKIP_FSM | (state->rs_use_wal ? 0 : UHEAP_INSERT_SKIP_WAL));
+    } else {
+        uheaptup = tup;
+    }
+    len = MAXALIGN(uheaptup->disk_tuple_size); /* be conservative */
+    /*
+     * If we're gonna fail for oversize tuple, do it right away
+     */
+    if (len > MaxUHeapTupleSize(state->rs_new_rel)) {
+        ereport(ERROR, (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED), errmsg("row is too big: size %lu, maximum size %lu",
+            (unsigned long)len, (unsigned long)MaxUHeapTupleSize(state->rs_new_rel))));
+    }
+
+    /* Compute desired extra freespace due to fillfactor option */
+    saveFreeSpace = RelationGetTargetPageFreeSpace(state->rs_new_rel, HEAP_DEFAULT_FILLFACTOR);
+
+    /* Now we can check to see if there's enough free space already. */
+    if (state->rs_buffer_valid) {
+        pageFreeSpace = PageGetUHeapFreeSpace(page);
+        if (len + saveFreeSpace > pageFreeSpace) {
+            /* Doesn't fit, so write out the existing page */
+
+            /* check tablespace size limitation when extending new file. */
+            STORAGE_SPACE_OPERATION(state->rs_new_rel, BLCKSZ);
+
+            /* XLOG stuff */
+            if (state->rs_use_wal) {
+                log_newpage(&state->rs_new_rel->rd_node, MAIN_FORKNUM, state->rs_blockno, page, true);
+            }
+
+            /*
+             * Now write the page. We say isTemp = true even if it's not a
+             * temp table, because there's no need for smgr to schedule an
+             * fsync for this write; we'll do it ourselves in
+             * end_heap_rewrite.
+             */
+            RelationOpenSmgr(state->rs_new_rel);
+
+            PageSetChecksumInplace(page, state->rs_blockno);
+
+            rewrite_flush_page(state, page);
+
+            state->rs_blockno++;
+            state->rs_buffer_valid = false;
+        }
+    }
+
+    if (!state->rs_buffer_valid) {
+        UHeapPageHeaderData *uheappage = (UHeapPageHeaderData *)page;
+        /* Initialize a new empty page */
+        UPageInit<UPAGE_HEAP>(page, BLCKSZ, DEFAULT_SPECIAL_SIZE, RelationGetInitTd(state->rs_new_rel));
+        uheappage->pd_xid_base = u_sess->utils_cxt.RecentXmin - FirstNormalTransactionId;
+        uheappage->pd_multi_base = 0;
+        state->rs_buffer_valid = true;
+    }
+
+    /* And now we can insert the tuple into the page */
+    UHeapBufferPage bufpage = {InvalidBuffer, page};
+    newoff = UPageAddItem(state->rs_new_rel, &bufpage, (Item)uheaptup->disk_tuple, uheaptup->disk_tuple_size,
+        InvalidOffsetNumber, false);
+    if (newoff == InvalidOffsetNumber) {
+        ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED), errmsg("failed to add tuple")));
+    }
+
+    /* Update caller's t_self to the actual position where it was stored */
+    ItemPointerSet(&(tup->ctid), state->rs_blockno, newoff);
+
+    /* If uheaptup is a private copy, release it. */
+    if (uheaptup != tup) {
+        UHeapFreeTuple(uheaptup);
+    }
 }

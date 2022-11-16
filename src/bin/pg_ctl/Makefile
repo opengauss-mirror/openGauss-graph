@@ -16,9 +16,11 @@ subdir = src/bin/pg_ctl
 top_builddir = ../../..
 include $(top_builddir)/src/Makefile.global
 
-override CPPFLAGS := -I$(libpq_srcdir) -I$(ZLIB_INCLUDE_PATH) $(CPPFLAGS) -DHAVE_LIBZ -DFRONTEND -I$(top_builddir)/src/bin/pg_rewind
-
-LIBS += -lgssapi_krb5_gauss -lgssrpc_gauss -lkrb5_gauss -lkrb5support_gauss -lk5crypto_gauss -lcom_err_gauss
+override CPPFLAGS := -I$(libpq_srcdir) -I$(ZLIB_INCLUDE_PATH) $(CPPFLAGS) -DHAVE_LIBZ -DFRONTEND -I$(top_builddir)/src/bin/pg_rewind -I${top_builddir}/src/lib/page_compression
+override LDFLAGS += -L${top_builddir}/src/lib/page_compression
+ifeq ($(enable_lite_mode), no)
+    LIBS += -lgssapi_krb5_gauss -lgssrpc_gauss -lkrb5_gauss -lkrb5support_gauss -lk5crypto_gauss -lcom_err_gauss -lpagecompression -lzstd
+endif
 
 ifneq "$(MAKECMDGOALS)" "clean"
   ifneq "$(MAKECMDGOALS)" "distclean"
@@ -38,14 +40,14 @@ OBJS=	pg_ctl.o  pg_build.o backup.o receivelog.o streamutil.o xlogreader.o xlogr
              $(top_builddir)/src/lib/hotpatch/client/libhotpatchclient.a
 endif
 
-all: gs_ctl
+all: submake-pagecompression gs_ctl
 
 gs_ctl: $(OBJS) | submake-libpq submake-libpgport
 	$(CC) -fPIC $(CXXFLAGS) $(OBJS) $(LIBS) $(libpq_pgport) $(LDFLAGS) $(LDFLAGS_EX) -o $@$(X)
 
 ctla: $(OBJS)
 	$(CC) -fPIC -shared $(CXXFLAGS) $(OBJS) $(LIBS) $(libpq_pgport) $(LDFLAGS) $(LDFLAGS_EX) -o lib$@.so
-	mv lib$@.so $(top_builddir)/src/distribute/test/ut/lib
+	mv lib$@.so $(top_builddir)/../distribute/test/ut/lib
 
 xlogreader.cpp: % : $(top_srcdir)/src/gausskernel/storage/access/transam/%
 	rm -f $@ && $(LN_S) $< .

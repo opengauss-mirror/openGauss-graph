@@ -13,6 +13,7 @@
 
 #include "storage/checksum.h"
 #include "storage/checksum_impl.h"
+#include "PageCompression.h"
 #include "pg_lzcompress.h"
 #include "file.h"
 
@@ -33,8 +34,89 @@ typedef struct DataPage
     char    data[BLCKSZ];
 } DataPage;
 
+uint32 CHECK_STEP = 2;
 static bool get_page_header(FILE *in, const char *fullpath, BackupPageHeader* bph,
                                                 pg_crc32 *crc, bool use_crc32c);
+
+static inline uint32 pg_checksum_init(uint32 seed, uint32 value)
+{
+    CHECKSUM_COMP(seed, value);
+    return seed;
+}
+
+uint32 pg_checksum_block(char* data, uint32 size)
+{
+    uint32 sums[N_SUMS];
+    uint32* dataArr = (uint32*)data;
+    uint32 result = 0;
+    uint32 i, j;
+
+    /* ensure that the size is compatible with the algorithm */
+    Assert((size % (sizeof(uint32) * N_SUMS)) == 0);
+
+    /* initialize partial checksums to their corresponding offsets */
+    for (j = 0; j < N_SUMS; j += CHECK_STEP) {
+        sums[j] = pg_checksum_init(g_checksumBaseOffsets[j], dataArr[j]);
+        sums[j + 1] = pg_checksum_init(g_checksumBaseOffsets[j + 1], dataArr[j + 1]);
+    }
+    dataArr += N_SUMS;
+
+    /* main checksum calculation */
+    for (i = 1; i < size / (sizeof(uint32) * N_SUMS); i++) {
+        for (j = 0; j < N_SUMS; j += CHECK_STEP) {
+            CHECKSUM_COMP(sums[j], dataArr[j]);
+            CHECKSUM_COMP(sums[j + 1], dataArr[j + 1]);
+        }
+        dataArr += N_SUMS;
+    }
+
+    /* finally add in two rounds of zeroes for additional mixing */
+    for (j = 0; j < N_SUMS; j++) {
+        CHECKSUM_COMP(sums[j], 0);
+        CHECKSUM_COMP(sums[j], 0);
+
+        /* xor fold partial checksums together */
+        result ^= sums[j];
+    }
+
+    return result;
+}
+
+/*
+ * Compute the checksum for a openGauss page.  The page must be aligned on a
+ * 4-byte boundary.
+ *
+ * The checksum includes the block number (to detect the case where a page is
+ * somehow moved to a different location), the page header (excluding the
+ * checksum itself), and the page data.
+ */
+uint16 pg_checksum_page(char* page, BlockNumber blkno)
+{
+    PageHeader phdr = (PageHeader)page;
+    uint16 save_checksum;
+    uint32 checksum;
+
+    /*
+     * Save pd_checksum and temporarily set it to zero, so that the checksum
+     * calculation isn't affected by the old checksum stored on the page.
+     * Restore it after, because actually updating the checksum is NOT part of
+     * the API of this function.
+     */
+    save_checksum = phdr->pd_checksum;
+    phdr->pd_checksum = 0;
+    checksum = pg_checksum_block(page, BLCKSZ);
+    phdr->pd_checksum = save_checksum;
+
+    /* Mix in the block number to detect transposed pages */
+    checksum ^= blkno;
+
+    /*
+     * Reduce to a uint16 (to fit in the pd_checksum field) with an offset of
+     * one. That avoids checksums of zero, which seems like a good idea.
+     */
+    return (checksum % UINT16_MAX) + 1;
+}
+
 
 #ifdef HAVE_LIBZ
 /* Implementation of zlib compression method */
@@ -270,7 +352,7 @@ get_checksum_errormsg(Page page, char **errormsg, BlockNumber absolute_blkno)
          "page verification failed, "
          "calculated checksum %u but expected %u",
          phdr->pd_checksum,
-         /*pg_checksum_page(page, absolute_blkno)*/0);
+         pg_checksum_page(page, absolute_blkno));
     securec_check_ss_c(nRet, "\0", "\0");
 }
 
@@ -299,7 +381,8 @@ prepare_page(ConnectionArgs *conn_arg,
                             Page page, bool strict,
                             uint32 checksum_version,
                             const char *from_fullpath,
-                            PageState *page_st)
+                            PageState *page_st, PageCompression *pageCompression = NULL)
+
 {
     int     try_again = PAGE_READ_ATTEMPTS;
     bool        page_is_valid = false;
@@ -319,7 +402,7 @@ prepare_page(ConnectionArgs *conn_arg,
     while (!page_is_valid && try_again--)
     {
         /* read the block */
-        int read_len = fio_pread(in, page, blknum * BLCKSZ);
+        int read_len = fio_pread(in, page, blknum * BLCKSZ, pageCompression);
 
         /* The block could have been truncated. It is fine. */
         if (read_len == 0)
@@ -684,8 +767,6 @@ restore_data_file(parray *parent_chain, pgFile *dest_file, FILE *out,
     /* start with full backup */
         backup_seq = parray_num(parent_chain) - 1;
 
-    //  for (i = parray_num(parent_chain) - 1; i >= 0; i--)
-    //  for (i = 0; i < parray_num(parent_chain); i++)
     while (backup_seq >= 0 && (size_t)backup_seq < parray_num(parent_chain))
     {
         char     from_root[MAXPGPATH];
@@ -1428,13 +1509,14 @@ validate_one_page(Page page, BlockNumber absolute_blkno,
     }
 
     /* Verify checksum */
-    page_st->checksum = 0;//pg_checksum_page(page, absolute_blkno);
+    page_st->checksum = pg_checksum_page(page, absolute_blkno);
 
     if (checksum_version)
     {
         /* Checksums are enabled, so check them. */
-        if (page_st->checksum != ((PageHeader) page)->pd_checksum)
+        if (page_st->checksum != ((PageHeader) page)->pd_checksum && !PageCompression::InnerPageCompressChecksum(page)) {
             return PAGE_CHECKSUM_MISMATCH;
+        }
     }
 
     /* At this point page header is sane, if checksums are enabled - the`re ok.
@@ -1473,7 +1555,7 @@ check_data_file(ConnectionArgs *arguments, pgFile *file,
     {
         /*
         * If file is not found, this is not en error.
-        * It could have been deleted by concurrent postgres transaction.
+        * It could have been deleted by concurrent openGauss transaction.
         */
         if (errno == ENOENT)
         {
@@ -1734,7 +1816,7 @@ validate_file_pages(pgFile *file, const char *fullpath, XLogRecPtr stop_lsn,
     {
         elog(WARNING, "Invalid CRC of backup file \"%s\": %X. Expected %X",
             fullpath, crc, file->crc);
-            //is_valid = false;
+        is_valid = false;
     }
 
     pg_free(headers);
@@ -1789,8 +1871,10 @@ get_checksum_map(const char *fullpath, uint32 checksum_version,
 
             if (rc == PAGE_IS_VALID)
             {
-                
-                checksum_map[blknum].checksum = page_st.checksum;
+                if (checksum_version)
+                    checksum_map[blknum].checksum = ((PageHeader) read_buffer)->pd_checksum;
+                else
+                    checksum_map[blknum].checksum = page_st.checksum;
                 checksum_map[blknum].lsn = page_st.lsn;
             }
         }
@@ -1928,9 +2012,11 @@ open_local_file_rw(const char *to_fullpath, char **out_buf, uint32 buf_size)
     FILE *out = NULL;
     /* open backup file for write  */
     out = fopen(to_fullpath, PG_BINARY_W);
-    if (out == NULL)
+    if (out == NULL) {
         elog(ERROR, "Cannot open backup file \"%s\": %s",
             to_fullpath, strerror(errno));
+        exit(1);
+    }
 
     /* update file permission */
     if (chmod(to_fullpath, FILE_PERMISSION) == -1)
@@ -1960,18 +2046,30 @@ send_pages(ConnectionArgs* conn_arg, const char *to_fullpath, const char *from_f
     BlockNumber blknum = 0;
     datapagemap_iterator_t *iter = NULL;
     int   compressed_size = 0;
+    PageCompression* pageCompression = NULL;
+    std::unique_ptr<PageCompression> pageCompressionPtr = NULL;
 
     /* stdio buffers */
     char *in_buf = NULL;
     char *out_buf = NULL;
 
-    /* open source file for read */
-    in = fopen(from_fullpath, PG_BINARY_R);
+    if (file->compressedFile) {
+        /* init pageCompression and return pcdFd for error check */
+        pageCompression = new PageCompression();
+        pageCompressionPtr = std::unique_ptr<PageCompression>(pageCompression);
+        pageCompression->Init(from_fullpath, MAXPGPATH, file->segno, file->compressedChunkSize);
+        in = pageCompression->GetPcdFile();
+        /* force compress page if file is compressed file */
+        calg = (calg == NOT_DEFINED_COMPRESS || calg == NONE_COMPRESS) ? PGLZ_COMPRESS : calg;
+    } else {
+        /* open source file for read */
+        in = fopen(from_fullpath, PG_BINARY_R);
+    }
     if (in == NULL)
     {
         /*
         * If file is not found, this is not en error.
-        * It could have been deleted by concurrent postgres transaction.
+        * It could have been deleted by concurrent openGauss transaction.
         */
         if (errno == ENOENT)
         return FILE_MISSING;
@@ -2004,7 +2102,7 @@ send_pages(ConnectionArgs* conn_arg, const char *to_fullpath, const char *from_f
         int rc = prepare_page(conn_arg, file, prev_backup_start_lsn,
                                             blknum, in, backup_mode, curr_page,
                                             true, checksum_version,
-                                            from_fullpath, &page_st);
+                                            from_fullpath, &page_st, pageCompression);
         if (rc == PageIsTruncated)
             break;
 
@@ -2064,7 +2162,10 @@ send_pages(ConnectionArgs* conn_arg, const char *to_fullpath, const char *from_f
     if (in && fclose(in))
         elog(ERROR, "Cannot close the source file \"%s\": %s",
             to_fullpath, strerror(errno));
-
+    
+    if (pageCompressionPtr) {
+        pageCompressionPtr->ResetPcdFd();
+    }
     /* close local output file */
     if (out && fclose(out))
         elog(ERROR, "Cannot close the backup file \"%s\": %s",

@@ -6,6 +6,7 @@
  * Portions Copyright (c) 2020 Huawei Technologies Co.,Ltd.
  * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
+ * Portions Copyright (c) 2021, openGauss Contributors
  *
  *
  * IDENTIFICATION
@@ -44,25 +45,29 @@
 #include "utils/syscache.h"
 #include "utils/typcache.h"
 #include "utils/elog.h"
+#include "commands/sqladvisor.h"
 
 THR_LOCAL uint32 SPI_processed = 0;
 THR_LOCAL SPITupleTable *SPI_tuptable = NULL;
 THR_LOCAL int SPI_result;
 
-static Portal SPI_cursor_open_internal(const char *name, SPIPlanPtr plan, ParamListInfo paramLI, bool read_only);
+static void SubReleaseSpiPlanRef(TransactionId mysubid);
 
-static void _SPI_prepare_plan(const char *src, SPIPlanPtr plan);
+static Portal SPI_cursor_open_internal(const char *name, SPIPlanPtr plan, ParamListInfo paramLI, bool read_only,
+                                       bool isCollectParam = false);
+
+void _SPI_prepare_plan(const char *src, SPIPlanPtr plan);
 #ifdef PGXC
 static void _SPI_pgxc_prepare_plan(const char *src, List *src_parsetree, SPIPlanPtr plan);
 #endif
 
-static void _SPI_prepare_oneshot_plan(const char *src, SPIPlanPtr plan);
+void _SPI_prepare_oneshot_plan(const char *src, SPIPlanPtr plan);
 
-static int _SPI_execute_plan(SPIPlanPtr plan, ParamListInfo paramLI, Snapshot snapshot, Snapshot crosscheck_snapshot,
-    bool read_only, bool fire_triggers, long tcount, bool from_lock = false);
+int _SPI_execute_plan(SPIPlanPtr plan, ParamListInfo paramLI, Snapshot snapshot, Snapshot crosscheck_snapshot,
+    bool read_only, bool fire_triggers, long tcount, bool from_lock);
 
-static ParamListInfo _SPI_convert_params(int nargs, Oid *argtypes, Datum *Values, const char *Nulls,
-    Cursor_Data *cursor_data = NULL);
+ParamListInfo _SPI_convert_params(int nargs, Oid *argtypes, Datum *Values, const char *Nulls,
+    Cursor_Data *cursor_data);
 
 static int _SPI_pquery(QueryDesc *queryDesc, bool fire_triggers, long tcount, bool from_lock = false);
 
@@ -73,11 +78,14 @@ static void _SPI_cursor_operation(Portal portal, FetchDirection direction, long 
 static SPIPlanPtr _SPI_make_plan_non_temp(SPIPlanPtr plan);
 static SPIPlanPtr _SPI_save_plan(SPIPlanPtr plan);
 
-static int _SPI_begin_call(bool execmem);
 static MemoryContext _SPI_procmem(void);
 static bool _SPI_checktuples(void);
 extern void ClearVacuumStmt(VacuumStmt *stmt);
 static void CopySPI_Plan(SPIPlanPtr newplan, SPIPlanPtr plan, MemoryContext plancxt);
+
+// /*   graph  */
+static _SPI_connection *_SPI_current = NULL;
+
 
 /* =================== interface functions =================== */
 int SPI_connect(CommandDest dest, void (*spiCallbackfn)(void *), void *clientData)
@@ -139,10 +147,19 @@ int SPI_connect_ext(CommandDest dest, void (*spiCallbackfn)(void *), void *clien
     u_sess->SPI_cxt._current->spi_hash_key = INVALID_SPI_KEY;
     u_sess->SPI_cxt._current->visit_id = (uint32)-1;
     u_sess->SPI_cxt._current->plan_id = -1;
+    if (u_sess->attr.attr_sql.sql_compatibility == A_FORMAT) {
+        u_sess->SPI_cxt._current->stmtTimestamp = t_thrd.time_cxt.stmt_system_timestamp;
+    } else {
+        u_sess->SPI_cxt._current->stmtTimestamp = -1;
+    }
 
     u_sess->SPI_cxt._current->atomic = atomic;
     u_sess->SPI_cxt._current->internal_xact = false;
- 
+
+    if (u_sess->SPI_cxt._connected == 0) {
+        u_sess->SPI_cxt.autonomous_session = NULL;
+    }
+
     /*
      * Create memory contexts for this procedure
      *
@@ -169,9 +186,8 @@ int SPI_connect_ext(CommandDest dest, void (*spiCallbackfn)(void *), void *clien
 
 int SPI_finish(void)
 {
-    int res;
-
-    res = _SPI_begin_call(false); /* live in procedure memory */
+    SPI_STACK_LOG("begin", NULL, NULL);
+    int res = _SPI_begin_call(false); /* live in procedure memory */
     if (res < 0) {
         return res;
     }
@@ -191,6 +207,11 @@ int SPI_finish(void)
     SPI_processed = 0;
     u_sess->SPI_cxt.lastoid = InvalidOid;
     SPI_tuptable = NULL;
+
+    /* Recover timestamp */
+    if (u_sess->SPI_cxt._current->stmtTimestamp > 0) {
+        SetCurrentStmtTimestamp(u_sess->SPI_cxt._current->stmtTimestamp);
+    }
 
     /*
      * After _SPI_begin_call u_sess->SPI_cxt._connected == u_sess->SPI_cxt._curid. Now we are closing
@@ -219,18 +240,41 @@ void SPI_restore_current_stp_transaction_state()
 }
 
 /* This function will be called by commit/rollback inside STP to start a new transaction */
-void SPI_start_transaction(void)
+void SPI_start_transaction(List* transactionHead)
 {
+    Oid savedCurrentUser = InvalidOid;
+    int saveSecContext = 0;
+    MemoryContext savedContext = MemoryContextSwitchTo(t_thrd.mem_cxt.portal_mem_cxt);
+    GetUserIdAndSecContext(&savedCurrentUser, &saveSecContext);
+    if (transactionHead != NULL) {
+        ListCell* cell;
+        foreach(cell, transactionHead) {
+            transactionNode* node = (transactionNode*)lfirst(cell);
+            SetUserIdAndSecContext(node->userId, node->secContext);
+            break;
+        }
+    }
+    MemoryContextSwitchTo(savedContext);
     MemoryContext oldcontext = CurrentMemoryContext;
-    StartTransactionCommand(true);
+    PG_TRY();
+    {
+        StartTransactionCommand(true);
+    }
+    PG_CATCH();
+    {
+        SetUserIdAndSecContext(savedCurrentUser, saveSecContext);
+        PG_RE_THROW();
+    }
+    PG_END_TRY();
     MemoryContextSwitchTo(oldcontext);
+    SetUserIdAndSecContext(savedCurrentUser, saveSecContext);
 }
 
 /* 
  * Firstly Call this to check whether commit/rollback statement is supported, then call 
  * SPI_commit/SPI_rollback to change transaction state.
  */
-void SPI_stp_transaction_check(bool read_only) 
+void SPI_stp_transaction_check(bool read_only, bool savepoint)
 {
     /* Can not commit/rollback if it's atomic is true */
     if (u_sess->SPI_cxt._current->atomic) {
@@ -241,30 +285,33 @@ void SPI_stp_transaction_check(bool read_only)
     /* If commit/rollback is not within store procedure report error */
     if (!u_sess->SPI_cxt.is_stp) {
         ereport(ERROR, (errcode(ERRCODE_INVALID_TRANSACTION_TERMINATION), 
-            errmsg("cannot commit/rollback within function or procedure started by trigger")));
+            errmsg("cannot commit/rollback/savepoint within function or procedure started by trigger")));
+    }
+
+    if (u_sess->SPI_cxt.is_complex_sql) {
+        ereport(ERROR, (errcode(ERRCODE_INVALID_TRANSACTION_TERMINATION),
+            errmsg("cannot commit/rollback within function or procedure started by complicated SQL statements")));
     }
 
 #ifdef ENABLE_MULTIPLE_NODES
     /* Can not commit/rollback at non-CN nodes */
     if (!IS_PGXC_COORDINATOR || IsConnFromCoord()) {
         ereport(ERROR, (errcode(ERRCODE_INVALID_TRANSACTION_TERMINATION), 
-            errmsg("cannot commit/rollback at non-CN node")));
+            errmsg("cannot commit/rollback/savepoint at non-CN node")));
     }
 #endif
 
     if (read_only) {
         ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), 
-            errmsg("commit/rollback is not allowed in a non-volatile function")));
+            errmsg("commit/rollback/savepoint is not allowed in a non-volatile function")));
             /* translator: %s is a SQL statement name */
     }
 
-    if (IsStpInOuterSubTransaction()) {
+    if (!savepoint && IsStpInOuterSubTransaction()) {
         ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), 
             errmsg("commit/rollback is not allowed in outer sub transaction block.")));
 
     }
-
-    return;
 }
 
 /*
@@ -315,6 +362,206 @@ void SPI_rollback()
     return;
 }
 
+/*
+ * rollback and release current transaction.
+ */
+void SPI_savepoint_rollbackAndRelease(const char *spName, SubTransactionId subXid)
+{
+    if (subXid == InvalidTransactionId) {
+        RollbackAndReleaseCurrentSubTransaction(true);
+
+        if (spName != NULL) {
+            u_sess->plsql_cxt.stp_savepoint_cnt--;
+        } else {
+            u_sess->SPI_cxt.portal_stp_exception_counter--;
+        }
+    } else if (subXid != GetCurrentSubTransactionId()) {
+        /* errors during starting a subtransaction */
+        AbortSubTransaction();
+        CleanupSubTransaction();
+    }
+
+#ifdef ENABLE_MULTIPLE_NODES
+    /* DN had aborted the complete transaction already while cancel_query failed. */
+    if (IS_PGXC_COORDINATOR && !IsConnFromCoord() &&
+        !t_thrd.xact_cxt.handlesDestroyedInCancelQuery) {
+        /* internal savepoint while spName is NULL */
+        const char *name = (spName != NULL) ? spName : "s1";
+
+        StringInfoData str;
+        initStringInfo(&str);
+        appendStringInfo(&str, "ROLLBACK TO %s;", name);
+
+        HandleReleaseOrRollbackSavepoint(str.data, name, SUB_STMT_ROLLBACK_TO);
+        /* CN send rollback savepoint to remote nodes to abort sub transaction remotely */
+        pgxc_node_remote_savepoint(str.data, EXEC_ON_DATANODES, false, false);
+
+        resetStringInfo(&str);
+        appendStringInfo(&str, "RELEASE %s;", name);
+        HandleReleaseOrRollbackSavepoint(str.data, name, SUB_STMT_RELEASE);
+        /* CN should send release savepoint command to remote nodes for savepoint name reuse */
+        pgxc_node_remote_savepoint(str.data, EXEC_ON_DATANODES, false, false);
+
+        FreeStringInfo(&str);
+    }
+#endif
+}
+
+/*
+ * define a savepint in STP
+ */
+void SPI_savepoint_create(const char* spName)
+{
+#ifdef ENABLE_MULTIPLE_NODES
+    /* CN should send savepoint command to remote nodes to begin sub transaction remotely. */
+    if (IS_PGXC_COORDINATOR && !IsConnFromCoord()) {
+        /* internal savepoint while spName is NULL */
+        const char *name = (spName != NULL) ? spName : "s1";
+
+        StringInfoData str;
+        initStringInfo(&str);
+        appendStringInfo(&str, "SAVEPOINT %s;", name);
+
+        /* if do savepoint, always treat myself as local write node */
+        RegisterTransactionLocalNode(true);
+        RecordSavepoint(str.data, name, false, SUB_STMT_SAVEPOINT);
+        pgxc_node_remote_savepoint(str.data, EXEC_ON_DATANODES, true, true);
+
+        FreeStringInfo(&str);
+    }
+#endif
+
+    SubTransactionId subXid = GetCurrentSubTransactionId();
+    PG_TRY();
+    {
+        BeginInternalSubTransaction(spName);
+    }
+    PG_CATCH();
+    {
+        SPI_savepoint_rollbackAndRelease(spName, subXid);
+
+        PG_RE_THROW();
+    }
+    PG_END_TRY();
+
+    if (spName != NULL) {
+        u_sess->plsql_cxt.stp_savepoint_cnt++;
+    } else {
+        u_sess->SPI_cxt.portal_stp_exception_counter++;
+    }
+}
+
+/*
+ * rollback to a savepoint in STP
+ */
+void SPI_savepoint_rollback(const char* spName)
+{
+    /* mark subtransaction to be rollback as abort pending */
+    RollbackToSavepoint(spName, true);
+
+#ifdef ENABLE_MULTIPLE_NODES
+    /* savepoint for exception while spName is NULL */
+    const char *name = (spName != NULL) ? spName : "s1";
+
+    StringInfoData str;
+    initStringInfo(&str);
+    appendStringInfo(&str, "ROLLBACK TO %s;", name);
+
+    if (IS_PGXC_COORDINATOR && !IsConnFromCoord()) {
+        HandleReleaseOrRollbackSavepoint(str.data, name, SUB_STMT_ROLLBACK_TO);
+        /* CN send rollback savepoint to remote nodes to abort sub transaction remotely */
+        pgxc_node_remote_savepoint(str.data, EXEC_ON_DATANODES, false, false);
+    }
+
+    FreeStringInfo(&str);
+#endif
+
+    /*
+     * Do this after remote savepoint, so no cancel in AbortSubTransaction will be sent to
+     * interrupt previous cursor fetch.
+     */
+    CommitTransactionCommand(true);
+}
+
+/*
+ * release savepoint in STP
+ */
+void SPI_savepoint_release(const char* spName)
+{
+    /* Commit the inner transaction, return to outer xact context */
+    ReleaseSavepoint(spName, true);
+
+#ifdef ENABLE_MULTIPLE_NODES
+    /* CN should send release savepoint command to remote nodes for savepoint name reuse */
+    if (IS_PGXC_COORDINATOR && !IsConnFromCoord()) {
+        /* internal savepoint while spName is NULL */
+        const char *name = (spName != NULL) ? spName : "s1";
+
+        StringInfoData str;
+        initStringInfo(&str);
+        appendStringInfo(&str, "RELEASE %s;", name);
+
+        HandleReleaseOrRollbackSavepoint(str.data, name, SUB_STMT_RELEASE);
+        pgxc_node_remote_savepoint(str.data, EXEC_ON_DATANODES, false, false);
+
+        FreeStringInfo(&str);
+    }
+#endif
+
+    /*
+     * Do this after remote savepoint, so no cancel in AbortSubTransaction will be sent to
+     * interrupt previous cursor fetch.
+     */
+    CommitTransactionCommand(true);
+}
+
+/*
+ * return SPI current connect's stack level.
+ */
+int SPI_connectid()
+{
+    return u_sess->SPI_cxt._connected;
+}
+
+/*
+ * pop SPI connect till specified stack level.
+ */
+void SPI_disconnect(int connect)
+{
+    while (u_sess->SPI_cxt._connected >= connect) {
+        /* Restore memory context as it was before procedure call */
+        (void)MemoryContextSwitchTo(u_sess->SPI_cxt._current->savedcxt);
+
+        /*
+         * Memory can't be destoryed now since cleanup as those as in AbortSubTransaction
+         * are not done still. We ignore them here, and they will be freed along with top
+         * transaction's termination or portal drop. Any idea to free it in advance?
+         */
+        u_sess->SPI_cxt._current->execCxt = NULL;
+        u_sess->SPI_cxt._current->procCxt = NULL;
+
+        /* Recover timestamp */
+        if (u_sess->SPI_cxt._current->stmtTimestamp > 0) {
+            SetCurrentStmtTimestamp(u_sess->SPI_cxt._current->stmtTimestamp);
+        }
+
+        u_sess->SPI_cxt._connected--;
+        u_sess->SPI_cxt._curid = u_sess->SPI_cxt._connected;
+        if (u_sess->SPI_cxt._connected == -1) {
+            u_sess->SPI_cxt._current = NULL;
+        } else {
+            u_sess->SPI_cxt._current = &(u_sess->SPI_cxt._stack[u_sess->SPI_cxt._connected]);
+        }
+    }
+
+    /*
+     * Reset result variables, especially SPI_tuptable which is probably
+     * pointing at a just-deleted tuptable
+     */
+    SPI_processed = 0;
+    u_sess->SPI_cxt.lastoid = InvalidOid;
+    SPI_tuptable = NULL;
+}
 
 /*
  * Clean up SPI state.  Called on transaction end (of non-SPI-internal
@@ -386,6 +633,9 @@ void AtEOSubXact_SPI(bool isCommit, SubTransactionId mySubid, bool STP_rollback,
          * Release procedure memory explicitly (see note in SPI_connect)
          */
         bool need_free_context = isCommit ? true : connection->atomic;
+        if (!isCommit && need_free_context) {
+            SubReleaseSpiPlanRef(mySubid);
+        }
         if (connection->execCxt && need_free_context) {
             MemoryContextDelete(connection->execCxt);
             connection->execCxt = NULL;
@@ -393,7 +643,12 @@ void AtEOSubXact_SPI(bool isCommit, SubTransactionId mySubid, bool STP_rollback,
         if (connection->procCxt && need_free_context) {
             MemoryContextDelete(connection->procCxt);
             connection->procCxt = NULL;
-        }  
+        }
+
+        /* Recover timestamp */
+        if (connection->stmtTimestamp > 0) {
+            SetCurrentStmtTimestamp(connection->stmtTimestamp);
+        }
 
         /*
          * Pop the stack entry and reset global variables. Unlike
@@ -486,7 +741,6 @@ void SPI_restore_connection(void)
 int SPI_execute_direct(const char *remote_sql, char *nodename)
 {
     _SPI_plan plan;
-    int res;
     ExecDirectStmt *stmt = makeNode(ExecDirectStmt);
     StringInfoData execdirect;
 
@@ -498,7 +752,8 @@ int SPI_execute_direct(const char *remote_sql, char *nodename)
     stmt->node_names = list_make1(makeString(nodename));
     stmt->query = pstrdup(remote_sql);
 
-    res = _SPI_begin_call(true);
+    SPI_STACK_LOG("begin", remote_sql, NULL);
+    int res = _SPI_begin_call(true);
     if (res < 0) {
         return res;
     }
@@ -514,22 +769,26 @@ int SPI_execute_direct(const char *remote_sql, char *nodename)
 
     res = _SPI_execute_plan(&plan, NULL, InvalidSnapshot, InvalidSnapshot, false, true, 0, true);
 
+    SPI_STACK_LOG("end", remote_sql, NULL);
     _SPI_end_call(true);
     return res;
 }
 #endif
 
-/* Parse, plan, and execute a query string */
-int SPI_execute(const char *src, bool read_only, long tcount)
+/* 
+ * Parse, plan, and execute a query string 
+ * @isCollectParam: default false, is used to collect sql info in sqladvisor online mode.
+ */
+int SPI_execute(const char *src, bool read_only, long tcount, bool isCollectParam)
 {
     _SPI_plan plan;
-    int res;
 
     if (src == NULL || tcount < 0) {
         return SPI_ERROR_ARGUMENT;
     }
+    SPI_STACK_LOG("begin", src, NULL);
 
-    res = _SPI_begin_call(true);
+    int res = _SPI_begin_call(true);
     if (res < 0) {
         return res;
     }
@@ -542,6 +801,13 @@ int SPI_execute(const char *src, bool read_only, long tcount)
     _SPI_prepare_oneshot_plan(src, &plan);
 
     res = _SPI_execute_plan(&plan, NULL, InvalidSnapshot, InvalidSnapshot, read_only, true, tcount);
+
+#ifdef ENABLE_MULTIPLE_NODES
+    if (isCollectParam && checkSPIPlan(&plan)) {
+        collectDynWithArgs(src, NULL, 0);
+    }
+#endif
+    SPI_STACK_LOG("end", src, NULL);
 
     _SPI_end_call(true);
     return res;
@@ -556,8 +822,6 @@ int SPI_exec(const char *src, long tcount)
 /* Execute a previously prepared plan */
 int SPI_execute_plan(SPIPlanPtr plan, Datum *Values, const char *Nulls, bool read_only, long tcount)
 {
-    int res;
-
     if (plan == NULL || plan->magic != _SPI_PLAN_MAGIC || tcount < 0) {
         return SPI_ERROR_ARGUMENT;
     }
@@ -565,13 +829,15 @@ int SPI_execute_plan(SPIPlanPtr plan, Datum *Values, const char *Nulls, bool rea
     if (plan->nargs > 0 && Values == NULL)
         return SPI_ERROR_PARAM;
 
-    res = _SPI_begin_call(true);
+    SPI_STACK_LOG("begin", NULL, plan);
+    int res = _SPI_begin_call(true);
     if (res < 0) {
         return res;
     }
     res = _SPI_execute_plan(plan, _SPI_convert_params(plan->nargs, plan->argtypes, Values, Nulls), InvalidSnapshot,
         InvalidSnapshot, read_only, true, tcount);
 
+    SPI_STACK_LOG("end", NULL, plan);
     _SPI_end_call(true);
     return res;
 }
@@ -585,18 +851,18 @@ int SPI_execp(SPIPlanPtr plan, Datum *Values, const char *Nulls, long tcount)
 /* Execute a previously prepared plan */
 int SPI_execute_plan_with_paramlist(SPIPlanPtr plan, ParamListInfo params, bool read_only, long tcount)
 {
-    int res;
-
     if (plan == NULL || plan->magic != _SPI_PLAN_MAGIC || tcount < 0) {
         return SPI_ERROR_ARGUMENT;
     }
+    SPI_STACK_LOG("begin", NULL, plan);
 
-    res = _SPI_begin_call(true);
+    int res = _SPI_begin_call(true);
     if (res < 0) {
         return res;
     }
     res = _SPI_execute_plan(plan, params, InvalidSnapshot, InvalidSnapshot, read_only, true, tcount);
 
+    SPI_STACK_LOG("end", NULL, plan);
     _SPI_end_call(true);
     return res;
 }
@@ -617,8 +883,6 @@ int SPI_execute_plan_with_paramlist(SPIPlanPtr plan, ParamListInfo params, bool 
 int SPI_execute_snapshot(SPIPlanPtr plan, Datum *Values, const char *Nulls, Snapshot snapshot,
     Snapshot crosscheck_snapshot, bool read_only, bool fire_triggers, long tcount)
 {
-    int res;
-
     if (plan == NULL || plan->magic != _SPI_PLAN_MAGIC || tcount < 0) {
         return SPI_ERROR_ARGUMENT;
     }
@@ -626,14 +890,16 @@ int SPI_execute_snapshot(SPIPlanPtr plan, Datum *Values, const char *Nulls, Snap
     if (plan->nargs > 0 && Values == NULL) {
         return SPI_ERROR_PARAM;
     }
+    SPI_STACK_LOG("begin", NULL, plan);
 
-    res = _SPI_begin_call(true);
+    int res = _SPI_begin_call(true);
     if (res < 0) {
         return res;
     }
     res = _SPI_execute_plan(plan, _SPI_convert_params(plan->nargs, plan->argtypes, Values, Nulls), snapshot,
         crosscheck_snapshot, read_only, fire_triggers, tcount);
 
+    SPI_STACK_LOG("end", NULL, plan);
     _SPI_end_call(true);
     return res;
 }
@@ -647,9 +913,7 @@ int SPI_execute_snapshot(SPIPlanPtr plan, Datum *Values, const char *Nulls, Snap
 int SPI_execute_with_args(const char *src, int nargs, Oid *argtypes, Datum *Values, const char *Nulls, bool read_only,
     long tcount, Cursor_Data *cursor_data)
 {
-    int res;
     _SPI_plan plan;
-    ParamListInfo param_list_info;
 
     if (src == NULL || nargs < 0 || tcount < 0) {
         return SPI_ERROR_ARGUMENT;
@@ -659,7 +923,8 @@ int SPI_execute_with_args(const char *src, int nargs, Oid *argtypes, Datum *Valu
         return SPI_ERROR_PARAM;
     }
 
-    res = _SPI_begin_call(true);
+    SPI_STACK_LOG("begin", src, NULL);
+    int res = _SPI_begin_call(true);
     if (res < 0) {
         return res;
     }
@@ -672,12 +937,17 @@ int SPI_execute_with_args(const char *src, int nargs, Oid *argtypes, Datum *Valu
     plan.parserSetup = NULL;
     plan.parserSetupArg = NULL;
 
-    param_list_info = _SPI_convert_params(nargs, argtypes, Values, Nulls, cursor_data);
+    ParamListInfo param_list_info = _SPI_convert_params(nargs, argtypes, Values, Nulls, cursor_data);
 
     _SPI_prepare_oneshot_plan(src, &plan);
 
     res = _SPI_execute_plan(&plan, param_list_info, InvalidSnapshot, InvalidSnapshot, read_only, true, tcount);
-
+#ifdef ENABLE_MULTIPLE_NODES
+    if (checkAdivsorState() && checkSPIPlan(&plan)) {
+        collectDynWithArgs(src, param_list_info, plan.cursor_options);
+    }
+#endif
+    SPI_STACK_LOG("end", src, NULL);
     _SPI_end_call(true);
     return res;
 }
@@ -690,14 +960,13 @@ SPIPlanPtr SPI_prepare(const char *src, int nargs, Oid *argtypes)
 SPIPlanPtr SPI_prepare_cursor(const char *src, int nargs, Oid *argtypes, int cursorOptions)
 {
     _SPI_plan plan;
-    SPIPlanPtr result;
 
     if (src == NULL || nargs < 0 || (nargs > 0 && argtypes == NULL)) {
         SPI_result = SPI_ERROR_ARGUMENT;
         return NULL;
     }
 
-
+    SPI_STACK_LOG("begin", src, NULL);
     SPI_result = _SPI_begin_call(true);
     if (SPI_result < 0) {
         return NULL;
@@ -730,8 +999,9 @@ SPIPlanPtr SPI_prepare_cursor(const char *src, int nargs, Oid *argtypes, int cur
     u_sess->SPI_cxt._current->spi_hash_key = old_key;
 
     /* copy plan to procedure context */
-    result = _SPI_make_plan_non_temp(&plan);
+    SPIPlanPtr result = _SPI_make_plan_non_temp(&plan);
 
+    SPI_STACK_LOG("end", src, NULL);
     _SPI_end_call(true);
 
     return result;
@@ -740,13 +1010,13 @@ SPIPlanPtr SPI_prepare_cursor(const char *src, int nargs, Oid *argtypes, int cur
 SPIPlanPtr SPI_prepare_params(const char *src, ParserSetupHook parserSetup, void *parserSetupArg, int cursorOptions)
 {
     _SPI_plan plan;
-    SPIPlanPtr result;
 
     if (src == NULL) {
         SPI_result = SPI_ERROR_ARGUMENT;
         return NULL;
     }
 
+    SPI_STACK_LOG("begin", src, NULL);
     SPI_result = _SPI_begin_call(true);
     if (SPI_result < 0) {
         return NULL;
@@ -760,14 +1030,16 @@ SPIPlanPtr SPI_prepare_params(const char *src, ParserSetupHook parserSetup, void
     plan.argtypes = NULL;
     plan.parserSetup = parserSetup;
     plan.parserSetupArg = parserSetupArg;
+    plan.stmt_list = NIL;
     plan.spi_key = INVALID_SPI_KEY;
     plan.id = (uint32)-1;
 
     _SPI_prepare_plan(src, &plan);
 
     /* copy plan to procedure context */
-    result = _SPI_make_plan_non_temp(&plan);
+    SPIPlanPtr result = _SPI_make_plan_non_temp(&plan);
 
+    SPI_STACK_LOG("end", src, NULL);
     _SPI_end_call(true);
 
     return result;
@@ -816,22 +1088,21 @@ int SPI_keepplan(SPIPlanPtr plan)
 
 SPIPlanPtr SPI_saveplan(SPIPlanPtr plan)
 {
-    SPIPlanPtr new_plan = NULL;
-
     if (plan == NULL || plan->magic != _SPI_PLAN_MAGIC) {
         SPI_result = SPI_ERROR_ARGUMENT;
         return NULL;
     }
-
+    SPI_STACK_LOG("begin", NULL, plan);
     SPI_result = _SPI_begin_call(false); /* don't change context */
     if (SPI_result < 0) {
         return NULL;
     }
 
-    new_plan = _SPI_save_plan(plan);
+    SPIPlanPtr new_plan = _SPI_save_plan(plan);
 
     SPI_result = _SPI_end_call(false);
 
+    SPI_STACK_LOG("end", NULL, plan);
     return new_plan;
 }
 
@@ -864,7 +1135,6 @@ int SPI_freeplan(SPIPlanPtr plan)
 HeapTuple SPI_copytuple(HeapTuple tuple)
 {
     MemoryContext old_ctx = NULL;
-    HeapTuple c_tuple;
 
     if (tuple == NULL) {
         SPI_result = SPI_ERROR_ARGUMENT;
@@ -880,8 +1150,7 @@ HeapTuple SPI_copytuple(HeapTuple tuple)
         old_ctx = MemoryContextSwitchTo(u_sess->SPI_cxt._current->savedcxt);
     }
 
-
-    c_tuple = (HeapTuple)tableam_tops_copy_tuple(tuple);
+    HeapTuple c_tuple = (HeapTuple)tableam_tops_copy_tuple(tuple);
 
     if (old_ctx) {
         (void)MemoryContextSwitchTo(old_ctx);
@@ -893,7 +1162,6 @@ HeapTuple SPI_copytuple(HeapTuple tuple)
 HeapTupleHeader SPI_returntuple(HeapTuple tuple, TupleDesc tupdesc)
 {
     MemoryContext old_ctx = NULL;
-    HeapTupleHeader d_tup;
 
     if (tuple == NULL || tupdesc == NULL) {
         SPI_result = SPI_ERROR_ARGUMENT;
@@ -914,7 +1182,7 @@ HeapTupleHeader SPI_returntuple(HeapTuple tuple, TupleDesc tupdesc)
         old_ctx = MemoryContextSwitchTo(u_sess->SPI_cxt._current->savedcxt);
     }
 
-    d_tup = (HeapTupleHeader)palloc(tuple->t_len);
+    HeapTupleHeader d_tup = (HeapTupleHeader)palloc(tuple->t_len);
     errno_t rc = memcpy_s((char *)d_tup, tuple->t_len, (char *)tuple->t_data, tuple->t_len);
     securec_check(rc, "\0", "\0");
 
@@ -957,7 +1225,6 @@ HeapTuple SPI_modifytuple(Relation rel, HeapTuple tuple, int natts, int *attnum,
     n = (bool *)palloc(num_of_attr * sizeof(bool));
 
     /* fetch old values and nulls */
-
     heap_deform_tuple(tuple, rel->rd_att, v, n);
     /* replace values and nulls */
     for (i = 0; i < natts; i++) {
@@ -970,7 +1237,6 @@ HeapTuple SPI_modifytuple(Relation rel, HeapTuple tuple, int natts, int *attnum,
 
     if (i == natts) {
         /* no errors in *attnum */
-
         m_tuple = heap_form_tuple(rel->rd_att, v, n);
         /*
          * copy the identification info of the old tuple: t_ctid, t_self, and
@@ -1035,7 +1301,7 @@ char *SPI_fname(TupleDesc tupdesc, int fnumber)
     if (fnumber > 0) {
         attr = tupdesc->attrs[fnumber - 1];
     } else {
-        attr = SystemAttributeDefinition(fnumber, true, false);
+        attr = SystemAttributeDefinition(fnumber, true, false, false);
     }
 
     return pstrdup(NameStr(attr->attname));
@@ -1057,6 +1323,7 @@ char *SPI_getvalue(HeapTuple tuple, TupleDesc tupdesc, int fnumber)
     }
 
     orig_val = tableam_tops_tuple_getattr(tuple, (unsigned int)fnumber, tupdesc, &is_null);
+
     if (is_null) {
         return NULL;
     }
@@ -1064,7 +1331,7 @@ char *SPI_getvalue(HeapTuple tuple, TupleDesc tupdesc, int fnumber)
     if (fnumber > 0) {
         typoid = tupdesc->attrs[fnumber - 1]->atttypid;
     } else {
-        typoid = (SystemAttributeDefinition(fnumber, true, false))->atttypid;
+        typoid = (SystemAttributeDefinition(fnumber, true, false, false))->atttypid;
     }
 
     getTypeOutputInfo(typoid, &foutoid, &typo_is_varlen);
@@ -1117,7 +1384,7 @@ char *SPI_gettype(TupleDesc tupdesc, int fnumber)
     if (fnumber > 0) {
         typoid = tupdesc->attrs[fnumber - 1]->atttypid;
     } else {
-        typoid = (SystemAttributeDefinition(fnumber, true, false))->atttypid;
+        typoid = (SystemAttributeDefinition(fnumber, true, false, false))->atttypid;
     }
 
     type_tuple = SearchSysCache1(TYPEOID, ObjectIdGetDatum(typoid));
@@ -1143,7 +1410,7 @@ Oid SPI_gettypeid(TupleDesc tupdesc, int fnumber)
     if (fnumber > 0) {
         return tupdesc->attrs[fnumber - 1]->atttypid;
     } else {
-        return (SystemAttributeDefinition(fnumber, true, false))->atttypid;
+        return (SystemAttributeDefinition(fnumber, true, false, false))->atttypid;
     }
 }
 
@@ -1236,9 +1503,7 @@ Portal SPI_cursor_open(const char *name, SPIPlanPtr plan, Datum *Values, const c
 Portal SPI_cursor_open_with_args(const char *name, const char *src, int nargs, Oid *argtypes, Datum *Values,
     const char *Nulls, bool read_only, int cursorOptions)
 {
-    Portal result;
     _SPI_plan plan;
-    ParamListInfo param_list_info;
     errno_t errorno = EOK;
 
     if (src == NULL || nargs < 0) {
@@ -1253,6 +1518,7 @@ Portal SPI_cursor_open_with_args(const char *name, const char *src, int nargs, O
                 (argtypes == NULL) ? "argument type is NULL" : "value is NULL")));
     }
 
+    SPI_STACK_LOG("begin", src, NULL);
     SPI_result = _SPI_begin_call(true);
     if (SPI_result < 0) {
         ereport(ERROR, (errcode(ERRCODE_INVALID_CURSOR_STATE),
@@ -1273,7 +1539,7 @@ Portal SPI_cursor_open_with_args(const char *name, const char *src, int nargs, O
     plan.id = (uint32)-1;
 
     /* build transient ParamListInfo in executor context */
-    param_list_info = _SPI_convert_params(nargs, argtypes, Values, Nulls);
+    ParamListInfo param_list_info = _SPI_convert_params(nargs, argtypes, Values, Nulls);
     /* don't call SPI_keepplan, so won't put plancache into first_save_plan.
        so this plancache can't share into gpc, set spi_hash_key to invalid when call _SPI_prepare_plan. */
     uint32 old_key = u_sess->SPI_cxt._current->spi_hash_key;
@@ -1293,10 +1559,16 @@ Portal SPI_cursor_open_with_args(const char *name, const char *src, int nargs, O
     /* We needn't copy the plan; SPI_cursor_open_internal will do so */
     /* Adjust stack so that SPI_cursor_open_internal doesn't complain */
     u_sess->SPI_cxt._curid--;
-
-    result = SPI_cursor_open_internal(name, &plan, param_list_info, read_only);
+    bool isCollectParam = false;
+#ifdef ENABLE_MULTIPLE_NODES
+    if (checkAdivsorState()) {
+        isCollectParam = true;
+    }
+#endif
+    Portal result = SPI_cursor_open_internal(name, &plan, param_list_info, read_only, isCollectParam);
 
     /* And clean up */
+    SPI_STACK_LOG("end", src, NULL);
     u_sess->SPI_cxt._curid++;
     _SPI_end_call(true);
 
@@ -1309,20 +1581,34 @@ Portal SPI_cursor_open_with_args(const char *name, const char *src, int nargs, O
  * 	Same as SPI_cursor_open except that parameters (if any) are passed
  * 	as a ParamListInfo, which supports dynamic parameter set determination
  */
-Portal SPI_cursor_open_with_paramlist(const char *name, SPIPlanPtr plan, ParamListInfo params, bool read_only)
+Portal SPI_cursor_open_with_paramlist(const char *name, SPIPlanPtr plan, ParamListInfo params,
+                                      bool read_only, bool isCollectParam)
 {
-    return SPI_cursor_open_internal(name, plan, params, read_only);
+    return SPI_cursor_open_internal(name, plan, params, read_only, isCollectParam);
 }
+
+#ifdef ENABLE_MULTIPLE_NODES
+/* check plan's stream node and set flag */
+static void check_portal_stream(Portal portal)
+{
+    if (IS_PGXC_COORDINATOR && check_stream_for_loop_fetch(portal)) {
+        if (!ENABLE_SQL_BETA_FEATURE(PLPGSQL_STREAM_FETCHALL)) {
+            /* save flag for warning */
+            u_sess->SPI_cxt.has_stream_in_cursor_or_forloop_sql = portal->hasStreamForPlpgsql;
+        }
+    }
+}
+#endif
 
 /*
  * SPI_cursor_open_internal
  *
  * 	Common code for SPI_cursor_open variants
  */
-static Portal SPI_cursor_open_internal(const char *name, SPIPlanPtr plan, ParamListInfo paramLI, bool read_only)
+static Portal SPI_cursor_open_internal(const char *name, SPIPlanPtr plan, ParamListInfo paramLI, bool read_only,
+                                       bool isCollectParam)
 {
     CachedPlanSource *plansource = NULL;
-    CachedPlan *cplan = NULL;
     List *stmt_list = NIL;
     char *query_string = NULL;
     Snapshot snapshot;
@@ -1350,6 +1636,7 @@ static Portal SPI_cursor_open_internal(const char *name, SPIPlanPtr plan, ParamL
     Assert(list_length(plan->plancache_list) == 1);
     plansource = (CachedPlanSource *)linitial(plan->plancache_list);
 
+    SPI_STACK_LOG("begin", NULL, plan);
     /* Push the SPI stack */
     if (_SPI_begin_call(true) < 0) {
         ereport(ERROR, (errcode(ERRCODE_INVALID_CURSOR_STATE),
@@ -1390,7 +1677,7 @@ static Portal SPI_cursor_open_internal(const char *name, SPIPlanPtr plan, ParamL
      * plancache refcount.
      */
     /* Replan if needed, and increment plan refcount for portal */
-    cplan = GetCachedPlan(plansource, paramLI, false);
+    CachedPlan* cplan = GetCachedPlan(plansource, paramLI, false);
 
     if (ENABLE_GPC && plan->saved && plansource->gplan) {
         MemoryContext tmpCxt = NULL;
@@ -1481,6 +1768,14 @@ static Portal SPI_cursor_open_internal(const char *name, SPIPlanPtr plan, ParamL
         snapshot = GetTransactionSnapshot();
     }
 
+#ifdef ENABLE_MULTIPLE_NODES
+    if (isCollectParam && checkCommandTag(portal->commandTag) && checkPlan(portal->stmts)) {
+        collectDynWithArgs(query_string, paramLI, portal->cursorOptions);
+    }
+    /* check plan if has stream */
+    check_portal_stream(portal);
+#endif
+
     /*
      * If the plan has parameters, copy them into the portal.  Note that this
      * must be done after revalidating the plan, because in dynamic parameter
@@ -1500,6 +1795,11 @@ static Portal SPI_cursor_open_internal(const char *name, SPIPlanPtr plan, ParamL
     Assert(portal->strategy != PORTAL_MULTI_QUERY);
 
     /* Pop the SPI stack */
+    SPI_STACK_LOG("end", NULL, plan);
+
+    /* reset flag */
+    u_sess->SPI_cxt.has_stream_in_cursor_or_forloop_sql = false;
+
     _SPI_end_call(true);
 
     /* Return the created portal */
@@ -1912,7 +2212,7 @@ void spi_printtup(TupleTableSlot *slot, DestReceiver *self)
  * what we are creating is a "temporary" SPIPlan.  Cruft generated during
  * parsing is also left in CurrentMemoryContext.
  */
-static void _SPI_prepare_plan(const char *src, SPIPlanPtr plan)
+void _SPI_prepare_plan(const char *src, SPIPlanPtr plan)
 {
 #ifdef PGXC
     _SPI_pgxc_prepare_plan(src, NULL, plan);
@@ -1977,7 +2277,8 @@ static void _SPI_pgxc_prepare_plan(const char *src, List *src_parsetree, SPIPlan
             spi_signature.func_oid = u_sess->SPI_cxt._current->func_oid;
             spi_signature.spi_id = u_sess->SPI_cxt._current->visit_id;
             spi_signature.plansource_id = u_sess->SPI_cxt._current->plan_id;
-            plansource = g_instance.plan_cache->Fetch(src, (uint32)strlen(src), plan->nargs, &spi_signature);
+            plansource = g_instance.plan_cache->Fetch(src, (uint32)strlen(src), plan->nargs,
+                                                      plan->argtypes, &spi_signature);
             if (plansource) {
                 Assert(plansource->is_oneshot == false);
                 Assert(plansource->gpc.status.IsSharePlan());
@@ -2017,9 +2318,9 @@ static void _SPI_pgxc_prepare_plan(const char *src, List *src_parsetree, SPIPlan
         } else {
             stmt_list = pg_analyze_and_rewrite(parsetree, src, plan->argtypes, plan->nargs);
         }
-
+        plan->stmt_list = list_concat(plan->stmt_list, list_copy(stmt_list));
         /* Finish filling in the CachedPlanSource */
-        CompleteCachedPlan(plansource, stmt_list, NULL, plan->argtypes, plan->nargs, plan->parserSetup,
+        CompleteCachedPlan(plansource, stmt_list, NULL, plan->argtypes, NULL, plan->nargs, plan->parserSetup,
             plan->parserSetupArg, plan->cursor_options, false, /* not fixed result */
             "");
 
@@ -2063,21 +2364,23 @@ static void SPIParseOneShotPlan(CachedPlanSource* plansource, SPIPlanPtr plan)
     Node *parsetree = plansource->raw_parse_tree;
     const char *src = plansource->query_string;
     List *statement_list = NIL;
-    
-    /*
-     * Parameter datatypes are driven by parserSetup hook if provided,
-     * otherwise we use the fixed parameter list.
-     */
-    if (plan->parserSetup != NULL) {
-        Assert(plan->nargs == 0);
-        statement_list = pg_analyze_and_rewrite_params(parsetree, src, plan->parserSetup, plan->parserSetupArg);
-    } else {
-        statement_list = pg_analyze_and_rewrite(parsetree, src, plan->argtypes, plan->nargs);
-    }
 
-    /* Finish filling in the CachedPlanSource */
-    CompleteCachedPlan(plansource, statement_list, NULL, plan->argtypes, plan->nargs, plan->parserSetup,
-                       plan->parserSetupArg, plan->cursor_options, false, ""); /* not fixed result */
+    if (!plansource->is_complete) {
+        /*
+         * Parameter datatypes are driven by parserSetup hook if provided,
+         * otherwise we use the fixed parameter list.
+         */
+        if (plan->parserSetup != NULL) {
+            Assert(plan->nargs == 0);
+            statement_list = pg_analyze_and_rewrite_params(parsetree, src, plan->parserSetup, plan->parserSetupArg);
+        } else {
+            statement_list = pg_analyze_and_rewrite(parsetree, src, plan->argtypes, plan->nargs);
+        }
+
+        /* Finish filling in the CachedPlanSource */
+        CompleteCachedPlan(plansource, statement_list, NULL, plan->argtypes, NULL, plan->nargs, plan->parserSetup,
+                           plan->parserSetupArg, plan->cursor_options, false, ""); /* not fixed result */
+    }
 }
 
 /*
@@ -2099,7 +2402,7 @@ static void SPIParseOneShotPlan(CachedPlanSource* plansource, SPIPlanPtr plan)
  * what we are creating is a "temporary" SPIPlan.  Cruft generated during
  * parsing is also left in CurrentMemoryContext.
  */
-static void _SPI_prepare_oneshot_plan(const char *src, SPIPlanPtr plan)
+void _SPI_prepare_oneshot_plan(const char *src, SPIPlanPtr plan)
 {
     List *raw_parsetree_list = NIL;
     List *plancache_list = NIL;
@@ -2150,6 +2453,87 @@ static void _SPI_prepare_oneshot_plan(const char *src, SPIPlanPtr plan)
     t_thrd.log_cxt.error_context_stack = spi_err_context.previous;
 }
 
+bool RememberSpiPlanRef(CachedPlan* cplan, CachedPlanSource* plansource, bool useResOwner)
+{
+    bool ans = false;
+    /* incase commit/rollback release cachedplan from resource owner during execute spi plan,
+     * make sure current spi has cplan. So without commit/rollback, spi should has 2 refcount on cplan */
+    if (!cplan->isShared() && !plansource->is_oneshot) {
+        cplan->refcount++;
+        ans = true;
+    } else if (cplan->isShared()) {
+        (void)pg_atomic_fetch_add_u32((volatile uint32*)&cplan->global_refcount, 1);
+        ans = true;
+    }
+    if (ans) {
+        SPICachedPlanStack* cur_spi_cplan = (SPICachedPlanStack*)MemoryContextAlloc(
+            SESS_GET_MEM_CXT_GROUP(MEMORY_CONTEXT_EXECUTOR), sizeof(SPICachedPlanStack));
+        cur_spi_cplan->previous = u_sess->SPI_cxt.spi_exec_cplan_stack;
+        cur_spi_cplan->cplan = cplan;
+        cur_spi_cplan->owner = useResOwner ? t_thrd.utils_cxt.CurrentResourceOwner : NULL;
+        cur_spi_cplan->subtranid = GetCurrentSubTransactionId();
+        u_sess->SPI_cxt.spi_exec_cplan_stack = cur_spi_cplan;
+    }
+    return ans;
+}
+
+void ForgetSpiPlanRef()
+{
+    if (u_sess->SPI_cxt.spi_exec_cplan_stack == NULL)
+        return;
+    SPICachedPlanStack* cur_spi_cplan = u_sess->SPI_cxt.spi_exec_cplan_stack;
+    CachedPlan* cplan = cur_spi_cplan->cplan;
+    if (cplan->isShared()) {
+        (void)pg_atomic_fetch_sub_u32((volatile uint32*)&cplan->global_refcount, 1);
+    } else if (!cplan->is_oneshot) {
+        cplan->refcount--;
+    }
+    u_sess->SPI_cxt.spi_exec_cplan_stack = cur_spi_cplan->previous;
+    pfree_ext(cur_spi_cplan);
+}
+
+ResourceOwner AddCplanRefAgainIfNecessary(SPIPlanPtr plan,
+    CachedPlanSource* plansource, CachedPlan* cplan, TransactionId oldTransactionId, ResourceOwner oldOwner)
+{
+    /*
+     * When commit/rollback occurs, or its subtransaction is finished by savepoint, except
+     * for the oneshot plan, plan cache's refcount has already been released in resourceowner.
+     *  To match subsequent processing, an extra increment about reference is required here.
+     */
+    if ((oldTransactionId != SPI_get_top_transaction_id() ||
+        !ResourceOwnerIsValid(oldOwner)) && !plansource->is_oneshot) {
+        /* need addrefcount and save into resource owner again */
+        if (plan->saved)
+            ResourceOwnerEnlargePlanCacheRefs(t_thrd.utils_cxt.CurrentResourceOwner);
+        if (!cplan->isShared()) {
+            cplan->refcount++;
+        } else {
+            (void)pg_atomic_fetch_add_u32((volatile uint32*)&cplan->global_refcount, 1);
+        }
+        if (plan->saved)
+            ResourceOwnerRememberPlanCacheRef(t_thrd.utils_cxt.CurrentResourceOwner, cplan);
+
+        return plan->saved ? t_thrd.utils_cxt.CurrentResourceOwner : oldOwner;
+    }
+
+    return oldOwner;
+}
+
+void FreeMultiQueryString(SPIPlanPtr plan)
+{
+    if (IS_PGXC_COORDINATOR && PointerIsValid(plan->plancache_list) && list_length(plan->plancache_list) > 1) {
+        ListCell *list_item = NULL;
+
+        foreach (list_item, plan->plancache_list) {
+            CachedPlanSource *PlanSource = (CachedPlanSource *)lfirst(list_item);
+            if (PlanSource->query_string != NULL) {
+                pfree_ext((PlanSource->query_string));
+                PlanSource->query_string = NULL;
+            }
+        }
+    }
+}
+
 /*
  * Execute the given plan with the given parameter values
  *
@@ -2161,7 +2545,7 @@ static void _SPI_prepare_oneshot_plan(const char *src, SPIPlanPtr plan)
  * 		FALSE means any AFTER triggers are postponed to end of outer query
  * tcount: execution tuple-count limit, or 0 for none
  */
-static int _SPI_execute_plan(SPIPlanPtr plan, ParamListInfo paramLI, Snapshot snapshot, Snapshot crosscheck_snapshot,
+static int _SPI_execute_plan0(SPIPlanPtr plan, ParamListInfo paramLI, Snapshot snapshot, Snapshot crosscheck_snapshot,
     bool read_only, bool fire_triggers, long tcount, bool from_lock)
 {
     int my_res = 0;
@@ -2176,6 +2560,13 @@ static int _SPI_execute_plan(SPIPlanPtr plan, ParamListInfo paramLI, Snapshot sn
     ListCell *lc1 = NULL;
     bool tmp_enable_light_proxy = u_sess->attr.attr_sql.enable_light_proxy;
     TransactionId oldTransactionId = SPI_get_top_transaction_id();
+    bool need_remember_cplan = false;
+
+    /*
+     * With savepoint in STP feature, CurrentResourceOwner is different before and after _SPI_pquery.
+     * We need to hold the original one in order to forget the snapshot, plan reference.and etc.
+     */
+    ResourceOwner oldOwner = t_thrd.utils_cxt.CurrentResourceOwner;
 
     /* not allow Light CN */
     u_sess->attr.attr_sql.enable_light_proxy = false;
@@ -2274,10 +2665,11 @@ static int _SPI_execute_plan(SPIPlanPtr plan, ParamListInfo paramLI, Snapshot sn
             continue;
         }
 
+        need_remember_cplan = RememberSpiPlanRef(cplan, plansource, plan->saved);
+
         for (int i = 0; i < stmt_list->length; i++) {
             Node *stmt = (Node *)list_nth(stmt_list, i);
             bool canSetTag = false;
-            DestReceiver *dest = NULL;
 
             u_sess->SPI_cxt._current->processed = 0;
             u_sess->SPI_cxt._current->lastoid = InvalidOid;
@@ -2285,6 +2677,10 @@ static int _SPI_execute_plan(SPIPlanPtr plan, ParamListInfo paramLI, Snapshot sn
 
             if (IsA(stmt, PlannedStmt)) {
                 canSetTag = ((PlannedStmt *)stmt)->canSetTag;
+
+                if (((PlannedStmt*)stmt)->commandType != CMD_SELECT) {
+                    SPI_forbid_exec_push_down_with_exception();
+                }
             } else {
                 /* utilities are canSetTag if only thing in list */
                 canSetTag = (list_length(stmt_list) == 1);
@@ -2302,10 +2698,6 @@ static int _SPI_execute_plan(SPIPlanPtr plan, ParamListInfo paramLI, Snapshot sn
                 } 
             }
 
-            if (reinterpret_cast<PlannedStmt*>(stmt)->commandType != CMD_SELECT) {
-                SPI_forbid_exec_push_down_with_exception();
-            } 
- 
             if (read_only && !CommandIsReadOnly(stmt)) {
                 ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
                     /* translator: %s is a SQL statement name */
@@ -2321,22 +2713,19 @@ static int _SPI_execute_plan(SPIPlanPtr plan, ParamListInfo paramLI, Snapshot sn
                 UpdateActiveSnapshotCommandId();
             }
 
-            dest = CreateDestReceiver(canSetTag ? u_sess->SPI_cxt._current->dest : DestNone);
+            DestReceiver *dest = CreateDestReceiver(canSetTag ? u_sess->SPI_cxt._current->dest : DestNone);
 
             if (IsA(stmt, PlannedStmt) && ((PlannedStmt *)stmt)->utilityStmt == NULL) {
                 QueryDesc *qdesc = NULL;
-                Snapshot snap;
-
-                if (ActiveSnapshotSet()) {
-                    snap = GetActiveSnapshot();
-                } else {
-                    snap = InvalidSnapshot;
-                }
+                Snapshot snap = ActiveSnapshotSet() ? GetActiveSnapshot() : InvalidSnapshot;
 
                 qdesc = CreateQueryDesc((PlannedStmt *)stmt, plansource->query_string, snap, crosscheck_snapshot, dest,
                     paramLI, 0);
                 res = _SPI_pquery(qdesc, fire_triggers, canSetTag ? tcount : 0, from_lock);
+                ResourceOwner tmp = t_thrd.utils_cxt.CurrentResourceOwner;
+                t_thrd.utils_cxt.CurrentResourceOwner = oldOwner;
                 FreeQueryDesc(qdesc);
+                t_thrd.utils_cxt.CurrentResourceOwner = tmp;
             } else {
                 char completionTag[COMPLETION_TAG_BUFSIZE];
 
@@ -2381,7 +2770,7 @@ static int _SPI_execute_plan(SPIPlanPtr plan, ParamListInfo paramLI, Snapshot sn
                  * return a special result code if the statement was spelled
                  * SELECT INTO.
                  */
-                if (IsA(stmt, CreateTableAsStmt)) {
+                if (IsA(stmt, CreateTableAsStmt) && ((CreateTableAsStmt *)stmt)->relkind != OBJECT_MATVIEW) {
                     Assert(strncmp(completionTag, "SELECT ", 7) == 0);
                     u_sess->SPI_cxt._current->processed = strtoul(completionTag + 7, NULL, 10);
                     if (((CreateTableAsStmt *)stmt)->is_select_into) {
@@ -2419,19 +2808,18 @@ static int _SPI_execute_plan(SPIPlanPtr plan, ParamListInfo paramLI, Snapshot sn
                 my_res = res;
                 goto fail;
             }
-
-            // When commit/rollback occurs, the plan cache will be cleared(except for oneshot plan),
-            // so we must rebuild plan cache again.
-            if (oldTransactionId != SPI_get_top_transaction_id() && !plansource->is_oneshot) {
-                cplan = GetCachedPlan(plansource, paramLI, plan->saved);
-                stmt_list = cplan->stmt_list;
-                if (cplan->isShared())
-                    (void)pg_atomic_fetch_add_u32((volatile uint32*)&cplan->global_refcount, 1);
-            }
+            /* When commit/rollback occurs
+             * the plan cache will be release refcount by resourceowner(except for oneshot plan) */
+            oldOwner = AddCplanRefAgainIfNecessary(plan, plansource, cplan, oldTransactionId, oldOwner);
         }
 
         /* Done with this plan, so release refcount */
+        if (need_remember_cplan)
+            ForgetSpiPlanRef();
+        ResourceOwner tmp = t_thrd.utils_cxt.CurrentResourceOwner;
+        t_thrd.utils_cxt.CurrentResourceOwner = oldOwner;
         ReleaseCachedPlan(cplan, plan->saved);
+        t_thrd.utils_cxt.CurrentResourceOwner  = tmp;
         cplan = NULL;
         if (ENABLE_GPC && tmp_cxt)
             MemoryContextDelete(tmp_cxt);
@@ -2455,24 +2843,18 @@ fail:
 
     /* We no longer need the cached plan refcount, if any */
     if (cplan != NULL) {
+        if (need_remember_cplan)
+            ForgetSpiPlanRef();
+        ResourceOwner tmp = t_thrd.utils_cxt.CurrentResourceOwner;
+        t_thrd.utils_cxt.CurrentResourceOwner = oldOwner;
         ReleaseCachedPlan(cplan, plan->saved);
+        t_thrd.utils_cxt.CurrentResourceOwner  = tmp;
     }
-
     /*
      * When plan->plancache_list > 1 means it's a multi query and  have been malloc memory
      * through get_next_snippet, so we need free them here.
      */
-    if (IS_PGXC_COORDINATOR && PointerIsValid(plan->plancache_list) && list_length(plan->plancache_list) > 1) {
-        ListCell *list_item = NULL;
-
-        foreach (list_item, plan->plancache_list) {
-            CachedPlanSource *PlanSource = (CachedPlanSource *)lfirst(list_item);
-            if (PlanSource->query_string != NULL) {
-                pfree_ext((PlanSource->query_string));
-                PlanSource->query_string = NULL;
-            }
-        }
-    }
+    FreeMultiQueryString(plan);
 
     /*
      * Pop the error context stack
@@ -2501,10 +2883,172 @@ fail:
     return my_res;
 }
 
+static bool IsNeedSubTxnForSPIPlan(SPIPlanPtr plan)
+{
+    /* not required to act as the same as O */
+    if (!PLSTMT_IMPLICIT_SAVEPOINT) {
+        return false;
+    }
+
+    /* not inside exception block */
+    if (u_sess->SPI_cxt.portal_stp_exception_counter == 0) {
+        return false;
+    }
+
+    /* wrap statement doing modifications with subtransaction, so changes can be rollback. */
+    ListCell *lc1 = NULL;
+    foreach (lc1, plan->plancache_list) {
+        CachedPlanSource *plansource = (CachedPlanSource *)lfirst(lc1);
+
+        if (plan->oneshot) {
+            SPIParseOneShotPlan(plansource, plan);
+        }
+
+        ListCell* l = NULL;
+        foreach (l, plansource->query_list) {
+            Query* qry = (Query*)lfirst(l);
+
+            /*
+             * Here act as the opsite as CommandIsReadOnly does. (1) utility cmd;
+             * (2) SELECT FOR UPDATE/SHARE; (3) data-modifying CTE.
+             */
+            if (qry->commandType != CMD_SELECT || qry->rowMarks != NULL || qry->hasModifyingCTE) {
+                return true;
+            }
+
+#ifdef ENABLE_MULTIPLE_NODES
+            /*
+             * DN aborts subtransaction automatically once error occurs. Current start an new implicit
+             * savepoint to isolate from runtime error even that it is a read only statement.
+             *
+             * If statement contains only system table, it will run at CN without savepint. It's
+             * a worth thing to check it?
+             */
+            return list_length(plansource->relationOids) != 0;
+#endif
+        }
+    }
+
+    return false;
+}
+
+/*
+ * Execute plan with the given parameter values
+ *
+ * Here we would wrap it with a savepoint for rollback its updates.
+ */
+extern int _SPI_execute_plan(SPIPlanPtr plan, ParamListInfo paramLI, Snapshot snapshot,
+    Snapshot crosscheck_snapshot, bool read_only, bool fire_triggers, long tcount, bool from_lock)
+{
+    int my_res = 0;
+
+    if (IsNeedSubTxnForSPIPlan(plan)) {
+        volatile int curExceptionCounter;
+        MemoryContext oldcontext = CurrentMemoryContext;
+        int64 stackId = u_sess->plsql_cxt.nextStackEntryId;
+
+        /* start an implicit savepoint for this stmt. */
+        SPI_savepoint_create(NULL);
+
+        /* switch into old memory context, don't run it under subtransaction. */
+        MemoryContextSwitchTo(oldcontext);
+
+        curExceptionCounter = u_sess->SPI_cxt.portal_stp_exception_counter;
+        PG_TRY();
+        {
+            my_res = _SPI_execute_plan0(plan, paramLI, snapshot,
+                crosscheck_snapshot, read_only, fire_triggers, tcount, from_lock);
+        }
+        PG_CATCH();
+        {
+            /* rollback this stmt's updates. */
+            if (curExceptionCounter == u_sess->SPI_cxt.portal_stp_exception_counter &&
+                GetCurrentTransactionName() == NULL) {
+                SPI_savepoint_rollbackAndRelease(NULL, InvalidTransactionId);
+                stp_cleanup_subxact_resowner(stackId);
+            }
+            PG_RE_THROW();
+        }
+        PG_END_TRY();
+
+        /*
+         * if there is any new inner subtransaction, don't release savepoint.
+         * any idea for this remained subtransaction?
+         */
+        if (curExceptionCounter == u_sess->SPI_cxt.portal_stp_exception_counter &&
+            GetCurrentTransactionName() == NULL) {
+            SPI_savepoint_release(NULL);
+            stp_cleanup_subxact_resowner(stackId);
+        }
+    } else {
+        my_res = _SPI_execute_plan0(plan, paramLI, snapshot,
+            crosscheck_snapshot, read_only, fire_triggers, tcount, from_lock);
+    }
+
+    return my_res;
+}
+
+void ReleaseSpiPlanRef()
+{
+    if (u_sess->SPI_cxt.spi_exec_cplan_stack == NULL)
+        return;
+    SPICachedPlanStack* cur_spi_cplan = NULL;
+    while (u_sess->SPI_cxt.spi_exec_cplan_stack != NULL) {
+        cur_spi_cplan = u_sess->SPI_cxt.spi_exec_cplan_stack;
+        CachedPlan* cplan = cur_spi_cplan->cplan;
+        if (cplan->isShared()) {
+            (void)pg_atomic_fetch_sub_u32((volatile uint32*)&cplan->global_refcount, 1);
+        } else if (!cplan->is_oneshot) {
+            cplan->refcount--;
+        }
+        u_sess->SPI_cxt.spi_exec_cplan_stack = cur_spi_cplan->previous;
+        pfree_ext(cur_spi_cplan);
+    }
+    u_sess->SPI_cxt.spi_exec_cplan_stack = NULL;
+}
+
+static void SubReleaseSpiPlanRef(TransactionId mysubid)
+{
+    if (u_sess->SPI_cxt.spi_exec_cplan_stack == NULL) {
+        return;
+    }
+    Assert(GetCurrentSubTransactionId() == mysubid);
+    struct SPICachedPlanStack* cur_spi_cplan = u_sess->SPI_cxt.spi_exec_cplan_stack;
+    struct SPICachedPlanStack* last_exec_cplan_stack = NULL;
+
+    while (cur_spi_cplan != NULL) {
+        CachedPlan* cplan = cur_spi_cplan->cplan;
+        if (cplan->isShared()) {
+            last_exec_cplan_stack = cur_spi_cplan;
+            cur_spi_cplan = cur_spi_cplan->previous;
+            continue;
+        }
+        if (cur_spi_cplan->subtranid != mysubid) {
+            continue;
+        }
+        if (!cplan->is_oneshot) {
+            cplan->refcount--;
+        }
+        if (cur_spi_cplan->owner != NULL) {
+            ResourceOwnerForgetPlanCacheRef(cur_spi_cplan->owner, cplan);
+        }
+        if (last_exec_cplan_stack == NULL) {
+            Assert(u_sess->SPI_cxt.spi_exec_cplan_stack == cur_spi_cplan);
+            u_sess->SPI_cxt.spi_exec_cplan_stack = cur_spi_cplan->previous;
+        } else {
+            Assert(last_exec_cplan_stack->previous == cur_spi_cplan);
+            last_exec_cplan_stack->previous = cur_spi_cplan->previous;
+        }
+        struct SPICachedPlanStack* tmp = cur_spi_cplan;
+        cur_spi_cplan = cur_spi_cplan->previous;
+        pfree_ext(tmp);
+    }
+}
+
 /*
  * Convert arrays of query parameters to form wanted by planner and executor
  */
-static ParamListInfo _SPI_convert_params(int nargs, Oid *argtypes, Datum *Values, const char *Nulls,
+ParamListInfo _SPI_convert_params(int nargs, Oid *argtypes, Datum *Values, const char *Nulls,
     Cursor_Data *cursor_data)
 {
     ParamListInfo param_list_info;
@@ -2531,6 +3075,7 @@ static ParamListInfo _SPI_convert_params(int nargs, Oid *argtypes, Datum *Values
             if (cursor_data != NULL) {
                 CopyCursorInfoData(&prm->cursor_data, &cursor_data[i]);
             }
+            prm->tabInfo = NULL;
         }
     } else {
         param_list_info = NULL;
@@ -2591,6 +3136,12 @@ static int _SPI_pquery(QueryDesc *queryDesc, bool fire_triggers, long tcount, bo
     }
 
     TransactionId oldTransactionId = SPI_get_top_transaction_id();
+    /*
+     * With savepoint in STP feature, CurrentResourceOwner is different before and after executor.
+     * We need to hold the original one in order to forget the snapshot, plan reference.and etc.
+     */
+    ResourceOwner oldOwner = t_thrd.utils_cxt.CurrentResourceOwner;
+
     ExecutorStart(queryDesc, eflags);
 
     bool forced_control = !from_lock && IS_PGXC_COORDINATOR &&
@@ -2677,7 +3228,11 @@ static int _SPI_pquery(QueryDesc *queryDesc, bool fire_triggers, long tcount, bo
         queryDesc->estate->es_crosscheck_snapshot = NULL;
     }
 
+    ResourceOwner tmp  = t_thrd.utils_cxt.CurrentResourceOwner;
+    t_thrd.utils_cxt.CurrentResourceOwner = oldOwner;
     ExecutorEnd(queryDesc);
+    t_thrd.utils_cxt.CurrentResourceOwner = tmp;
+
     /* FreeQueryDesc is done by the caller */
 #ifdef SPI_EXECUTOR_STATS
     if (ShowExecutorStats)
@@ -2744,6 +3299,7 @@ static void _SPI_cursor_operation(Portal portal, FetchDirection direction, long 
     }
 
     /* Push the SPI stack */
+    SPI_STACK_LOG("begin", portal->sourceText, NULL);
     if (_SPI_begin_call(true) < 0) {
         ereport(ERROR, (errcode(ERRCODE_SPI_CONNECTION_FAILURE),
             errmsg("SPI stack is corrupted when perform cursor operation, current level: %d, connected level: %d",
@@ -2782,6 +3338,7 @@ static void _SPI_cursor_operation(Portal portal, FetchDirection direction, long 
     u_sess->SPI_cxt._current->tuptable = NULL;
 
     /* Pop the SPI stack */
+    SPI_STACK_LOG("end", portal->sourceText, NULL);
     _SPI_end_call(true);
 }
 
@@ -2793,6 +3350,7 @@ static void _SPI_cursor_operation(Portal portal, FetchDirection direction, long 
 void _SPI_hold_cursor()
 {
     /* Push the SPI stack */
+    SPI_STACK_LOG("begin", NULL, NULL);
     if (_SPI_begin_call(true) < 0) {
         ereport(ERROR, (errcode(ERRCODE_SPI_CONNECTION_FAILURE),
             errmsg("SPI stack is corrupted when perform cursor operation, current level: %d, connected level: %d",
@@ -2802,6 +3360,7 @@ void _SPI_hold_cursor()
     HoldPinnedPortals();
 
     /* Pop the SPI stack */
+    SPI_STACK_LOG("end", NULL, NULL);
     _SPI_end_call(true);
 }
 
@@ -2813,7 +3372,7 @@ static MemoryContext _SPI_procmem(void)
 /*
  * _SPI_begin_call: begin a SPI operation within a connected procedure
  */
-static int _SPI_begin_call(bool execmem)
+int _SPI_begin_call(bool execmem)
 {
     if (u_sess->SPI_cxt._curid + 1 != u_sess->SPI_cxt._connected)
         return SPI_ERROR_UNCONNECTED;
@@ -2936,6 +3495,7 @@ void CopySPI_Plan(SPIPlanPtr newplan, SPIPlanPtr plan, MemoryContext plancxt)
     newplan->plancxt = plancxt;
     newplan->cursor_options = plan->cursor_options;
     newplan->nargs = plan->nargs;
+    newplan->stmt_list = NIL;
     newplan->id = plan->id;
     newplan->spi_key = plan->spi_key;
     if (plan->nargs > 0) {
@@ -2947,6 +3507,12 @@ void CopySPI_Plan(SPIPlanPtr newplan, SPIPlanPtr plan, MemoryContext plancxt)
     }
     newplan->parserSetup = plan->parserSetup;
     newplan->parserSetupArg = plan->parserSetupArg;
+    ListCell* lc = NULL;
+    foreach (lc, plan->stmt_list) {
+        Query* q = (Query*)lfirst(lc);
+        Query* new_q = (Query*)copyObject(q);
+        newplan->stmt_list = lappend(newplan->stmt_list, new_q);
+    }
 }
 
 /*
@@ -3153,12 +3719,14 @@ void spi_exec_with_callback(CommandDest dest, const char *src, bool read_only, l
         }
 
         connected = false;
+        SPI_STACK_LOG("finish", NULL, NULL);
         (void)SPI_finish();
     }
     /* Clean up in case of error. */
     PG_CATCH();
     {
         if (connected) {
+            SPI_STACK_LOG("finish", NULL, NULL);
             SPI_finish();
         }
 
@@ -3201,3 +3769,40 @@ TransactionId SPI_get_top_transaction_id()
     return t_thrd.proc->lxid;
 }
 
+List* _SPI_get_querylist(SPIPlanPtr plan)
+{
+    return plan ? plan->stmt_list : NULL;
+}
+
+void _SPI_prepare_oneshot_plan_for_validator(const char *src, SPIPlanPtr plan)
+{
+    _SPI_prepare_oneshot_plan(src, plan);
+}
+
+void InitSPIPlanCxt()
+{
+    /* initialize memory context */
+    if (g_instance.spi_plan_cxt.global_spi_plan_context == NULL) {
+        g_instance.spi_plan_cxt.global_spi_plan_context = AllocSetContextCreate(
+            g_instance.instance_context, "SPIPlanContext", 
+            ALLOCSET_DEFAULT_MINSIZE, ALLOCSET_DEFAULT_INITSIZE, ALLOCSET_DEFAULT_MAXSIZE, SHARED_CONTEXT);
+    }
+}
+
+Datum
+SPI_datumTransfer(Datum value, bool typByVal, int typLen)
+{
+	MemoryContext oldcxt;
+	Datum		result;
+
+	if (_SPI_current == NULL)
+		elog(ERROR, "SPI_datumTransfer called while not connected to SPI");
+
+	oldcxt = MemoryContextSwitchTo(_SPI_current->savedcxt);
+
+	result = datumTransfer(value, typByVal, typLen);
+
+	MemoryContextSwitchTo(oldcxt);
+
+	return result;
+}

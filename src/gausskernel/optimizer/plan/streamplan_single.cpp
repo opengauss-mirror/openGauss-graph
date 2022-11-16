@@ -194,7 +194,7 @@ bool is_rangelist_plan(Plan* plan)
     return false;
 }
 
-ExecNodes* stream_merge_exec_nodes(Plan* lefttree, Plan* righttree)
+ExecNodes* stream_merge_exec_nodes(Plan* lefttree, Plan* righttree, bool push_nodelist)
 {
     return lefttree->exec_nodes;
 }
@@ -612,8 +612,11 @@ static void mark_distribute_setop_distribution(PlannerInfo* root, Node* node, Pl
                                              redistributeDistribution);
                     }
                 }
-                Stream *streamNode = (Stream *)newplan;
-                streamNode->is_sorted = IsA(node, MergeAppend) ? true : false;
+
+                if (IsA(newplan, Stream)) {
+                    Stream *streamNode = (Stream *)newplan;
+                    streamNode->is_sorted = IsA(node, MergeAppend) ? true : false;
+                }
 
                 if (PointerIsValid(mergeAppend)) {
                     newSubPlans = lappend(newSubPlans,

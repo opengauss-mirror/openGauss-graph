@@ -51,6 +51,28 @@ id=32
 id=31
 
 end E2E2
+start OFFSET 1 LIMIT 10 E2
+name=name11
+
+name=name11
+
+name=name11
+
+name=name11
+
+name=name11
+
+name=name11
+
+name=name11
+
+name=name11
+
+name=name11
+
+name=name11
+
+end OFFSET 1 LIMIT 10 E2
 aff_row=10
 id=1,class=0,name=name1
 id=2,class=0,name=name2
@@ -122,6 +144,22 @@ id=14,class=1,name=name_k
 id=13,class=1,name=name_k
 id=12,class=1,name=name_k
 id=11,class=1,name=name_k
+c2=2
+
+c2=3
+
+break of a resultset of pstmt1
+c2=2
+
+c2=3
+
+break of a resultset of pstmt1
+c2=2
+
+c2=3
+
+break of a resultset of pstmt1
+end of a resultset
 close connection
 DROP TABLE IF EXISTS jdbcpbebypass CASCADE;
 RESET ROLE;

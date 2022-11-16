@@ -22,10 +22,13 @@
 #include "replication/dataqueuedefs.h"
 #include "replication/replicainternal.h"
 #include "replication/libpqwalreceiver.h"
-#include "replication/obswalreceiver.h"
+#include "replication/archive_walreceiver.h"
+#include "replication/shared_storage_walreceiver.h"
+#include "replication/subscription_walreceiver.h"
 #include "storage/latch.h"
 #include "storage/spin.h"
 #include "pgxc/barrier.h"
+#include "pgxc/pgxc.h"
 
 /*
  * MAXCONNINFO: maximum size of a connection string.
@@ -35,6 +38,24 @@
 #define MAXCONNINFO 1024
 #define HIGHEST_PERCENT 100
 #define STREAMING_START_PERCENT 90
+#define IS_PAUSE_BY_TARGET_BARRIER 0x00000001
+#define IS_CANCEL_LOG_CTRL 0x00000010
+
+#ifdef ENABLE_MULTIPLE_NODES
+#define AM_HADR_CN_WAL_RECEIVER (t_thrd.postmaster_cxt.HaShmData->is_cross_region && \
+            t_thrd.postmaster_cxt.HaShmData->current_mode == STANDBY_MODE && IS_PGXC_COORDINATOR)
+#endif
+
+#define AM_HADR_WAL_RECEIVER (t_thrd.postmaster_cxt.HaShmData->is_cross_region && \
+            t_thrd.postmaster_cxt.HaShmData->is_hadr_main_standby)
+
+#define IS_DISASTER_RECOVER_MODE \
+    (t_thrd.postmaster_cxt.HaShmData->current_mode == STANDBY_MODE && \
+    g_instance.attr.attr_common.stream_cluster_run_mode == RUN_MODE_STANDBY)
+
+#define IS_CN_DISASTER_RECOVER_MODE \
+    (IS_PGXC_COORDINATOR && t_thrd.postmaster_cxt.HaShmData->current_mode == STANDBY_MODE && \
+    g_instance.attr.attr_common.stream_cluster_run_mode == RUN_MODE_STANDBY)
 
 #define DUMMY_STANDBY_DATADIR "base/dummy_standby"
 
@@ -67,25 +88,32 @@ typedef enum {
  * Description	: NONE_ERROR		(first try to connect the primary)
  *				  CHANNEL_ERROR		(server should try next channel)
  *				  REPL_INFO_ERROR	(server should try next replconnlist)
+ *                DCF_LOG_ERROR     (server should replicate dcf log by full build)
  */
-typedef enum { NONE_ERROR, CHANNEL_ERROR, REPL_INFO_ERROR } WalRcvConnError;
+typedef enum { NONE_ERROR, CHANNEL_ERROR, REPL_INFO_ERROR, DCF_LOG_ERROR } WalRcvConnError;
 
 typedef struct WalRcvCtlBlock {
     XLogRecPtr receivePtr; /* last byte + 1 received in the standby. */
     XLogRecPtr writePtr;   /* last byte + 1 written out in the standby */
     XLogRecPtr flushPtr;   /* last byte + 1 flushed in the standby */
     XLogRecPtr walStart;
-	XLogRecPtr lastReadPtr;
     int64 walWriteOffset;
     int64 walFreeOffset;
-    int64 walReadOffset;
     bool walIsWriting;
     slock_t mutex;
 
     char walReceiverBuffer[FLEXIBLE_ARRAY_MEMBER];
 } WalRcvCtlBlock;
 
-typedef enum { REPCONNTARGET_DEFAULT, REPCONNTARGET_PRIMARY, REPCONNTARGET_DUMMYSTANDBY, REPCONNTARGET_STANDBY, REPCONNTARGET_OBS } ReplConnTarget;
+typedef enum { 
+    REPCONNTARGET_DEFAULT, 
+    REPCONNTARGET_PRIMARY, 
+    REPCONNTARGET_DUMMYSTANDBY,
+    REPCONNTARGET_STANDBY, 
+    REPCONNTARGET_OBS, 
+    REPCONNTARGET_SHARED_STORAGE,
+    REPCONNTARGET_PUBLICATION
+} ReplConnTarget;
 
 /* Shared memory area for management of walreceiver process */
 typedef struct WalRcvData {
@@ -148,7 +176,7 @@ typedef struct WalRcvData {
      */
     XLogRecPtr latestValidRecord;
     pg_crc32 latestRecordCrc;
-
+    uint32 latestRecordLen;
     /*
      * Time of send and receive of any message received.
      */
@@ -190,15 +218,19 @@ typedef struct WalRcvData {
     slock_t exitLock;
     char recoveryTargetBarrierId[MAX_BARRIER_ID_LENGTH];
     char recoveryStopBarrierId[MAX_BARRIER_ID_LENGTH];
+    char recoverySwitchoverBarrierId[MAX_BARRIER_ID_LENGTH];
     char lastRecoveredBarrierId[MAX_BARRIER_ID_LENGTH];
+    char lastReceivedBarrierId[MAX_BARRIER_ID_LENGTH];
     XLogRecPtr lastRecoveredBarrierLSN;
+    XLogRecPtr lastReceivedBarrierLSN;
+    XLogRecPtr lastSwitchoverBarrierLSN;
+    XLogRecPtr targetSwitchoverBarrierLSN;
+    bool isFirstTimeAccessStorage;
+    bool isPauseByTargetBarrier;
     Latch* obsArchLatch;
-    bool archive_enabled;
-    XLogRecPtr standby_archive_start_point;
-    Latch* arch_latch;
-    bool arch_finish_result;
-    volatile unsigned int arch_task_status;
-    ArchiveXlogMessage archive_task;
+    struct ArchiveSlotConfig *archive_slot;
+    uint32 rcvDoneFromShareStorage;
+    uint32 shareStorageTerm;
 } WalRcvData;
 
 typedef struct WalReceiverFunc {
@@ -206,12 +238,25 @@ typedef struct WalReceiverFunc {
     bool (*walrcv_receive)(int timeout, unsigned char* type, char** buffer, int* len);
     void (*walrcv_send)(const char *buffer, int nbytes);
     void (*walrcv_disconnect)();
+    bool (*walrcv_command)(const char *cmd, char **err, int *sqlstate);
+    void (*walrcv_identify_system)();
+    void (*walrcv_startstreaming)(const LibpqrcvConnectParam *options);
+    void (*walrcv_create_slot)(const LibpqrcvConnectParam *options);
 } WalReceiverFunc;
+
+#define WalRcvIsOnline()                                                              \
+    ((g_instance.pid_cxt.WalReceiverPID != 0 && t_thrd.walreceiverfuncs_cxt.WalRcv && \
+        t_thrd.walreceiverfuncs_cxt.WalRcv->isRuning))
+
+#define GET_FUNC_IDX \
+    (t_thrd.walreceiverfuncs_cxt.WalRcv->conn_target - REPCONNTARGET_STANDBY < 0 ?   \
+        0 : t_thrd.walreceiverfuncs_cxt.WalRcv->conn_target - REPCONNTARGET_STANDBY)
 
 extern const WalReceiverFunc WalReceiverFuncTable[];
 
 extern XLogRecPtr latestValidRecord;
 extern pg_crc32 latestRecordCrc;
+extern uint32 latestRecordLen;
 
 extern const char *g_reserve_param[RESERVE_SIZE];
 extern bool ws_dummy_data_writer_use_file;
@@ -232,6 +277,7 @@ extern void WalRcvShmemInit(void);
 extern void KillWalRcvWriter(void);
 extern void ShutdownWalRcv(void);
 extern bool WalRcvInProgress(void);
+extern bool WalRcvIsRunning(void);
 extern void connect_dn_str(char* conninfo, int replIndex);
 extern void RequestXLogStreaming(
     XLogRecPtr* recptr, const char* conninfo, ReplConnTarget conn_target, const char* slotname);
@@ -248,6 +294,7 @@ extern void CloseWSDataFileOnDummyStandby(void);
 extern void InitWSDataNumOnDummyStandby(void);
 
 extern WalRcvCtlBlock* getCurrentWalRcvCtlBlock(void);
+
 extern int walRcvWrite(WalRcvCtlBlock* walrcb);
 extern int WSWalRcvWrite(WalRcvCtlBlock* walrcb, char* buf, Size nbytes, XLogRecPtr start_ptr);
 extern void WalRcvXLogClose(void);
@@ -257,7 +304,6 @@ extern void ProcessWSRmXLog(void);
 extern void ProcessWSRmData(void);
 extern void SetWalRcvWriterPID(ThreadId tid);
 extern bool WalRcvWriterInProgress(void);
-extern bool walRcvCtlBlockIsEmpty(void);
 extern void ProcessWalRcvInterrupts(void);
 extern ReplConnInfo* GetRepConnArray(int* cur_idx);
 extern void XLogWalRcvSendReply(bool force, bool requestReply);
@@ -265,16 +311,21 @@ extern int GetSyncPercent(XLogRecPtr startLsn, XLogRecPtr maxLsn, XLogRecPtr now
 extern const char* wal_get_role_string(ServerMode mode, bool getPeerRole = false);
 extern const char* wal_get_rebuild_reason_string(HaRebuildReason reason);
 extern Datum pg_stat_get_stream_replications(PG_FUNCTION_ARGS);
-extern void GetPrimaryServiceAddress(char* address, size_t address_len);
 extern void MakeDebugLog(TimestampTz sendTime, TimestampTz lastMsgReceiptTime, const char* msgFmt);
 extern void WalRcvSetPercentCountStartLsn(XLogRecPtr startLsn);
 extern void clean_failover_host_conninfo_for_dummy(void);
 extern void set_failover_host_conninfo_for_dummy(const char *remote_host, int remote_port);
 extern void get_failover_host_conninfo_for_dummy(int *repl);
 extern void set_wal_rcv_write_rec_ptr(XLogRecPtr rec_ptr);
-extern void setObsArchLatch(const Latch* latch);
-extern void SetStandbyArchLatch(const Latch* latch);
-
+extern void ha_set_rebuild_connerror(HaRebuildReason reason, WalRcvConnError connerror);
+extern void XLogWalRcvReceive(char *buf, Size nbytes, XLogRecPtr recptr);
+extern void wal_get_ha_rebuild_reason(char *buildReason, ServerMode local_role, bool isRunning);
+extern bool HasBuildReason();
+extern void GetMinLsnRecordsFromHadrCascadeStandby(void);
+extern void XLogWalRecordsPreProcess(char **buf, Size *len, WalDataMessageHeader *msghdr);
+extern int XLogDecompression(const char *buf, Size len, XLogRecPtr dataStart);
+void GetPasswordForHadrStreamingReplication(char user[], char password[]);
+extern char* remove_ipv6_zone(char* addr_src, char* addr_dest, int len);
 
 static inline void WalRcvCtlAcquireExitLock(void)
 {

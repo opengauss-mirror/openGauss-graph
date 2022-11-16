@@ -30,6 +30,7 @@
 
 #include "access/reloptions.h"
 #include "access/gtm.h"
+#include "access/sysattr.h"
 #include "catalog/dependency.h"
 #include "catalog/gs_column_keys.h"
 #include "catalog/gs_encrypted_columns.h"
@@ -74,11 +75,11 @@
 #include "optimizer/nodegroups.h"
 #include "pgxc/execRemote.h"
 #include "pgxc/redistrib.h"
-#include "executor/nodeModifyTable.h"
+#include "executor/node/nodeModifyTable.h"
 #endif
 #include "parser/parser.h"
 #include "rewrite/rewriteManip.h"
-#include "executor/nodeModifyTable.h"
+#include "executor/node/nodeModifyTable.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/extended_statistics.h"
@@ -92,10 +93,28 @@
 #include "utils/numeric_gs.h"
 #include "mb/pg_wchar.h"
 #include "gaussdb_version.h"
-
+#include "gs_ledger/ledger_utils.h"
 #include "client_logic/client_logic.h"
 #include "client_logic/client_logic_enums.h"
 #include "storage/checksum_impl.h"
+
+//graph
+#ifdef GS_GRAPH
+#include "gs_const.h"
+// #include "access/amapi.h"
+// #include "access/htup_details.h"
+#include "catalog/gs_graph_fn.h"
+#include "catalog/gs_graph.h"
+#include "catalog/gs_label.h"
+#include "catalog/pg_am.h"
+// #include "catalog/pg_constraint_fn.h"
+#include "catalog/pg_statistic_ext.h"
+#include "commands/graphcmds.h"
+#include "optimizer/planner.h"
+#include "parser/parse_cypher_expr.h"
+#include "utils/graph.h"
+#endif /* GS_GRAPH */
+// #include "utils/ruleutils.h"
 
 /* State shared by transformCreateSchemaStmt and its subroutines */
 typedef struct {
@@ -122,7 +141,7 @@ typedef struct {
 static void transformColumnDefinition(CreateStmtContext* cxt, ColumnDef* column, bool preCheck);
 static void transformTableConstraint(CreateStmtContext* cxt, Constraint* constraint);
 static void transformTableLikeClause(
-    CreateStmtContext* cxt, TableLikeClause* table_like_clause, bool preCheck, bool isFirstNode = false);
+    CreateStmtContext* cxt, TableLikeClause* table_like_clause, bool preCheck, bool isFirstNode, bool is_row_table, TransformTableType transformType);
 /* decide if serial column should be copied under analyze */
 static bool IsCreatingSeqforAnalyzeTempTable(CreateStmtContext* cxt);
 static void transformTableLikePartitionProperty(Relation relation, HeapTuple partitionTableTuple, List** partKeyColumns,
@@ -149,7 +168,7 @@ static void CheckListRangeDistribClause(CreateStmtContext *cxt, CreateStmt *stmt
 static void transformIndexConstraints(CreateStmtContext* cxt);
 static void checkConditionForTransformIndex(
     Constraint* constraint, CreateStmtContext* cxt, Oid index_oid, Relation index_rel);
-static IndexStmt* transformIndexConstraint(Constraint* constraint, CreateStmtContext* cxt);
+static IndexStmt* transformIndexConstraint(Constraint* constraint, CreateStmtContext* cxt, bool mustGlobal = false);
 static void transformFKConstraints(CreateStmtContext* cxt, bool skipValidation, bool isAddConstraint);
 static void transformConstraintAttrs(CreateStmtContext* cxt, List* constraintList);
 static void transformColumnType(CreateStmtContext* cxt, ColumnDef* column);
@@ -179,14 +198,30 @@ static void get_rel_partition_info(Relation partTableRel, List** pos, Const** up
 static void get_src_partition_bound(Relation partTableRel, Oid srcPartOid, Const** lowBound, Const** upBound);
 static Oid get_split_partition_oid(Relation partTableRel, SplitPartitionState* splitState);
 static List* add_range_partition_def_state(List* xL, List* boundary, const char* partName, const char* tblSpaceName);
+static bool CheckStepInRange(ParseState *pstate, Const *startVal, Const *endVal, Const *everyVal,
+    Form_pg_attribute attr);
 static List* divide_start_end_every_internal(ParseState* pstate, char* partName, Form_pg_attribute attr,
     Const* startVal, Const* endVal, Node* everyExpr, int* numPart,
     int maxNum, bool isinterval, bool needCheck, bool isPartition);
 static List* DividePartitionStartEndInterval(ParseState* pstate, Form_pg_attribute attr, char* partName,
     Const* startVal, Const* endVal, Const* everyVal, Node* everyExpr, int* numPart, int maxNum, bool isPartition);
-static void TryReuseFilenode(Relation rel, CreateStmtContext *ctx, bool clonepart);
 extern Node* makeAConst(Value* v, int location);
 static bool IsElementExisted(List* indexElements, IndexElem* ielem);
+static char* CreatestmtGetOrientation(CreateStmt *stmt);
+
+//graph
+#ifdef GS_GRAPH
+static List *makeVertexElements(void);
+static List *makeEdgeElements(void);
+static List *makeEdgeIndex(RangeVar *label);
+static bool isLabelKind(RangeVar *label, char labkind);
+static void transformLabelIdDefinition(CreateStmtContext *cxt, ColumnDef *col);
+static CommentStmt *makeComment(ObjectType type, RangeVar *name, char *desc);
+static Node *prop_ref_mutator(Node *node);
+static ObjectType getLabelObjectType(char *labname, Oid graphid);
+static bool figure_prop_index_colname_walker(Node *node, char **colname);
+#endif /* GS_GRAPH */
+
 #define REDIS_SCHEMA "data_redis"
 /*
  * transformCreateStmt -
@@ -202,16 +237,17 @@ static bool IsElementExisted(List* indexElements, IndexElem* ielem);
  * then expand those into multiple IndexStmt blocks.
  *	  - thomas 1997-12-02
  */
-List* transformCreateStmt(CreateStmt* stmt, const char* queryString, const List* uuids, bool preCheck, bool isFirstNode)
+List* transformCreateStmt(CreateStmt* stmt, const char* queryString, const List* uuids, bool preCheck,
+Oid *namespaceid, bool isFirstNode)
 {
     ParseState* pstate = NULL;
     CreateStmtContext cxt;
     List* result = NIL;
     List* save_alist = NIL;
     ListCell* elements = NULL;
-    Oid namespaceid;
     Oid existing_relid;
-
+    bool is_ledger_nsp = false;
+    bool is_row_table = is_ledger_rowstore(stmt->options);
     /*
      * We must not scribble on the passed-in CreateStmt, so copy it.  (This is
      * overkill, but easy.)
@@ -233,7 +269,27 @@ List* transformCreateStmt(CreateStmt* stmt, const char* queryString, const List*
      * preexisting relation in that namespace with the same name, and updates
      * stmt->relation->relpersistence if the select namespace is temporary.
      */
-    namespaceid = RangeVarGetAndCheckCreationNamespace(stmt->relation, NoLock, &existing_relid);
+    *namespaceid = RangeVarGetAndCheckCreationNamespace(stmt->relation, NoLock, &existing_relid, RELKIND_RELATION);
+
+    /*
+     * Check whether relation is in ledger schema. If it is, we add hash column.
+     */
+    HeapTuple tp = SearchSysCache1(NAMESPACEOID, ObjectIdGetDatum(*namespaceid));
+    if (HeapTupleIsValid(tp)) {
+        bool is_null = true;
+        Datum datum = SysCacheGetAttr(NAMESPACEOID, tp, Anum_pg_namespace_nspblockchain, &is_null);
+        if (!is_null) {
+            is_ledger_nsp = DatumGetBool(datum);
+        }
+        ReleaseSysCache(tp);
+    }
+
+    if (is_ledger_nsp && stmt->partTableState != NULL && stmt->partTableState->subPartitionState != NULL) {
+        ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                 (errmsg("Un-support feature"), errdetail("Subpartition table does not support ledger user table."),
+                  errcause("The function is not implemented."), erraction("Use other actions instead."))));
+    }
 
     /*
      * If the relation already exists and the user specified "IF NOT EXISTS",
@@ -311,8 +367,20 @@ List* transformCreateStmt(CreateStmt* stmt, const char* queryString, const List*
      * are earlier in the search path.	But a local temp table is effectively
      * specified to be in pg_temp, so no need for anything extra in that case.
      */
-    if (stmt->relation->schemaname == NULL && stmt->relation->relpersistence != RELPERSISTENCE_TEMP)
-        stmt->relation->schemaname = get_namespace_name(namespaceid);
+    if (stmt->relation->schemaname == NULL && stmt->relation->relpersistence != RELPERSISTENCE_TEMP) {
+        /* If create schema already set, use the latest one */
+        if (t_thrd.proc->workingVersionNum >= 92408 && u_sess->catalog_cxt.setCurCreateSchema) {
+            stmt->relation->schemaname = pstrdup(u_sess->catalog_cxt.curCreateSchema);
+        } else {
+            stmt->relation->schemaname = get_namespace_name(*namespaceid);
+        }
+        if (t_thrd.proc->workingVersionNum >= 92408 && IS_MAIN_COORDINATOR &&
+            !u_sess->catalog_cxt.setCurCreateSchema) {
+            u_sess->catalog_cxt.setCurCreateSchema = true;
+            u_sess->catalog_cxt.curCreateSchema =
+                MemoryContextStrdup(u_sess->top_transaction_mem_cxt,stmt->relation->schemaname);
+        }
+    }
 
     /* Set up pstate and CreateStmtContext */
     pstate = make_parsestate(NULL);
@@ -348,9 +416,6 @@ List* transformCreateStmt(CreateStmt* stmt, const char* queryString, const List*
     cxt.node = (Node*)stmt;
     cxt.internalData = stmt->internalData;
     cxt.isResizing = false;
-    cxt.bucketOid = InvalidOid;
-    cxt.relnodelist = NULL;
-    cxt.toastnodelist = NULL;
     cxt.ofType = (stmt->ofTypename != NULL);
 
     /* We have gen uuids, so use it */
@@ -380,12 +445,32 @@ List* transformCreateStmt(CreateStmt* stmt, const char* queryString, const List*
      */
     foreach (elements, stmt->tableElts) {
         TableLikeClause* tbl_like_clause = NULL;
+        TransformTableType transformType = TRANSFORM_INVALID;
         Node* element = (Node*)lfirst(elements);
         cxt.uuids = stmt->uuids;
 
         switch (nodeTag(element)) {
             case T_ColumnDef:
+                if (is_ledger_nsp && strcmp(((ColumnDef*)element)->colname, "hash") == 0 &&
+                    !IsA(stmt, CreateForeignTableStmt) && stmt->relation->relpersistence == RELPERSISTENCE_PERMANENT &&
+                    is_row_table) {
+                    ereport(ERROR,
+                        (errcode(ERRCODE_INVALID_TABLE_DEFINITION),
+                            errmsg("\"hash\" column is reserved for system in ledger schema.")));
+                }
                 transformColumnDefinition(&cxt, (ColumnDef*)element, !isFirstNode && preCheck);
+
+                if (((ColumnDef *)element)->clientLogicColumnRef != NULL) {
+                    if (stmt->partTableState != NULL && stmt->partTableState->subPartitionState != NULL) {
+                        ereport(
+                            ERROR,
+                            (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                             (errmsg("Un-support feature"),
+                              errdetail("For subpartition table, cryptographic database is not yet supported."),
+                              errcause("The function is not implemented."), erraction("Use other actions instead."))));
+                    }
+                }
+
                 break;
 
             case T_Constraint:
@@ -422,7 +507,15 @@ List* transformCreateStmt(CreateStmt* stmt, const char* queryString, const List*
                     }
                 }
 #endif
-                transformTableLikeClause(&cxt, (TableLikeClause*)element, !isFirstNode && preCheck, isFirstNode);
+                if (!(tbl_like_clause->options & CREATE_TABLE_LIKE_RELOPTIONS)) {
+                    //transformType is only use in hashbucket data transfer
+                    if (is_ledger_hashbucketstore(stmt->options)) {
+                        transformType = TRANSFORM_TO_HASHBUCKET;
+                    } else {
+                        transformType = TRANSFORM_TO_NONHASHBUCKET;
+                    }
+                }
+                transformTableLikeClause(&cxt, (TableLikeClause*)element, !isFirstNode && preCheck, isFirstNode, is_row_table, transformType);
                 if (stmt->relation->relpersistence != RELPERSISTENCE_TEMP &&
                     tbl_like_clause->relation->relpersistence == RELPERSISTENCE_TEMP)
                     ereport(ERROR,
@@ -436,6 +529,30 @@ List* transformCreateStmt(CreateStmt* stmt, const char* queryString, const List*
                         errmsg("unrecognized node type: %d", (int)nodeTag(element))));
                 break;
         }
+    }
+
+    /*
+     * add hash column for table in ledger scheam;
+     */
+    if (is_ledger_nsp && !IsA(stmt, CreateForeignTableStmt) &&
+        stmt->relation->relpersistence == RELPERSISTENCE_PERMANENT && is_ledger_rowstore(stmt->options)) {
+        ColumnDef* col = makeNode(ColumnDef);
+        col->colname = pstrdup("hash");
+        col->typname = SystemTypeName("hash16");
+        col->kvtype = 0;
+        col->inhcount = 0;
+        col->is_local = true;
+        col->is_not_null = false;
+        col->is_from_type = false;
+        col->storage = 0;
+        col->cmprs_mode = ATT_CMPR_UNDEFINED;
+        col->raw_default = NULL;
+        col->cooked_default = NULL;
+        col->collClause = NULL;
+        col->collOid = InvalidOid;
+        col->constraints = NIL;
+        col->fdwoptions = NIL;
+        transformColumnDefinition(&cxt, col, !isFirstNode && preCheck);
     }
 
     // cxt.csc_partTableState is the partitionState generated
@@ -457,6 +574,7 @@ List* transformCreateStmt(CreateStmt* stmt, const char* queryString, const List*
         if (NULL != ftblStmt->part_state) {
             cxt.ispartitioned = true;
             cxt.partitionKey = ftblStmt->part_state->partitionKey;
+            cxt.subPartitionKey = NULL;
         } else {
             cxt.ispartitioned = false;
         }
@@ -464,6 +582,11 @@ List* transformCreateStmt(CreateStmt* stmt, const char* queryString, const List*
         cxt.ispartitioned = PointerIsValid(stmt->partTableState);
         if (cxt.ispartitioned) {
             cxt.partitionKey = stmt->partTableState->partitionKey;
+            if (stmt->partTableState->subPartitionState != NULL) {
+                cxt.subPartitionKey = stmt->partTableState->subPartitionState->partitionKey;
+            } else {
+                cxt.subPartitionKey = NULL;
+            }
         }
     }
 
@@ -482,7 +605,7 @@ List* transformCreateStmt(CreateStmt* stmt, const char* queryString, const List*
         pos = GetPartitionkeyPos(stmt->partTableState->partitionKey, cxt.columns);
 
         /* get descriptor */
-        desc = BuildDescForRelation(cxt.columns, (Node*)makeString(ORIENTATION_ROW));
+        desc = BuildDescForRelation(cxt.columns);
 
         /* entry of transform */
         stmt->partTableState->partitionList = transformRangePartStartEndStmt(
@@ -493,7 +616,11 @@ List* transformCreateStmt(CreateStmt* stmt, const char* queryString, const List*
 // only check partition name duplication on primary coordinator
 #ifdef PGXC
         if ((IS_PGXC_COORDINATOR && !IsConnFromCoord()) || IS_SINGLE_NODE) {
-            checkPartitionName(stmt->partTableState->partitionList);
+            if (stmt->partTableState->subPartitionState != NULL) {
+                checkSubPartitionName(stmt->partTableState->partitionList);
+            } else {
+                checkPartitionName(stmt->partTableState->partitionList);
+            }
         }
 #else
         checkPartitionName(stmt->partTableState->partitionList);
@@ -576,12 +703,9 @@ List* transformCreateStmt(CreateStmt* stmt, const char* queryString, const List*
     stmt->tableElts = cxt.columns;
     stmt->constraints = cxt.ckconstraints;
     stmt->clusterKeys = cxt.clusterConstraints;
-    stmt->oldBucket = cxt.bucketOid;
-    stmt->oldNode  = cxt.relnodelist;
-    stmt->oldToastNode = cxt.toastnodelist;
-    if (stmt->internalData == NULL)
+    if (stmt->internalData == NULL) {
         stmt->internalData = cxt.internalData;
-
+    }
     result = lappend(cxt.blist, stmt);
     result = list_concat(result, cxt.alist);
     result = list_concat(result, save_alist);
@@ -597,7 +721,7 @@ List* transformCreateStmt(CreateStmt* stmt, const char* queryString, const List*
 #else
     if (!IsA(stmt, CreateForeignTableStmt) && !stmt->distributeby && !stmt->inhRelations && cxt.fallback_dist_col) {
 #endif
-        stmt->distributeby = (DistributeBy*)palloc0(sizeof(DistributeBy));
+        stmt->distributeby = makeNode(DistributeBy);
         stmt->distributeby->disttype = DISTTYPE_HASH;
         stmt->distributeby->colname = cxt.fallback_dist_col;
     }
@@ -611,7 +735,7 @@ List* transformCreateStmt(CreateStmt* stmt, const char* queryString, const List*
  *		create a sequence owned by table, need to add record to pg_depend.
  *		used in CREATE TABLE and CREATE TABLE ... LIKE
  */
-static void createSeqOwnedByTable(CreateStmtContext* cxt, ColumnDef* column, bool preCheck)
+static void createSeqOwnedByTable(CreateStmtContext* cxt, ColumnDef* column, bool preCheck, bool large)
 {
     Oid snamespaceid;
     char* snamespace = NULL;
@@ -664,6 +788,7 @@ static void createSeqOwnedByTable(CreateStmtContext* cxt, ColumnDef* column, boo
 #ifdef PGXC
     seqstmt->is_serial = true;
 #endif
+    seqstmt->is_large = large;
 
     /* Assign UUID for create sequence */
     if (!IS_SINGLE_NODE)
@@ -707,6 +832,7 @@ static void createSeqOwnedByTable(CreateStmtContext* cxt, ColumnDef* column, boo
 #endif
     attnamelist = list_make3(makeString(snamespace), makeString(cxt->relation->relname), makeString(column->colname));
     altseqstmt->options = list_make1(makeDefElem("owned_by", (Node*)attnamelist));
+    altseqstmt->is_large = large;
 
     cxt->alist = lappend(cxt->alist, altseqstmt);
 
@@ -771,6 +897,7 @@ static bool isColumnEncryptionAllowed(CreateStmtContext *cxt, ColumnDef *column)
 static void transformColumnDefinition(CreateStmtContext* cxt, ColumnDef* column, bool preCheck)
 {
     bool is_serial = false;
+    bool large = false;
     bool saw_nullable = false;
     bool saw_default = false;
     bool saw_generated = false;
@@ -800,10 +927,23 @@ static void transformColumnDefinition(CreateStmtContext* cxt, ColumnDef* column,
             is_serial = true;
             column->typname->names = NIL;
             column->typname->typeOid = INT8OID;
-        } else if (strcmp(typname, "byteawithoutordercol") == 0 || 
-            strcmp(typname, "byteawithoutorderwithequalcol") == 0 ||
-            strcmp(typname, "_byteawithoutordercol") == 0 ||
-            strcmp(typname, "_byteawithoutorderwithequalcol") == 0) {
+        } else if (strcmp(typname, "largeserial") == 0 || strcmp(typname, "serial16") == 0) {
+#ifdef ENABLE_MULTIPLE_NODES
+            ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                    errmsg("Un-support feature"),
+                    errdetail("Pldebug is not supported for distribute currently.")));
+#endif
+            is_serial = true;
+            column->typname->names = NIL;
+            column->typname->typeOid = NUMERICOID;
+            large = true;
+#ifdef ENABLE_MULTIPLE_NODES
+        } else if ((is_enc_type(typname) && IS_MAIN_COORDINATOR) ||
+#else
+        } else if (is_enc_type(typname) ||
+#endif
+            (!u_sess->attr.attr_common.enable_beta_features && strcmp(typname, "int16") == 0)) {
             ereport(ERROR,
                 (errcode(ERRCODE_OPERATE_NOT_SUPPORTED),
                     errmsg("It's not supported to create %s column", typname)));
@@ -840,7 +980,7 @@ static void transformColumnDefinition(CreateStmtContext* cxt, ColumnDef* column,
     /* Special actions for SERIAL pseudo-types */
     column->is_serial = is_serial;
     if (is_serial) {
-        createSeqOwnedByTable(cxt, column, preCheck);
+        createSeqOwnedByTable(cxt, column, preCheck, large);
     }
 
     /* Process column constraints, if any... */
@@ -949,7 +1089,11 @@ static void transformColumnDefinition(CreateStmtContext* cxt, ColumnDef* column,
         }
     }
     if (column->clientLogicColumnRef != NULL) {
-        if (!IsConnFromCoord() && !u_sess->attr.attr_common.enable_full_encryption) {
+#ifdef ENABLE_MULTIPLE_NODES
+        if (IS_MAIN_COORDINATOR && !u_sess->attr.attr_common.enable_full_encryption) {
+#else
+        if (!u_sess->attr.attr_common.enable_full_encryption) {
+#endif
             ereport(ERROR,
                 (errcode(ERRCODE_OPERATE_NOT_SUPPORTED),
                     errmsg("Un-support to define encrypted column when client encryption is disabled.")));
@@ -1142,11 +1286,120 @@ static void transformTableLikeFromSerialData(CreateStmtContext* cxt, TableLikeCl
     foreach (cell, cxt->columns) {
         ColumnDef* column = (ColumnDef*)lfirst(cell);
         if (column->is_serial) {
-            createSeqOwnedByTable(cxt, column, false);
+            bool large = (column->typname->typeOid == NUMERICOID);
+            createSeqOwnedByTable(cxt, column, false, large);
         } else if (column->cooked_default != NULL) {
             checkTableLikeSequence(column->cooked_default);
         }
     }
+}
+
+/*
+ * Get all tag for tsdb
+ */
+
+static DistributeBy* GetHideTagDistribution(TupleDesc tupleDesc)
+{
+    DistributeBy* distributeby = makeNode(DistributeBy);
+    distributeby->disttype = DISTTYPE_HASH;
+    for (int attno = 1; attno <= tupleDesc->natts; attno++) {
+        Form_pg_attribute attribute = tupleDesc->attrs[attno - 1];
+        char* attributeName = NameStr(attribute->attname);
+        if (attribute->attkvtype == ATT_KV_TAG) {
+            distributeby->colname = lappend(distributeby->colname, makeString(attributeName));
+        }
+    }
+    return distributeby;
+}
+
+/*
+ * Support Create table like on table with subpartitions
+ * In transform phase, we need fill PartitionState
+ * 1. Recursively fill partitionList in PartitionState also including subpartitionList
+ * 2. Recursively fill PartitionState also including SubPartitionState
+ */
+static PartitionState *transformTblSubpartition(Relation relation, HeapTuple partitionTuple,
+                                    List* partitionList, List* subPartitionList)
+{
+    ListCell *lc1 = NULL;
+    ListCell *lc2 = NULL;
+    ListCell *lc3 = NULL;
+
+    List *partKeyColumns = NIL;
+    List *partitionDefinitions = NIL;
+    PartitionState *partState = NULL;
+    PartitionState *subPartState = NULL;
+    Form_pg_partition tupleForm = NULL;
+    Form_pg_partition partitionForm = NULL;
+    Form_pg_partition subPartitionForm = NULL;
+
+    tupleForm = (Form_pg_partition)GETSTRUCT(partitionTuple);
+
+    /* prepare partition definitions */
+    transformTableLikePartitionProperty(
+        relation, partitionTuple, &partKeyColumns, partitionList, &partitionDefinitions);
+
+    partState = makeNode(PartitionState);
+    partState->partitionKey = partKeyColumns;
+    partState->partitionList = partitionDefinitions;
+    partState->partitionStrategy = tupleForm->partstrategy;
+
+    partState->rowMovement = relation->rd_rel->relrowmovement ? ROWMOVEMENT_ENABLE : ROWMOVEMENT_DISABLE;
+
+    /* prepare subpartition definitions */
+    forboth(lc1, partitionList, lc2, subPartitionList) {
+        List *subPartKeyColumns = NIL;
+        List *subPartitionDefinitions = NIL;
+        RangePartitionDefState *partitionDef = NULL;
+
+        HeapTuple partTuple = (HeapTuple)lfirst(lc1);
+        List *subPartitions = (List *)lfirst(lc2);
+
+        HeapTuple subPartTuple = (HeapTuple)linitial(subPartitions);
+        subPartitionForm = (Form_pg_partition)GETSTRUCT(subPartTuple);
+        partitionForm = (Form_pg_partition)GETSTRUCT(partTuple);
+
+        if (subPartitionForm->partstrategy != PART_STRATEGY_RANGE) {
+            ereport(ERROR,
+                    (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                    errmsg("Un-support feature"),
+                    errdetail("Create Table like with subpartition only support range strategy.")));
+        }
+
+        Oid partOid = HeapTupleGetOid(partTuple);
+        Partition part = partitionOpen(relation, partOid, AccessShareLock);
+        Relation partRel = partitionGetRelation(relation, part);
+
+        transformTableLikePartitionProperty(
+            partRel, partTuple, &subPartKeyColumns, subPartitions, &subPartitionDefinitions);
+
+        if (subPartState == NULL) {
+            subPartState = makeNode(PartitionState);
+            subPartState->partitionKey = subPartKeyColumns;
+            subPartState->partitionList = NULL;
+            subPartState->partitionStrategy = subPartitionForm->partstrategy;
+        }
+
+        /* Here do this for reserve origin subpartitions order */
+        foreach(lc3, partitionDefinitions) {
+            RangePartitionDefState *rightDef = (RangePartitionDefState*)lfirst(lc3);
+
+            if (pg_strcasecmp(NameStr(partitionForm->relname), rightDef->partitionName) == 0) {
+                partitionDef = rightDef;
+                break;
+            }
+        }
+
+        Assert(partitionDef != NULL);
+        partitionDef->subPartitionDefState = subPartitionDefinitions;
+
+        releaseDummyRelation(&partRel);
+        partitionClose(relation, part, NoLock);
+    }
+
+    partState->subPartitionState = subPartState;
+
+    return partState;
 }
 
 /*
@@ -1157,7 +1410,7 @@ static void transformTableLikeFromSerialData(CreateStmtContext* cxt, TableLikeCl
  * <srctable>.
  */
 static void transformTableLikeClause(
-    CreateStmtContext* cxt, TableLikeClause* table_like_clause, bool preCheck, bool isFirstNode)
+    CreateStmtContext* cxt, TableLikeClause* table_like_clause, bool preCheck, bool isFirstNode, bool is_row_table, TransformTableType transformType)
 {
     AttrNumber parent_attno;
     Relation relation;
@@ -1270,7 +1523,7 @@ static void transformTableLikeClause(
      * Views are not created on Datanodes, so this will result in an error
      * In order to fix this problem, it will be necessary to
      * transform the query string of CREATE TABLE into something not using
-     * the view definition. Now Postgres-XC only uses the raw string...
+     * the view definition. Now openGauss only uses the raw string...
      * There is some work done with event triggers in 9.3, so it might
      * be possible to use that code to generate the SQL query to be sent to
      * remote nodes. When this is done, this error will be removed.
@@ -1278,7 +1531,7 @@ static void transformTableLikeClause(
     if (relation->rd_rel->relkind == RELKIND_VIEW || relation->rd_rel->relkind == RELKIND_CONTQUERY)
         ereport(ERROR,
             (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-                errmsg("Postgres-XC does not support VIEW in LIKE clauses"),
+                errmsg("openGauss does not support VIEW in LIKE clauses"),
                 errdetail("The feature is not currently supported")));
 #endif
 
@@ -1326,6 +1579,7 @@ static void transformTableLikeClause(
     /*
      * Insert the copied attributes into the cxt for the new table definition.
      */
+    bool hideTag = false;
     for (parent_attno = 1; parent_attno <= tupleDesc->natts; parent_attno++) {
         Form_pg_attribute attribute = tupleDesc->attrs[parent_attno - 1];
         char* attributeName = NameStr(attribute->attname);
@@ -1336,6 +1590,13 @@ static void transformTableLikeClause(
          */
         if (attribute->attisdropped && (!u_sess->attr.attr_sql.enable_cluster_resize || RelationIsTsStore(relation)))
             continue;
+        /*
+         * Ignore hide tag(tsdb)
+         */
+        if (attribute->attkvtype == ATT_KV_HIDE && table_like_clause->options != CREATE_TABLE_LIKE_ALL) {
+            hideTag = true;
+            continue;
+        }
 
         if (u_sess->attr.attr_sql.enable_cluster_resize && attribute->attisdropped) {
             def = makeNode(ColumnDef);
@@ -1399,7 +1660,7 @@ static void transformTableLikeClause(
              * When analyzing a column-oriented table with default_statistics_target < 0, we will create a row-oriented
              * temp table. In this case, ignore the compression flag.
              */
-            if (u_sess->analyze_cxt.is_under_analyze) {
+            if (u_sess->analyze_cxt.is_under_analyze || (IsConnFromCoord() && is_row_table)) {
                 if (def->cmprs_mode != ATT_CMPR_UNDEFINED) {
                     def->cmprs_mode = ATT_CMPR_NOCOMPRESS;
                 }
@@ -1449,8 +1710,10 @@ static void transformTableLikeClause(
                     if (seqs != NULL && list_member_oid(seqs, DatumGetObjectId(seqId))) {
                         /* is serial type */
                         def->is_serial = true;
+                        bool large = (get_rel_relkind(seqId) == RELKIND_LARGE_SEQUENCE);
                         /* Special actions for SERIAL pseudo-types */
-                        createSeqOwnedByTable(cxt, def, preCheck);
+
+                        createSeqOwnedByTable(cxt, def, preCheck, large);
                     }
                 }
             }
@@ -1614,23 +1877,29 @@ static void transformTableLikeClause(
         HeapTuple partitionTableTuple = NULL;
         Form_pg_partition partitionForm = NULL;
         List* partitionList = NIL;
+        List* subPartitionList = NIL;
 
         // read out partitioned table tuple, and partition tuple list
         partitionTableTuple =
             searchPgPartitionByParentIdCopy(PART_OBJ_TYPE_PARTED_TABLE, ObjectIdGetDatum(relation->rd_id));
         partitionList = searchPgPartitionByParentId(PART_OBJ_TYPE_TABLE_PARTITION, ObjectIdGetDatum(relation->rd_id));
 
+        if (RelationIsSubPartitioned(relation)) {
+            subPartitionList = searchPgSubPartitionByParentId(PART_OBJ_TYPE_TABLE_SUB_PARTITION, partitionList);
+        }
+
         if (partitionTableTuple != NULL) {
             partitionForm = (Form_pg_partition)GETSTRUCT(partitionTableTuple);
-	    if (partitionForm->partstrategy == PART_STRATEGY_LIST ||
-		partitionForm->partstrategy == PART_STRATEGY_HASH) {
-		freePartList(partitionList);
-		heap_freetuple_ext(partitionTableTuple);
+
+            if (partitionForm->partstrategy == PART_STRATEGY_LIST ||
+                partitionForm->partstrategy == PART_STRATEGY_HASH) {
+                freePartList(partitionList);
+                heap_freetuple_ext(partitionTableTuple);
                 heap_close(relation, NoLock);
-		ereport(ERROR,
-			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-			errmsg("Un-support feature"),
-			errdetail("The Like feature is not supported currently for List and Hash.")));
+                ereport(ERROR,
+                        (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                        errmsg("Un-support feature"),
+                        errdetail("The Like feature is not supported currently for List and Hash.")));
             }
             bool value_partition_rel = (partitionForm->partstrategy == PART_STRATEGY_VALUE);
 
@@ -1638,7 +1907,7 @@ static void transformTableLikeClause(
              * We only have to create PartitionState for a range partition table
              * with known partitions or a value partition table(HDFS).
              */
-            if ((NIL != partitionList) || value_partition_rel) {
+            if ((NIL != partitionList && subPartitionList == NIL) || value_partition_rel) {
                 {
                     List* partKeyColumns = NIL;
                     List* partitionDefinitions = NIL;
@@ -1669,6 +1938,17 @@ static void transformTableLikeClause(
 
                     freePartList(partitionList);
                 }
+            } else if (subPartitionList != NULL) {
+                n = transformTblSubpartition(relation,
+                            partitionTableTuple,
+                            partitionList,
+                            subPartitionList);
+
+                /* store the produced partition state in CreateStmtContext */
+                cxt->csc_partTableState = n;
+
+                freePartList(partitionList);
+                freePartList(subPartitionList);
             }
 
             heap_freetuple_ext(partitionTableTuple);
@@ -1681,7 +1961,6 @@ static void transformTableLikeClause(
     if ((table_like_clause->options & CREATE_TABLE_LIKE_INDEXES) && relation->rd_rel->relhasindex) {
         List* parent_indexes = NIL;
         ListCell* l = NULL;
-
         parent_indexes = RelationGetIndexList(relation);
 
         foreach (l, parent_indexes) {
@@ -1692,7 +1971,7 @@ static void transformTableLikeClause(
             parent_index = index_open(parent_index_oid, AccessShareLock);
 
             /* Build CREATE INDEX statement to recreate the parent_index */
-            index_stmt = generateClonedIndexStmt(cxt, parent_index, attmap, tupleDesc->natts, relation);
+            index_stmt = generateClonedIndexStmt(cxt, parent_index, attmap, tupleDesc->natts, relation, transformType);
 
             /* Copy comment on index, if requested */
             if (table_like_clause->options & CREATE_TABLE_LIKE_COMMENTS) {
@@ -1747,8 +2026,8 @@ static void transformTableLikeClause(
      */
     if (table_like_clause->options & CREATE_TABLE_LIKE_DISTRIBUTION) {
         cxt->distributeby = (IS_PGXC_COORDINATOR) ? 
-                            getTableDistribution(relation->rd_id) : 
-                            getTableHBucketDistribution(relation);
+                        (hideTag ? GetHideTagDistribution(tupleDesc) : getTableDistribution(relation->rd_id)) : 
+                        getTableHBucketDistribution(relation);
     }
 #endif
 
@@ -1777,16 +2056,6 @@ static void transformTableLikeClause(
 
     if (u_sess->attr.attr_sql.enable_cluster_resize) {
          cxt->isResizing = RelationInClusterResizing(relation);
-
-         if (RELATION_OWN_BUCKET(relation) && RelationInClusterResizing(relation)) {
-             char new_tablename[NAMEDATALEN];
-             RelationGetNewTableName(relation, (char*)new_tablename);
-             if(strcmp(cxt->relation->schemaname, REDIS_SCHEMA) == 0 
-                && strcmp(cxt->relation->relname, new_tablename) == 0 ){
-                cxt->bucketOid = relation->rd_bucketoid;
-                TryReuseFilenode(relation, cxt, table_like_clause->options & CREATE_TABLE_LIKE_PARTITION);
-             }
-         }
     }
 
     /*
@@ -2123,12 +2392,60 @@ char* getTmptableIndexName(const char* srcSchema, const char* srcIndex)
     return idxname;
 }
 
+static bool* getPartIndexUsableStat(Relation indexRelation)
+{
+    Oid relation_oid = IndexGetRelation(indexRelation->rd_id, false);
+    Relation rel = relation_open(relation_oid, NoLock);
+    List* relation_oid_list = relationGetPartitionOidList(rel);
+    List* partitions = indexGetPartitionList(indexRelation, ExclusiveLock);
+    bool *usable = (bool *)palloc0(sizeof(bool) * list_length(partitions));
+    ListCell* cell = NULL;
+    int i = 0;
+
+    foreach (cell, relation_oid_list) {
+        Oid relid = lfirst_oid(cell);
+        ListCell* parCell = NULL;
+        bool found = false;
+        foreach (parCell, partitions) {
+            Partition indexPartition = (Partition)lfirst(parCell);
+            if (relid == indexPartition->pd_part->indextblid) {
+                usable[i++] = indexPartition->pd_part->indisusable;
+                found = true;
+                break;
+            }
+        }
+        Assert(found);
+    }
+    releasePartitionList(indexRelation, &partitions, ExclusiveLock);
+    list_free_ext(relation_oid_list);
+    list_free_ext(partitions);
+    relation_close(rel, NoLock);
+    return usable;
+}
+
+void GenerateClonedIndexHbucketTransfer(Relation rel, IndexStmt* index, TransformTableType transformType, bool constainsExp)
+{
+    if (PointerIsValid(rel) && RelationInClusterResizing(rel) && RELATION_HAS_BUCKET(rel) &&
+        transformType == TRANSFORM_TO_NONHASHBUCKET) {
+        if (index->options != NULL && is_contain_crossbucket(index->options)) {
+            index->options = list_delete_name(index->options, "crossbucket");
+        }
+    }
+
+    if (PointerIsValid(rel) && RelationInClusterResizing(rel) && !RELATION_HAS_BUCKET(rel) &&
+        transformType == TRANSFORM_TO_HASHBUCKET) {
+        if (constainsExp || index->whereClause) {
+            index->options = lappend(index->options, makeDefElem("crossbucket", (Node*)makeString("off")));
+        }
+    }
+
+}
 /*
  * Generate an IndexStmt node using information from an already existing index
  * "source_idx".  Attribute numbers should be adjusted according to attmap.
  */
 IndexStmt* generateClonedIndexStmt(
-    CreateStmtContext* cxt, Relation source_idx, const AttrNumber* attmap, int attmap_length, Relation rel)
+    CreateStmtContext* cxt, Relation source_idx, const AttrNumber* attmap, int attmap_length, Relation rel, TransformTableType transformType)
 {
     Oid source_relid = RelationGetRelid(source_idx);
     Form_pg_attribute* attrs = RelationGetDescr(source_idx)->attrs;
@@ -2147,7 +2464,6 @@ IndexStmt* generateClonedIndexStmt(
     Oid keycoltype;
     Datum datum;
     bool isnull = false;
-    bool isResize = false;
     int indnkeyatts;
 
     /*
@@ -2210,8 +2526,10 @@ IndexStmt* generateClonedIndexStmt(
         char *srcSchema = get_namespace_name(source_idx->rd_rel->relnamespace);
         char *srcIndex = NameStr(source_idx->rd_rel->relname);
         index->idxname = getTmptableIndexName(srcSchema, srcIndex);
-        isResize = true;
         pfree_ext(srcSchema);
+        if (index->isPartitioned) {
+            index->partIndexUsable = getPartIndexUsableStat(source_idx);
+        }
     } else {
         index->idxname = NULL;
     }
@@ -2374,26 +2692,22 @@ IndexStmt* generateClonedIndexStmt(
         index->indexParams = lappend(index->indexParams, iparam);
     }
 
-    if (u_sess->attr.attr_sql.enable_cluster_resize && 
-            isResize && RELATION_OWN_BUCKET(rel)) {
-        if (!index->isPartitioned) {
-            TryReuseIndex(source_idx->rd_id, index);
-        } else {
-            tryReusePartedIndex(source_idx->rd_id, index, rel);
-        }
-    }
-
     /* Handle included columns separately */
-    if (indnkeyatts != idxrec->indnatts) {
-        /* Only global-partition-index would satisfy this condition in the current code */
-        index->isGlobal = true;
-        index->isPartitioned = true;
+    for (int i = indnkeyatts; i < idxrec->indnatts; i++) {
+        AttrNumber attnum = idxrec->indkey.values[i];
+        if (attnum == TableOidAttributeNumber) {
+            /* global-partition-index */
+            index->isGlobal = true;
+            index->isPartitioned = true;
+            break;
+        }
     }
 
     /* Copy reloptions if any */
     datum = SysCacheGetAttr(RELOID, ht_idxrel, Anum_pg_class_reloptions, &isnull);
-    if (!isnull)
+    if (!isnull) {
         index->options = untransformRelOptions(datum);
+    }
 
     /* If it's a partial index, decompile and append the predicate */
     datum = SysCacheGetAttr(INDEXRELID, ht_idx, Anum_pg_index_indpred, &isnull);
@@ -2419,7 +2733,7 @@ IndexStmt* generateClonedIndexStmt(
 
         index->whereClause = pred_tree;
     }
-
+    GenerateClonedIndexHbucketTransfer(rel, index, transformType, indexprs != NULL);
     /* Clean up */
     ReleaseSysCache(ht_idxrel);
 
@@ -2495,6 +2809,42 @@ static List* get_opclass(Oid opclass, Oid actual_datatype)
     return result;
 }
 
+static bool IsPartitionKeyInParmaryKeyAndUniqueKey(const char *pkname, const List* constraintKeys)
+{
+    bool found = false;
+    ListCell *ixcell = NULL;
+
+    foreach (ixcell, constraintKeys) {
+        char *ikname = strVal(lfirst(ixcell));
+
+        if (!strcmp(pkname, ikname)) {
+            found = true;
+            break;
+        }
+    }
+
+    return found;
+}
+
+static bool IsPartitionKeyAllInParmaryKeyAndUniqueKey(const List *partitionKey, const List *constraintKeys)
+{
+    ListCell *pkcell = NULL;
+    bool found = true;
+
+    foreach (pkcell, partitionKey) {
+        ColumnRef *colref = (ColumnRef *)lfirst(pkcell);
+        char *pkname = ((Value *)linitial(colref->fields))->val.str;
+
+        found = found && IsPartitionKeyInParmaryKeyAndUniqueKey(pkname, constraintKeys);
+
+        if (!found) {
+            return false;
+        }
+    }
+
+    return found;
+}
+
 /*
  * transformIndexConstraints
  *		Handle UNIQUE, PRIMARY KEY, EXCLUDE constraints, which create indexes.
@@ -2515,6 +2865,7 @@ static void transformIndexConstraints(CreateStmtContext* cxt)
      */
     foreach (lc, cxt->ixconstraints) {
         Constraint* constraint = (Constraint*)lfirst(lc);
+        bool mustGlobal = false;
 
         AssertEreport(IsA(constraint, Constraint), MOD_OPT, "");
         AssertEreport(constraint->contype == CONSTR_PRIMARY || constraint->contype == CONSTR_UNIQUE ||
@@ -2538,38 +2889,20 @@ static void transformIndexConstraints(CreateStmtContext* cxt)
                     (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
                         errmsg("Partitioned table does not support EXCLUDE index")));
             } else {
-                ListCell* ixcell = NULL;
-                ListCell* pkcell = NULL;
-
-                foreach (pkcell, cxt->partitionKey) {
-                    ColumnRef* colref = (ColumnRef*)lfirst(pkcell);
-                    char* pkname = ((Value*)linitial(colref->fields))->val.str;
-                    bool found = false;
-
-                    foreach (ixcell, constraint->keys) {
-                        char* ikname = strVal(lfirst(ixcell));
-
-                        /*
-                         * Indexkey column for PRIMARY KEY/UNIQUE constraint Must
-                         * contain partitionKey
-                         */
-                        if (!strcmp(pkname, ikname)) {
-                            found = true;
-                            break;
-                        }
-                    }
-
-                    if (!found) {
-                        ereport(ERROR,
-                            (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-                                errmsg("Invalid PRIMARY KEY/UNIQUE constraint for partitioned table"),
-                                errdetail("Columns of PRIMARY KEY/UNIQUE constraint Must contain PARTITION KEY")));
-                    }
+                bool checkPartitionKey = IsPartitionKeyAllInParmaryKeyAndUniqueKey(cxt->partitionKey, constraint->keys);
+                if (cxt->subPartitionKey != NULL) {
+                    // for subpartition table.
+                    bool checkSubPartitionKey =
+                        IsPartitionKeyAllInParmaryKeyAndUniqueKey(cxt->subPartitionKey, constraint->keys);
+                    mustGlobal = !(checkPartitionKey && checkSubPartitionKey);
+                } else {
+                    // for partition table.
+                    mustGlobal = !checkPartitionKey;
                 }
             }
         }
 
-        index = transformIndexConstraint(constraint, cxt);
+        index = transformIndexConstraint(constraint, cxt, mustGlobal);  // ��cxt�е�ixconstraint(List)����ѭ������ʵ���� �ö��󲻴���
 
         indexlist = lappend(indexlist, index);
     }
@@ -2623,12 +2956,15 @@ static void transformIndexConstraints(CreateStmtContext* cxt)
 
         foreach (k, cxt->alist) {
             IndexStmt* priorindex = (IndexStmt*)lfirst(k);
+            bool accessMethodEqual = index->accessMethod == priorindex->accessMethod ||
+                (index->accessMethod != NULL && priorindex->accessMethod != NULL &&
+                 strcmp(index->accessMethod, priorindex->accessMethod) == 0);
 
             if (equal(index->indexParams, priorindex->indexParams) &&
                 equal(index->indexIncludingParams, priorindex->indexIncludingParams) &&
                 equal(index->whereClause, priorindex->whereClause) &&
                 equal(index->excludeOpNames, priorindex->excludeOpNames) &&
-                strcmp(index->accessMethod, priorindex->accessMethod) == 0 &&
+                accessMethodEqual &&
                 index->deferrable == priorindex->deferrable && index->initdeferred == priorindex->initdeferred) {
                 priorindex->unique = priorindex->unique || index->unique;
 
@@ -2725,7 +3061,7 @@ static void checkConditionForTransformIndex(
      * pg_upgrade in particular).
      */
     if (index_rel->rd_rel->relam != get_am_oid(DEFAULT_INDEX_TYPE, false) &&
-        index_rel->rd_rel->relam != get_am_oid(CSTORE_BTREE_INDEX_TYPE, false))
+        index_rel->rd_rel->relam != get_am_oid(DEFAULT_USTORE_INDEX_TYPE, false))
         ereport(ERROR,
             (errcode(ERRCODE_WRONG_OBJECT_TYPE),
                 errmsg("index \"%s\" is not a btree", index_name),
@@ -2737,7 +3073,7 @@ static void checkConditionForTransformIndex(
  *		Transform one UNIQUE, PRIMARY KEY, or EXCLUDE constraint for
  *		transformIndexConstraints.
  */
-static IndexStmt* transformIndexConstraint(Constraint* constraint, CreateStmtContext* cxt)
+static IndexStmt* transformIndexConstraint(Constraint* constraint, CreateStmtContext* cxt, bool mustGlobal)
 {
     IndexStmt* index = NULL;
     ListCell* lc = NULL;
@@ -2777,7 +3113,7 @@ static IndexStmt* transformIndexConstraint(Constraint* constraint, CreateStmtCon
         index->idxname = NULL; /* DefineIndex will choose name */
 
     index->relation = cxt->relation;
-    index->accessMethod = const_cast<char*>(constraint->access_method ? constraint->access_method : DEFAULT_INDEX_TYPE);
+    index->accessMethod = constraint->access_method;
     index->options = constraint->options;
     index->tableSpace = constraint->indexspace;
     index->whereClause = constraint->where_clause;
@@ -2789,6 +3125,7 @@ static IndexStmt* transformIndexConstraint(Constraint* constraint, CreateStmtCon
     index->oldNode = InvalidOid;
     index->oldPSortOid = InvalidOid;
     index->concurrent = false;
+    index->isGlobal = mustGlobal;
 
     /*
      * @hdfs
@@ -2802,6 +3139,7 @@ static IndexStmt* transformIndexConstraint(Constraint* constraint, CreateStmtCon
         index->isPartitioned = false;
     } else {
         index->isPartitioned = cxt->ispartitioned;
+
     }
 
     index->inforConstraint = constraint->inforConstraint;
@@ -2874,7 +3212,7 @@ static IndexStmt* transformIndexConstraint(Constraint* constraint, CreateStmtCon
                 AssertEreport(attnum <= heap_rel->rd_att->natts, MOD_OPT, "");
                 attform = heap_rel->rd_att->attrs[attnum - 1];
             } else
-                attform = SystemAttributeDefinition(attnum, heap_rel->rd_rel->relhasoids,  RELATION_HAS_BUCKET(heap_rel));
+                attform = SystemAttributeDefinition(attnum, heap_rel->rd_rel->relhasoids,  RELATION_HAS_BUCKET(heap_rel), RELATION_HAS_UIDS(heap_rel));
             attname = pstrdup(NameStr(attform->attname));
 
             if (i < indnkeyatts) {
@@ -2952,7 +3290,7 @@ static IndexStmt* transformIndexConstraint(Constraint* constraint, CreateStmtCon
             }
             if (found) {
                 /* found column in the new table; force it to be NOT NULL */
-                if (constraint->contype == CONSTR_PRIMARY && !constraint->inforConstraint->nonforced)
+                if (constraint->contype == CONSTR_PRIMARY)
                     column->is_not_null = TRUE;
             } else if (SystemAttributeByName(key, cxt->hasoids) != NULL) {
                 /*
@@ -3272,6 +3610,7 @@ IndexStmt* transformIndexStmt(Oid relid, IndexStmt* stmt, const char* queryStrin
     ParseState* pstate = NULL;
     RangeTblEntry* rte = NULL;
     ListCell* l = NULL;
+    int crossbucketopt = -1; /* -1 means the SQL statement doesn't contain crossbucket option */
 
     /*
      * We must not scribble on the passed-in IndexStmt, so copy it.  (This is
@@ -3298,33 +3637,67 @@ IndexStmt* transformIndexStmt(Oid relid, IndexStmt* stmt, const char* queryStrin
 #endif
 
     /* default partition index is set to Global index */
-    if (RELATION_IS_PARTITIONED(rel) && !stmt->isPartitioned) {
-        stmt->isPartitioned = true;
+    if (RELATION_IS_PARTITIONED(rel) && !stmt->isPartitioned && DEFAULT_CREATE_GLOBAL_INDEX) {
         stmt->isGlobal = true;
+    }
+
+    /* set to crossbucket flag as necessary */
+    if (RELATION_HAS_BUCKET(rel) && !stmt->crossbucket) {
+        stmt->crossbucket = get_crossbucket_option(&stmt->options, stmt->isGlobal, stmt->accessMethod, &crossbucketopt);
     }
 
     bool isColStore = RelationIsColStore(rel);
     if (stmt->accessMethod == NULL) {
         if (!isColStore) {
             /* row store using btree index by default */
-            stmt->accessMethod = DEFAULT_INDEX_TYPE;
+            if (!RelationIsUstoreFormat(rel)) {
+                stmt->accessMethod = DEFAULT_INDEX_TYPE;
+            } else {
+                stmt->accessMethod = DEFAULT_USTORE_INDEX_TYPE;
+            }
         } else {
             if (stmt->isGlobal) {
+                if (stmt->isconstraint) {
+                    ereport(ERROR,
+                            (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                                errmsg("Invalid PRIMARY KEY/UNIQUE constraint for column partitioned table"),
+                                errdetail("Columns of PRIMARY KEY/UNIQUE constraint Must contain PARTITION KEY")));
+                }
                 ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), 
                         errmsg("Global partition index does not support column store.")));
             }
-            /* column store using psort index by default */
-            stmt->accessMethod = DEFAULT_CSTORE_INDEX_TYPE;
+            if (crossbucketopt > 0) {
+                ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), 
+                        errmsg("cross-bucket index does not support column store")));
+            }
+            if (stmt->isconstraint && (stmt->unique || stmt->primary)) {
+                /* cstore unique and primary key only support cbtree */
+                stmt->accessMethod = CSTORE_BTREE_INDEX_TYPE;
+            } else {
+                /* column store using psort index by default */
+                stmt->accessMethod = DEFAULT_CSTORE_INDEX_TYPE;
+            }
         }
-    } else if (stmt->isGlobal) { 
+    } else if (stmt->isGlobal) {
         /* Global partition index only support btree index */
-        if (pg_strcasecmp(stmt->accessMethod, DEFAULT_INDEX_TYPE) != 0) {
+        if (pg_strcasecmp(stmt->accessMethod, DEFAULT_INDEX_TYPE) != 0 &&
+            pg_strcasecmp(stmt->accessMethod, DEFAULT_USTORE_INDEX_TYPE) != 0) {
             ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), 
                     errmsg("Global partition index only support btree.")));
         }
         if (isColStore) {
             ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), 
                     errmsg("Global partition index does not support column store.")));
+        }
+    } else if (crossbucketopt > 0) {
+        if (pg_strcasecmp(stmt->accessMethod, DEFAULT_INDEX_TYPE) != 0) {
+            /* report error when presenting crossbucket option with non-btree access method */
+            ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), 
+                    errmsg("cross-bucket index only supports btree")));
+        }
+        if (isColStore) {
+            ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), 
+                    errmsg("cross-bucket index does not support column store")));
         }
     } else {
         bool isDfsStore = RelationIsDfsStore(rel);
@@ -3353,12 +3726,22 @@ IndexStmt* transformIndexStmt(Oid relid, IndexStmt* stmt, const char* queryStrin
 
         if (!isColStore && (0 != pg_strcasecmp(stmt->accessMethod, DEFAULT_INDEX_TYPE)) &&
             (0 != pg_strcasecmp(stmt->accessMethod, DEFAULT_GIN_INDEX_TYPE)) &&
-            (0 != pg_strcasecmp(stmt->accessMethod, DEFAULT_GIST_INDEX_TYPE))) {
-            /* row store only support btree/gin/gist index */
+            (0 != pg_strcasecmp(stmt->accessMethod, DEFAULT_GIST_INDEX_TYPE)) &&
+            (0 != pg_strcasecmp(stmt->accessMethod, DEFAULT_USTORE_INDEX_TYPE)) &&
+            (0 != pg_strcasecmp(stmt->accessMethod, DEFAULT_HASH_INDEX_TYPE))) {
+            /* row store only support btree/ubtree/gin/gist/hash index */
             ereport(ERROR,
                 (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
                     errmsg("access method \"%s\" does not support row store", stmt->accessMethod)));
         }
+
+        if (0 == pg_strcasecmp(stmt->accessMethod, DEFAULT_HASH_INDEX_TYPE) && 
+            t_thrd.proc->workingVersionNum < SUPPORT_HASH_XLOG_VERSION_NUM) {
+            ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                    errmsg("access method \"%s\" does not support row store", stmt->accessMethod)));
+        }
+
         if (isColStore && (!isPsortMothed && !isCBtreeMethod && !isCGinBtreeMethod)) {
             /* column store support psort/cbtree/gin index */
             ereport(ERROR,
@@ -3776,6 +4159,7 @@ List* transformAlterTableStmt(Oid relid, AlterTableStmt* stmt, const char* query
     AlterTableCmd* newcmd = NULL;
     Node* rangePartDef = NULL;
     AddPartitionState* addDefState = NULL;
+    AddSubPartitionState* addSubdefState = NULL;
     SplitPartitionState* splitDefState = NULL;
     ListCell* cell = NULL;
 
@@ -3832,9 +4216,6 @@ List* transformAlterTableStmt(Oid relid, AlterTableStmt* stmt, const char* query
 #endif
     cxt.node = (Node*)stmt;
     cxt.isResizing = false;
-    cxt.bucketOid = InvalidOid;
-    cxt.relnodelist = NULL;
-    cxt.toastnodelist = NULL;
     cxt.ofType = false;
 
     if (RelationIsForeignTable(rel) || RelationIsStream(rel)) {
@@ -3914,11 +4295,11 @@ List* transformAlterTableStmt(Oid relid, AlterTableStmt* stmt, const char* query
                 /* A_Const -->Const */
                 foreach (cell, addDefState->partitionList) {
                     rangePartDef = (Node*)lfirst(cell);
-                    transformRangePartitionValue(pstate, rangePartDef, true);
+                    transformPartitionValue(pstate, rangePartDef, true);
                 }
 
                 /* transform START/END into LESS/THAN:
-                 * Put this part behind the transformRangePartitionValue().
+                 * Put this part behind the transformPartitionValue().
                  */
                 if (addDefState->isStartEnd) {
                     List* pos = NIL;
@@ -3950,25 +4331,55 @@ List* transformAlterTableStmt(Oid relid, AlterTableStmt* stmt, const char* query
                 newcmds = lappend(newcmds, cmd);
                 break;
 
+            case AT_AddSubPartition:
+                /* transform the boundary of subpartition,
+                 * this step transform it from A_Const into Const */
+                addSubdefState = (AddSubPartitionState*)cmd->def;
+                if (!PointerIsValid(addSubdefState)) {
+                    ereport(ERROR, (errcode(ERRCODE_UNEXPECTED_NULL_VALUE), errmodule(MOD_OPT),
+                        errmsg("Missing definition of adding subpartition"),
+                        errdetail("The AddSubPartitionState in ADD SUBPARTITION command is not found"),
+                        errcause("Try ADD SUBPARTITION without subpartition defination"),
+                        erraction("Please check DDL syntax for \"ADD SUBPARTITION\"")));
+                }
+                /* A_Const -->Const */
+                foreach (cell, addSubdefState->subPartitionList) {
+                    rangePartDef = (Node*)lfirst(cell);
+                    transformPartitionValue(pstate, rangePartDef, true);
+                }
+
+                newcmds = lappend(newcmds, cmd);
+                break;
+
             case AT_DropPartition:
+            case AT_DropSubPartition:
             case AT_TruncatePartition:
             case AT_ExchangePartition:
+            case AT_TruncateSubPartition:
                 /* transform the boundary of range partition,
                  * this step transform it from A_Const into Const */
                 rangePartDef = (Node*)cmd->def;
                 if (PointerIsValid(rangePartDef)) {
-                    transformRangePartitionValue(pstate, rangePartDef, false);
+                    transformPartitionValue(pstate, rangePartDef, false);
                 }
 
                 newcmds = lappend(newcmds, cmd);
                 break;
 
             case AT_SplitPartition:
-                if (!RELATION_IS_PARTITIONED(rel))
+                if (!RELATION_IS_PARTITIONED(rel)) {
                     ereport(ERROR,
                         (errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
                             errmodule(MOD_OPT),
                             errmsg("can not split partition against NON-PARTITIONED table")));
+                }
+                if (RelationIsSubPartitioned(rel)) {
+                    ereport(ERROR,
+                            (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                             (errmsg("Un-support feature"),
+                              errdetail("For subpartition table, split partition is not supported yet."),
+                              errcause("The function is not implemented."), erraction("Use other actions instead."))));
+                }
                 if (rel->partMap->type == PART_TYPE_LIST || rel->partMap->type == PART_TYPE_HASH) {
                     ereport(ERROR,
                         (errcode(ERRCODE_WRONG_OBJECT_TYPE), errmsg("can not split LIST/HASH partition table")));
@@ -3979,7 +4390,7 @@ List* transformAlterTableStmt(Oid relid, AlterTableStmt* stmt, const char* query
                 if (!PointerIsValid(splitDefState->split_point)) {
                     foreach (cell, splitDefState->dest_partition_define_list) {
                         rangePartDef = (Node*)lfirst(cell);
-                        transformRangePartitionValue(pstate, rangePartDef, true);
+                        transformPartitionValue(pstate, rangePartDef, true);
                     }
                 }
                 if (splitDefState->partition_for_values)
@@ -4023,6 +4434,20 @@ List* transformAlterTableStmt(Oid relid, AlterTableStmt* stmt, const char* query
                 newcmds = lappend(newcmds, cmd);
                 break;
 
+            case AT_SplitSubPartition:
+                splitDefState = (SplitPartitionState*)cmd->def;
+                if (splitDefState->splitType == LISTSUBPARTITIION) {
+                    newcmds = lappend(newcmds, cmd);
+                } else if (splitDefState->splitType == RANGESUBPARTITIION) {
+                    if (!PointerIsValid(splitDefState->split_point)) {
+                        foreach (cell, splitDefState->dest_partition_define_list) {
+                            rangePartDef = (Node *)lfirst(cell);
+                            transformPartitionValue(pstate, rangePartDef, true);
+                        }
+                    }
+                    newcmds = lappend(newcmds, cmd);
+                }
+                break;
             default:
                 newcmds = lappend(newcmds, cmd);
                 break;
@@ -4254,6 +4679,18 @@ static void transformColumnType(CreateStmtContext* cxt, ColumnDef* column)
                     parser_errposition(cxt->pstate, column->collClause->location)));
     }
 
+#ifndef ENABLE_MULTIPLE_NODES
+    /* don't allow package or procedure type as column type */
+    if (IsPackageDependType(typeTypeId(ctype), InvalidOid)) {
+        ereport(ERROR,
+            (errcode(ERRCODE_DATATYPE_MISMATCH),
+                errmodule(MOD_PLSQL),
+                errmsg("type \"%s\" is not supported as column type", TypeNameToString(column->typname)),
+                errdetail("\"%s\" is a package or procedure type", TypeNameToString(column->typname)),
+                errcause("feature not supported"),
+                erraction("check type name")));
+    }
+#endif
     ReleaseSysCache(ctype);
 }
 
@@ -4379,6 +4816,67 @@ static void setSchemaName(char* context_schema, char** stmt_schema_name)
                        "different from the one being created (%s)",
                     *stmt_schema_name,
                     context_schema)));
+}
+
+NodeTag GetPartitionStateType(char type)
+{
+    NodeTag partitionType = T_Invalid;
+    switch (type) {
+        case 'r':
+            partitionType = T_RangePartitionDefState;
+            break;
+        case 'l':
+            partitionType = T_ListPartitionDefState;
+            break;
+        case 'h':
+            partitionType = T_HashPartitionDefState;
+            break;
+        default:
+            ereport(ERROR, (errcode(ERRCODE_INVALID_OPERATION),
+                            errmsg("unsupported subpartition type: %c", type)));
+            break;
+    }
+    return partitionType;
+}
+
+char* GetPartitionDefStateName(Node *partitionDefState)
+{
+    char* partitionName = NULL;
+    switch (nodeTag(partitionDefState)) {
+        case T_RangePartitionDefState:
+            partitionName = ((RangePartitionDefState *)partitionDefState)->partitionName;
+            break;
+        case T_ListPartitionDefState:
+            partitionName = ((ListPartitionDefState *)partitionDefState)->partitionName;
+            break;
+        case T_HashPartitionDefState:
+            partitionName = ((HashPartitionDefState *)partitionDefState)->partitionName;
+            break;
+        default:
+            ereport(ERROR, (errcode(ERRCODE_INVALID_OPERATION), errmsg("unsupported subpartition type")));
+            break;
+    }
+    return partitionName;
+}
+
+List* GetSubPartitionDefStateList(Node *partitionDefState)
+{
+    List* subPartitionList = NIL;
+    switch (nodeTag(partitionDefState)) {
+        case T_RangePartitionDefState:
+            subPartitionList = ((RangePartitionDefState *)partitionDefState)->subPartitionDefState;
+            break;
+        case T_ListPartitionDefState:
+            subPartitionList = ((ListPartitionDefState *)partitionDefState)->subPartitionDefState;
+            break;
+        case T_HashPartitionDefState:
+            subPartitionList = ((HashPartitionDefState *)partitionDefState)->subPartitionDefState;
+            break;
+        default:
+            subPartitionList = NIL;
+            break;
+    }
+    return subPartitionList;
 }
 
 /*
@@ -4528,6 +5026,49 @@ void checkPartitionSynax(CreateStmt* stmt)
         pfree(interval);
 #endif
     }
+
+    /* check subpartition synax */
+    if (stmt->partTableState->subPartitionState != NULL) {
+        NodeTag subPartitionType = GetPartitionStateType(stmt->partTableState->subPartitionState->partitionStrategy);
+        List* partitionList = stmt->partTableState->partitionList;
+        ListCell* lc1 = NULL;
+        ListCell* lc2 = NULL;
+        foreach (lc1, partitionList) {
+            Node* partitionDefState = (Node*)lfirst(lc1);
+            List* subPartitionList = GetSubPartitionDefStateList(partitionDefState);
+            foreach (lc2, subPartitionList) {
+                Node *subPartitionDefState = (Node *)lfirst(lc2);
+                if ((nodeTag(subPartitionDefState) != subPartitionType)) {
+                    ereport(ERROR, (errcode(ERRCODE_INVALID_OPERATION),
+                                    errmsg("The syntax format of subpartition is incorrect, the declaration and "
+                                           "definition of the subpartition do not match."),
+                                    errdetail("The syntax format of subpartition %s is incorrect.",
+                                              GetPartitionDefStateName(subPartitionDefState)),
+                                    errcause("The declaration and definition of the subpartition do not match."),
+                                    erraction("Consistent declaration and definition of subpartition.")));
+                }
+            }
+        }
+    } else {
+        /* If there is a definition of subpartition, there must be a declaration of subpartition.
+         * However, if there is a declaration of subpartition, there may not be a definition of subpartition.
+         * This is because the system creates a default subpartition.
+         */
+        List* partitionList = stmt->partTableState->partitionList;
+        ListCell* lc1 = NULL;
+        foreach (lc1, partitionList) {
+            Node* partitionDefState = (Node*)lfirst(lc1);
+            List *subPartitionList = GetSubPartitionDefStateList(partitionDefState);
+            if (subPartitionList != NIL) {
+                ereport(
+                    ERROR,
+                    (errcode(ERRCODE_INVALID_OPERATION),
+                     errmsg("The syntax format of subpartition is incorrect, missing declaration of subpartition."),
+                     errdetail("N/A"), errcause("Missing declaration of subpartition."),
+                     erraction("Supplements declaration of subpartition.")));
+            }
+        }
+    }
 }
 
 /*
@@ -4549,7 +5090,7 @@ static void checkPartitionValue(CreateStmtContext* cxt, CreateStmt* stmt)
     /* transform expression in partition definition and evaluate the expression */
     foreach (cell, partdef->partitionList) {
         Node* state = (Node*)lfirst(cell);
-        transformRangePartitionValue(cxt->pstate, state, true);
+        transformPartitionValue(cxt->pstate, state, true);
     }
 }
 
@@ -4638,6 +5179,66 @@ void checkPartitionName(List* partitionList, bool isPartition)
     }
 }
 
+List* GetPartitionNameList(List* partitionList)
+{
+    ListCell* cell = NULL;
+    ListCell* lc = NULL;
+    List* subPartitionDefStateList = NIL;
+    List* partitionNameList = NIL;
+
+    foreach (cell, partitionList) {
+        if (IsA((Node*)lfirst(cell), RangePartitionDefState)) {
+            RangePartitionDefState* partitionDefState = (RangePartitionDefState*)lfirst(cell);
+            subPartitionDefStateList = partitionDefState->subPartitionDefState;
+            partitionNameList = lappend(partitionNameList, partitionDefState->partitionName);
+        } else if (IsA((Node*)lfirst(cell), ListPartitionDefState)) {
+            ListPartitionDefState* partitionDefState = (ListPartitionDefState*)lfirst(cell);
+            subPartitionDefStateList = partitionDefState->subPartitionDefState;
+            partitionNameList = lappend(partitionNameList, partitionDefState->partitionName);
+        } else {
+            HashPartitionDefState* partitionDefState = (HashPartitionDefState*)lfirst(cell);
+            subPartitionDefStateList = partitionDefState->subPartitionDefState;
+            partitionNameList = lappend(partitionNameList, partitionDefState->partitionName);
+        }
+
+        foreach (lc, subPartitionDefStateList) {
+            if (IsA((Node *)lfirst(lc), RangePartitionDefState)) {
+                RangePartitionDefState *partitionDefState = (RangePartitionDefState *)lfirst(lc);
+                partitionNameList = lappend(partitionNameList, partitionDefState->partitionName);
+            } else if (IsA((Node *)lfirst(lc), ListPartitionDefState)) {
+                ListPartitionDefState *partitionDefState = (ListPartitionDefState *)lfirst(lc);
+                partitionNameList = lappend(partitionNameList, partitionDefState->partitionName);
+            } else {
+                HashPartitionDefState *partitionDefState = (HashPartitionDefState *)lfirst(lc);
+                partitionNameList = lappend(partitionNameList, partitionDefState->partitionName);
+            }
+        }
+    }
+
+    return partitionNameList;
+}
+
+void checkSubPartitionName(List* partitionList)
+{
+    ListCell* cell = NULL;
+    ListCell* lc = NULL;
+    List* partitionNameList = GetPartitionNameList(partitionList);
+
+    foreach (cell, partitionNameList) {
+        char *subPartitionName1 = (char *)lfirst(cell);
+        lc = cell;
+        while ((lc = lnext(lc)) != NULL) {
+            char *subPartitionName2 = (char *)lfirst(lc);
+            if (!strcmp(subPartitionName1, subPartitionName2)) {
+                list_free_ext(partitionNameList);
+                ereport(ERROR, (errcode(ERRCODE_DUPLICATE_OBJECT),
+                                errmsg("duplicate subpartition name: \"%s\"", subPartitionName2)));
+            }
+        }
+    }
+    list_free_ext(partitionNameList);
+}
+
 static void CheckDistributionSyntax(CreateStmt* stmt)
 {
     DistributeBy *distBy = stmt->distributeby;
@@ -4709,6 +5310,10 @@ static void TransformListDistributionValue(ParseState* pstate, Node** listDistDe
 
 static List* GetDistributionkeyPos(List* partitionkeys, List* schema)
 {
+    if (schema == NULL) {
+        return NULL;
+    }
+
     ListCell* cell = NULL;
     ListCell* schemaCell = NULL;
     ColumnDef* schemaDef = NULL;
@@ -4760,6 +5365,19 @@ static List* GetDistributionkeyPos(List* partitionkeys, List* schema)
     return pos;
 }
 
+/* get storage type from CreateStmt.optitions, which is generated by WITH clause */
+static char* CreatestmtGetOrientation(CreateStmt *stmt)
+{
+    ListCell *lc = NULL;
+    foreach (lc, stmt->options) {
+        DefElem* def = (DefElem*)lfirst(lc);
+        if (pg_strcasecmp(def->defname, "orientation") == 0) {
+            return defGetString(def);
+        }
+    }
+    /* default orientation by row store */
+    return ORIENTATION_ROW;
+}
 
 static void ConvertSliceStartEnd2LessThan(CreateStmtContext *cxt, CreateStmt *stmt)
 {
@@ -4769,7 +5387,14 @@ static void ConvertSliceStartEnd2LessThan(CreateStmtContext *cxt, CreateStmt *st
     TupleDesc desc;
 
     pos = GetDistributionkeyPos(distBy->colname, cxt->columns);
-    desc = BuildDescForRelation(cxt->columns, (Node  *)makeString(ORIENTATION_ROW));
+    char *storeChar = CreatestmtGetOrientation(stmt);
+    if ((pg_strcasecmp(storeChar, ORIENTATION_ROW) != 0) && (pg_strcasecmp(storeChar, ORIENTATION_COLUMN) != 0)) {
+        ereport(ERROR,
+            (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                errmsg("Un-supported feature"),
+                    errdetail("Orientation type %s is not supported for range distributed table.", storeChar)));
+    }
+    desc = BuildDescForRelation(cxt->columns, (Node *)makeString(storeChar));
 
     distState->sliceList = transformRangePartStartEndStmt(
         cxt->pstate, distState->sliceList, pos, desc->attrs, 0, NULL, NULL, true, false);
@@ -4988,7 +5613,19 @@ List* transformListPartitionValue(ParseState* pstate, List* boundary, bool needC
     return newValueList;
 }
 
-void transformRangePartitionValue(ParseState* pstate, Node* rangePartDef, bool needCheck)
+void transformRangeSubPartitionValue(ParseState* pstate, List* subPartitionDefStateList)
+{
+    if (subPartitionDefStateList == NIL) {
+        return;
+    }
+    ListCell *cell = NULL;
+    foreach (cell, subPartitionDefStateList) {
+        Node *subPartitionDefState = (Node *)lfirst(cell);
+        transformPartitionValue(pstate, subPartitionDefState, true);
+    }
+}
+
+void transformPartitionValue(ParseState* pstate, Node* rangePartDef, bool needCheck)
 {
     Assert(rangePartDef); /* never null */
 
@@ -4997,6 +5634,7 @@ void transformRangePartitionValue(ParseState* pstate, Node* rangePartDef, bool n
             RangePartitionDefState* state = (RangePartitionDefState*)rangePartDef;
             /* only one boundary need transform */
             state->boundary = transformRangePartitionValueInternal(pstate, state->boundary, needCheck, true);
+            transformRangeSubPartitionValue(pstate, state->subPartitionDefState);
             break;
         }
         case T_RangePartitionStartEndDefState: {
@@ -5011,12 +5649,14 @@ void transformRangePartitionValue(ParseState* pstate, Node* rangePartDef, bool n
         case T_ListPartitionDefState: {
             ListPartitionDefState* state = (ListPartitionDefState*)rangePartDef;
             state->boundary = transformListPartitionValue(pstate, state->boundary, needCheck, true);
+            transformRangeSubPartitionValue(pstate, state->subPartitionDefState);
             break;
         }
         case T_HashPartitionDefState: {
             HashPartitionDefState* state = (HashPartitionDefState*)rangePartDef;
             /* only one boundary need transform */
             state->boundary = transformListPartitionValue(pstate, state->boundary, needCheck, true);
+            transformRangeSubPartitionValue(pstate, state->subPartitionDefState);
             break;
         }
 
@@ -5137,7 +5777,7 @@ Oid generateClonedIndex(Relation source_idx, Relation source_relation, char* tem
         attmap[i] = i + 1;
 
     /* generate an index statement */
-    index_stmt = generateClonedIndexStmt(&cxt, source_idx, attmap, attmap_length, NULL);
+    index_stmt = generateClonedIndexStmt(&cxt, source_idx, attmap, attmap_length, NULL, TRANSFORM_INVALID);
 
     if (tempIndexName != NULL)
         index_stmt->idxname = tempIndexName;
@@ -5747,6 +6387,70 @@ static Oid choose_coerce_type(Oid leftid, Oid rightid)
         return InvalidOid; /* let make_op decide */
 }
 
+/* check if everyVal <= endVal - startVal, but think of overflow, we should be careful */
+static bool CheckStepInRange(ParseState *pstate, Const *startVal, Const *endVal, Const *everyVal,
+    Form_pg_attribute attr)
+{
+    List *opr_mi = list_make1(makeString("-"));
+    List *opr_lt = list_make1(makeString("<"));
+    List *opr_le = list_make1(makeString("<="));
+
+    Datum res;
+    Oid targetType = attr->atttypid;
+    Oid targetCollation = attr->attcollation;
+    int16 targetLen = attr->attlen;
+    bool targetByval = attr->attbyval;
+    bool targetIsVarlena = (!targetByval) && (targetLen == -1);
+    int32 targetTypmod;
+    bool targetIsTimetype = (targetType == DATEOID || targetType == TIMESTAMPOID || targetType == TIMESTAMPTZOID);
+    if (targetIsTimetype) {
+        targetTypmod = -1; /* avoid accuracy-problem of date */
+    } else {
+        targetTypmod = attr->atttypmod;
+    }
+
+    bool flag1 = false; /* whether startVal < 0 */
+    bool flag2 = false; /* whether endVal < 0 */
+    if (!targetIsTimetype) {
+        Const *zeroVal = NULL;
+        if (targetType == NUMERICOID) {
+            zeroVal = makeConst(NUMERICOID, targetTypmod, targetCollation, targetLen,
+                (Datum)DirectFunctionCall3(numeric_in, CStringGetDatum("0.0"), ObjectIdGetDatum(0), Int32GetDatum(-1)),
+                false, targetByval);
+        } else if (targetIsVarlena) {
+            /* if it's a varlena type, we make cstring type, type cast will be done in evaluate_opexpr */
+            zeroVal = makeConst(UNKNOWNOID, -1, InvalidOid, -2, CStringGetDatum(""), false, false);
+        } else {
+            zeroVal = makeConst(targetType, targetTypmod, targetCollation, targetLen, (Datum)0, false, targetByval);
+        }
+
+        res = evaluate_opexpr(pstate, opr_lt, (Node *)startVal, (Node *)zeroVal, NULL, -1);
+        flag1 = DatumGetBool(res); /* whether startVal < 0 */
+        res = evaluate_opexpr(pstate, opr_lt, (Node *)endVal, (Node *)zeroVal, NULL, -1);
+        flag2 = DatumGetBool(res); /* whether endVal < 0 */
+    }
+
+    /* we've checked startVal < endVal, so if startVal >= 0, make sure endVal >= 0 too,
+     * (!flag1 && flag2) can never happen */
+    Assert(flag1 || !flag2);
+
+    /* there are some errors on interval compare, because it treats one month as 30days, but one year as 12 months.
+     * so for time type, we don't use interval type. */
+    if ((flag1 && !flag2) || targetIsTimetype) { /* startVal < 0 && endVal >= 0 */
+        /* check if startVal <= endVal - everyVal */
+        res = evaluate_opexpr(pstate, opr_mi, (Node *)endVal, (Node *)everyVal, &targetType, -1);
+        Const *secheck = makeConst(targetType, targetTypmod, targetCollation, targetLen, res, false, targetByval);
+        res = evaluate_opexpr(pstate, opr_le, (Node *)startVal, (Node *)secheck, NULL, -1);
+    } else { /* startVal < 0 && endVal < 0, or startVal >= 0 && endVal >= 0 */
+        /* check if everyVal <= endVal - startVal */
+        res = evaluate_opexpr(pstate, opr_mi, (Node *)endVal, (Node *)startVal, &everyVal->consttype, -1);
+        Const *secheck =
+            makeConst(everyVal->consttype, targetTypmod, targetCollation, targetLen, res, false, targetByval);
+        res = evaluate_opexpr(pstate, opr_le, (Node *)everyVal, (Node *)secheck, NULL, -1);
+    }
+    return DatumGetBool(res);
+}
+
 /*
  * divide_start_end_every_internal
  * 	internal implementaion for dividing an interval indicated by any-datatype
@@ -5776,6 +6480,7 @@ static List* divide_start_end_every_internal(ParseState* pstate, char* partName,
 {
     List* result = NIL;
     List* opr_pl = NIL;
+    List* opr_mi = NIL;
     List* opr_lt = NIL;
     List* opr_le = NIL;
     List* opr_mul = NIL;
@@ -5785,7 +6490,6 @@ static List* divide_start_end_every_internal(ParseState* pstate, char* partName,
     Oid restypid;
     Const* curpnt = NULL;
     int32 nPart;
-    bool isEnd = false;
     Const* everyVal = NULL;
     Oid targetType;
     bool targetByval = false;
@@ -5797,10 +6501,22 @@ static List* divide_start_end_every_internal(ParseState* pstate, char* partName,
     Assert(maxNum > 0 && maxNum <= MAX_PARTITION_NUM);
 
     opr_pl = list_make1(makeString("+"));
+    opr_mi = list_make1(makeString("-"));
     opr_lt = list_make1(makeString("<"));
     opr_le = list_make1(makeString("<="));
     opr_mul = list_make1(makeString("*"));
     opr_eq = list_make1(makeString("="));
+
+    /* get target type info */
+    targetType = attr->atttypid;
+    targetByval = attr->attbyval;
+    targetCollation = attr->attcollation;
+    if (targetType == DATEOID || targetType == TIMESTAMPOID || targetType == TIMESTAMPTZOID) {
+        targetTypmod = -1; /* avoid accuracy-problem of date */
+    } else {
+        targetTypmod = attr->atttypmod;
+    }
+    targetLen = attr->attlen;
 
     /*
      * cast everyExpr to targetType
@@ -5810,31 +6526,43 @@ static List* divide_start_end_every_internal(ParseState* pstate, char* partName,
 
     /* first compare start/end value */
     res = evaluate_opexpr(pstate, opr_le, (Node*)endVal, (Node*)startVal, NULL, -1);
-    if (DatumGetBool(res))
+    if (DatumGetBool(res)) {
         ereport(ERROR,
             (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
                 errmsg("start value must be less than end value for %s \"%s\".",
                     partTypeName, partName)));
+    }
 
-    /* get target type info */
-    targetType = attr->atttypid;
-    targetByval = attr->attbyval;
-    targetCollation = attr->attcollation;
-    if (targetType == DATEOID || targetType == TIMESTAMPOID || targetType == TIMESTAMPTZOID)
-        targetTypmod = -1; /* avoid accuracy-problem of date */
-    else
-        targetTypmod = attr->atttypmod;
-    targetLen = attr->attlen;
+    /* second, we should make sure that everyVal <= endVal - startVal */
+    if (!CheckStepInRange(pstate, startVal, endVal, everyVal, attr)) {
+        ereport(ERROR,
+            (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                errmsg("%s step is too big for %s \"%s\".", partTypeName, partTypeName, partName)));
+    }
 
     /* build result */
     curpnt = startVal;
     nPart = 0;
-    isEnd = false;
-    while (nPart < maxNum) {
-        /* compute currentPnt + everyval */
-        res = evaluate_opexpr(pstate, opr_pl, (Node*)curpnt, (Node*)everyVal, &targetType, -1);
-        pnt = makeConst(targetType, targetTypmod, targetCollation, targetLen, res, false, targetByval);
-        pnt = (Const*)GetTargetValue(attr, (Const*)pnt, false);
+    while (true) {
+        /* if too many partitions, report error */
+        if (nPart >= maxNum) {
+            pfree_ext(pnt);
+            ereport(ERROR,
+                (errcode(ERRCODE_INVALID_TABLE_DEFINITION),
+                    errmsg("too many %ss after split %s \"%s\".", partTypeName, partTypeName, partName),
+                    errhint("number of %ss can not be more than %d, MINVALUE will be auto-included if not assigned.",
+                        partTypeName, MAX_PARTITION_NUM)));
+        }
+
+        /* compute curpnt + everyval, but if curpnt + everyVal > endVal, we use endVal instead, 
+         * so we can make sure that pnt <= endVal */
+        if (!CheckStepInRange(pstate, curpnt, endVal, everyVal, attr)) {
+            pnt = (Const*)copyObject(endVal);
+        } else {
+            res = evaluate_opexpr(pstate, opr_pl, (Node*)curpnt, (Node*)everyVal, &targetType, -1);
+            pnt = makeConst(targetType, targetTypmod, targetCollation, targetLen, res, false, targetByval);
+            pnt = (Const*)GetTargetValue(attr, (Const*)pnt, false);
+        }
 
         /* necessary check in first pass */
         if (nPart == 0) {
@@ -5885,47 +6613,24 @@ static List* divide_start_end_every_internal(ParseState* pstate, char* partName,
                         errmsg("%s step is too small for %s \"%s\".", partTypeName, partTypeName, partName)));
         }
 
+        /* pnt must be less than or equal to endVal */
+        Assert(DatumGetBool(evaluate_opexpr(pstate, opr_le, (Node*)pnt, (Node*)endVal, NULL, -1)));
+        result = lappend(result, pnt);
+        nPart++;
+
         /* check to determine if it is the final partition */
-        res = evaluate_opexpr(pstate, opr_le, (Node*)pnt, (Node*)endVal, NULL, -1);
+        res = evaluate_opexpr(pstate, opr_eq, (Node*)pnt, (Node*)endVal, NULL, -1);
         if (DatumGetBool(res)) {
-            result = lappend(result, pnt);
-            nPart++;
-            res = evaluate_opexpr(pstate, opr_lt, (Node*)pnt, (Node*)endVal, NULL, -1);
-            if (!DatumGetBool(res)) {
-                /* case-1: final partition just matches endVal  */
-                isEnd = true;
-                break;
-            }
-        } else if (nPart == 0) {
-            ereport(ERROR,
-                (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-                    errmsg("%s step is too big for %s \"%s\".", partTypeName, partTypeName, partName)));
-        } else {
-            /* case-2: final partition is smaller than others */
-            pfree_ext(pnt);
-            pnt = (Const*)copyObject(endVal);
-            result = lappend(result, pnt);
-            nPart++;
-            isEnd = true;
             break;
         }
-
         curpnt = pnt;
-    }
-
-    if (!isEnd) {
-        /* too many partitions, report error */
-        ereport(ERROR,
-            (errcode(ERRCODE_INVALID_TABLE_DEFINITION),
-                errmsg("too many %ss after split %s \"%s\".", partTypeName, partTypeName, partName),
-                errhint("number of %ss can not be more than %d, MINVALUE will be auto-included if not assigned.",
-                    partTypeName, MAX_PARTITION_NUM)));
     }
 
     /* done */
     Assert(result && result->length == nPart);
-    if (numPart != NULL)
+    if (numPart != NULL) {
         *numPart = nPart;
+    }
 
     return result;
 }
@@ -6627,7 +7332,7 @@ List* transformRangePartStartEndStmt(ParseState* pstate, List* partitionList, Li
                 ereport(ERROR,
                     (errcode(ERRCODE_INVALID_TABLE_DEFINITION),
                         errmsg("too many %ss after split %s \"%s\".",
-                            partTypeName, defState->partitionName, partTypeName),
+                            partTypeName, partTypeName, defState->partitionName),
                         errhint("number of %ss can not be more than %d, MINVALUE will be auto-included if not "
                                 "assigned.",
                             partTypeName, MAX_PARTITION_NUM)));
@@ -6788,46 +7493,6 @@ bool is_multi_nodegroup_createtbllike(PGXCSubCluster* subcluster, Oid oid)
 }
 #endif
 
-static void
-TryReuseFilenode(Relation rel, CreateStmtContext *ctx, bool clonepart)
-{
-    Form_pg_partition partForm = NULL;
-    HeapTuple partTuple = NULL;
-    List *partitionList = NULL;
-    ListCell *cell= NULL;
-    Relation toastRel;      
-
-    if (!RelationIsPartitioned(rel)) {
-        ctx->relnodelist = lappend_oid(ctx->relnodelist, rel->rd_rel->relfilenode);
-        if (OidIsValid(rel->rd_rel->reltoastrelid)) {
-            toastRel = heap_open(rel->rd_rel->reltoastrelid, NoLock);
-            ctx->toastnodelist = lappend_oid(ctx->toastnodelist, rel->rd_rel->reltoastrelid);
-            ctx->toastnodelist = lappend_oid(ctx->toastnodelist, toastRel->rd_rel->reltoastidxid);
-            heap_close(toastRel, NoLock);
-        }
-    } else if (clonepart) {
-        partitionList = searchPgPartitionByParentId(PART_OBJ_TYPE_TABLE_PARTITION, ObjectIdGetDatum(rel->rd_id));
-        foreach (cell, partitionList) {
-            partTuple = (HeapTuple)lfirst(cell);            
-            partForm = (Form_pg_partition) GETSTRUCT(partTuple);
-            ctx->relnodelist = lappend_oid(ctx->relnodelist, HeapTupleGetOid(partTuple));
-
-            if (OidIsValid(partForm->reltoastrelid)) {
-                toastRel = heap_open(partForm->reltoastrelid, NoLock);
-                ctx->toastnodelist = lappend_oid(ctx->toastnodelist, partForm->reltoastrelid);
-                ctx->toastnodelist = lappend_oid(ctx->toastnodelist, toastRel->rd_rel->reltoastidxid);
-                heap_close(toastRel, NoLock);
-            }
-        }
-        freePartList(partitionList);
-    } else {
-        ereport(ERROR,
-            (errcode(ERRCODE_WRONG_OBJECT_TYPE),
-            errmsg("Not specify \"INCLUDING PARTITION\" for partitioned-table relation:\"%s\"",
-            RelationGetRelationName(rel))));
-    }
-}
-
 static bool IsCreatingSeqforAnalyzeTempTable(CreateStmtContext* cxt)
 {
     if (cxt->relation->relpersistence != RELPERSISTENCE_TEMP) {
@@ -6846,3 +7511,1043 @@ static bool IsCreatingSeqforAnalyzeTempTable(CreateStmtContext* cxt)
     }
     return isUnderAnalyze;
 }
+
+
+//graph
+#ifdef GS_GRAPH
+
+/*
+ * transformCreateGraphStmt - analyzes the CREATE GRAPH statement
+ *
+ * See transformCreateSchemaStmt
+ */
+List *
+transformCreateGraphStmt(CreateGraphStmt *stmt)
+{
+	CreateSeqStmt *labseq;
+	CreateLabelStmt	*vertex;
+	CreateLabelStmt	*edge;
+
+	labseq = makeNode(CreateSeqStmt);
+	labseq->sequence = makeRangeVar(stmt->graphname, GS_LABEL_SEQ, -1);
+	labseq->options =
+			list_make2(makeDefElem("maxvalue", (Node *)
+								   makeInteger(GRAPHID_LABID_MAX)),
+					   makeDefElem("cycle", (Node *) makeInteger(TRUE)));
+	labseq->ownerId = InvalidOid;
+	// labseq->if_not_exists = false;
+
+	vertex = makeNode(CreateLabelStmt);
+	vertex->labelKind = LABEL_VERTEX;
+	vertex->relation = makeRangeVar(stmt->graphname, GS_VERTEX, -1);
+	vertex->inhRelations = NIL;
+
+	edge = makeNode(CreateLabelStmt);
+	edge->labelKind = LABEL_EDGE;
+	edge->relation = makeRangeVar(stmt->graphname, GS_EDGE, -1);
+	edge->inhRelations = NIL;
+
+	return list_make3(labseq, vertex, edge);
+}
+
+/*
+ * transformCreateLabelStmt - parse analysis for CREATE VLABEL/ELABEL
+ *
+ * This function is based on transformCreateStmt().
+ * Graph Labels have default inheritance, primary key, and sequence.
+ * But they are not written in statements.
+ * Thus this adds nodes for label statement.
+ */
+List *
+transformCreateLabelStmt(CreateLabelStmt *labelStmt, const char *queryString)
+{
+	RangeVar   *label;
+	char	   *graphname;
+	ParseState *pstate;
+	ParseCallbackState pcbstate;
+	Oid			existing_relid;
+	CreateStmt *stmt;
+	List	   *indexlist;
+	CreateStmtContext cxt;
+	ListCell   *elements;
+	char		descbuf[256];
+	char	   *labdesc;
+	char	   *tabdesc;
+	char	   *qname;
+	CommentStmt *comment;
+	List	   *save_alist;
+	List	   *result;
+
+	label = (RangeVar* )copyObject(labelStmt->relation);
+	/* set graph schema name, if not specified */
+	if (label->schemaname == NULL)
+		label->schemaname = get_graph_path(true);
+	graphname = label->schemaname;
+
+	pstate = make_parsestate(NULL);
+	pstate->p_sourcetext = queryString;
+
+	setup_parser_errposition_callback(&pcbstate, pstate,
+									  label->location);
+	RangeVarGetAndCheckCreationNamespace(label, NoLock, &existing_relid, RELKIND_RELATION);
+	cancel_parser_errposition_callback(&pcbstate);
+
+	/*
+	 * If the label already exists and the user specified "IF NOT EXISTS",
+	 * bail out with a NOTICE.
+	 */
+	if (OidIsValid(existing_relid))
+	{
+		if (labelStmt->if_not_exists)
+		{
+			ereport(NOTICE,
+					(errcode(ERRCODE_DUPLICATE_TABLE),
+					 errmsg("label \"%s\" already exists, skipping",
+							label->relname)));
+			return NIL;
+		}
+		else
+		{
+			ereport(ERROR,
+					(errcode(ERRCODE_DUPLICATE_TABLE),
+					 errmsg("label \"%s\" already exists", label->relname)));
+		}
+	}
+
+	/*
+	 * create CreateStmt for label
+	 */
+
+	stmt = makeNode(CreateStmt);
+
+	stmt->relation = label;
+	stmt->options = (List* )copyObject(labelStmt->options);
+	stmt->oncommit = ONCOMMIT_NOOP;
+	stmt->tablespacename = labelStmt->tablespacename;
+	stmt->if_not_exists = labelStmt->if_not_exists;
+
+	/* set appropriate table elements and indexes */
+	if (labelStmt->labelKind == LABEL_VERTEX)
+	{
+		stmt->tableElts = makeVertexElements();
+
+		indexlist = NIL;
+	}
+	else if (labelStmt->labelKind == LABEL_EDGE)
+	{
+		stmt->tableElts = makeEdgeElements();
+
+		indexlist = makeEdgeIndex(stmt->relation);
+	}
+	else
+	{
+		elog(ERROR, "unknown label type: %d", labelStmt->labelKind);
+	}
+
+	if (strcmp(labelStmt->relation->relname, GS_VERTEX) != 0 &&
+		strcmp(labelStmt->relation->relname, GS_EDGE) != 0)
+	{
+		/* inherit base vertex/edge */
+		if (labelStmt->inhRelations == NIL)
+		{
+			char *name;
+
+			name = const_cast<char*>((labelStmt->labelKind == LABEL_VERTEX ? GS_VERTEX : GS_EDGE));
+			stmt->inhRelations = list_make1(makeRangeVar(graphname, name, -1));
+		}
+		/* user requested inherit option */
+		else
+		{
+			ListCell *inhRel;
+
+			stmt->inhRelations = (List *)copyObject(labelStmt->inhRelations);
+
+			foreach(inhRel, stmt->inhRelations)
+			{
+				RangeVar *parent = (RangeVar *) lfirst(inhRel);
+
+				/* force schema */
+				if (parent->schemaname == NULL)
+				{
+					parent->schemaname = graphname;
+				}
+				else if (strcmp(parent->schemaname, graphname) != 0)
+				{
+					ereport(ERROR,
+						(errcode(ERRCODE_INVALID_SCHEMA_NAME),
+						 errmsg("parent graph label \"%s\" must be in the same graph path \"%s\"",
+								parent->relname, graphname)));
+				}
+
+				if (labelStmt->labelKind == LABEL_VERTEX &&
+					!isLabelKind(parent, LABEL_KIND_VERTEX))
+				{
+					ereport(ERROR,
+							(errcode(ERRCODE_INVALID_SCHEMA_NAME),
+							 errmsg("parent graph label \"%s\" is not vertex label.",
+									parent->relname)));
+				}
+
+				if (labelStmt->labelKind == LABEL_EDGE &&
+					!isLabelKind(parent, LABEL_KIND_EDGE))
+				{
+					ereport(ERROR,
+							(errcode(ERRCODE_INVALID_SCHEMA_NAME),
+							 errmsg("parent graph label \"%s\" is not edge label.",
+									parent->relname)));
+				}
+			}
+		}
+	}
+	else
+	{
+		if (labelStmt->inhRelations != NIL)
+			ereport(WARNING,
+					(errcode(ERRCODE_INVALID_SCHEMA_NAME),
+					 errmsg("graph label \"%s\" is base label, inherit option is discarded",
+							stmt->relation->relname)));
+
+		stmt->inhRelations = NIL;
+	}
+
+	/*
+	 * process CreateStmt
+	 */
+
+	cxt.pstate = pstate;
+	cxt.stmtType = (labelStmt->labelKind == LABEL_VERTEX) ? "CREATE VLABEL"
+														  : "CREATE ELABEL";
+	cxt.relation = stmt->relation;
+	cxt.rel = NULL;
+	cxt.inhRelations = stmt->inhRelations;
+	cxt.isalter = false;
+	cxt.hasoids = false;
+	cxt.columns = NIL;
+	cxt.ckconstraints = NIL;
+	cxt.fkconstraints = NIL;
+	cxt.ixconstraints = NIL;  
+    cxt.clusterConstraints = NIL;
+	cxt.inh_indexes = NIL;
+	cxt.blist = NIL;
+	cxt.alist = NIL;
+	cxt.pkey = NULL;
+	cxt.ispartitioned = false;
+    cxt.fallback_dist_col = NIL;
+	cxt.ofType = (stmt->ofTypename != NULL);
+
+    if (IsA(stmt, CreateForeignTableStmt)) {
+        CreateForeignTableStmt* fStmt = (CreateForeignTableStmt*)stmt;
+        cxt.canInfomationalConstraint = CAN_BUILD_INFORMATIONAL_CONSTRAINT_BY_STMT(fStmt);
+    } else {
+        cxt.canInfomationalConstraint = false;
+    }
+
+	foreach(elements, stmt->tableElts)
+	{
+		Node *element = (Node *)lfirst(elements);
+
+		switch (nodeTag(element))
+		{
+			case T_ColumnDef:
+				transformLabelIdDefinition(&cxt, (ColumnDef *) element);
+				transformColumnDefinition(&cxt, (ColumnDef *) element, false);
+				break;
+			case T_Constraint:
+				/* fall-through */
+			case T_TableLikeClause:
+				/* fall-through */
+			default:
+				elog(ERROR, "graph base label definition has columns only, element node type: %d",
+					 (int) nodeTag(element));
+		}
+	}
+
+	/* make descriptions for label and table */
+	if (strcmp(stmt->relation->relname, GS_VERTEX) == 0)
+	{
+		snprintf(descbuf, sizeof(descbuf), "base vertex label of graph %s",
+				 graphname);
+		labdesc = pstrdup(descbuf);
+		comment = makeComment(OBJECT_VLABEL, stmt->relation, labdesc);
+		cxt.alist = lappend(cxt.alist, comment);
+	}
+	else if (strcmp(labelStmt->relation->relname, GS_EDGE) == 0)
+	{
+		snprintf(descbuf, sizeof(descbuf), "base edge label of graph %s",
+				 graphname);
+		labdesc = pstrdup(descbuf);
+		comment = makeComment(OBJECT_ELABEL, stmt->relation, labdesc);
+		cxt.alist = lappend(cxt.alist, comment);
+	}
+	qname = quote_qualified_identifier(graphname, stmt->relation->relname);
+	snprintf(descbuf, sizeof(descbuf), "base table for graph label %s", qname);
+	tabdesc = pstrdup(descbuf);
+	comment = makeComment(OBJECT_TABLE, stmt->relation, tabdesc);
+	cxt.alist = lappend(cxt.alist, comment);
+
+	/* save original alist for indexes and constraints */
+	save_alist = cxt.alist;
+	cxt.alist = NULL;
+	transformIndexConstraints(&cxt);
+	cxt.alist = list_concat(cxt.alist, indexlist);
+	transformFKConstraints(&cxt, true, false);
+
+	/*
+	 * if `disable_index` is true
+	 * then set DisableIndexStmt after CREATE INDEX statements
+	 */
+	if (labelStmt->disable_index)
+	{
+		DisableIndexStmt *disable_idx_stmt;
+
+		disable_idx_stmt = makeNode(DisableIndexStmt);
+		disable_idx_stmt->relation = stmt->relation;
+		cxt.alist = lappend(cxt.alist, disable_idx_stmt);
+	}
+
+	stmt->tableElts = cxt.columns;
+	stmt->constraints = cxt.ckconstraints;
+
+	result = lappend(cxt.blist, stmt);
+	result = list_concat(result, cxt.alist);
+	result = list_concat(result, save_alist);
+
+	return result;
+}
+
+
+/* make table elements for base `vertex` table */
+static List *
+makeVertexElements(void)
+{
+	Constraint *pk = makeNode(Constraint);
+	ColumnDef  *id = makeNode(ColumnDef);
+	Constraint *notnull = makeNode(Constraint);
+	Constraint *jsonb_empty_obj = makeNode(Constraint);
+	List	   *constrs;
+	ColumnDef  *prop_map = makeNode(ColumnDef);
+
+	pk->contype = CONSTR_PRIMARY;
+	pk->location = -1;
+
+	id->colname = GS_ELEM_LOCAL_ID;
+	id->typname = makeTypeName("graphid");
+	id->is_local = true;
+	id->constraints = list_make1(pk);
+	// id->position->position = -1;
+
+	notnull->contype = CONSTR_NOTNULL;
+	notnull->location = -1;
+
+	jsonb_empty_obj->contype = CONSTR_DEFAULT;
+	jsonb_empty_obj->raw_expr = (Node *)
+			makeFuncCall(list_make1(makeString("jsonb_build_object")), NIL, -1);
+	jsonb_empty_obj->location = -1;
+
+	constrs = list_make2(notnull, jsonb_empty_obj);
+
+	prop_map->colname = GS_ELEM_PROP_MAP;
+	prop_map->typname = makeTypeName("jsonb");
+	prop_map->is_local = true;
+	prop_map->constraints = constrs;
+	// prop_map->position->position = -1;
+
+	return list_make2(id, prop_map);
+}
+
+/* make table elements for base `edge` table */
+static List *
+makeEdgeElements(void)
+{
+	Constraint *notnull = makeNode(Constraint);
+	List	   *constrs;
+	ColumnDef  *id = makeNode(ColumnDef);
+	ColumnDef  *start = makeNode(ColumnDef);
+	ColumnDef  *end = makeNode(ColumnDef);
+	Constraint *jsonb_empty_obj = makeNode(Constraint);
+	ColumnDef  *prop_map = makeNode(ColumnDef);
+
+	notnull->contype = CONSTR_NOTNULL;
+	notnull->location = -1;
+
+	constrs = list_make1(notnull);
+
+	id->colname = GS_ELEM_LOCAL_ID;
+	id->typname = makeTypeName("graphid");
+	id->is_local = true;
+	id->constraints = (List* )copyObject(constrs);
+	// id->position->position = -1;
+
+	start->colname = GS_START_ID;
+	start->typname = makeTypeName("graphid");
+	start->is_local = true;
+	start->constraints = (List* )copyObject(constrs);
+	// start->position->position = -1;
+
+	end->colname = GS_END_ID;
+	end->typname = makeTypeName("graphid");
+	end->is_local = true;
+	end->constraints = (List* )copyObject(constrs);
+	// end->position->position = -1;
+
+	jsonb_empty_obj->contype = CONSTR_DEFAULT;
+	jsonb_empty_obj->raw_expr = (Node *)
+			makeFuncCall(list_make1(makeString("jsonb_build_object")), NIL, -1);
+	jsonb_empty_obj->location = -1;
+
+	constrs = lappend(constrs, jsonb_empty_obj);
+
+	prop_map->colname = GS_ELEM_PROP_MAP;
+	prop_map->typname = makeTypeName("jsonb");
+	prop_map->is_local = true;
+	prop_map->constraints = constrs;
+	// prop_map->position->position = -1;
+
+	return list_make4(id, start, end, prop_map);
+}
+
+static List *
+makeEdgeIndex(RangeVar *label)
+{
+	char	   *labname;
+	Oid			graphid;
+	IndexElem  *id_col;
+	IndexElem  *start_col;
+	IndexElem  *end_col;
+	IndexStmt  *edge_id_idx;
+	IndexStmt  *start_idx;
+	IndexStmt  *end_idx;
+
+	labname = label->relname;
+	graphid = RangeVarGetCreationNamespace(label);
+
+	/* make index elements */
+
+	id_col = makeNode(IndexElem);
+	id_col->name = GS_ELEM_LOCAL_ID;
+
+	start_col = makeNode(IndexElem);
+	start_col->name = GS_START_ID;
+
+	end_col = makeNode(IndexElem);
+	end_col->name = GS_END_ID;
+
+	/* make indexes */
+
+	edge_id_idx = makeNode(IndexStmt);
+	edge_id_idx->idxname = ChooseRelationName(labname, GS_ELEM_LOCAL_ID,
+											  "idx", strlen("idx"), graphid, false);
+	edge_id_idx->relation = (RangeVar* )copyObject(label);
+	edge_id_idx->accessMethod = "btree";
+	edge_id_idx->indexParams = list_make1(id_col);
+
+	start_idx = makeNode(IndexStmt);
+	start_idx->idxname = ChooseRelationName(labname, GS_START_ID,
+											"idx", strlen("idx"), graphid, false);
+	start_idx->relation = (RangeVar* )copyObject(label);
+	start_idx->accessMethod = "btree";
+	start_idx->indexParams = list_make2(start_col, end_col);
+
+	end_idx = makeNode(IndexStmt);
+	end_idx->idxname = ChooseRelationName(labname, GS_END_ID,
+										  "idx", strlen("idx"), graphid, false);
+	end_idx->relation = (RangeVar* )copyObject(label);
+	end_idx->accessMethod = "btree";
+	end_idx->indexParams = list_make2(end_col, start_col);
+
+	return list_make3(edge_id_idx, start_idx, end_idx);
+}
+
+static bool
+isLabelKind(RangeVar *label, char labkind)
+{
+	Oid graphid = get_graphname_oid(label->schemaname);
+
+	return (getLabelKind(label->relname, graphid) == labkind);
+}
+
+char
+getLabelKind(char *labname, Oid graphid)
+{
+	HeapTuple	tuple;
+	Form_gs_label labtup;
+	char		labkind;
+
+	tuple = SearchSysCache2(LABELNAMEGRAPH, PointerGetDatum(labname),
+							ObjectIdGetDatum(graphid));
+	if (!HeapTupleIsValid(tuple))
+		elog(ERROR, "label \"%s\" does not exist", labname);
+
+	labtup = (Form_gs_label) GETSTRUCT(tuple);
+	labkind = labtup->labkind;
+	Assert(labkind == LABEL_KIND_VERTEX || labkind == LABEL_KIND_EDGE);
+
+	ReleaseSysCache(tuple);
+
+	return labkind;
+}
+
+
+
+/* See transformColumnDefinition() */
+static void
+transformLabelIdDefinition(CreateStmtContext *cxt, ColumnDef *col)
+{
+	Oid			snamespaceid;
+	char	   *snamespace;
+	char	   *sname;
+	CreateSeqStmt *seqstmt;
+	DefElem	   *maxval;
+	List	   *attnamelist;
+	DefElem	   *ownedby;
+	AlterSeqStmt *altseqstmt;
+	char	   *qname;
+	A_Const	   *relname;
+	FuncCall   *fclabid;
+	A_Const	   *seqname;
+	TypeCast   *castseq;
+	FuncCall   *fcnextval;
+	FuncCall   *fcgraphid;
+	Constraint *defid;
+
+	if (strcmp(col->colname, GS_ELEM_LOCAL_ID) != 0)
+		return;
+
+	snamespaceid = RangeVarGetCreationNamespace(cxt->relation);
+	RangeVarAdjustRelationPersistence(cxt->relation, snamespaceid);
+
+	snamespace = get_namespace_name(snamespaceid);
+	sname = ChooseRelationName(cxt->relation->relname, GS_ELEM_LOCAL_ID,
+							   "seq", strlen("seq"), snamespaceid);
+
+	/* CREATE SEQUENCE before CREATE TABLE */
+
+	seqstmt = makeNode(CreateSeqStmt);
+	seqstmt->sequence = makeRangeVar(snamespace, sname, -1);
+	seqstmt->options = NIL;
+	seqstmt->ownerId = InvalidOid;
+
+	cxt->blist = lappend(cxt->blist, seqstmt);
+
+	/* ALTER SEQUENCE OWNED BY after CREATE TABLE */
+
+#ifdef HAVE_LONG_INT_64
+	maxval = makeDefElem("maxvalue", (Node *) makeInteger(GRAPHID_LOCID_MAX));
+#else
+	{
+		char buf[32];
+
+		snprintf(buf, sizeof(buf), UINT64_FORMAT, GRAPHID_LOCID_MAX);
+		maxval = makeDefElem("maxvalue", (Node *) makeFloat(pstrdup(buf)), -1);
+	}
+#endif
+	attnamelist = list_make3(makeString(snamespace),
+							 makeString(cxt->relation->relname),
+							 makeString(GS_ELEM_LOCAL_ID));
+	ownedby = makeDefElem("owned_by", (Node *) attnamelist);
+	altseqstmt = makeNode(AlterSeqStmt);
+	altseqstmt->sequence = makeRangeVar(snamespace, sname, -1);
+	altseqstmt->options = list_make2(maxval, ownedby);
+
+	cxt->alist = lappend(cxt->alist, altseqstmt);
+
+	/*
+	 * add DEFAULT constraint to the column
+	 *
+	 * graphid(graph_labid(`relname`), nextval(`seqname`::regclass))
+	 */
+
+	qname = quote_qualified_identifier(snamespace, cxt->relation->relname);
+	relname = makeNode(A_Const);
+	relname->val.type = T_String;
+	relname->val.val.str = qname;
+	relname->location = -1;
+	fclabid = makeFuncCall(SystemFuncName("graph_labid"),
+						   list_make1(relname), -1);
+	qname = quote_qualified_identifier(snamespace, sname);
+	seqname = makeNode(A_Const);
+	seqname->val.type = T_String;
+	seqname->val.val.str = qname;
+	seqname->location = -1;
+	castseq = makeNode(TypeCast);
+	castseq->typname = SystemTypeName("regclass");
+	castseq->arg = (Node *) seqname;
+	castseq->location = -1;
+	fcnextval = makeFuncCall(SystemFuncName("nextval"),
+							 list_make1(castseq), -1);
+	fcgraphid = makeFuncCall(SystemFuncName("graphid"),
+							 list_make2(fclabid, fcnextval), -1);
+	defid = makeNode(Constraint);
+	defid->contype = CONSTR_DEFAULT;
+	defid->location = -1;
+	defid->raw_expr = (Node *) fcgraphid;
+
+	col->constraints = lappend(col->constraints, defid);
+}
+
+static CommentStmt *
+makeComment(ObjectType type, RangeVar *name, char *desc)
+{
+	CommentStmt *c;
+
+	c = makeNode(CommentStmt);
+	c->objtype = type;
+	c->objname = list_make2(makeString(name->schemaname),
+									makeString(name->relname));
+	c->comment = pstrdup(desc);
+
+	return c;
+}
+
+AlterTableStmt *
+transformAlterLabelStmt(AlterTableStmt *stmt)
+{
+	AlterTableStmt *result;
+	List	   *newcmds = NIL;
+	ListCell   *lcmd;
+	Oid			laboid;
+
+	result = makeNode(AlterTableStmt);
+	result->relation = makeRangeVar(get_graph_path(false),
+									stmt->relation->relname, 0);
+	result->relkind = stmt->relkind;
+	result->missing_ok = stmt->missing_ok;
+
+	laboid = get_labname_laboid(stmt->relation->relname, get_graph_path_oid());
+	if (!OidIsValid(laboid))
+	{
+		if (stmt->missing_ok)
+			ereport(NOTICE,
+					(errcode(ERRCODE_UNDEFINED_OBJECT),
+					 errmsg("graph label \"%s\" does not exist, skipping",
+							stmt->relation->relname)));
+		else
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_OBJECT),
+					 errmsg("graph label \"%s\" does not exist",
+							stmt->relation->relname)));
+
+		return NULL;
+	}
+
+	CheckLabelType(stmt->relkind, laboid, "ALTER");
+
+	foreach(lcmd, stmt->cmds)
+	{
+		AlterTableCmd *cmd = (AlterTableCmd *) lfirst(lcmd);
+
+		switch (cmd->subtype)
+		{
+			case AT_SetStorage:
+				{
+					/* storage option is meaningless for graph id
+					 * so forced to graph property */
+					cmd->name = GS_ELEM_PROP_MAP;
+
+					newcmds = lappend(newcmds, cmd);
+					break;
+				}
+			case AT_AddInherit:
+			case AT_DropInherit:
+				{
+					RangeVar *par = (RangeVar *) cmd->def;
+
+					if (strcmp(par->relname, GS_VERTEX) == 0
+						|| strcmp(par->relname, GS_EDGE) == 0)
+						ereport(ERROR,
+								(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+								 errmsg("cannot ALTER inheritance with base label")));
+
+					par->schemaname = get_graph_path(false);
+
+					newcmds = lappend(newcmds, cmd);
+					break;
+				}
+			default:
+				newcmds = lappend(newcmds, cmd);
+				break;
+		}
+	}
+	result->cmds = newcmds;
+
+	return result;
+}
+
+/*
+ * transformCreateConstraintStmt - parse analysis for CREATE CONSTRAINT
+ *
+ * This function transforms a CreateConstraintStmt to a AlterTableStmt,
+ * and returns the AlterTableStmt.
+ */
+Node *
+transformCreateConstraintStmt(ParseState *pstate,
+							  CreateConstraintStmt *constraintStmt)
+{
+	RangeVar   *label;
+	ObjectType	objtype;
+	CypherGenericExpr *cexpr;
+	Node	   *propexpr;
+	Constraint *constr;
+	AlterTableCmd *atcmd;
+	AlterTableStmt *atstmt;
+
+	label = constraintStmt->graphlabel;
+	label->schemaname = get_graph_path(false);
+
+	objtype = getLabelObjectType(label->relname, get_graph_path_oid());
+
+	cexpr = makeNode(CypherGenericExpr);
+	cexpr->expr = prop_ref_mutator(constraintStmt->expr);
+
+	propexpr = (Node *) cexpr;
+
+	constr = makeNode(Constraint);
+	switch (constraintStmt->contype)
+	{
+		case CONSTR_CHECK:
+			{
+				constr->contype = constraintStmt->contype;
+				constr->conname = constraintStmt->conname;
+				constr->raw_expr = propexpr;
+				constr->initially_valid = true;
+			}
+			break;
+		case CONSTR_UNIQUE:
+			{
+				IndexElem  *uniqueElem;
+				List	   *equalOp;
+				List	   *excludeExpr;
+
+				/*
+				 * We cannot create UNIQUE constraints on expressions in
+				 * PostgreSQL. Instead, we can support the same functionality
+				 * through EXCLUDE.
+				 */
+
+				uniqueElem = makeNode(IndexElem);
+				uniqueElem->expr = propexpr;
+				equalOp = list_make1(makeString("="));
+				excludeExpr = list_make2(uniqueElem, equalOp);
+
+				constr->contype = CONSTR_EXCLUSION;
+				constr->access_method = DEFAULT_INDEX_TYPE;
+				constr->exclusions = list_make1(excludeExpr);
+				constr->conname = constraintStmt->conname;
+				if (constr->conname == NULL)
+				{
+					Oid nsid;
+
+					nsid = LookupNamespaceNoError(label->schemaname);
+					constr->conname = ChooseRelationName(label->relname,
+														 "unique",
+														 "constraint", strlen("constraint"), nsid, false);
+				}
+			}
+			break;
+		default:
+			elog(ERROR, "unrecognized constraint type: %d",
+				 (int) constraintStmt->contype);
+	}
+
+	atcmd = makeNode(AlterTableCmd);
+	atcmd->subtype = AT_AddConstraint;
+	atcmd->def = (Node *) constr;
+
+	atstmt = makeNode(AlterTableStmt);
+	atstmt->relation = label;
+	atstmt->cmds = list_make1(atcmd);
+	atstmt->relkind = objtype;
+
+	return (Node *) atstmt;
+}
+
+/*
+ * transformDropConstraintStmt - parse analysis for DROP CONSTRAINT
+ *
+ * This function transforms a DropConstraintStmt to a AlterTableStmt,
+ * and returns the AlterTableStmt.
+ */
+Node *
+transformDropConstraintStmt(ParseState *pstate,
+							DropConstraintStmt *constraintStmt)
+{
+	RangeVar   *label;
+	ObjectType	objtype;
+	AlterTableCmd *atcmd;
+	AlterTableStmt *atstmt;
+
+	label = constraintStmt->graphlabel;
+	label->schemaname = get_graph_path(false);
+
+	objtype = getLabelObjectType(label->relname, get_graph_path_oid());
+
+	atcmd = makeNode(AlterTableCmd);
+	atcmd->subtype = AT_DropConstraint;
+	atcmd->name = constraintStmt->conname;
+	atcmd->behavior = DROP_RESTRICT;
+
+	atstmt = makeNode(AlterTableStmt);
+	atstmt->relation = label;
+	atstmt->cmds = list_make1(atcmd);
+	atstmt->relkind = objtype;
+
+	return (Node *) atstmt;
+}
+
+/*
+ * Change ColumnRef in `node` to an expression which is an indirection on
+ * GS_ELEM_PROP_MAP
+ */
+static Node *
+prop_ref_mutator(Node *node)
+{
+	if (node == NULL)
+		return NULL;
+
+	if (IsA(node, ColumnRef))
+	{
+		ColumnRef  *cref;
+
+		cref = castNode(ColumnRef, copyObject(node));
+		cref->fields = lcons(makeString(GS_ELEM_PROP_MAP), cref->fields);
+
+		return (Node *) cref;
+	}
+
+	return raw_expression_tree_mutator(node, (Node* (*)(Node*, void*))prop_ref_mutator, NULL);
+}
+
+static ObjectType
+getLabelObjectType(char *labname, Oid graphid)
+{
+	char labkind = getLabelKind(labname, graphid);
+
+	if (labkind == LABEL_KIND_VERTEX)
+	{
+		return OBJECT_VLABEL;
+	}
+	else
+	{
+		Assert(labkind == LABEL_KIND_EDGE);
+
+		return OBJECT_ELABEL;
+	}
+}
+
+/*
+ * transformIndexStmt - parse analysis for CREATE PROPERTY INDEX
+ *
+ * This function is based on transformIndexStmt().
+ *
+ * Return an IndexStmt node using information from an PropertyIndexStmt.
+ */
+IndexStmt *
+transformCreatePropertyIndexStmt(Oid relid, CreatePropertyIndexStmt *stmt,
+								 const char *queryString)
+{
+	IndexStmt  *idxstmt;
+	ParseState *pstate;
+	ListCell   *l;
+	Relation	rel;
+	RangeTblEntry *rte;
+
+	Assert(!stmt->transformed);
+
+	idxstmt = (IndexStmt *) copyObject(stmt);
+	NodeSetTag(idxstmt, T_IndexStmt);
+
+	/* Set up pstate */
+	pstate = make_parsestate(NULL);
+	pstate->p_sourcetext = queryString;
+
+	/*
+	 * Put the parent table into the rtable so that the expressions can refer
+	 * to its fields without qualification.  Caller is responsible for locking
+	 * relation, but we still need to open it.
+	 */
+	rel = relation_open(relid, NoLock);
+	rte = addRangeTableEntryForRelation(pstate, rel, NULL, false, true);
+
+	/* no to join list, yes to namespaces */
+	addRTEtoQuery(pstate, rte, false, true, true);
+
+	/* take care of the where clause */
+	if (idxstmt->whereClause)
+	{
+		idxstmt->whereClause = prop_ref_mutator(idxstmt->whereClause);
+
+		idxstmt->whereClause = transformCypherWhere(pstate,
+													idxstmt->whereClause,
+													EXPR_KIND_INDEX_PREDICATE);
+
+		/* we have to fix its collations too */
+		assign_expr_collations(pstate, idxstmt->whereClause);
+	}
+
+	/* take care of any index expressions */
+	foreach(l, idxstmt->indexParams)
+	{
+		IndexElem  *ielem = (IndexElem *) lfirst(l);
+
+		if (ielem->expr == NULL || ielem->name != NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_SYNTAX_ERROR),
+					 errmsg("property index must have expressions")));
+
+		if (ielem->indexcolname == NULL)
+		{
+			char	   *colname;
+
+			/*
+			 * just fill indexcolname with a properly chosen name at here and
+			 * let ChooseIndexName() build the name of the index later
+			 */
+			if (figure_prop_index_colname_walker(ielem->expr, &colname))
+				ielem->indexcolname = colname;
+			else
+				ielem->indexcolname = FigureIndexColname(ielem->expr);
+		}
+
+		ielem->expr = prop_ref_mutator(ielem->expr);
+
+		/* Now do parse transformation of the expression */
+		ielem->expr = transformCypherExpr(pstate, ielem->expr,
+										  EXPR_KIND_INDEX_EXPRESSION);
+
+		/* We have to fix its collations too */
+		assign_expr_collations(pstate, ielem->expr);
+
+		/*
+		 * transformExpr() should have already rejected subqueries,
+		 * aggregates, and window functions, based on the EXPR_KIND_ for
+		 * an index expression.
+		 *
+		 * Also reject expressions returning sets; this is for consistency
+		 * with what transformWhereClause() checks for the predicate.
+		 * DefineIndex() will make more checks.
+		 */
+		if (expression_returns_set(ielem->expr))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATATYPE_MISMATCH),
+					 errmsg("property index expression cannot return a set")));
+	}
+
+	/*
+	 * Check that only the base rel is mentioned.  (This should be dead code
+	 * now that add_missing_from is history.)
+	 */
+	if (list_length(pstate->p_rtable) != 1)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_COLUMN_REFERENCE),
+				 errmsg("index expressions and predicates can refer only to the table being indexed")));
+
+	free_parsestate(pstate);
+
+	/* Close relation */
+	heap_close(rel, NoLock);
+
+	/* Mark statement as successfully transformed */
+	// idxstmt->transformed = true;
+
+	return idxstmt;
+}
+
+/*
+ * Just return the last valid name in the fields of ColumnRef or
+ * in the indirection of A_Indirection.
+ * It will be the last path element of the indirection on properties.
+ */
+static bool
+figure_prop_index_colname_walker(Node *node, char **colname)
+{
+	char	   *fname = NULL;
+
+	if (node == NULL)
+		return false;
+
+	if (IsA(node, A_Indirection))
+	{
+		A_Indirection *indir = (A_Indirection *) node;
+		ListCell   *li;
+
+		foreach(li, indir->indirection)
+		{
+			Node	   *i = (Node*)lfirst(li);
+
+			if (IsA(i, String))
+			{
+				fname = strVal(i);
+			}
+			else
+			{
+				A_Indices  *ind = (A_Indices *) i;
+
+				Assert(IsA(i, A_Indices));
+
+				if (!ind->is_slice && IsA(ind->uidx, A_Const))
+					fname = strVal(&((A_Const *) ind->uidx)->val);
+			}
+		}
+		if (fname != NULL)
+		{
+			*colname = fname;
+			return true;
+		}
+
+		return figure_prop_index_colname_walker(indir->arg, colname);
+	}
+
+	if (IsA(node, ColumnRef))
+	{
+		fname = FigureIndexColname(node);
+		if (fname == NULL)
+			return false;
+
+		*colname = fname;
+		return true;
+	}
+
+	return raw_expression_tree_walker(node, (bool (*)())figure_prop_index_colname_walker,
+									  colname);
+}
+
+DropStmt *
+transformDropPropertyIndex(DropPropertyIndexStmt *stmt)
+{
+	DropStmt   *dropstmt = makeNode(DropStmt);
+	char	   *graphname;
+	Oid			indexoid;
+	Oid			schemaoid;
+
+	graphname = get_graph_path(true);
+
+	/* get schema that exists target index */
+	schemaoid = get_namespace_oid(graphname, false);
+
+	indexoid = get_relname_relid(stmt->idxname, schemaoid);
+	if (!OidIsValid(indexoid) && !stmt->missing_ok)
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("index \"%s\" does not exist",
+						stmt->idxname)));
+
+	// if (OidIsValid(indexoid) && !isPropertyIndex(indexoid))
+	// {
+	// 	ereport(ERROR,
+	// 			(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+	// 			 errmsg("\"%s\" is not property index",
+	// 					stmt->idxname)));
+	// }
+
+	dropstmt->objects = list_make1(list_make2(makeString(graphname),
+											  makeString(stmt->idxname)));
+	dropstmt->arguments = NIL;
+	dropstmt->removeType = OBJECT_INDEX;
+	dropstmt->behavior = stmt->behavior;
+	dropstmt->missing_ok = stmt->missing_ok;
+	dropstmt->concurrent = false;
+
+	return dropstmt;
+}
+
+#endif /* GS_GRAPH */

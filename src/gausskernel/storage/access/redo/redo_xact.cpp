@@ -57,10 +57,12 @@
 #include "replication/dataqueue.h"
 #include "replication/walsender.h"
 #include "replication/syncrep.h"
+#include "storage/smgr/fd.h"
 #include "storage/lmgr.h"
 #include "storage/predicate.h"
 #include "storage/sinvaladt.h"
-#include "storage/smgr.h"
+#include "storage/smgr/smgr.h"
+#include "storage/smgr/segment.h"
 #include "utils/combocid.h"
 #include "utils/guc.h"
 #include "utils/inval.h"
@@ -84,54 +86,15 @@ XLogRecParseState *xact_redo_rmddl_parse_to_block(XLogReaderState *record, XLogR
     XLogRecParseState *blockstate = NULL;
 
     Assert(nrels > 0);
-
-    for (int i = 0; i < nrels; ++i) {
-        ColFileNodeRel *colFileNode = xnodes + i;
-        ColFileNode node;
-        ColFileNodeCopy(&node, colFileNode);
-        if (!IsValidColForkNum(node.forknum)) {
-            if (SUPPORT_DFS_BATCH && ((IS_PGXC_COORDINATOR && IsValidPaxDfsForkNum(node.forknum)) ||
-                                      (!IS_PGXC_COORDINATOR && IsTruncateDfsForkNum(node.forknum)))) {
-                (*blocknum)++;
-                XLogParseBufferAllocListStateFunc(record, &blockstate, &recordstatehead);
-                if (blockstate == NULL) {
-                    return NULL;
-                }
-                ForkNumber fork = (ForkNumber)node.forknum;
-                XLogRecSetBlockCommonState(record, BLOCK_DATA_DDL_TYPE, fork, InvalidBlockNumber, &node.filenode,
-                                           blockstate);
-                XLogRecSetBlockDdlState(&(blockstate->blockparse.extra_rec.blockddlrec), BLOCK_DDL_DROP_RELNODE, false,
-                                        NULL, node.ownerid);
-            } else {
-                (*blocknum)++;
-                XLogParseBufferAllocListStateFunc(record, &blockstate, &recordstatehead);
-                if (blockstate == NULL) {
-                    return NULL;
-                }
-                XLogRecSetBlockCommonState(record, BLOCK_DATA_DDL_TYPE, MAX_FORKNUM, InvalidBlockNumber, &node.filenode,
-                                           blockstate);
-                XLogRecSetBlockDdlState(&(blockstate->blockparse.extra_rec.blockddlrec), BLOCK_DDL_DROP_RELNODE, false,
-                                        NULL, node.ownerid);
-            }
-
-        } else {
-            if (SUPPORT_COLUMN_BATCH) {
-                (*blocknum)++;
-                XLogParseBufferAllocListStateFunc(record, &blockstate, &recordstatehead);
-                if (blockstate == NULL) {
-                    return NULL;
-                }
-
-                Assert(IsValidColForkNum(node.forknum));
-                int fork = (ForkNumber)node.forknum;
-
-                XLogRecSetBlockCommonState(record, BLOCK_DATA_DDL_TYPE, fork, InvalidBlockNumber, &node.filenode,
-                                           blockstate);
-                XLogRecSetBlockDdlState(&(blockstate->blockparse.extra_rec.blockddlrec), BLOCK_DDL_DROP_RELNODE, true,
-                                        NULL, node.ownerid);
-            }
-        }
+    (*blocknum)++;
+    XLogParseBufferAllocListStateFunc(record, &blockstate, &recordstatehead);
+    if (blockstate == NULL) {
+        return NULL;
     }
+    RelFileNodeForkNum filenode = RelFileNodeForkNumFill(NULL, InvalidBackendId, MAIN_FORKNUM, InvalidBlockNumber);
+    XLogRecSetBlockCommonState(record, BLOCK_DATA_DDL_TYPE, filenode, blockstate);
+    XLogRecSetBlockDdlState(&(blockstate->blockparse.extra_rec.blockddlrec), BLOCK_DDL_DROP_RELNODE, (char *)xnodes,
+        nrels);
 
     return recordstatehead;
 }
@@ -207,7 +170,7 @@ static XLogRecParseState *xact_xlog_abort_internal_parse(XLogReaderState *record
     *blocknum = 0;
 
     xl_xact_abort *xlrec = NULL;
-    if (info == XLOG_XACT_ABORT) {
+    if (info == XLOG_XACT_ABORT || info == XLOG_XACT_ABORT_WITH_XID) {
         xlrec = (xl_xact_abort *)XLogRecGetData(record);
     } else {
         xl_xact_abort_prepared *xlrecpre = (xl_xact_abort_prepared *)XLogRecGetData(record);
@@ -250,7 +213,9 @@ static XLogRecParseState *xact_xlog_prepare_internal_parse(XLogReaderState *reco
 
     *blocknum = 0;
     if (TransactionIdIsNormal(hdr->xid)) {
-        sub_xids = (TransactionId *)(recorddata + MAXALIGN(sizeof(TwoPhaseFileHeader)));
+        int hdrSize = (hdr->magic == TWOPHASE_MAGIC_NEW) ?
+               sizeof(TwoPhaseFileHeaderNew) : sizeof(TwoPhaseFileHeader);
+        sub_xids = (TransactionId *)(recorddata + MAXALIGN(hdrSize));
         nsubxacts = hdr->nsubxacts;
 
         xid = hdr->xid;
@@ -277,7 +242,7 @@ XLogRecParseState *xact_redo_parse_to_block(XLogReaderState *record, uint32 *blo
 
     if ((info == XLOG_XACT_COMMIT_COMPACT) || (info == XLOG_XACT_COMMIT) || (info == XLOG_XACT_COMMIT_PREPARED)) {
         recordblockstate = xact_xlog_commit_internal_parse(record, blocknum);
-    } else if ((info == XLOG_XACT_ABORT) || (info == XLOG_XACT_ABORT_PREPARED)) {
+    } else if ((info == XLOG_XACT_ABORT) || (info == XLOG_XACT_ABORT_PREPARED) || (info == XLOG_XACT_ABORT_WITH_XID)) {
         recordblockstate = xact_xlog_abort_internal_parse(record, blocknum);
     } else if (info == XLOG_XACT_PREPARE) {
         recordblockstate = xact_xlog_prepare_internal_parse(record, blocknum);
@@ -329,6 +294,7 @@ XLogRecParseState *xact_xlog_commit_parse_to_block(XLogReaderState *record, XLog
     relnode.spcNode = InvalidOid;
     relnode.relNode = InvalidOid;
     relnode.bucketNode = InvalidBktId;
+    relnode.opt = 0;
 
     (*blocknum)++;
     XLogParseBufferAllocListStateFunc(record, &blockstate, &recordstatehead);
@@ -381,8 +347,9 @@ XLogRecParseState *xact_xlog_commit_parse_to_block(XLogReaderState *record, XLog
         xact_time = xlrec->xact_time;
     }
 
-    XLogRecSetBlockCommonState(record, BLOCK_DATA_XACTDATA_TYPE, InvalidForkNumber, InvalidBlockNumber, &relnode,
-                               blockstate);
+    RelFileNodeForkNum filenode =
+        RelFileNodeForkNumFill(&relnode, InvalidBackendId, InvalidForkNumber, InvalidBlockNumber);
+    XLogRecSetBlockCommonState(record, BLOCK_DATA_XACTDATA_TYPE, filenode, blockstate);
 
     XLogRecSetXactCommonState(&blockstate->blockparse.extra_rec.blockxact, info, xrecinfo, xact_time);
 
@@ -404,10 +371,6 @@ XLogRecParseState *xact_xlog_abort_parse_to_block(XLogReaderState *record, XLogR
     XLogRecPtr lsn = record->EndRecPtr;
     bool delayddlflag = false;
     uint8 info = XLogRecGetInfo(record) & ~XLR_INFO_MASK;
-    TimestampTz xact_time;
-    ColFileNodeRel *xnodes = NULL;
-    int nrels = 0;
-    int nlibrary = 0;
     char *libfilename = NULL;
 
     (*blocknum)++;
@@ -417,17 +380,16 @@ XLogRecParseState *xact_xlog_abort_parse_to_block(XLogReaderState *record, XLogR
     }
 
     xl_xact_abort *xlrec = NULL;
-    int nsubxacts = 0;
-    if (info == XLOG_XACT_ABORT) {
+    if (info == XLOG_XACT_ABORT || info == XLOG_XACT_ABORT_WITH_XID) {
         xlrec = (xl_xact_abort *)XLogRecGetData(record);
     } else {
         xl_xact_abort_prepared *xlrecpre = (xl_xact_abort_prepared *)XLogRecGetData(record);
         xlrec = &(xlrecpre->arec);
     }
-    xact_time = xlrec->xact_time;
-    xnodes = xlrec->xnodes;
-    nrels = xlrec->nrels;
-    nsubxacts = xlrec->nsubxacts;
+    TimestampTz xact_time = xlrec->xact_time;
+    ColFileNodeRel *xnodes = xlrec->xnodes;
+    int nrels = xlrec->nrels;
+    int nsubxacts = xlrec->nsubxacts;
 
     if (nrels > 0) {
         globalDelayDDLLSN = GetDDLDelayStartPtr();
@@ -437,13 +399,17 @@ XLogRecParseState *xact_xlog_abort_parse_to_block(XLogReaderState *record, XLogR
             delayddlflag = false;
     }
 
-    nlibrary = xlrec->nlibrary;
+    int nlibrary = xlrec->nlibrary;
     if (nlibrary > 0) {
         libfilename = (char *)xnodes + (nrels * sizeof(ColFileNode)) + (nsubxacts * sizeof(TransactionId));
     }
 
-    XLogRecSetBlockCommonState(record, BLOCK_DATA_XACTDATA_TYPE, InvalidForkNumber, InvalidBlockNumber, NULL,
-                               blockstate);
+    if (info == XLOG_XACT_ABORT_WITH_XID) {
+        libfilename += sizeof(TransactionId);
+    }
+
+    RelFileNodeForkNum filenode = RelFileNodeForkNumFill(NULL, InvalidBackendId, InvalidForkNumber, InvalidBlockNumber);
+    XLogRecSetBlockCommonState(record, BLOCK_DATA_XACTDATA_TYPE, filenode, blockstate);
 
     XLogRecSetXactCommonState(&blockstate->blockparse.extra_rec.blockxact, info, 0, xact_time);
 
@@ -475,8 +441,8 @@ XLogRecParseState *xact_xlog_prepare_parse_to_block(XLogReaderState *record, XLo
         return NULL;
     }
 
-    XLogRecSetBlockCommonState(record, BLOCK_DATA_PREPARE_TYPE, InvalidForkNumber, InvalidBlockNumber, NULL,
-                               blockstate);
+    RelFileNodeForkNum filenode = RelFileNodeForkNumFill(NULL, InvalidBackendId, InvalidForkNumber, InvalidBlockNumber);
+    XLogRecSetBlockCommonState(record, BLOCK_DATA_PREPARE_TYPE, filenode, blockstate);
     char *maindata = XLogRecGetData(record);
     Size maindatalen = XLogRecGetDataLen(record);
     XLogRecSetPreparState(&blockstate->blockparse.extra_rec.blockprepare, maxxid, maindata, maindatalen);

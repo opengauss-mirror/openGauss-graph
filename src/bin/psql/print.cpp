@@ -1,7 +1,8 @@
 /*
- * psql - the PostgreSQL interactive terminal
+ * psql - the openGauss interactive terminal
  *
  * Copyright (c) 2000-2012, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2021, openGauss Contributors
  *
  * src/bin/psql/print.c
  */
@@ -112,7 +113,6 @@ static void IsPagerNeeded(
     const printTableContent* cont, const int extra_lines, bool expanded, FILE** fout, bool* is_pager);
 
 static void print_aligned_vertical(const printTableContent* cont, FILE* fout);
-static char* GetEnvStr(const char* env);
 
 static void* pg_local_malloc(size_t size)
 {
@@ -335,7 +335,7 @@ static void print_unaligned_text(const printTableContent* cont, FILE* fout)
     if (cont->opt->stop_table) {
         printTableFooter* footers = footers_with_default(cont);
 
-        if (!opt_tuples_only && footers != NULL && !cancel_pressed) {
+        if (!opt_tuples_only && footers != NULL && !cancel_pressed && cont->opt->feedback) {
             printTableFooter* f = NULL;
 
             for (f = footers; f != NULL; f = f->next) {
@@ -408,7 +408,7 @@ static void print_unaligned_vertical(const printTableContent* cont, FILE* fout)
 
     if (cont->opt->stop_table) {
         /* print footers */
-        if (!opt_tuples_only && cont->footers != NULL && !cancel_pressed) {
+        if (!opt_tuples_only && cont->footers != NULL && !cancel_pressed && cont->opt->feedback) {
             printTableFooter* f = NULL;
 
             print_separator(cont->opt->recordSep, fout);
@@ -968,7 +968,7 @@ static void print_aligned_text(const printTableContent* cont, FILE* fout)
             _print_horizontal_line(col_count, width_wrap, opt_border, PRINT_RULE_BOTTOM, format, fout);
 
         /* print footers */
-        if ((footers != NULL) && !opt_tuples_only && !cancel_pressed) {
+        if ((footers != NULL) && !opt_tuples_only && !cancel_pressed && cont->opt->feedback) {
             printTableFooter* f = NULL;
 
             for (f = footers; f != NULL; f = f->next)
@@ -1229,7 +1229,7 @@ static void print_aligned_vertical(const printTableContent* cont, FILE* fout)
             print_aligned_vertical_line(cont, 0, hwidth, dwidth, PRINT_RULE_BOTTOM, fout);
 
         /* print footers */
-        if (!opt_tuples_only && cont->footers != NULL && !cancel_pressed) {
+        if (!opt_tuples_only && cont->footers != NULL && !cancel_pressed && cont->opt->feedback) {
             printTableFooter* f = NULL;
 
             if (opt_border < 2)
@@ -1362,7 +1362,7 @@ static void print_html_text(const printTableContent* cont, FILE* fout)
         fputs("</table>\n", fout);
 
         /* print footers */
-        if (!opt_tuples_only && footers != NULL && !cancel_pressed) {
+        if (!opt_tuples_only && footers != NULL && !cancel_pressed && cont->opt->feedback) {
             printTableFooter* f = NULL;
 
             fputs("<p>", fout);
@@ -1434,7 +1434,7 @@ static void print_html_vertical(const printTableContent* cont, FILE* fout)
         fputs("</table>\n", fout);
 
         /* print footers */
-        if (!opt_tuples_only && cont->footers != NULL && !cancel_pressed) {
+        if (!opt_tuples_only && cont->footers != NULL && !cancel_pressed && cont->opt->feedback) {
             printTableFooter* f = NULL;
 
             fputs("<p>", fout);
@@ -1565,7 +1565,7 @@ static void print_latex_text(const printTableContent* cont, FILE* fout)
         fputs("\\end{tabular}\n\n\\noindent ", fout);
 
         /* print footers */
-        if ((footers != NULL) && !opt_tuples_only && !cancel_pressed) {
+        if ((footers != NULL) && !opt_tuples_only && !cancel_pressed && cont->opt->feedback) {
             printTableFooter* f = NULL;
 
             for (f = footers; f != NULL; f = f->next) {
@@ -1643,7 +1643,7 @@ static void print_latex_vertical(const printTableContent* cont, FILE* fout)
         fputs("\\end{tabular}\n\n\\noindent ", fout);
 
         /* print footers */
-        if ((cont->footers != NULL) && !opt_tuples_only && !cancel_pressed) {
+        if ((cont->footers != NULL) && !opt_tuples_only && !cancel_pressed && cont->opt->feedback) {
             printTableFooter* f = NULL;
 
             for (f = cont->footers; f != NULL; f = f->next) {
@@ -1742,7 +1742,7 @@ static void print_troff_ms_text(const printTableContent* cont, FILE* fout)
         fputs(".TE\n.DS L\n", fout);
 
         /* print footers */
-        if ((footers != NULL) && !opt_tuples_only && !cancel_pressed) {
+        if ((footers != NULL) && !opt_tuples_only && !cancel_pressed && cont->opt->feedback) {
             printTableFooter* f = NULL;
 
             for (f = footers; f != NULL; f = f->next) {
@@ -1837,7 +1837,7 @@ static void print_troff_ms_vertical(const printTableContent* cont, FILE* fout)
         fputs(".TE\n.DS L\n", fout);
 
         /* print footers */
-        if ((cont->footers != NULL) && !opt_tuples_only && !cancel_pressed) {
+        if ((cont->footers != NULL) && !opt_tuples_only && !cancel_pressed && cont->opt->feedback) {
             printTableFooter* f = NULL;
 
             for (f = cont->footers; f != NULL; f = f->next) {
@@ -1954,7 +1954,7 @@ void printTableInit(
     content->headers = (const char**)pg_local_calloc(ncolumns + 1, sizeof(*content->headers));
 
     if (ncolumns * nrows + 1 <= 0) {
-        fprintf(stderr, _("Integer Overflow:ncolumns * nrows + 1"));
+        fprintf(stderr, _("Error: Integer overflow when select execution.\n"));
         exit(EXIT_FAILURE);
     }
     content->cells = (const char**)pg_local_calloc(ncolumns * nrows + 1, sizeof(*content->cells));
@@ -2045,7 +2045,7 @@ void printTableAddCell(printTableContent* const content, char* cell, const bool 
         if (content->cellmustfree == NULL) {
             int64 res = (int64)content->ncolumns * (int64)content->nrows;
             if ((res + 1) >= (int64)PG_INT32_MAX) {
-                fprintf(stderr, _("Integer Overflow:content->ncolumns * content->nrows + 1\n"));
+                fprintf(stderr, _("Error: Integer overflow when select execution\n"));
                 exit(EXIT_FAILURE);
             }
             content->cellmustfree = (bool*)pg_local_calloc(res + 1, sizeof(bool));
@@ -2266,6 +2266,7 @@ void printQuery(const PGresult* result, const printQueryOpt* opt, FILE* fout, FI
             case INT2OID:
             case INT4OID:
             case INT8OID:
+            case INT16OID:
             case FLOAT4OID:
             case FLOAT8OID:
             case NUMERICOID:
@@ -2428,27 +2429,3 @@ void check_env_value(const char* input_env_value)
     }
 }
 
-/*
- * GetEnvStr
- *
- * Note: malloc space for get the return of getenv() function, then return the malloc space.
- *         so, this space need be free.
- */
-static char* GetEnvStr(const char* env)
-{
-    char* tmpvar = NULL;
-    const char* temp = getenv(env);
-    errno_t rc = 0;
-    if (temp != NULL) {
-        size_t len = strlen(temp);
-        if (0 == len)
-            return NULL;
-        tmpvar = (char*)malloc(len + 1);
-        if (tmpvar != NULL) {
-            rc = strcpy_s(tmpvar, len + 1, temp);
-            securec_check_c(rc, "\0", "\0");
-            return tmpvar;
-        }
-    }
-    return NULL;
-}

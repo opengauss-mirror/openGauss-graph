@@ -1,7 +1,7 @@
 /* -------------------------------------------------------------------------
  *
  * keywords.h
- *	  lexical token lookup for key words in PostgreSQL
+ *	  lexical token lookup for key words in openGauss
  *
  *
  * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
@@ -25,6 +25,17 @@ typedef struct ScanKeyword {
     int16 value;      /* grammar's token code */
     int16 category;   /* see codes above */
 } ScanKeyword;
+
+typedef struct PlpgsqlKeywordValue {
+    int16 procedure;
+    int16 function;
+    int16 begin;
+    int16 select;
+    int16 update;
+    int16 insert;
+    int16 Delete;
+    int16 merge;
+} PlpgsqlKeywordValue;
 
 extern PGDLLIMPORT const ScanKeyword ScanKeywords[];
 extern PGDLLIMPORT const int NumScanKeywords;

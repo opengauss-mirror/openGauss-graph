@@ -31,6 +31,7 @@ static void stream_walker_query_recursive(Query* query, shipping_context *cxt);
 static void stream_walker_query_distinct(Query* query, shipping_context *cxt);
 static void stream_walker_query_returning(Query* query, shipping_context *cxt);
 static void stream_walker_query_merge(Query* query, shipping_context *cxt);
+static void stream_walker_query_upsert(Query *query, shipping_context *cxt);
 static void stream_walker_query_rtable(Query* query, shipping_context *cxt);
 static void stream_walker_query_exec_direct(Query* query, shipping_context *cxt);
 static void stream_walker_query_cte(Query* query, shipping_context *cxt);
@@ -66,6 +67,12 @@ static uint unsupport_func[] = {
     PGSTATGETBACKENDPIDFUNCOID,  // pg_stat_get_backend_pid
     PERCENTILECONTAGGFUNCOID,    // percentile_cont
     MODEAGGFUNCOID,              // mode
+    FLOAT8MEDIANOID,             // median(float8)
+    INTERVALMEDIANOID,           // median(interval)
+    FIRSTAGGFUNCOID,             // first
+    LASTAGGFUNCOID,              // last
+    JSONAGGFUNCOID,              // json_agg
+    JSONOBJECTAGGFUNCOID         // json_object_agg
 };
 
 /*
@@ -99,6 +106,59 @@ bool stream_walker(Node* node, void* context)
             break;
     }
     return expression_tree_walker(node, (bool (*)())stream_walker, context);
+}
+
+static bool containReplicatedTable(List *rtable)
+{
+    ListCell *lc = NULL;
+    foreach(lc, rtable) {
+        RangeTblEntry *rte = (RangeTblEntry *)lfirst(lc);
+        if (IsLocatorReplicated(rte->locator_type)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void stream_walker_query_insertinto_rep(Query* query, shipping_context *cxt)
+{
+    if (!cxt->current_shippable) {
+        return;
+    }
+    if (query->commandType != CMD_INSERT || query->resultRelation == 0 ||
+        !IsLocatorReplicated(rt_fetch(query->resultRelation, query->rtable)->locator_type)) {
+        return;
+    }
+    ListCell *lc = NULL;
+    int index = 0;
+    foreach(lc, query->rtable) {
+        index++;
+        if (index == query->resultRelation) {
+            continue;
+        }
+        RangeTblEntry *rte = rt_fetch(index, query->rtable);
+        if (rte->rtekind != RTE_SUBQUERY || rte->subquery == NULL) {
+            continue;
+        }
+
+        if (rte->subquery->hasWindowFuncs && containReplicatedTable(rte->subquery->rtable)) {
+            cxt->current_shippable = false;
+            break;
+        }
+
+        /* Cannot shipping if there are junk tlists in replicated subquery */
+        if (check_replicated_junktlist(rte->subquery)) {
+            cxt->current_shippable = false;
+            break;
+        }
+    }
+
+    if (!cxt->current_shippable) {
+        errno_t sprintf_rc = sprintf_s(u_sess->opt_cxt.not_shipping_info->not_shipping_reason,
+            NOTPLANSHIPPING_LENGTH,
+            "\"insert into replicated table with select rep table with winfunc\" can not be shipped");
+        securec_check_ss_c(sprintf_rc, "\0", "\0");
+    }
 }
 
 static void stream_walker_query_update(Query* query, shipping_context *cxt)
@@ -184,6 +244,10 @@ static void stream_walker_query_merge(Query* query, shipping_context *cxt)
     
                     cxt->is_nextval_shippable = saved_is_nextval_shippable;
                     cxt->allow_func_in_targetlist = false;
+                } else {
+                    if (expression_tree_walker((Node*)mc->targetList, (bool (*)())stream_walker, (void *)cxt)) {
+                        cxt->current_shippable = false;
+                    }
                 }
     
                 if (expression_tree_walker((Node*)mc->qual, (bool (*)())stream_walker, (void *)cxt)) {
@@ -194,6 +258,22 @@ static void stream_walker_query_merge(Query* query, shipping_context *cxt)
                     cxt->current_shippable = false;
                 }
             }
+        }
+    }
+}
+
+static void stream_walker_query_upsert(Query *query, shipping_context *cxt)
+{
+    if (query->commandType == CMD_INSERT && query->upsertClause != NULL) {
+        /* For replicated table in stream, upsertClause cannot contain unshippable expression */
+        if (query->resultRelation &&
+            IsLocatorReplicated(rt_fetch(query->resultRelation, query->rtable)->locator_type)) {
+            bool saved_disallow_volatile_func_shippable = cxt->disallow_volatile_func_shippable;
+            cxt->disallow_volatile_func_shippable = true;
+            if (expression_tree_walker((Node *)query->upsertClause, (bool (*)())stream_walker, (void *)cxt)) {
+                cxt->current_shippable = false;
+            }
+            cxt->disallow_volatile_func_shippable = saved_disallow_volatile_func_shippable;
         }
     }
 }
@@ -344,6 +424,7 @@ static void stream_walker_query(Query* query, shipping_context *cxt)
     stream_walker_query_rtable(query, cxt);
     stream_walker_query_exec_direct(query, cxt);
     stream_walker_query_merge(query, cxt);
+    stream_walker_query_upsert(query, cxt);
     stream_walker_query_cte(query, cxt);
     stream_walker_query_limitoffset(query, cxt);
     stream_walker_query_targetlist(query, cxt);
@@ -351,6 +432,7 @@ static void stream_walker_query(Query* query, shipping_context *cxt)
     stream_walker_query_having(query, cxt);
     stream_walker_query_window(query, cxt);
 
+    stream_walker_query_insertinto_rep(query, cxt);
     /* mark shippable flag based on rte shippbility */
     stream_walker_finalize_cxt(query, cxt);
 
@@ -517,66 +599,86 @@ static bool contains_unsupport_tables(List* rtable, Query* query, shipping_conte
         RangeTblEntry* rte = (RangeTblEntry*)lfirst(item);
         rIdx++;
 
-        if (rte->rtekind == RTE_RELATION) {
-            if (table_contain_unsupport_feature(rte->relid, query) && !u_sess->attr.attr_sql.enable_cluster_resize) {
-                context->current_shippable = false;
-                return true;
+        switch (rte->rtekind) {
+            case RTE_RELATION: {
+                if (table_contain_unsupport_feature(rte->relid, query) &&
+                    !u_sess->attr.attr_sql.enable_cluster_resize) {
+                    context->current_shippable = false;
+                    return true;
+                }
+
+                rte->locator_type = GetLocatorType(rte->relid);
+                /* SQLONHADOOP has to support RROBIN MODULO distribution mode */
+                if (((rte->locator_type == LOCATOR_TYPE_RROBIN || rte->locator_type == LOCATOR_TYPE_MODULO) &&
+                    rte->relkind != RELKIND_FOREIGN_TABLE && rte->relkind != RELKIND_STREAM)) {
+                    sprintf_rc = sprintf_s(u_sess->opt_cxt.not_shipping_info->not_shipping_reason,
+                        NOTPLANSHIPPING_LENGTH,
+                        "Table %s can not be shipped",
+                        get_rel_name(rte->relid));
+                    securec_check_ss_c(sprintf_rc, "\0", "\0");
+                    context->current_shippable = false;
+                    return true;
+                }
+                if (rte->inh && has_subclass(rte->relid)) {
+                    sprintf_rc = sprintf_s(u_sess->opt_cxt.not_shipping_info->not_shipping_reason,
+                        NOTPLANSHIPPING_LENGTH,
+                        "Table %s inherited can not be shipped",
+                        get_rel_name(rte->relid));
+                    securec_check_ss_c(sprintf_rc, "\0", "\0");
+                    context->current_shippable = false;
+                    return true;
+                }
+
+                if (query->commandType == CMD_INSERT && list_length(rtable) == 2 && rIdx == 1)
+                    target_table_loctype = rte->locator_type;
+
+                break;
             }
+            case RTE_SUBQUERY: {
+                /*
+                 * We allow to push the nextval and uuid_generate_v1 to DN for the following query:
+                 * 	  insert into t1 select nextval('seq1'),* from t2;
+                 * 	  insert into t1 select uuid_generate_v1, * from t2;
+                 * It fullfill the following conditions:
+                 * 1. Top level query is Insert.
+                 * 2. There are two RTE in rtable, the first one is the target table,
+                 *    which should be hash/range/list distributed.
+                 *    The second one is a subquery
+                 * We allow the the nextval and uuid_generate_v1 in the target list of the subquery.
+                 */
+                bool supportLoctype = (target_table_loctype == LOCATOR_TYPE_HASH ||
+                                      IsLocatorDistributedBySlice(target_table_loctype) ||
+                                      target_table_loctype == LOCATOR_TYPE_NONE);
+                if (query->commandType == CMD_INSERT && list_length(rtable) == 2 && rIdx == 2 &&
+                    supportLoctype) {
+                    scontext.allow_func_in_targetlist = true;
+                }
 
-            rte->locator_type = GetLocatorType(rte->relid);
-            /* SQLONHADOOP has to support RROBIN MODULO distribution mode */
-            if (((rte->locator_type == LOCATOR_TYPE_RROBIN || rte->locator_type == LOCATOR_TYPE_MODULO) &&
-                rte->relkind != RELKIND_FOREIGN_TABLE && rte->relkind != RELKIND_STREAM)) {
-                sprintf_rc = sprintf_s(u_sess->opt_cxt.not_shipping_info->not_shipping_reason,
-                    NOTPLANSHIPPING_LENGTH,
-                    "Table %s can not be shipped",
-                    get_rel_name(rte->relid));
-                securec_check_ss_c(sprintf_rc, "\0", "\0");
-                context->current_shippable = false;
-                return true;
+                (void)stream_walker((Node*)rte->subquery, (void*)(&scontext));
+
+                inh_shipping_context(context, &scontext);
+
+                scontext.allow_func_in_targetlist = false;
+
+                break;
             }
-            if (rte->inh && has_subclass(rte->relid)) {
-                sprintf_rc = sprintf_s(u_sess->opt_cxt.not_shipping_info->not_shipping_reason,
-                    NOTPLANSHIPPING_LENGTH,
-                    "Table %s inherited can not be shipped",
-                    get_rel_name(rte->relid));
-                securec_check_ss_c(sprintf_rc, "\0", "\0");
-                context->current_shippable = false;
-                return true;
+            case RTE_FUNCTION: {
+                (void)stream_walker((Node*)rte->funcexpr, (void*)(&scontext));
+
+                inh_shipping_context(context, &scontext);
+
+                break;
             }
+            case RTE_VALUES: {
+                (void)stream_walker((Node*)rte->values_lists, (void*)(&scontext));
 
-            if (query->commandType == CMD_INSERT && list_length(rtable) == 2 && rIdx == 1)
-                target_table_loctype = rte->locator_type;
-        } else if (rte->rtekind == RTE_SUBQUERY) {
-            /*
-             * We allow to push the nextval and uuid_generate_v1 to DN for the following query:
-             * 	  insert into t1 select nextval('seq1'),* from t2;
-             * 	  insert into t1 select uuid_generate_v1, * from t2;
-             * It fullfill the following conditions:
-             * 1. Top level query is Insert.
-             * 2. There are two RTE in rtable, the first one is the target table,
-             *    which should be hash/range/list distributed.
-             *    The second one is a subquery
-             * We allow the the nextval and uuid_generate_v1 in the target list of the subquery.
-             */
-            if (query->commandType == CMD_INSERT && list_length(rtable) == 2 && rIdx == 2 &&
-                (target_table_loctype == LOCATOR_TYPE_HASH || IsLocatorDistributedBySlice(target_table_loctype))) {
-                scontext.allow_func_in_targetlist = true;
+                inh_shipping_context(context, &scontext);
+
+                break;
             }
-
-            (void)stream_walker((Node*)rte->subquery, (void*)(&scontext));
-
-            inh_shipping_context(context, &scontext);
-
-            scontext.allow_func_in_targetlist = false;
-        } else if (rte->rtekind == RTE_FUNCTION) {
-            (void)stream_walker((Node*)rte->funcexpr, (void*)(&scontext));
-
-            inh_shipping_context(context, &scontext);
-        } else if (rte->rtekind == RTE_VALUES) {
-            (void)stream_walker((Node*)rte->values_lists, (void*)(&scontext));
-
-            inh_shipping_context(context, &scontext);
+            default: {
+                break;
+            }
         }
     }
 
@@ -608,7 +710,8 @@ static bool rel_contain_unshippable_feature(RangeTblEntry* rte, shipping_context
              * if 1. the target table is hash/range/list distributed table
              *  2. the nextval and uuid_generate_v1 function existed in the target list of the result table
              */
-            if (rte->locator_type == LOCATOR_TYPE_HASH || IsLocatorDistributedBySlice(rte->locator_type)) {
+            if (rte->locator_type == LOCATOR_TYPE_HASH || IsLocatorDistributedBySlice(rte->locator_type) ||
+                rte->locator_type == LOCATOR_TYPE_NONE) {
                 context->allow_func_in_targetlist = true;
             }
         }
@@ -679,6 +782,16 @@ static bool table_contain_unsupport_feature(Oid relid, Query* query)
         /* If contains system relation, we will not output the not shipping reasion */
         if (rel->rd_rel->relnamespace == PG_CATALOG_NAMESPACE) {
             u_sess->opt_cxt.not_shipping_info->need_log = false;
+        }
+
+        /* globel temp table could not ship */
+        if (rel->rd_rel->relpersistence == RELPERSISTENCE_GLOBAL_TEMP) {
+            sprintf_rc = sprintf_s(u_sess->opt_cxt.not_shipping_info->not_shipping_reason,
+                NOTPLANSHIPPING_LENGTH,
+                "global template table not support stream operator.");
+            securec_check_ss_c(sprintf_rc, "\0", "\0");
+            relation_close(rel, NoLock);
+            return true;
         }
 
         /* Currently dml with trigger can not get stream plan. */
@@ -758,6 +871,33 @@ static bool contain_unsupport_expression(Node* expr, void* context)
             foreach (temp, (List*)expr) {
                 if (contain_unsupport_expression((Node*)lfirst(temp), context)) {
                     cxt->current_shippable = false;
+                }
+            }
+        } break;
+        case T_WindowFunc: {
+            WindowFunc* winfunc = (WindowFunc*)expr;
+            ListCell* temp = NULL;
+
+            /*
+             * We need to be extra careful with row_number() in INSERT/UPDATE/DELETE/MERGE
+             * on replicated relations, since the data on DNs doesn't neccessarily have the same order
+             * for example:
+             * INSERT INTO rep SELECT c1, c2, row_number() OVER (order by c1) as rn FROM rep WHERE c1 = 1;
+             * The output of column rep.c2 in SELECT may vary depends on the order of data in rep.c2,
+             * which is not allowed in replicated relations. Thus, we need to make sure the row_number()
+             * doesn't ship in this case.
+             */
+            if (winfunc->winfnoid == ROWNUMBERFUNCOID) {
+                foreach (temp, cxt->query_list) {
+                    Query* query = (Query*)lfirst(temp);
+                    if (query->resultRelation &&
+                        GetLocatorType(rt_fetch(query->resultRelation, query->rtable)->relid) == 'R') {
+                        sprintf_rc = sprintf_s(u_sess->opt_cxt.not_shipping_info->not_shipping_reason,
+                            NOTPLANSHIPPING_LENGTH,
+                            "row_number() can not be shipped when INSERT/UPDATE/DELETE a replication table");
+                        securec_check_ss_c(sprintf_rc, "\0", "\0");
+                        cxt->current_shippable = false;
+                    }
                 }
             }
         } break;

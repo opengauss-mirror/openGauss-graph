@@ -710,3 +710,33 @@ bool var_from_sublink_pulluped(Query *parse, Var *var)
 
     return tbl->sublink_pull_up;
 }
+
+#ifdef GS_GRAPH
+/*
+ * apply_tlist_labeling
+ *		Apply the TargetEntry labeling attributes of src_tlist to dest_tlist
+ *
+ * This is useful for reattaching column names etc to a plan's final output
+ * targetlist.
+ */
+void
+apply_tlist_labeling(List *dest_tlist, List *src_tlist)
+{
+	ListCell   *ld,
+			   *ls;
+
+	Assert(list_length(dest_tlist) == list_length(src_tlist));
+	forboth(ld, dest_tlist, ls, src_tlist)
+	{
+		TargetEntry *dest_tle = (TargetEntry *) lfirst(ld);
+		TargetEntry *src_tle = (TargetEntry *) lfirst(ls);
+
+		Assert(dest_tle->resno == src_tle->resno);
+		dest_tle->resname = src_tle->resname;
+		dest_tle->ressortgroupref = src_tle->ressortgroupref;
+		dest_tle->resorigtbl = src_tle->resorigtbl;
+		dest_tle->resorigcol = src_tle->resorigcol;
+		dest_tle->resjunk = src_tle->resjunk;
+	}
+}
+#endif

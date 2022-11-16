@@ -64,6 +64,9 @@
 /* Define to 1 if you want to generate gauss product as multiple nodes. (--enable-multiple-nodes) */
 #undef ENABLE_MULTIPLE_NODES 
 
+/* Define to 1 if you want to generate gauss product as lite mode. (--enable-lite-mode) */
+#undef ENABLE_LITE_MODE
+
 /* Define to 1 if you want MOT support. (--enable-mot).
    Supported only in single_node mode, not supported with (--enable-multiple-nodes) */
 #undef ENABLE_MOT
@@ -722,11 +725,22 @@
 /* Postgres-XC version as a number */
 #undef PGXC_VERSION_NUM
 
+/* openGauss version as a number */
+#undef OPENGAUSS_VERSION_NUM_STR
+
 /* A string containing the version number, platform, and C compiler */
 #undef PG_VERSION_STR
 
 /* A string containing the version number of Postgres-XC, platform, and C compiler */
 #undef PGXC_VERSION_STR
+
+/* LLVM Version */
+#undef LLVM_MAJOR_VERSION
+#undef LLVM_MINOR_VERSION
+
+/* Flex Version */
+#undef FLEX_MAJOR_VERSION
+#undef FLEX_MINOR_VERSION
 
 /* Define to 1 to allow profiling output to be saved separately for each
    process. */
@@ -910,3 +924,5 @@
    code using `volatile' can become incorrect without. Disable with care. */
 #undef volatile
 
+/* Define to 1 if opengauss is integration into the openeuler system. (--with-openeuler-os) */
+#undef WITH_OPENEULER_OS

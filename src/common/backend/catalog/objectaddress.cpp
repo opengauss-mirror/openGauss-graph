@@ -20,7 +20,13 @@
 #include "catalog/catalog.h"
 #include "catalog/indexing.h"
 #include "catalog/gs_model.h"
+#ifdef GS_GRAPH
+#include "catalog/gs_graph.h"
+#include "catalog/gs_graph_fn.h"
+#include "catalog/gs_label.h"
+#endif /* GS_GRAPH */
 #include "catalog/objectaddress.h"
+#include "catalog/objectaccess.h"
 #include "catalog/pg_authid.h"
 #include "catalog/pg_cast.h"
 #include "catalog/pg_collation.h"
@@ -38,7 +44,11 @@
 #include "catalog/pg_opfamily.h"
 #include "catalog/pg_operator.h"
 #include "catalog/pg_proc.h"
+#include "catalog/pg_publication.h"
+#include "catalog/pg_publication_rel.h"
+#include "catalog/gs_package.h"
 #include "catalog/pg_rewrite.h"
+#include "catalog/pg_subscription.h"
 #include "catalog/pg_rlspolicy.h"
 #include "catalog/pg_tablespace.h"
 #include "catalog/pg_trigger.h"
@@ -101,6 +111,7 @@ static THR_LOCAL const ObjectPropertyType ObjectProperty[] = {{CastRelationId, C
     {ForeignDataWrapperRelationId, ForeignDataWrapperOidIndexId, FOREIGNDATAWRAPPEROID, InvalidAttrNumber},
     {ForeignServerRelationId, ForeignServerOidIndexId, FOREIGNSERVEROID, InvalidAttrNumber},
     {ProcedureRelationId, ProcedureOidIndexId, PROCOID, Anum_pg_proc_pronamespace},
+    {PackageRelationId, PackageOidIndexId, PACKAGEOID, Anum_gs_package_pkgnamespace},
     {
         LanguageRelationId,
         LanguageOidIndexId,
@@ -133,7 +144,34 @@ static THR_LOCAL const ObjectPropertyType ObjectProperty[] = {{CastRelationId, C
         Anum_pg_ts_template_tmplnamespace,
     },
     {TypeRelationId, TypeOidIndexId, TYPEOID, Anum_pg_type_typnamespace},
-    {RlsPolicyRelationId, PgRlspolicyOidIndex, -1, InvalidAttrNumber}};
+    {RlsPolicyRelationId, PgRlspolicyOidIndex, -1, InvalidAttrNumber},
+    {
+        PublicationRelationId,
+        PublicationObjectIndexId,
+        PUBLICATIONOID,
+        InvalidAttrNumber
+    },
+    {
+        SubscriptionRelationId,
+        SubscriptionObjectIndexId,
+        SUBSCRIPTIONOID,
+        InvalidAttrNumber
+    },
+#ifdef GS_GRAPH
+	{
+		GraphRelationId,
+		GraphOidIndexId,
+		GRAPHOID,
+		InvalidAttrNumber
+	},
+	{
+		LabelRelationId,
+		LabelOidIndexId,
+		LABELOID,
+		InvalidAttrNumber
+	}
+#endif /* GS_GRAPH */
+};
 
 static ObjectAddress get_object_address_unqualified(ObjectType objtype, List* qualname, bool missing_ok);
 static ObjectAddress get_relation_by_qualified_name(
@@ -144,6 +182,10 @@ static ObjectAddress get_object_address_attribute(
 static ObjectAddress get_object_address_type(ObjectType objtype, List* objname, bool missing_ok);
 static ObjectAddress get_object_address_opcf(ObjectType objtype, List* objname, List* objargs, bool missing_ok);
 static const ObjectPropertyType* get_object_property_data(Oid class_id);
+#ifdef GS_GRAPH
+static ObjectAddress get_object_address_graph(List *object, bool missing_ok);
+static ObjectAddress get_object_address_label(List *objname, bool missing_ok);
+#endif /* GS_GRAPH */
 
 /*
  * Translate an object name and arguments (as passed by the parser) to an
@@ -171,23 +213,29 @@ ObjectAddress get_object_address(
     ObjectAddress address;
     ObjectAddress old_address = {InvalidOid, InvalidOid, 0};
     Relation relation = NULL;
-    uint64 inval_count;
+    Relation old_relation = NULL;
+    List* objargs_agg = NULL;
 
     /* Some kind of lock must be taken. */
     Assert(lockmode != NoLock);
-
+    uint64 sess_inval_count;
+    uint64 thrd_inval_count = 0;
     for (;;) {
         /*
          * Remember this value, so that, after looking up the object name and
          * locking it, we can check whether any invalidation messages have
          * been processed that might require a do-over.
          */
-        inval_count = u_sess->inval_cxt.SharedInvalidMessageCounter;
+        sess_inval_count = u_sess->inval_cxt.SIMCounter;
+        if (EnableLocalSysCache()) {
+            thrd_inval_count = t_thrd.lsc_cxt.lsc->inval_cxt.SIMCounter;
+        }
 
         /* Look up object address. */
         switch (objtype) {
             case OBJECT_INDEX:
             case OBJECT_SEQUENCE:
+            case OBJECT_LARGE_SEQUENCE:
             case OBJECT_TABLE:
             case OBJECT_VIEW:
             case OBJECT_CONTQUERY:
@@ -216,6 +264,8 @@ ObjectAddress get_object_address(
             case OBJECT_FDW:
             case OBJECT_FOREIGN_SERVER:
             case OBJECT_DATA_SOURCE:
+            case OBJECT_PUBLICATION:
+            case OBJECT_SUBSCRIPTION:
                 address = get_object_address_unqualified(objtype, objname, missing_ok);
                 break;
             case OBJECT_TYPE:
@@ -225,16 +275,26 @@ ObjectAddress get_object_address(
             case OBJECT_AGGREGATE:
                 /* Given ordered set aggregate with no direct args, aggr_args variable is modified in gram.y.
                    So the parse of aggr_args should be changed. See gram.y for detail. */
-                objargs = (List*)linitial(objargs);
+                objargs_agg = (List*)linitial(objargs);
 
                 address.classId = ProcedureRelationId;
-                address.objectId = LookupAggNameTypeNames(objname, objargs, missing_ok);
+                address.objectId = LookupAggNameTypeNames(objname, objargs_agg, missing_ok);
                 address.objectSubId = 0;
                 break;
             case OBJECT_FUNCTION:
                 address.classId = ProcedureRelationId;
                 address.objectId = LookupFuncNameOptTypeNames(objname, objargs, missing_ok);
                 address.objectSubId = 0;
+                break;
+            case OBJECT_PACKAGE:
+                address.classId = PackageRelationId;
+                address.objectId = PackageNameListGetOid(objname, missing_ok);
+                address.objectSubId = 0;
+                break;
+            case OBJECT_PACKAGE_BODY:
+                address.classId = PackageRelationId;
+                address.objectId = PackageNameListGetOid(objname, missing_ok);
+                address.objectSubId = (int32)address.objectId; /* same as objectId for package body */
                 break;
             case OBJECT_OPERATOR:
                 Assert(list_length(objargs) == 2);
@@ -302,6 +362,16 @@ ObjectAddress get_object_address(
             case OBJECT_DIRECTORY:
                 address = get_object_address_unqualified(objtype, objname, missing_ok);
                 break;
+#ifdef GS_GRAPH
+            case OBJECT_GRAPH:
+                // Assert(false);
+				address = get_object_address_graph(objname, missing_ok);
+				break;
+			case OBJECT_ELABEL:
+			case OBJECT_VLABEL:
+				address = get_object_address_label(objname, missing_ok);
+				break;
+#endif
             default:
                 ereport(
                     ERROR, (errcode(ERRCODE_UNRECOGNIZED_NODE_TYPE), errmsg("unrecognized objtype: %d", (int)objtype)));
@@ -326,9 +396,21 @@ ObjectAddress get_object_address(
          */
         if (OidIsValid(old_address.classId)) {
             if (old_address.classId == address.classId && old_address.objectId == address.objectId &&
-                old_address.objectSubId == address.objectSubId)
-                break;
+                old_address.objectSubId == address.objectSubId) {
+                    if (old_relation != NULL) {
+                        Assert(old_relation == relation);
+                        /* should be 2 */
+                        Assert(old_relation->rd_refcnt > 1);
+                        heap_close(old_relation, NoLock);
+                        old_relation = NULL;
+                    }
+                    break;
+                }
             if (old_address.classId != RelationRelationId) {
+                if (old_relation != NULL) {
+                    heap_close(old_relation, NoLock);
+                    old_relation = NULL;
+                }
                 if (IsSharedRelation(old_address.classId))
                     UnlockSharedObject(old_address.classId, old_address.objectId, 0, lockmode);
                 else
@@ -367,9 +449,18 @@ ObjectAddress get_object_address(
          * up no longer refers to the object we locked, so we retry the lookup
          * and see whether we get the same answer.
          */
-        if (inval_count == u_sess->inval_cxt.SharedInvalidMessageCounter || relation != NULL)
-            break;
+        if (EnableLocalSysCache()) {
+            if (sess_inval_count == u_sess->inval_cxt.SIMCounter &&
+                thrd_inval_count == t_thrd.lsc_cxt.lsc->inval_cxt.SIMCounter) {
+                break;
+            }
+        } else {
+            if (sess_inval_count == u_sess->inval_cxt.SIMCounter) {
+                break;
+            }
+        }
         old_address = address;
+        old_relation = relation;
     }
 
     /* Return the object address and the relation. */
@@ -427,6 +518,12 @@ static ObjectAddress get_object_address_unqualified(ObjectType objtype, List* qu
                 break;
             case OBJECT_DIRECTORY:
                 msg = gettext_noop("directory name cannot be qualified");
+                break;
+            case OBJECT_PUBLICATION:
+                msg = gettext_noop("publication name cannot be qualified");
+                break;
+            case OBJECT_SUBSCRIPTION:
+                msg = gettext_noop("subscription name cannot be qualified");
                 break;
             default:
                 ereport(
@@ -497,6 +594,16 @@ static ObjectAddress get_object_address_unqualified(ObjectType objtype, List* qu
             address.objectId = get_directory_oid(name, missing_ok);
             address.objectSubId = 0;
             break;
+        case OBJECT_PUBLICATION:
+            address.classId = PublicationRelationId;
+            address.objectId = get_publication_oid(name, missing_ok);
+            address.objectSubId = 0;
+            break;
+        case OBJECT_SUBSCRIPTION:
+            address.classId = SubscriptionRelationId;
+            address.objectId = get_subscription_oid(name, missing_ok);
+            address.objectSubId = 0;
+            break;
         default:
             ereport(ERROR, (errcode(ERRCODE_UNRECOGNIZED_NODE_TYPE), errmsg("unrecognized objtype: %d", (int)objtype)));
             /* placate compiler, which doesn't know elog won't return */
@@ -538,6 +645,12 @@ static ObjectAddress get_relation_by_qualified_name(
                 ereport(ERROR,
                     (errcode(ERRCODE_WRONG_OBJECT_TYPE),
                         errmsg("\"%s\" is not a sequence", RelationGetRelationName(relation))));
+            break;
+        case OBJECT_LARGE_SEQUENCE:
+            if (relation->rd_rel->relkind != RELKIND_LARGE_SEQUENCE)
+                ereport(ERROR,
+                    (errcode(ERRCODE_WRONG_OBJECT_TYPE),
+                        errmsg("\"%s\" is not a large sequence", RelationGetRelationName(relation))));
             break;
         case OBJECT_TABLE:
             if (relation->rd_rel->relkind != RELKIND_RELATION)
@@ -635,7 +748,7 @@ static ObjectAddress get_object_address_relobject(ObjectType objtype, List* objn
 
         /* Extract relation name and open relation, here allow it is synonym object. */
         relname = list_truncate(list_copy(objname), nnames - 1);
-        relation = heap_openrv_extended(makeRangeVarFromNameList(relname), AccessShareLock, false, true);
+        relation = HeapOpenrvExtended(makeRangeVarFromNameList(relname), AccessShareLock, false, true);
         reloid = RelationGetRelid(relation);
 
         switch (objtype) {
@@ -710,6 +823,8 @@ static ObjectAddress get_object_address_attribute(
                 (errcode(ERRCODE_UNDEFINED_COLUMN),
                     errmsg("column \"%s\" of relation \"%s\" does not exist", attname, NameListToString(relname))));
 
+        /* close but save lock */
+        heap_close(relation, NoLock);
         address.classId = RelationRelationId;
         address.objectId = InvalidOid;
         address.objectSubId = InvalidAttrNumber;
@@ -753,6 +868,18 @@ static ObjectAddress get_object_address_type(ObjectType objtype, List* objname, 
             ereport(ERROR,
                 (errcode(ERRCODE_WRONG_OBJECT_TYPE), errmsg("\"%s\" is not a domain", TypeNameToString(typname))));
     }
+
+#ifndef ENABLE_MULTIPLE_NODES
+    if (IsPackageDependType(typeTypeId(tup), InvalidOid)) {
+        ereport(ERROR,
+            (errcode(ERRCODE_WRONG_OBJECT_TYPE),
+                errmodule(MOD_PLSQL),
+                errmsg("Not allowed to drop type \"%s\"", TypeNameToString(typname)),
+                errdetail("\"%s\" is a package or procedure type", TypeNameToString(typname)),
+                errcause("feature not supported"),
+                erraction("check type name")));
+    }
+#endif
 
     ReleaseSysCache(tup);
 
@@ -801,6 +928,7 @@ void check_object_ownership(
     switch (objtype) {
         case OBJECT_INDEX:
         case OBJECT_SEQUENCE:
+        case OBJECT_LARGE_SEQUENCE:
         case OBJECT_TABLE:
         case OBJECT_VIEW:
         case OBJECT_CONTQUERY:
@@ -837,6 +965,11 @@ void check_object_ownership(
         case OBJECT_FUNCTION:
             if (!pg_proc_ownercheck(address.objectId, roleid))
                 aclcheck_error(ACLCHECK_NO_PRIV, ACL_KIND_PROC, NameListToString(objname));
+            break;
+        case OBJECT_PACKAGE:
+        case OBJECT_PACKAGE_BODY:
+            if (!pg_package_ownercheck(address.objectId, roleid))
+                aclcheck_error(ACLCHECK_NO_PRIV, ACL_KIND_PACKAGE, NameListToString(objname));
             break;
         case OBJECT_OPERATOR:
             if (!pg_oper_ownercheck(address.objectId, roleid))
@@ -950,8 +1083,29 @@ void check_object_ownership(
             break;
         case OBJECT_DIRECTORY:
             if (!pg_directory_ownercheck(address.objectId, roleid))
-                aclcheck_error(ACLCHECK_NOT_OWNER, ACL_KIND_DIRECTORY, NameListToString(objname));
+                aclcheck_error(ACLCHECK_NO_PRIV, ACL_KIND_DIRECTORY, NameListToString(objname));
             break;
+        case OBJECT_PUBLICATION:
+            if (!pg_publication_ownercheck(address.objectId, roleid)) {
+                aclcheck_error(ACLCHECK_NOT_OWNER, ACL_KIND_PUBLICATION, NameListToString(objname));
+            }
+            break;
+        case OBJECT_SUBSCRIPTION:
+            if (!pg_subscription_ownercheck(address.objectId, roleid)) {
+                aclcheck_error(ACLCHECK_NOT_OWNER, ACL_KIND_SUBSCRIPTION, NameListToString(objname));
+            }
+            break;
+        case OBJECT_GRAPH:
+			if (!gs_graph_ownercheck(address.objectId, roleid))
+				aclcheck_error(ACLCHECK_NOT_OWNER, ACL_KIND_GRAPH,
+							   NameListToString(objname));
+			break;
+		case OBJECT_VLABEL:
+		case OBJECT_ELABEL:
+			if (!gs_label_ownercheck(address.objectId, roleid))
+				aclcheck_error(ACLCHECK_NOT_OWNER, ACL_KIND_LABEL,
+							   NameListToString(objname));
+			break;
         default:
             ereport(
                 ERROR, (errcode(ERRCODE_UNRECOGNIZED_NODE_TYPE), errmsg("unrecognized object type: %d", (int)objtype)));
@@ -1008,3 +1162,102 @@ static const ObjectPropertyType* get_object_property_data(Oid class_id)
     ereport(ERROR, (errcode(ERRCODE_UNRECOGNIZED_NODE_TYPE), errmsg("unrecognized class id: %u", class_id)));
     return NULL; /* not reached */
 }
+
+const ObjectAddress InvalidObjectAddress =
+{
+	InvalidOid,
+	InvalidOid,
+	0
+};
+
+void
+RunObjectPostAlterHook(Oid classId, Oid objectId, int subId,
+					   Oid auxiliaryId, bool is_internal)
+{
+	ObjectAccessPostAlter pa_arg;
+
+	/* caller should check, but just in case... */
+	Assert(object_access_hook != NULL);
+
+	memset(&pa_arg, 0, sizeof(ObjectAccessPostAlter));
+	pa_arg.auxiliary_id = auxiliaryId;
+	pa_arg.is_internal = is_internal;
+
+	(*object_access_hook) (OAT_POST_ALTER,
+						   classId, objectId, subId,
+						   (void *) &pa_arg);
+}
+
+#ifdef GS_GRAPH
+/*
+ * Find the ObjectAddress for a graph object
+ */
+static ObjectAddress
+get_object_address_graph(List *objname, bool missing_ok)
+{
+	ObjectAddress address;
+	char *graphname;
+
+	Assert(list_length(objname) == 1);
+
+	graphname = strVal(linitial(objname));
+
+	address.classId = GraphRelationId;
+	address.objectId = get_graphname_oid(graphname);
+	address.objectSubId = 0;
+
+	if (!OidIsValid(address.objectId) && !missing_ok)
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("graph \"%s\" does not exist", graphname)));
+
+	return address;
+}
+
+/*
+ * Find the ObjectAddress for a graph label
+ */
+static ObjectAddress
+get_object_address_label(List *objname, bool missing_ok)
+{
+	ObjectAddress address;
+	Oid			graphid;
+	char	   *graphname;
+	char	   *labname;
+
+	switch (list_length(objname))
+	{
+		case 1:
+			graphname = get_graph_path(false);
+			labname = strVal(linitial(objname));
+			break;
+		case 2:
+			graphname = strVal(linitial(objname));
+			labname = strVal(lsecond(objname));
+			break;
+		default:
+			ereport(ERROR,
+					(errcode(ERRCODE_SYNTAX_ERROR),
+					 errmsg("improper qualified name (too many dotted names): %s",
+							NameListToString(objname))));
+	}
+
+	graphid = get_graphname_oid(graphname);
+	if (!OidIsValid(graphid))
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("graph \"%s\" does not exist", graphname)));
+
+	address.classId = LabelRelationId;
+	address.objectId = get_labname_laboid(labname, graphid);
+	address.objectSubId = 0;
+
+	if (!OidIsValid(address.objectId) && !missing_ok)
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("graph label \"%s\" does not exist", labname)));
+
+	return address;
+}
+
+#endif /* GS_GRAPH */

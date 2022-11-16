@@ -50,12 +50,15 @@ extern void addRTEtoQuery(
 extern void errorMissingRTE(ParseState* pstate, RangeVar* relation, bool hasplus = false);
 extern void errorMissingColumn(ParseState *pstate, char *relname, char *colname, int location);
 extern void expandRTE(RangeTblEntry* rte, int rtindex, int sublevels_up, int location, bool include_dropped,
-    List** colnames, List** colvars);
+    List** colnames, List** colvars, ParseState* pstate = NULL);
 extern List* expandRelAttrs(ParseState* pstate, RangeTblEntry* rte, int rtindex, int sublevels_up, int location);
 extern int attnameAttNum(Relation rd, const char* attname, bool sysColOK);
 extern Name attnumAttName(Relation rd, int attid);
 extern Oid attnumTypeId(Relation rd, int attid);
 extern Oid attnumCollationId(Relation rd, int attid);
+extern Oid getPartitionOidForRTE(RangeTblEntry *rte, RangeVar *relation, ParseState *pstate, Relation rel);
+extern Oid getSubPartitionOidForRTE(RangeTblEntry *rte, RangeVar *relation, ParseState *pstate, Relation rel,
+                                    Oid *partOid);
 
 #ifdef PGXC
 extern int specialAttNum(const char* attname);

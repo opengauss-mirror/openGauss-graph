@@ -6,6 +6,7 @@
  * Portions Copyright (c) 2020 Huawei Technologies Co.,Ltd.
  * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
+ * Portions Copyright (c) 2021, openGauss Contributors
  *
  *
  * IDENTIFICATION
@@ -17,25 +18,38 @@
 #include "knl/knl_variable.h"
 
 #include "access/xact.h"
-#include "executor/execdebug.h"
-#include "executor/nodeAgg.h"
-#include "executor/nodeHashjoin.h"
-#include "executor/nodeMaterial.h"
-#include "executor/nodeRecursiveunion.h"
-#include "executor/nodeSetOp.h"
-#include "executor/nodeSort.h"
+#include "executor/exec/execdebug.h"
+#include "executor/node/nodeAgg.h"
+#include "executor/node/nodeCtescan.h"
+#include "executor/node/nodeHashjoin.h"
+#include "executor/node/nodeMaterial.h"
+#include "executor/node/nodeRecursiveunion.h"
+#include "executor/node/nodeSetOp.h"
+#include "executor/node/nodeSort.h"
 #include "libpq/libpq.h"
 #include "libpq/pqformat.h"
 #include "libpq/pqsignal.h"
 #include "miscadmin.h"
 #include "utils/memutils.h"
+#include "utils/elog.h"
 
-#define LOOP_ELOG(elevel, format, ...)           \
-    do {                                         \
-        if (loop_count >= 20) {                  \
-            elog(elevel, format, ##__VA_ARGS__); \
-        }                                        \
+#ifdef USE_ASSERT_CHECKING
+#define LOOP_ELOG(elevel, format, ...)                \
+    do {                                              \
+        if (loop_count >= 20) {                       \
+            ereport(elevel, (errmodule(MOD_EXECUTOR), \
+                    (errmsg(format, ##__VA_ARGS__)))); \
+        }                                             \
     } while (0)
+#else
+#define LOOP_ELOG(elevel, format, ...)                \
+    do {                                              \
+        if (loop_count >= 20) {                       \
+            ereport(DEBUG1, (errmodule(MOD_EXECUTOR), \
+                    (errmsg(format, ##__VA_ARGS__)))); \
+        }                                             \
+    } while (0)
+#endif
 
 #define INSTR (node->ps.instrument)
 
@@ -55,6 +69,11 @@ static void FindSyncUpStream(RecursiveUnionController* controller, PlanState* st
 static void StartNextRecursiveIteration(RecursiveUnionController* controller, int step);
 static void ExecInitRecursiveResultTupleSlot(EState* estate, PlanState* planstate);
 #endif
+
+static inline bool IsUnderStartWith(RecursiveUnion *ruplan)
+{
+    return (ruplan->internalEntryList != NIL);
+}
 
 /*
  * To implement UNION (without ALL), we need a hashtable that stores tuples
@@ -117,6 +136,17 @@ static inline void RecursiveUnionWaitCondNegtive(const bool* true_cond, const bo
     return;
 }
 
+static void markIterationStats(RecursiveUnionState* node, bool isSW)
+{
+    if (node->ps.instrument == NULL) {
+        return;
+    }
+    if (isSW) {
+        markSWLevelEnd(node->swstate, node->swstate->sw_numtuples);
+        markSWLevelBegin(node->swstate);
+    }
+}
+
 /* ----------------------------------------------------------------
  *		ExecRecursiveUnion(node)
  *
@@ -141,7 +171,9 @@ TupleTableSlot* ExecRecursiveUnion(RecursiveUnionState* node)
     PlanState* inner_plan = innerPlanState(node);
     RecursiveUnion* plan = (RecursiveUnion*)node->ps.plan;
     TupleTableSlot* slot = NULL;
+    TupleTableSlot* swSlot = NULL;
     bool is_new = false;
+    bool isSW = IsUnderStartWith((RecursiveUnion *)node->ps.plan);
 
     /* 0. build hash table if it is NULL */
     if (plan->numCols > 0) {
@@ -154,8 +186,10 @@ TupleTableSlot* ExecRecursiveUnion(RecursiveUnionState* node)
     if (!node->recursing) {
         for (;;) {
             slot = ExecProcNode(outer_plan);
-            if (TupIsNull(slot))
+            if (TupIsNull(slot)) {
+                markIterationStats(node, isSW);
                 break;
+            }
             if (plan->numCols > 0) {
                 /* Find or build hashtable entry for this tuple's group */
                 LookupTupleHashEntry(node->hashtable, slot, &is_new);
@@ -166,6 +200,21 @@ TupleTableSlot* ExecRecursiveUnion(RecursiveUnionState* node)
                     continue;
                 }
             }
+
+            /*
+             * For START WITH CONNECT BY, create converted tuple with pseudo columns.
+             */
+            slot = isSW ? ConvertRuScanOutputSlot(node, slot, false) : slot;
+            swSlot = isSW ? GetStartWithSlot(node, slot) : NULL;
+            if (isSW && swSlot == NULL) {
+                /*
+                 * SWCB terminal condition met. Time to stop.
+                 * Discarding the last tuple.
+                 */
+                markSWLevelEnd(node->swstate, node->swstate->sw_numtuples - 1);
+                break;
+            }
+
             /* Each non-duplicate tuple goes to the working table ... */
             tuplestore_puttupleslot(node->working_table, slot);
 
@@ -173,7 +222,7 @@ TupleTableSlot* ExecRecursiveUnion(RecursiveUnionState* node)
             node->step_tuple_produced++;
 
             /* ... and to the caller */
-            return slot;
+            return (isSW ? swSlot : slot);
         }
 
         /* Mark none-recursive part is down */
@@ -193,8 +242,11 @@ TupleTableSlot* ExecRecursiveUnion(RecursiveUnionState* node)
             /* Kick-Off next step */
             StartNextRecursiveIteration(node->rucontroller, WITH_RECURSIVE_SYNC_NONERQ);
         }
-        node->iteration = 1;
 #endif
+        node->iteration = 1;
+
+        /* Need reset sw_tuple_idx to 1 when non-recursive term finish */
+        node->sw_tuple_idx = 1;
     }
 
     /* 2. Execute recursive term */
@@ -205,6 +257,17 @@ TupleTableSlot* ExecRecursiveUnion(RecursiveUnionState* node)
     for (;;) {
         slot = ExecProcNode(inner_plan);
         if (TupIsNull(slot)) {
+            /* debug information for SWCBcase */
+            if (IsUnderStartWith((RecursiveUnion *)node->ps.plan) &&
+                !node->intermediate_empty) {
+                ereport(DEBUG1, (errmodule(MOD_EXECUTOR),
+                        errmsg("[SWCB DEBUG] current iteration is done: level:%d rownum_current:%d rownum_total:%lu",
+                        node->iteration + 1,
+                        node->swstate->sw_numtuples,
+                        node->swstate->sw_rownum)));
+                markSWLevelEnd(node->swstate, node->swstate->sw_numtuples);
+                markSWLevelBegin(node->swstate);
+            }
 #ifdef ENABLE_MULTIPLE_NODES
             /*
              * Check the recursive union is run out of max allowed iterations
@@ -237,6 +300,8 @@ TupleTableSlot* ExecRecursiveUnion(RecursiveUnionState* node)
                 break;
             }
 #endif
+            /* Need reset sw_tuple_idx to 1 when current iteration finish */
+            node->sw_tuple_idx = 1;
 
             /* done with old working table ... */
             tuplestore_end(node->working_table);
@@ -280,6 +345,7 @@ TupleTableSlot* ExecRecursiveUnion(RecursiveUnionState* node)
                 StartNextRecursiveIteration(node->rucontroller, WITH_RECURSIVE_SYNC_RQSTEP);
             }
 #else
+            node->iteration++;
             node->intermediate_table = tuplestore_begin_heap(false, false, u_sess->attr.attr_memory.work_mem);
             /* reset the recursive term */
             inner_plan->chgParam = bms_add_member(inner_plan->chgParam, plan->wtParam);
@@ -303,9 +369,64 @@ TupleTableSlot* ExecRecursiveUnion(RecursiveUnionState* node)
 
         /* Else, tuple is good; stash it in intermediate table ... */
         node->intermediate_empty = false;
+
+
+        /* For start-with, reason ditto */
+        bool isSW = IsUnderStartWith((RecursiveUnion*)node->ps.plan);
+        if (isSW) {
+            int max_times = u_sess->attr.attr_sql.max_recursive_times;
+            StartWithOp *swplan = (StartWithOp *)node->swstate->ps.plan;
+
+            /*
+             * Cannot exceed max_recursive_times
+             * The reason we also keep iteration check here is
+             * avoid order siblings by exist.
+             * */
+            if (node->iteration > max_times) {
+                ereport(ERROR,
+                        (errcode(ERRCODE_CONFIGURATION_LIMIT_EXCEEDED),
+                        errmsg("Current Start With...Connect by has exceeded max iteration times %d", max_times),
+                        errhint("Please check your connect by clause carefully")));
+            }
+
+            slot = ConvertRuScanOutputSlot(node, slot, true);
+            swSlot = GetStartWithSlot(node, slot);
+            if (isSW && swSlot == NULL) {
+                /*
+                 * SWCB terminal condition met. Time to stop.
+                 * Discarding the last tuple.
+                 */
+                markSWLevelEnd(node->swstate, node->swstate->sw_numtuples - 1);
+                break;
+            }
+
+            /*
+             * In ORDER SIBLINGS case, as we add SORT-Operator(material) on top of
+             * RecursiveUnion, so we have to do nocycle check here
+             */
+            if (swplan->swoptions->siblings_orderby_clause) {
+                StartWithOpState *swstate = (StartWithOpState *)node->swstate;
+                if (swstate->sw_nocycleStopOrderSiblings) {
+                    return (TupleTableSlot*)NULL;
+                }
+
+                if (CheckCycleExeception(swstate, slot)) {
+                    /*
+                     * Mark execution stop for order siblings, note we let the cycle-causing
+                     * tuple return to upper node and stop next one
+                     */
+                    swstate->sw_nocycleStopOrderSiblings = true;
+                    elog(DEBUG1, "nocycle option take effect on RecursiveUnion for Order Siblings! %s",
+                            swstate->sw_curKeyArrayStr);
+                }
+            }
+        }
+
         tuplestore_puttupleslot(node->intermediate_table, slot);
 
         /* ... and return it */
+        /* it is okay to point slot to swSlot and return now, if necessary */
+        slot = isSW ? swSlot : slot;
         inner_plan->state->es_skip_early_free = orig_early_free;
 
 #ifdef ENABLE_MULTIPLE_NODES
@@ -518,6 +639,16 @@ RecursiveUnionState* ExecInitRecursiveUnion(RecursiveUnion* node, EState* estate
             memset_s(&((rustate->ps.instrument)->recursiveInfo), sizeof(RecursiveInfo), 0, sizeof(RecursiveInfo));
         securec_check(rc, "\0", "\0");
     }
+
+    /* Init start with related variables */
+    rustate->swstate = NULL;
+    rustate->sw_tuple_idx = 1;
+    rustate->convertContext = AllocSetContextCreate(CurrentMemoryContext,
+        "RecursiveUnion Start With",
+        ALLOCSET_DEFAULT_MINSIZE,
+        ALLOCSET_DEFAULT_INITSIZE,
+        ALLOCSET_DEFAULT_MAXSIZE);
+
     return rustate;
 }
 
@@ -546,6 +677,9 @@ void ExecEndRecursiveUnion(RecursiveUnionState* node)
         MemoryContextDelete(node->tempContext);
     if (node->tableContext)
         MemoryContextDelete(node->tableContext);
+    if (node->convertContext) {
+        MemoryContextDelete(node->convertContext);
+    }
 
     /*
      * clean out the upper tuple table
@@ -596,6 +730,7 @@ void ExecReScanRecursiveUnion(RecursiveUnionState* node)
     /* reset processing state */
     node->recursing = false;
     node->intermediate_empty = true;
+    node->iteration = 0;
     tuplestore_clear(node->working_table);
     tuplestore_clear(node->intermediate_table);
 }
@@ -923,7 +1058,9 @@ void ExecSyncRecursiveUnionConsumer(RecursiveUnionController* controller, int st
                 stream_node_group->ConsumerGetSyncUpMessage(
                     controller, step, (StreamState*)state, RUSYNC_MSGTYPE_NODE_FINISH);
                 LOOP_ELOG(
-                    LOG, "MPP with-recursive[DEBUG] consumer step:%d in-loop[%d] wait step-finish", step, loop_count);
+                    DEBUG1, "MPP with-recursive[DEBUG] consumer step:%d in-loop[%d] wait step-finish", 
+                    step, 
+                    loop_count);
                 loop_count++;
                 for (int i = 0; i < consumer_number; i++) {
                     if (controller->none_recursive_tuples[i] == -1) {
@@ -974,7 +1111,7 @@ void ExecSyncRecursiveUnionConsumer(RecursiveUnionController* controller, int st
             while (true) {
                 /* Try to receive 'R' for each none RU-Coordinator nodes */
                 bool step_ready = true;
-                LOOP_ELOG(LOG,
+                LOOP_ELOG(DEBUG1,
                     "MPP with-recursive[DEBUG] consumer step:%d in-loop[%d] wait all node-finish",
                     step,
                     loop_count);
@@ -1082,7 +1219,9 @@ void ExecSyncRecursiveUnionProducer(RecursiveUnionController* controller, int pr
             /* wait on current node-step1 to finish */
             while (true) {
                 LOOP_ELOG(
-                    LOG, "MPP with-recursive[DEBUG] producer step:%d in-loop[%d] wait node-finish", step, loop_count);
+                    DEBUG1, "MPP with-recursive[DEBUG] producer step:%d in-loop[%d] wait node-finish", 
+                    step, 
+                    loop_count);
                 loop_count++;
                 tuple_produced = controller->controller.executor_stop ? 0 : 
                     controller->none_recursive_tuples[u_sess->pgxc_cxt.PGXCNodeId];
@@ -1127,7 +1266,9 @@ void ExecSyncRecursiveUnionProducer(RecursiveUnionController* controller, int pr
                 }
 
                 LOOP_ELOG(
-                    LOG, "MPP with-recursive[DEBUG] producer step:%d in-loop[%d] wait step-finish", step, loop_count);
+                    DEBUG1, "MPP with-recursive[DEBUG] producer step:%d in-loop[%d] wait step-finish", 
+                    step, 
+                    loop_count);
                 loop_count++;
                 if (controller->none_recursive_finished) {
                     /* Mark the curent step is forwarding to recursive-term (control-node) */
@@ -1178,7 +1319,9 @@ void ExecSyncRecursiveUnionProducer(RecursiveUnionController* controller, int pr
                 }
 
                 LOOP_ELOG(
-                    LOG, "MPP with-recursive[DEBUG] producer step:%d in-loop[%d] wait node-finish", step, loop_count);
+                    DEBUG1, "MPP with-recursive[DEBUG] producer step:%d in-loop[%d] wait node-finish", 
+                    step, 
+                    loop_count);
                 loop_count++;
 
                 /* Fetch tuple count */
@@ -1215,7 +1358,9 @@ void ExecSyncRecursiveUnionProducer(RecursiveUnionController* controller, int pr
              */
             while (target_iteration <= current_iteration) {
                 LOOP_ELOG(
-                    LOG, "MPP with-recursive[DEBUG] producer step:%d in-loop[%d] wait step-finish", step, loop_count);
+                    DEBUG1, "MPP with-recursive[DEBUG] producer step:%d in-loop[%d] wait step-finish", 
+                    step, 
+                    loop_count);
                 loop_count++;
                 /* the corresponding consumer may encounter a "short-circuit" */
                 if (controller->controller.executor_stop) {

@@ -84,6 +84,7 @@ void ThreadPoolStream::WaitMission()
         pthread_cond_wait(m_cond, m_mutex);
     }
     pthread_mutex_unlock(m_mutex);
+    Assert(t_thrd.proc->pid == t_thrd.proc_cxt.MyProcPid);
 
     if (m_threadStatus == THREAD_EXIT) {
         StreamExit();
@@ -136,7 +137,9 @@ void ThreadPoolStream::InitStream()
     InitializeGUCOptions();
     /* Read in remaining GUC variables */
     read_nondefault_variables();
+
     /* Do local initialization of file, storage and buffer managers */
+    ReBuildLSC();
     InitFileAccess();
     smgrinit();
 
@@ -211,6 +214,7 @@ static void ResetStreamStatus()
     if (!IS_PGSTATE_TRACK_UNDEFINE) {
         volatile PgBackendStatus* beentry = t_thrd.shemem_ptr_cxt.MyBEEntry;
         beentry->st_queryid = 0;
+        pgstat_report_unique_sql_id(true);
         beentry->st_sessionid = 0;
         beentry->st_parent_sessionid = 0;
         beentry->st_thread_level = 0;

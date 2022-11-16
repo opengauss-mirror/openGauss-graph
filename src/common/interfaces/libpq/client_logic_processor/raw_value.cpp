@@ -31,11 +31,6 @@
 #include "client_logic_fmt/gs_fmt.h"
 #include "client_logic_cache/icached_column.h"
 
-#define RETURN_IF(errorOK)      \
-    if (errorOK == NULL) {      \
-        return false;           \
-    }
-
 extern unsigned char *PQescapeByteaConn1(PGconn *conn, const unsigned char *from, size_t from_length, size_t *to_length,
     bool add_quotes);
 
@@ -51,7 +46,8 @@ RawValue::RawValue(PGconn *conn)
       m_processed_data(nullptr),
       m_processed_data_size(0),
       m_empty_repeat(false),
-      m_conn(conn)
+      m_conn(conn),
+      ref_count(0)
 {}
 
 RawValue::~RawValue()
@@ -108,7 +104,7 @@ bool RawValue::process(const ICachedColumn *cached_column, char *err_msg)
             allocated = true;
         }
 
-        binary = Format::text_to_binary(text_value, cached_column->get_origdatatype_oid(), 0,
+        binary = Format::text_to_binary((const PGconn*)m_conn, text_value, cached_column->get_origdatatype_oid(),
             cached_column->get_origdatatype_mod(), &binary_size, err_msg);
         if (allocated) {
             free(text_value);
@@ -133,7 +129,7 @@ bool RawValue::process(const ICachedColumn *cached_column, char *err_msg)
         rcs = memcpy_s(binary, binary_size, m_data_value, m_data_size);
         securec_check_c(rcs, "", "");
         unsigned char *result = Format::verify_and_adjust_binary(binary, &binary_size,
-            cached_column->get_origdatatype_oid(), 0, cached_column->get_origdatatype_mod(), err_msg);
+            cached_column->get_origdatatype_oid(), cached_column->get_origdatatype_mod(), err_msg);
         if (!result) {
             if (strlen(err_msg) == 0) {
                 check_sprintf_s(sprintf_s(err_msg, MAX_ERRMSG_LENGTH, "failed to convert text to binary"));
@@ -150,7 +146,7 @@ bool RawValue::process(const ICachedColumn *cached_column, char *err_msg)
         HooksManager::get_estimated_processed_data_size(cached_column->get_column_hook_executors(), binary_size) +
         sizeof(Oid),
         sizeof(unsigned char));
-    RETURN_IF(m_processed_data);
+    RETURN_IF(m_processed_data == NULL, false);
     int processed_size = HooksManager::process_data(cached_column, cached_column->get_column_hook_executors(), binary,
         binary_size, m_processed_data);
     if (processed_size <= 0) {
@@ -188,4 +184,15 @@ bool RawValue::process(const ICachedColumn *cached_column, char *err_msg)
     }
 
     return true;
+}
+
+void RawValue::inc_ref_count()
+{
+    Assert(ref_count >= 0);
+    ref_count++;
+}
+void RawValue::dec_ref_count()
+{
+    Assert(ref_count > 0);
+    ref_count--;
 }

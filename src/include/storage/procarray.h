@@ -1,7 +1,7 @@
 /* -------------------------------------------------------------------------
  *
  * procarray.h
- *	  POSTGRES process array definitions.
+ *	  openGauss process array definitions.
  *
  *
  * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
@@ -16,8 +16,22 @@
 #define PROCARRAY_H
 
 #include "storage/standby.h"
+#include "storage/lock/lwlock.h"
 #include "utils/snapshot.h"
 #include "pgstat.h"
+
+#define INIT_ROLEID_HASHTBL       512
+#define MAX_ROLEID_HASHTBL        1024
+
+typedef struct RoleIdHashEntry {
+    Oid roleoid;
+    int64 roleNum;
+} RoleIdHashEntry;
+
+extern void InitRoleIdHashTable();
+extern int GetRoleIdCount(Oid roleoid);
+extern int IncreaseUserCount(Oid roleoid);
+extern int DecreaseUserCount(Oid roleoid);
 
 extern void SyncLocalXidWait(TransactionId xid);
 
@@ -31,8 +45,8 @@ extern void CreateSharedRingBuffer(void);
 
 extern void ProcArrayEndTransaction(PGPROC* proc, TransactionId latestXid, bool isCommit = true);
 extern void ProcArrayClearTransaction(PGPROC* proc);
-extern bool TransactionIdIsInProgress(
-    TransactionId xid, uint32* needSync = NULL, bool shortcutByRecentXmin = false, bool bCareNextxid = false);
+extern bool TransactionIdIsInProgress(TransactionId xid, uint32 *needSync = NULL, bool shortcutByRecentXmin = false,
+    bool bCareNextxid = false, bool isTopXact = false, bool checkLatestCompletedXid = true);
 
 #ifdef PGXC /* PGXC_DATANODE */
 extern void SetGlobalSnapshotData(
@@ -55,18 +69,19 @@ extern Snapshot GetSnapshotData(Snapshot snapshot, bool force_local_snapshot);
 #endif
 
 extern Snapshot GetLocalSnapshotData(Snapshot snapshot);
-extern void ReleaseSnapshotData(Snapshot snapshot);
 
 extern bool ProcArrayInstallImportedXmin(TransactionId xmin, TransactionId sourcexid);
 extern RunningTransactions GetRunningTransactionData(void);
 
 extern bool TransactionIdIsActive(TransactionId xid);
+extern TransactionId GetOldestCatalogXmin();
 extern TransactionId GetRecentGlobalXmin(void);
-extern TransactionId GetOldestXmin(Relation rel, bool bFixRecentGlobalXmin = false);
+extern TransactionId GetOldestXmin(Relation rel, bool bFixRecentGlobalXmin = false,
+    bool bRecentGlobalXminNoCheck = false);
+extern TransactionId GetGlobalOldestXmin(void);
+extern TransactionId GetOldestXminForUndo(TransactionId * recycleXmin);
 extern void CheckCurrentTimeline(GTM_Timeline timeline);
 extern TransactionId GetOldestActiveTransactionId(TransactionId *globalXmin);
-extern void FixCurrentSnapshotByGxid(TransactionId gxid);
-extern void CheckSnapshotIsValidException(Snapshot snapshot, const char* location);
 extern TransactionId GetOldestSafeDecodingTransactionId(bool catalogOnly);
 extern void CheckSnapshotTooOldException(Snapshot snapshot, const char* location);
 
@@ -79,7 +94,7 @@ extern bool IsBackendPid(ThreadId pid);
 
 extern VirtualTransactionId* GetCurrentVirtualXIDs(
     TransactionId limitXmin, bool excludeXmin0, bool allDbs, int excludeVacuum, int* nvxids);
-extern VirtualTransactionId* GetConflictingVirtualXIDs(TransactionId limitXmin, Oid dbOid);
+extern VirtualTransactionId* GetConflictingVirtualXIDs(TransactionId limitXmin, Oid dbOid, XLogRecPtr lsn = 0);
 extern ThreadId CancelVirtualTransaction(const VirtualTransactionId& vxid, ProcSignalReason sigmode);
 
 extern bool MinimumActiveBackends(int min);
@@ -100,6 +115,24 @@ extern void ProcArrayGetReplicationSlotXmin(TransactionId* xmin, TransactionId* 
 extern TransactionId GetGlobal2pcXmin();
 
 extern void CSNLogRecordAssignedTransactionId(TransactionId newXid);
+
+/*
+ * Fast search of ProcArray mapping (xid => proc array index),
+ * reuse the concurrency control logic of ProcArray
+ */
+#define InvalidProcessId  -1
+
+typedef struct {
+        TransactionId xid;
+        int proc_id; /* index of the process in ProcArray */
+} ProcXactLookupEntry;
+
+extern Size ProcXactHashTableShmemSize(void);
+extern void CreateProcXactHashTable(void);
+extern void ProcXactHashTableAdd(TransactionId xid, int procId);
+extern void ProcXactHashTableRemove(TransactionId xid);
+extern int ProcXactHashTableLookup(TransactionId xid);
+/* definition of  ProcXactHashTable end */
 
 #ifdef PGXC
 typedef enum {
@@ -124,6 +157,7 @@ extern void SyncWaitXidEnd(TransactionId xid, Buffer buffer);
 extern CommitSeqNo calculate_local_csn_min();
 extern void proc_cancel_invalid_gtm_lite_conn();
 extern void forward_recent_global_xmin(void);
+extern void UpdateXLogMaxCSN(CommitSeqNo xlogCSN);
 
 extern void UpdateCSNLogAtTransactionEND(
     TransactionId xid, int nsubxids, TransactionId* subXids, CommitSeqNo csn, bool isCommit);
@@ -136,3 +170,4 @@ extern void ResetProcXidCache(PGPROC* proc, bool needlock);
 
 // For GTT
 extern TransactionId ListAllThreadGttFrozenxids(int maxSize, ThreadId *pids, TransactionId *xids, int *n);
+extern TransactionId GetReplicationSlotCatalogXmin();

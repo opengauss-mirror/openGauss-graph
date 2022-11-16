@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2020 Huawei Technologies Co.,Ltd.
+ * Portions Copyright (c) 2021, openGauss Contributors
  *
  * openGauss is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
@@ -73,7 +74,10 @@ void DevectorizeOneColumn(VecToRowState* state, ScalarVector* pColumn, int rows,
                 state->m_ttsvalues[k] = PointerGetDatum(val_arr + j);
                 break;
             }
-
+            case NAMEOID: {
+                state->m_ttsvalues[k] = PointerGetDatum(val);
+                break;
+            }
             case UNKNOWNOID: {
                 tmp = ScalarVector::Decode(val);
                 char* result = NULL;
@@ -154,6 +158,7 @@ TupleTableSlot* ExecVecToRow(VecToRowState* state) /* return: a tuple or NULL */
         state->m_currentRow = 0;
         // Convert the batch into row based tuple
         DevectorizeOneBatch(state);
+        outer_plan->ps_rownum += current_batch->m_rows;
     }
 
     // retrieve rows from current batch
@@ -183,21 +188,13 @@ void RecordCstorePartNum(VecToRowState* state, const VecToRow* node)
     } else {
         switch (nodeTag(outerPlan(node))) {
             case T_CStoreScan:
-                state->part_id = ((CStoreScanState*)outerPlanState(state))->part_id;
-                break;
             case T_DfsIndexScan:
-                if (((DfsIndexScanState*)outerPlanState(state))->m_indexScan) {
-                    state->part_id = ((DfsIndexScanState*)outerPlanState(state))->part_id;
-                }
-                break;
             case T_CStoreIndexScan:
-                state->part_id = ((CStoreIndexScanState*)outerPlanState(state))->part_id;
-                break;
             case T_CStoreIndexCtidScan:
-                state->part_id = ((CStoreIndexCtidScanState*)outerPlanState(state))->part_id;
-                break;
             case T_CStoreIndexHeapScan:
-                state->part_id = ((CStoreIndexHeapScanState*)outerPlanState(state))->part_id;
+                state->part_id = ((ScanState*)outerPlanState(state))->part_id;
+                state->subpartitions = ((ScanState*)outerPlanState(state))->subpartitions;
+                state->subPartLengthList = ((ScanState*)outerPlanState(state))->subPartLengthList;
                 break;
 
 #ifdef ENABLE_MULTIPLE_NODES
@@ -278,10 +275,12 @@ VecToRowState* ExecInitVecToRow(VecToRow* node, EState* estate, int eflags)
                 case VARCHAROID:
                     state->devectorizeFunRuntime[i] = DevectorizeOneColumn<VARCHAROID>;
                     break;
+                case NAMEOID:
+                    state->devectorizeFunRuntime[i] = DevectorizeOneColumn<NAMEOID>;
+                    break;
                 case TIMETZOID:
                 case TINTERVALOID:
                 case INTERVALOID:
-                case NAMEOID:
                 case MACADDROID:
                 case UUIDOID:
                     state->devectorizeFunRuntime[i] = DevectorizeOneColumn<TIMETZOID>;

@@ -40,6 +40,7 @@
 #include "utils/memutils.h"
 #include "utils/ps_status.h"
 #include "utils/guc.h"
+#include "replication/syncrep.h"
 
 #define SCHEDULER_TIME_UNIT 1000000  //us
 #define ENLARGE_THREAD_TIME 5
@@ -50,7 +51,7 @@
 
 static void SchedulerSIGKILLHandler(SIGNAL_ARGS)
 {
-    proc_exit(0);
+    t_thrd.threadpool_cxt.scheduler->m_getKilled = true;
 }
 
 void ThreadPoolScheduler::SigHupHandler()
@@ -60,9 +61,12 @@ void ThreadPoolScheduler::SigHupHandler()
 
 static void reloadConfigFileIfNecessary()
 {
-    if (t_thrd.threadpool_cxt.scheduler->m_getSIGHUP) {
+    if (unlikely(t_thrd.threadpool_cxt.scheduler->m_getSIGHUP)) {
         t_thrd.threadpool_cxt.scheduler->m_getSIGHUP = false;
         ProcessConfigFile(PGC_SIGHUP);
+        /* Update most_available_sync if it's modified dynamically. */
+        most_available_sync = (volatile bool) u_sess->attr.attr_storage.guc_most_available_sync;
+        SyncRepUpdateSyncStandbysDefined();
     }
 }
 
@@ -82,6 +86,10 @@ void TpoolSchedulerMain(ThreadPoolScheduler *scheduler)
     }
 
     while (true) {
+        if (unlikely(scheduler->m_getKilled)) {
+            scheduler->m_getKilled = false;
+            proc_exit(0);
+        }
         pg_usleep(SCHEDULER_TIME_UNIT);
         reloadConfigFileIfNecessary();
         scheduler->DynamicAdjustThreadPool();
@@ -100,6 +108,7 @@ ThreadPoolScheduler::ThreadPoolScheduler(int groupNum, ThreadPoolGroup** groups)
     m_freeStreamCount = (uint *)palloc0(sizeof(uint) * groupNum);
     m_gpcContext = NULL;
     m_getSIGHUP = false;
+    m_canAdjustPool = true;
 }
 
 ThreadPoolScheduler::~ThreadPoolScheduler()
@@ -119,7 +128,7 @@ int ThreadPoolScheduler::StartUp()
 void ThreadPoolScheduler::DynamicAdjustThreadPool()
 {
     for (int i = 0; i < m_groupNum; i++) {
-        if (pmState == PM_RUN) {
+        if (pmState == PM_RUN && m_canAdjustPool) {
             AdjustWorkerPool(i);
             AdjustStreamPool(i);
         }
@@ -158,6 +167,7 @@ void ThreadPoolScheduler::AdjustWorkerPool(int idx)
         m_freeTestCount[idx] = 0;
         EnlargeWorkerIfNecessage(idx);
     } else {
+        group->SetGroupHanged(false);
         m_hangTestCount[idx] = 0;
         m_freeTestCount[idx]++;
         ReduceWorkerIfNecessary(idx);
@@ -184,15 +194,16 @@ void ThreadPoolScheduler::AdjustStreamPool(int idx)
 void ThreadPoolScheduler::EnlargeWorkerIfNecessage(int groupIdx)
 {
     ThreadPoolGroup *group = m_groups[groupIdx];
-    if (m_hangTestCount[groupIdx] == ENLARGE_THREAD_TIME) {
+    if (m_hangTestCount[groupIdx] >= ENLARGE_THREAD_TIME && m_hangTestCount[groupIdx] < MAX_HANG_TIME) {
         if (group->EnlargeWorkers(THREAD_SCHEDULER_STEP)) {
             m_hangTestCount[groupIdx] = 0;
         }
     } else if (m_hangTestCount[groupIdx] == MAX_HANG_TIME) {
-        elog(LOG, "[SCHEDULER] Detect the system has hang %d seconds, "
+        elog(WARNING, "[SCHEDULER] Detect the system has hang %d seconds, "
             "and the thread num in pool exceed maximum, "
-            "so we need to cancel all current transactions.", MAX_HANG_TIME);
-        (void)SignalCancelAllBackEnd();
+            "so we need to close all new sessions.", MAX_HANG_TIME);
+        /* set flag for don't accept new session */
+        group->SetGroupHanged(true);
     }
 }
 

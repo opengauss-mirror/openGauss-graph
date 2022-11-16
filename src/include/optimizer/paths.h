@@ -46,11 +46,20 @@ extern void debug_print_rel(PlannerInfo* root, RelOptInfo* rel);
  * indxpath.c
  *	  routines to generate index paths
  */
+typedef enum {
+    NONFEATURED_INDEX,   /* Ordinary index, placeholder */
+    GLOBAL_PARTITION_INDEX = 1,
+    CROSSBUCKET_INDEX,
+    GLOBAL_PARTITION_AND_CROSSBUCKET_INDEX   /* GPI/CBI hybrid */
+} IndexFeature;
+
 extern void create_index_paths(PlannerInfo* root, RelOptInfo* rel);
 extern List* generate_bitmap_or_paths(
     PlannerInfo* root, RelOptInfo* rel, List* clauses, List* other_clauses, bool restriction_only);
-extern List* GenerateBitmapOrPathsUseGPI(
-    PlannerInfo* root, RelOptInfo* rel, const List* clauses, List* other_clauses, bool restriction_only);
+extern IndexFeature getIndexFeature(bool isPartitioned, bool hasBucket);
+extern List* GenerateBitmapOrPathsWithFeaturedIndex(
+    PlannerInfo* root, RelOptInfo* rel, const List* clauses, List* other_clauses, bool restriction_only,
+    IndexFeature idx_feature);
 extern bool relation_has_unique_index_for(
     PlannerInfo* root, RelOptInfo* rel, List* restrictlist, List* exprlist, List* oprlist);
 extern bool eclass_member_matches_indexcol(
@@ -89,7 +98,15 @@ extern void create_tidscan_paths(PlannerInfo* root, RelOptInfo* rel);
 extern void add_paths_to_joinrel(PlannerInfo* root, RelOptInfo* joinrel, RelOptInfo* outerrel, RelOptInfo* innerrel,
     JoinType jointype, SpecialJoinInfo* sjinfo, List* restrictlist);
 extern bool clause_sides_match_join(RestrictInfo* rinfo, RelOptInfo* outerrel, RelOptInfo* innerrel);
-
+#ifdef GS_GRAPH
+extern void add_paths_for_cdelete(PlannerInfo *root, RelOptInfo *joinrel,
+								  RelOptInfo *outerrel, RelOptInfo *innerrel,
+								  JoinType type, SpecialJoinInfo *sjinfo,
+								  List *restrictlist);
+extern void add_paths_to_joinrel_for_vle(PlannerInfo *root, RelOptInfo *joinrel,
+							 RelOptInfo *outerrel, RelOptInfo *innerrel,
+							 SpecialJoinInfo *sjinfo, List *restrictlist);
+#endif
 #ifdef PGXC
 /*
  * rquerypath.c
@@ -144,7 +161,17 @@ typedef enum {
     PATHKEYS_DIFFERENT /* neither pathkey includes the other */
 } PathKeysComparison;
 
+/* Passthrough data for standard_qp_callback */
+typedef struct {
+    List* tlist;         /* preprocessed query targetlist */
+    List* activeWindows; /* active windows, if any */
+    List* groupClause;   /* overrides parse->groupClause */
+} standard_qp_extra;
+
 extern List* canonicalize_pathkeys(PlannerInfo* root, List* pathkeys);
+extern List* remove_param_pathkeys(PlannerInfo* root, List* pathkeys);
+extern void construct_pathkeys(PlannerInfo *root, List *tlist, List *activeWindows,
+                   List *groupClause, bool canonical);
 extern PathKeysComparison compare_pathkeys(List* keys1, List* keys2);
 extern bool pathkeys_contained_in(List* keys1, List* keys2);
 extern Path* get_cheapest_path_for_pathkeys(
@@ -167,4 +194,17 @@ extern bool has_useful_pathkeys(PlannerInfo* root, RelOptInfo* rel);
 extern void set_path_rows(Path* path, double rows, double multiple = 1);
 extern EquivalenceClass* get_expr_eqClass(PlannerInfo* root, Expr* expr);
 extern void delete_eq_member(PlannerInfo* root, List* tlist, List* collectiveGroupExpr);
+extern bool CheckPathUseGlobalPartIndex(Path* path);
+
+extern void standard_qp_init(PlannerInfo *root, void *extra, List *tlist,
+                 List *activeWindows, List *groupClause);
+extern void standard_qp_callback(PlannerInfo *root, void *extra);
+
+#ifdef GS_GRAPH
+extern void add_paths_to_joinrel_for_vle(PlannerInfo *root, RelOptInfo *joinrel,
+										 RelOptInfo *outerrel,
+										 RelOptInfo *innerrel,
+										 SpecialJoinInfo *sjinfo,
+										 List *restrictlist);
+#endif /* GS_GRAPH */
 #endif /* PATHS_H */

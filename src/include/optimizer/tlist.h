@@ -47,4 +47,7 @@ extern void get_tlist_group_vars_split(Query* parse, List* tlist, List** group_c
 extern List* get_dependency_var_list(Query* parse, List* group_cols, List* non_group_vars);
 extern bool var_from_dependency_rel(Query* parse, Var* var, List* dep_oids);
 extern bool var_from_sublink_pulluped(Query *parse, Var *var);
+#ifdef GS_GRAPH
+extern void apply_tlist_labeling(List *dest_tlist, List *src_tlist);
+#endif
 #endif /* TLIST_H */

@@ -34,7 +34,7 @@ ifneq "$(MAKECMDGOALS)" "clean"
 endif
 
 OBJS = execAmi.o execCurrent.o execGrouping.o execJunk.o execMain.o \
-       execProcnode.o execQual.o execScan.o execTuples.o \
+       execProcnode.o execQual.o execReplication.o execScan.o execTuples.o \
        execUtils.o functions.o instrument.o nodeAppend.o nodeAgg.o \
        nodeBitmapAnd.o nodeBitmapOr.o \
        nodeBitmapHeapscan.o nodeBitmapIndexscan.o nodeHash.o \
@@ -43,11 +43,12 @@ OBJS = execAmi.o execCurrent.o execGrouping.o execJunk.o execMain.o \
        nodeMaterial.o nodeMergeAppend.o nodeMergejoin.o nodeModifyTable.o \
        nodeNestloop.o nodeFunctionscan.o nodeRecursiveunion.o nodeResult.o \
        nodeSamplescan.o nodeSeqscan.o nodeSetOp.o nodeSort.o nodeUnique.o \
-       nodeValuesscan.o nodeCtescan.o nodeWorktablescan.o \
+       nodeValuesscan.o nodeCtescan.o nodeStartWithOp.o nodeWorktablescan.o \
        nodeGroup.o nodeSubplan.o nodeSubqueryscan.o nodeTidscan.o \
        nodeForeignscan.o nodeWindowAgg.o tstoreReceiver.o spi.o \
        nodePartIterator.o nodeStub.o execClusterResize.o lightProxy.o execMerge.o \
-       nodeExtensible.o opfusion.o  opfusion_scan.o  opfusion_util.o  route.o nodeGD.o nodeKMeans.o
+       nodeExtensible.o route.o nodeTrainModel.o db4ai_common.o spiDbesql.o \
+       nodeModifyGraph.o nodeSparqlLoad.o nodeNestloopVle.o\
 
 override CPPFLAGS += -D__STDC_FORMAT_MACROS
 

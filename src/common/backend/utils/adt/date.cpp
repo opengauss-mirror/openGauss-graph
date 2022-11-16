@@ -51,6 +51,7 @@ static int tm2time(struct pg_tm* tm, fsec_t fsec, TimeADT* result);
 static int tm2timetz(struct pg_tm* tm, fsec_t fsec, int tz, TimeTzADT* result);
 static void AdjustTimeForTypmod(TimeADT* time, int32 typmod);
 
+
 /* common code for timetypmodin and timetztypmodin */
 static int32 anytime_typmodin(bool istz, ArrayType* ta)
 {
@@ -244,6 +245,15 @@ Datum date_send(PG_FUNCTION_ARGS)
     PG_RETURN_BYTEA_P(pq_endtypsend(&buf));
 }
 
+
+#ifdef GS_GRAPH
+/* Make the EncodeSpecialDate() callable from other files */
+void call_EncodeSpecialDate(DateADT dt, char* str, int strlen) 
+{
+    EncodeSpecialDate(dt, str, strlen);
+}
+
+#endif /* GS_GRAPH */
 /*
  * Convert reserved date values to string.
  */
@@ -1254,7 +1264,7 @@ Datum time_transform(PG_FUNCTION_ARGS)
 
 /* time_scale()
  * Adjust time type for specified scale factor.
- * Used by PostgreSQL type system to stuff columns.
+ * Used by openGauss type system to stuff columns.
  */
 Datum time_scale(PG_FUNCTION_ARGS)
 {
@@ -1969,7 +1979,7 @@ recalc:
 
 /* timetz_scale()
  * Adjust time type for specified scale factor.
- * Used by PostgreSQL type system to stuff columns.
+ * Used by openGauss type system to stuff columns.
  */
 Datum timetz_scale(PG_FUNCTION_ARGS)
 {
@@ -2808,3 +2818,5 @@ ScalarVector* vtimestamp_part(PG_FUNCTION_ARGS)
 
     return presult;
 }
+
+

@@ -6,6 +6,7 @@
  * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  * Portions Copyright (c) 2010-2012 Postgres-XC Development Group
+ * Portions Copyright (c) 2021, openGauss Contributors
  *
  * IDENTIFICATION
  *      src/backend/catalog/storage_gtt.c
@@ -45,7 +46,7 @@
 #include "storage/procarray.h"
 #include "storage/shmem.h"
 #include "storage/sinvaladt.h"
-#include "storage/smgr.h"
+#include "storage/smgr/smgr.h"
 #include "threadpool/threadpool.h"
 #include "utils/catcache.h"
 #include "gs_threadlocal.h"
@@ -402,7 +403,7 @@ void remember_gtt_storage_info(const RelFileNode rnode, Relation rel)
             }
         }
 
-        if (entry->relkind == RELKIND_RELATION || entry->relkind == RELKIND_SEQUENCE) {
+        if (entry->relkind == RELKIND_RELATION || RELKIND_IS_SEQUENCE(entry->relkind)) {
             gtt_storage_checkin(relid);
         }
     }
@@ -428,11 +429,7 @@ void remember_gtt_storage_info(const RelFileNode rnode, Relation rel)
     (void)MemoryContextSwitchTo(oldcontext);
 
     if (!u_sess->gtt_ctx.gtt_cleaner_exit_registered) {
-        if (!ENABLE_THREAD_POOL) {
-            on_shmem_exit(gtt_storage_removeall, 0);
-        } else {
-            u_sess->gtt_ctx.gtt_sess_exit = gtt_storage_removeall;
-        }
+        u_sess->gtt_ctx.gtt_sess_exit = gtt_storage_removeall;
         u_sess->gtt_ctx.gtt_cleaner_exit_registered = true;
     }
 
@@ -477,7 +474,7 @@ void forget_gtt_storage_info(Oid relid, const RelFileNode rnode, bool isCommit)
             Assert(dRnode);
         } else {
             if (entry->relfilenode_list == NIL) {
-                if (entry->relkind == RELKIND_RELATION || entry->relkind == RELKIND_SEQUENCE)
+                if (entry->relkind == RELKIND_RELATION || RELKIND_IS_SEQUENCE(entry->relkind))
                     gtt_storage_checkout(relid, false, isCommit);
 
                 gtt_free_statistics(entry);
@@ -498,7 +495,7 @@ void forget_gtt_storage_info(Oid relid, const RelFileNode rnode, bool isCommit)
     entry->relfilenode_list = list_delete_ptr(entry->relfilenode_list, dRnode);
     pfree(dRnode);
     if (entry->relfilenode_list == NIL) {
-        if (entry->relkind == RELKIND_RELATION || entry->relkind == RELKIND_SEQUENCE)
+        if (entry->relkind == RELKIND_RELATION || RELKIND_IS_SEQUENCE(entry->relkind))
             gtt_storage_checkout(relid, false, isCommit);
 
         if (isCommit && entry->oldrelid != InvalidOid) {
@@ -564,6 +561,7 @@ static void gtt_storage_removeall(int code, Datum arg)
             rnode.spcNode = gtt_rnode->spcnode;
             rnode.dbNode = u_sess->proc_cxt.MyDatabaseId;
             rnode.relNode = gtt_rnode->relfilenode;
+            rnode.opt = 0;
             rnode.bucketNode = InvalidBktId;
             srel = smgropen(rnode, BackendIdForTempRelations);
 
@@ -604,7 +602,7 @@ static void gtt_storage_removeall(int code, Datum arg)
     if (nrels) {
         (void)LWLockAcquire(&t_thrd.shemem_ptr_cxt.gtt_shared_ctl->lock, LW_EXCLUSIVE);
         for (i = 0; i < nrels; i++) {
-            if (relkinds[i] == RELKIND_RELATION || relkinds[i] == RELKIND_SEQUENCE)
+            if (relkinds[i] == RELKIND_RELATION || RELKIND_IS_SEQUENCE(relkinds[i]))
                 gtt_storage_checkout(relids[i], true, false);
         }
         LWLockRelease(&t_thrd.shemem_ptr_cxt.gtt_shared_ctl->lock);
@@ -1260,7 +1258,7 @@ static void CreateGTTRelFiles(const ResultRelInfo* resultRelInfo)
     UnlinkJunkRelFile(relation);
 
     RelationCreateStorage(
-        relation->rd_node, RELPERSISTENCE_GLOBAL_TEMP, relation->rd_rel->relowner, InvalidOid, InvalidOid, relation);
+        relation->rd_node, RELPERSISTENCE_GLOBAL_TEMP, relation->rd_rel->relowner, InvalidOid, relation);
     for (i = 0; i < resultRelInfo->ri_NumIndices; i++) {
         Relation index = resultRelInfo->ri_IndexRelationDescs[i];
         /* remove junk files when other session exited unexpected */
@@ -1279,7 +1277,7 @@ static void CreateGTTRelFiles(const ResultRelInfo* resultRelInfo)
         UnlinkJunkRelFile(toastrel);
 
         RelationCreateStorage(
-            toastrel->rd_node, RELPERSISTENCE_GLOBAL_TEMP, toastrel->rd_rel->relowner, InvalidOid, InvalidOid, toastrel);
+            toastrel->rd_node, RELPERSISTENCE_GLOBAL_TEMP, toastrel->rd_rel->relowner, InvalidOid, toastrel);
 
         ListCell* indlist = NULL;
         foreach (indlist, RelationGetIndexList(toastrel)) {
@@ -1309,6 +1307,14 @@ void init_gtt_storage(CmdType operation, ResultRelInfo* resultRelInfo)
 
     if (!RELATION_IS_GLOBAL_TEMP(relation)) {
         return;
+    }
+
+    if (u_sess->attr.attr_storage.max_active_gtt <= 0) {
+        ereport(ERROR,
+            (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                errmsg("Global temporary table feature is disable"),
+                errhint("You might need to increase max_active_global_temporary_table "
+                        "to enable this feature.")));
     }
 
     if (!(operation == CMD_UTILITY || operation == CMD_INSERT)) {

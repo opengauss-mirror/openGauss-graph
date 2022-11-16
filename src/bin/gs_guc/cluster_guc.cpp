@@ -148,6 +148,8 @@ extern unsigned int g_remote_command_result;
 
 /* storage the name which perform remote connection failed */
 extern nodeInfo* g_incorrect_nodeInfo;
+/* storage the name which need to ignore */
+extern nodeInfo* g_ignore_nodeInfo;
 
 typedef enum {
     NO_COMMAND = 0,
@@ -490,6 +492,10 @@ char* modify_parameter_value(const char* value, bool localMode)
             for (k = 0; k < backslash_num && j < MAX_VALUE_LEN; k++) {
                 buffer[j] = '\\';
                 j++;
+            }
+            if (j >= MAX_VALUE_LEN) {
+                write_stderr(_("%s: out of memory\n"), progname);
+                exit(1);
             }
             buffer[j] = value[i];
         } else {
@@ -1843,7 +1849,7 @@ char* get_AZ_value(const char* value, const char* data_dir)
 
     /* make sure it is digit and between 1 and 7, including 1 and 7 */
     if (isdigit((unsigned char)*p)) {
-        nRet = snprintf_s(level, sizeof(level) / sizeof(char), 
+        nRet = snprintf_s(level, sizeof(level) / sizeof(char),
             sizeof(level) / sizeof(char) - 1, "%c", (unsigned char)*p);
         securec_check_ss_c(nRet, "\0", "\0");
         if (atoi(level) < 1 || atoi(level) > 7) {
@@ -1888,6 +1894,7 @@ char* get_AZ_value(const char* value, const char* data_dir)
             p = vptr;
 
             if (CheckDataNameValue(p, data_dir) == false) {
+                GS_FREE(s);
                 goto failed;
             }
             vptr = strtok_r(NULL, delims, &vouter_ptr);
@@ -2478,6 +2485,21 @@ static void do_all_nodes_instance_local_in_parallel_loop(const char* instance_na
     }
 }
 
+static bool needPassNode(const char* nodename)
+{
+    int cmpLen = 0;
+    char* ignoreNode = NULL;
+
+    for (uint32 i = 0; i < g_ignore_nodeInfo->num; i++) {
+        ignoreNode = g_ignore_nodeInfo->nodename_array[i];
+        cmpLen = (strlen(ignoreNode) > strlen(nodename)) ? strlen(ignoreNode) : strlen(nodename);
+        if (strncmp(ignoreNode, nodename, cmpLen) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 void do_all_nodes_instance_local_in_parallel(const char* instance_name, const char* indatadir)
 {
     int idx = 0;
@@ -2510,8 +2532,12 @@ void do_all_nodes_instance_local_in_parallel(const char* instance_name, const ch
         if (NULL == g_parallel_command_cxt[idx].nodename) {
             continue;
         }
-        open_count++;
+
         nodename = g_parallel_command_cxt[idx].nodename;
+        if ((g_ignore_nodeInfo != NULL) && needPassNode(nodename)) {
+            continue;
+        }
+        open_count++;
 
         buf_len = (strlen(g_local_node_name) > strlen(nodename)) ? strlen(g_local_node_name) : strlen(nodename);
         is_local_node = (0 == strncmp(g_local_node_name, nodename, buf_len)) ? true : false;
@@ -2660,6 +2686,10 @@ static void readPopenOutputParallel(const char* cmd, bool if_for_all_instance)
                 }
                 curr_cxt->readbuf[0] = '\0';
                 curr_cxt->cur_buf_loc = 0;
+                endsp = strstr(result, "WARNING");
+                if (NULL != endsp) {
+                    (void)write_stderr("%s", result);
+                }
                 endsp = strstr(result, "Success to perform gs_guc");
                 if (NULL != endsp) {
                     successNumber++;
@@ -3012,12 +3042,13 @@ void save_parameter_info(char* buffer, gucInfo* guc_info)
      * split with '=', get parameter and value
      * both this two, we can makesure the point ptr is not NULL.
      */
-    ptr = strtok_r(tmp_str, ":", &outer_ptr);
+    ptr = strrchr(tmp_str, ':');
     if (NULL == ptr) {
         GS_FREE(tmp_str);
         return;
     }
-    ptr = strtok_r(ptr, "=", &outer_ptr);
+    *ptr = '\0';
+    ptr = strtok_r(tmp_str, "=", &outer_ptr);
     if (NULL == ptr) {
         GS_FREE(tmp_str);
         return;
@@ -3485,6 +3516,24 @@ bool check_cn_dn_parameter_is_valid()
                 all_valid = false;
                 (void)write_stderr("ERROR: The name of parameter \"%s\" is incorrect."
                                    "not work on this mode.\n",
+                    config_param[para_num]);
+            }
+            /* segment_test_param only work on debug mode */
+            char* segmentTestParam = "segment_test_param";
+            len = (strlen(tmp) > strlen(segmentTestParam)) ? strlen(tmp) : strlen(segmentTestParam);
+            if (strncmp(tmp, segmentTestParam, len) == 0) {
+                all_valid = false;
+                (void)write_stderr("ERROR: The name of parameter \"%s\" is incorrect."
+                                "not work on this mode.\n",
+                    config_param[para_num]);
+            }
+            /* enable_memory_context_check_debug  only work on debug mode */
+            char* memCtxCheckParam = "enable_memory_context_check_debug";
+            len = (strlen(tmp) > strlen(memCtxCheckParam)) ? strlen(tmp) : strlen(memCtxCheckParam);
+            if (strncmp(tmp, memCtxCheckParam, len) == 0) {
+                all_valid = false;
+                (void)write_stderr("ERROR: The name of parameter \"%s\" is incorrect."
+                                "not work on this mode.\n",
                     config_param[para_num]);
             }
 #endif

@@ -17,19 +17,20 @@ all: pg_config.h pg_config_os.h
 
 
 # Subdirectories containing headers for server-side dev
-SUBDIRS = bootstrap catalog commands client_logic datatype executor foreign gs_policy iprange lib libpq mb \
+SUBDIRS = bootstrap catalog commands client_logic datatype executor foreign gs_policy gs_ledger iprange lib libpq mb \
 	nodes optimizer parser pgxc postmaster regex replication rewrite  \
 	tcop snowball snowball/libstemmer tsearch tsearch/dicts utils\
 	port port/win32 port/win32_msvc port/win32_msvc/sys \
 	port/win32/arpa port/win32/netinet port/win32/sys \
 	portability \
-	gtm \
+	gtm tde_key_management \
 	storage vecexecutor access streaming access/obs \
 	hotpatch \
 	gstrace \
-	knl knl/knl_guc threadpool workload
+	knl knl/knl_guc threadpool workload lite
+	
 ifneq ($(enable_multiple_nodes), yes)
-    SUBDIRS += storage/lock storage/buf storage/item storage/cstore storage/mot fmgr
+    SUBDIRS += storage/smgr storage/lock storage/buf storage/item storage/cstore storage/mot fmgr
 endif
 
 # Install all headers
@@ -54,8 +55,11 @@ install: all installdirs
 	$(INSTALL_DATA) utils/errcodes.h '$(DESTDIR)$(includedir_server)/utils'
 	$(INSTALL_DATA) utils/fmgroids.h '$(DESTDIR)$(includedir_server)/utils'
 # These headers are needed by madlib
-	$(INSTALL_DATA) $(with_3rd)/$(BINARYPATH)/cjson/comm/include/cjson/cJSON.h '$(DESTDIR)$(includedir_server)'/cjson/cJSON.h
+	$(MKDIR_P) '$(DESTDIR)$(includedir_server)'/cjson/
+	$(INSTALL_DATA) $(CJSON_INCLUDE_PATH)/cjson/cJSON.h '$(DESTDIR)$(includedir_server)'/cjson/cJSON.h
+ifeq ($(enable_lite_mode), no)
 	$(INSTALL_DATA) $(with_3rd)/$(BINARYPATH)/libobs/comm/include/eSDKOBS.h '$(DESTDIR)$(includedir_server)'/access/obs/eSDKOBS.h
+endif
 	$(INSTALL_DATA) $(srcdir)/access/hash.inl '$(DESTDIR)$(includedir_server)'/access/hash.inl
 # These headers are needed by fdw
 	$(INSTALL_DATA) gssignal/gs_signal.h '$(DESTDIR)$(includedir_server)/gssignal/gs_signal.h'
@@ -71,6 +75,12 @@ install: all installdirs
 	$(INSTALL_DATA) ssl/gs_openssl_client.h '$(DESTDIR)$(includedir_server)/ssl/gs_openssl_client.h'
 	$(INSTALL_DATA) instruments/list.h '$(DESTDIR)$(includedir_server)/instruments/list.h'
 	$(INSTALL_DATA) instruments/instr_event.h '$(DESTDIR)$(includedir_server)/instruments/instr_event.h'
+	$(INSTALL_DATA) storage/smgr/fd.h '$(DESTDIR)$(includedir_server)/storage/smgr/fd.h'
+	$(INSTALL_DATA) storage/smgr/knl_usync.h '$(DESTDIR)$(includedir_server)/storage/smgr/knl_usync.h'
+	$(INSTALL_DATA) storage/smgr/relfilenode.h '$(DESTDIR)$(includedir_server)/storage/smgr/relfilenode.h'
+	$(INSTALL_DATA) storage/smgr/segment_internal.h '$(DESTDIR)$(includedir_server)/storage/smgr/segment_internal.h'
+	$(INSTALL_DATA) storage/smgr/segment.h '$(DESTDIR)$(includedir_server)/storage/smgr/segment.h'
+	$(INSTALL_DATA) storage/smgr/smgr.h '$(DESTDIR)$(includedir_server)/storage/smgr/smgr.h'
 	$(INSTALL_DATA) storage/dfs/dfs_connector.h '$(DESTDIR)$(includedir_server)/storage/dfs/dfs_connector.h' 
 	$(INSTALL_DATA) storage/buf/block.h '$(DESTDIR)$(includedir_server)/storage/buf/block.h'
 	$(INSTALL_DATA) storage/buf/buf.h '$(DESTDIR)$(includedir_server)/storage/buf/buf.h'
@@ -96,6 +106,27 @@ install: all installdirs
 	$(INSTALL_DATA) distributelayer/streamTransportCore.h '$(DESTDIR)$(includedir_server)/distributelayer/streamTransportCore.h'
 	$(INSTALL_DATA) fmgr/fmgr_comp.h '$(DESTDIR)$(includedir_server)/fmgr/fmgr_comp.h'
 	$(INSTALL_DATA) fmgr/fmgr_core.h '$(DESTDIR)$(includedir_server)/fmgr/fmgr_core.h'
+	$(INSTALL_DATA) lite/memory_lite.h '$(DESTDIR)$(includedir_server)/lite/memory_lite.h'
+# These headers are needed by postgis
+	$(INSTALL_DATA) access/ustore/undo/knl_uundotype.h '$(DESTDIR)$(includedir_server)/access/ustore/undo/knl_uundotype.h'
+	$(INSTALL_DATA) access/ustore/undo/knl_uundoapi.h '$(DESTDIR)$(includedir_server)/access/ustore/undo/knl_uundoapi.h'
+	$(INSTALL_DATA) access/ustore/knl_uheap.h '$(DESTDIR)$(includedir_server)/access/ustore/knl_uheap.h'
+	$(INSTALL_DATA) access/ustore/knl_utuple.h '$(DESTDIR)$(includedir_server)/access/ustore/knl_utuple.h'
+	$(INSTALL_DATA) access/ustore/knl_utype.h '$(DESTDIR)$(includedir_server)/access/ustore/knl_utype.h'
+	$(INSTALL_DATA) access/ustore/knl_upage.h '$(DESTDIR)$(includedir_server)/access/ustore/knl_upage.h'
+	$(INSTALL_DATA) access/ustore/knl_uredo.h '$(DESTDIR)$(includedir_server)/access/ustore/knl_uredo.h'
+	$(INSTALL_DATA) access/ustore/knl_uundovec.h '$(DESTDIR)$(includedir_server)/access/ustore/knl_uundovec.h'
+	$(INSTALL_DATA) access/ustore/knl_uundorecord.h '$(DESTDIR)$(includedir_server)/access/ustore/knl_uundorecord.h'
+	$(INSTALL_DATA) access/ustore/undo/knl_uundoxlog.h '$(DESTDIR)$(includedir_server)/access/ustore/undo/knl_uundoxlog.h'
+	$(INSTALL_DATA) access/ustore/undo/knl_uundotxn.h '$(DESTDIR)$(includedir_server)/access/ustore/undo/knl_uundotxn.h'
+	$(INSTALL_DATA) access/ustore/undo/knl_uundozone.h '$(DESTDIR)$(includedir_server)/access/ustore/undo/knl_uundozone.h'
+	$(INSTALL_DATA) access/ustore/undo/knl_uundospace.h '$(DESTDIR)$(includedir_server)/access/ustore/undo/knl_uundospace.h'
+	$(INSTALL_DATA) communication/commproxy_basic.h '$(DESTDIR)$(includedir_server)/communication/commproxy_basic.h'
+	$(INSTALL_DATA) access/parallel_recovery/page_redo.h '$(DESTDIR)$(includedir_server)/access/parallel_recovery/page_redo.h'
+	$(INSTALL_DATA) access/parallel_recovery/spsc_blocking_queue.h '$(DESTDIR)$(includedir_server)/access/parallel_recovery/spsc_blocking_queue.h'
+	$(INSTALL_DATA) executor/exec/execdesc.h '$(DESTDIR)$(includedir_server)/executor/exec/execdesc.h'
+	$(INSTALL_DATA) db4ai/matrix.h '$(DESTDIR)$(includedir_server)/db4ai/matrix.h'
+	$(INSTALL_DATA) db4ai/scores.h '$(DESTDIR)$(includedir_server)/db4ai/scores.h'
 # We don't use INSTALL_DATA for performance reasons --- there are a lot of files
 	cp $(srcdir)/*.h '$(DESTDIR)$(includedir_server)'/ || exit; \
 	chmod $(INSTALL_DATA_MODE) '$(DESTDIR)$(includedir_server)'/*.h  || exit; \

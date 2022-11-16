@@ -22,6 +22,8 @@
 #include "access/htup.h"
 #include "nodes/pg_list.h"
 #include "nodes/primnodes.h"
+#include "utils/rel.h"
+#include "utils/rel_gs.h"
 
 /* types supported by reloptions */
 typedef enum relopt_type {
@@ -128,6 +130,22 @@ typedef struct {
     relopt_type opttype; /* option's datatype */
     int offset;          /* offset of field in result struct */
 } relopt_parse_elt;
+
+struct TableCreateSupport {
+    int compressType;
+    bool compressLevel;
+    bool compressChunkSize;
+    bool compressPreAllocChunks;
+    bool compressByteConvert;
+    bool compressDiffConvert;
+};
+
+inline bool HasCompressOption(TableCreateSupport *tableCreateSupport)
+{
+    return tableCreateSupport->compressLevel || tableCreateSupport->compressChunkSize ||
+           tableCreateSupport->compressPreAllocChunks || tableCreateSupport->compressByteConvert ||
+           tableCreateSupport->compressDiffConvert;
+}
 
 /* 
  * The following are the table append modes currently supported.
@@ -246,7 +264,7 @@ extern relopt_value* parseRelOptions(Datum options, bool validate, relopt_kind k
 extern void* allocateReloptStruct(Size base, relopt_value* options, int numoptions);
 extern void fillRelOptions(void* rdopts, Size basesize, relopt_value* options, int numoptions, bool validate,
     const relopt_parse_elt* elems, int nelems);
-
+extern void fillTdeRelOptions(List *options, char relkind);
 extern bytea* default_reloptions(Datum reloptions, bool validate, relopt_kind kind);
 extern bytea* heap_reloptions(char relkind, Datum reloptions, bool validate);
 extern bytea* index_reloptions(RegProcedure amoptions, Datum reloptions, bool validate);
@@ -256,10 +274,15 @@ extern bytea* tsearch_config_reloptions(Datum tsoptions, bool validate, Oid prso
 extern void heaprel_set_compressing_modes(Relation rel, int16* modes);
 extern int8 heaprel_get_compresslevel_from_modes(int16 modes);
 extern int8 heaprel_get_compression_from_modes(int16 modes);
+extern bool get_crossbucket_option(List **options_ptr, bool stmtoptgpi = false, char *accessmethod = NULL,
+    int *crossbucketopt = NULL);
+extern bool is_contain_crossbucket(List *defList);
+extern bool is_cstore_option(char relkind, Datum reloptions);
 
 extern void CheckGetServerIpAndPort(const char* Address, List** AddrList, bool IsCheck, int real_addr_max);
 extern void CheckFoldernameOrFilenamesOrCfgPtah(const char* OptStr, char* OptType);
 extern void CheckWaitCleanGpi(const char* value);
+extern void CheckWaitCleanCbi(const char* value);
 
 extern void ForbidToSetOptionsForPSort(List* options);
 extern void ForbidOutUsersToSetInnerOptions(List* user_options);
@@ -267,11 +290,20 @@ extern void ForbidToSetOptionsForAttribute(List* options);
 extern void ForbidUserToSetUnsupportedOptions(
     List* options, const char* optnames[], int numoptnames, const char* detail);
 extern void ForbidToSetOptionsForColTbl(List* options);
+extern void ForbidToSetTdeOptionsForNonTdeTbl(List* options);
+extern void ForbidToAlterOptionsForTdeTbl(List* options);
+extern void ForbidToSetOptionsForUstoreTbl(List *options);
 extern void ForbidToSetOptionsForRowTbl(List* options);
 extern void ForbidUserToSetDefinedOptions(List* options);
+extern void ForbidUserToSetDefinedIndexOptions(List* options);
 extern bool CheckRelOptionValue(Datum options, const char* opt_name);
 extern void forbid_to_set_options_for_timeseries_tbl(List* options);
 extern List* RemoveRelOption(List* options, const char* optName, bool* removed);
-void RowTblCheckCompressionOption(List *options);
+void RowTblCheckCompressionOption(List *options, int8 rowCompress = REL_CMPRS_PAGE_PLAIN);
+void RowTblCheckHashBucketOption(List* options, StdRdOptions* std_opt);
+void ForbidUserToSetCompressedOptions(List *options);
+void SetOneOfCompressOption(DefElem* defElem, TableCreateSupport *tableCreateSupport);
+void CheckCompressOption(TableCreateSupport *tableCreateSupport);
+void ForbidUserToSetCompressedOptions(List *options);
 #endif /* RELOPTIONS_H */
 

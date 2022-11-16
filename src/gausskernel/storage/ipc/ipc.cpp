@@ -1,7 +1,7 @@
 /* -------------------------------------------------------------------------
  *
  * ipc.cpp
- *	  POSTGRES inter-process communication definitions.
+ *	  openGauss inter-process communication definitions.
  *
  * This file is misnamed, as it no longer has much of anything directly
  * to do with IPC.	The functionality here is concerned with managing
@@ -11,6 +11,7 @@
  * Portions Copyright (c) 2020 Huawei Technologies Co.,Ltd.
  * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
+ * Portions Copyright (c) 2021, openGauss Contributors
  *
  *
  * IDENTIFICATION
@@ -31,15 +32,18 @@
 #include "storage/ipc.h"
 #include "tcop/tcopprot.h"
 #include "libpq/libpq-be.h"
-#include "storage/fd.h"
+#include "storage/smgr/fd.h"
 #include "storage/latch.h"
+#include "storage/procarray.h"
 #include "gssignal/gs_signal.h"
 #include "storage/pmsignal.h"
 #include "access/gtm.h"
 #include "access/dfs/dfs_am.h"
+#include "access/ustore/undo/knl_uundoapi.h"
 #include "workload/workload.h"
 #include "postmaster/syslogger.h"
-#include "executor/execStream.h"
+#include "executor/exec/execStream.h"
+#include "postmaster/bgworker.h"
 #ifndef WIN32_ONLY_COMPILER
     #include "dynloader.h"
 #else
@@ -69,7 +73,7 @@ extern void pq_close(int code, Datum arg);
 extern void AtProcExit_Files(int code, Datum arg);
 extern void audit_processlogout(int code, Datum arg);
 extern void CancelAutoAnalyze();
-
+extern void DestoryAutonomousSession(bool force);
 #ifdef ENABLE_MOT
 static void MOTCleanupSession(int code, Datum arg)
 {
@@ -80,6 +84,8 @@ static void MOTCleanupSession(int code, Datum arg)
 static const pg_on_exit_callback on_sess_exit_list[] = {
     ShutdownPostgres,
     PGXCNodeCleanAndRelease,
+    PlDebugerCleanUp,
+    cleanGPCPlanProcExit,
 #ifdef ENABLE_MOT
     /*
      * 1. Must come after ShutdownPostgres(), in case there is abort/rollback callback.
@@ -241,15 +247,24 @@ void proc_exit(int code)
     if (IS_THREAD_POOL_WORKER) {
         if (t_thrd.threadpool_cxt.worker != NULL)
             t_thrd.threadpool_cxt.worker->CleanUpSessionWithLock();
+        DecreaseUserCount(u_sess->proc_cxt.MyRoleId);
     }
-
     RemoveFromDnHashTable();
 
     /* Clean up Dfs Reader stuffs */
     CleanupDfsHandlers(true);
 
+    BgworkerListSyncQuit();
+
+    /* Clean up Allocated descs */
+    FreeAllAllocatedDescs();
+
     /* Clean up everything that must be cleaned up */
     proc_exit_prepare(code);
+
+    if (u_sess->SPI_cxt.autonomous_session) {
+        DestoryAutonomousSession(true);
+    }
 
     /*
      * Protect the node group incase the ShutPostgres Callback function
@@ -351,16 +366,19 @@ void proc_exit(int code)
     SQMCloseLogFile();
     ASPCloseLogFile();
 
-    if (IS_THREAD_POOL_WORKER) {
+    if (IS_THREAD_POOL_WORKER && t_thrd.threadpool_cxt.worker) {
         CurrentMemoryContext = NULL;
         t_thrd.threadpool_cxt.worker->ShutDown();
-    } else if (IS_THREAD_POOL_LISTENER) {
+    } else if (IS_THREAD_POOL_LISTENER && t_thrd.threadpool_cxt.listener) {
         t_thrd.threadpool_cxt.listener->ResetThreadId();
-    } else if (IS_THREAD_POOL_SCHEDULER) {
+    } else if (IS_THREAD_POOL_SCHEDULER && t_thrd.threadpool_cxt.scheduler) {
         t_thrd.threadpool_cxt.scheduler->SetShutDown(true);
-    } else if (IS_THREAD_POOL_STREAM) {
+    } else if (IS_THREAD_POOL_STREAM && t_thrd.threadpool_cxt.stream) {
         t_thrd.threadpool_cxt.stream->ShutDown();
     }
+
+    GlobalStatsCleanupFiles();
+
     gs_thread_exit(code);
 }
 
@@ -372,8 +390,6 @@ void proc_exit(int code)
 void proc_exit_prepare(int code)
 {
     sigset_t old_sigset;
-
-    closeAllVfds();
 
     PreventInterrupt();
 
@@ -414,6 +430,9 @@ void proc_exit_prepare(int code)
         }
     }
 
+    /* release all refcount and lock */
+    CloseLocalSysDBCache();
+
     t_thrd.storage_cxt.on_proc_exit_index = 0;
 
     gs_signal_recover_mask(old_sigset);
@@ -445,6 +464,7 @@ void sess_exit(int code)
      */
     StreamNodeGroup::syncQuit(STREAM_ERROR);
     StreamNodeGroup::destroy(STREAM_ERROR);
+    BgworkerListSyncQuit();
     CloseClientSocket(u_sess, true);
 
     CancelAutoAnalyze();
@@ -462,7 +482,9 @@ void sess_exit_prepare(int code)
 {
     sigset_t old_sigset;
 
-    closeAllVfds();
+    if (!EnableLocalSysCache()) {
+        closeAllVfds();
+    }
 
     PreventInterrupt();
     HOLD_INTERRUPTS();
@@ -476,15 +498,15 @@ void sess_exit_prepare(int code)
             (u_sess->ext_fdw_ctx[i].fdwExitFunc)(code, UInt32GetDatum(NULL));
         }
     }
-	
-    if (u_sess->gtt_ctx.gtt_cleaner_exit_registered) {
-        pg_on_exit_callback func = u_sess->gtt_ctx.gtt_sess_exit;
-        (*func)(code, UInt32GetDatum(NULL));
-    }
-	
-    for (; u_sess->on_sess_exit_index < on_sess_exit_size; u_sess->on_sess_exit_index++)
-        (*on_sess_exit_list[u_sess->on_sess_exit_index])(code, UInt32GetDatum(NULL));
 
+    for (; u_sess->on_sess_exit_index < on_sess_exit_size; u_sess->on_sess_exit_index++) {
+        if (EnableLocalSysCache() && on_sess_exit_list[u_sess->on_sess_exit_index] == AtProcExit_Files) {
+            // we close this only on proc exit
+            continue;
+        }
+        (*on_sess_exit_list[u_sess->on_sess_exit_index])(code, UInt32GetDatum(NULL));
+    }
+    
     t_thrd.storage_cxt.on_proc_exit_index = 0;
     RESUME_INTERRUPTS();
     gs_signal_recover_mask(old_sigset);
@@ -533,6 +555,16 @@ void on_proc_exit(pg_on_exit_callback function, Datum arg)
 {
     if (t_thrd.storage_cxt.on_proc_exit_index >= MAX_ON_EXITS)
         ereport(FATAL, (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED), errmsg_internal("out of on_proc_exit slots")));
+    
+    /* reregister when cache miss on thread pool mode */
+    if ((function == AtProcExit_Files || function == smgrshutdown) && EnableLocalSysCache()) {
+        for (int i = 0; i < t_thrd.storage_cxt.on_proc_exit_index; i++) {
+            if (t_thrd.storage_cxt.on_proc_exit_list[i].function == function) {
+                Assert(t_thrd.storage_cxt.on_proc_exit_list[i].arg == arg);
+                return;
+            }
+        }
+    }
 
     t_thrd.storage_cxt.on_proc_exit_list[t_thrd.storage_cxt.on_proc_exit_index].function = function;
     t_thrd.storage_cxt.on_proc_exit_list[t_thrd.storage_cxt.on_proc_exit_index].arg = arg;
@@ -636,7 +668,8 @@ void CloseClientSocket(knl_session_context* sess, bool closesock)
     if (sess->proc_cxt.MyProcPort != NULL && closesock) {
         /* if gs_sock is NULL, just clean gs_poll hash table. */
         pfree_ext(sess->proc_cxt.MyProcPort->msgLog);
-        gs_close_gsocket(&(sess->proc_cxt.MyProcPort->gs_sock));
+        gsocket* curGsock = &sess->proc_cxt.MyProcPort->gs_sock;
+        gs_close_gsocket(curGsock);
     }
     if (t_thrd.postmaster_cxt.KeepSocketOpenForStream == false && (sess->proc_cxt.MyProcPort != NULL) &&
         sess->proc_cxt.MyProcPort->sock > 0) {

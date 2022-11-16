@@ -47,7 +47,7 @@
 #define RESPONSE_PLANID_OK 6
 #define RESPONSE_ANALYZE_ROWCNT 7
 #define RESPONSE_SEQUENCE_OK 8
-
+#define RESPONSE_MAXCSN_RECEIVED 9
 
 #define REMOTE_CHECKMSG_LEN 8  /* it equals to the count of bytes added in AddCheckMessage when is_stream is false */
 #define STREAM_CHECKMSG_LEN 20 /* it equals to the count of bytes added in AddCheckMessage when is_stream is true */
@@ -271,5 +271,6 @@ extern PGXCNodeAllHandles* connect_compute_pool_for_HDFS();
 extern PGXCNodeAllHandles* make_cp_conn(ComputePoolConfig** configs, int cnum, int srvtype, const char* dbname);
 extern List* get_dnlist_for_hdfs(int fnum);
 extern void ReloadTransactionNodes(void);
+extern void PgFdwRemoteReply(StringInfo msg);
 
 #endif

@@ -35,42 +35,45 @@
 #define XLOG_READER_MAX_MSGLENTH 1024
 
 /* Get a new XLogReader */
-extern XLogReaderState* XLogReaderAllocate(XLogPageReadCB pagereadfunc, void* private_data);
+extern XLogReaderState* XLogReaderAllocate(XLogPageReadCB pagereadfunc, void* private_data, Size alignedSize = 0);
 
 /* Free an XLogReader */
 extern void XLogReaderFree(XLogReaderState* state);
-/* The function has the stronger ability to find the next xlog record with XLogReadRecord() deployed. */
-extern bool ValidateNextXLogRecordPtr(XLogReaderState* state, XLogRecPtr& cur_ptr, char** err_msg);
-/* Adjust the start ptr of XlogRecoed for XlogReadRecord */
-extern void AlignXlogPtrToNextPageIfNeeded(XLogRecPtr* recPtr);
 /* Read the next XLog record. Returns NULL on end-of-WAL or failure */
 extern struct XLogRecord* XLogReadRecord(
-    XLogReaderState* state, XLogRecPtr recptr, char** errormsg, bool readoldversion = false, bool doDecode = true);
+    XLogReaderState* state, XLogRecPtr recptr, char** errormsg, bool doDecode = true, char* xlog_path = NULL);
 
-extern bool XLogRecGetBlockTag(
-    XLogReaderState* record, uint8 block_id, RelFileNode* rnode, ForkNumber* forknum, BlockNumber* blknum);
+extern bool XLogRecGetBlockTag(XLogReaderState *record, uint8 block_id, RelFileNode *rnode, ForkNumber *forknum,
+    BlockNumber *blknum, XLogPhyBlock *pblk = NULL);
 extern bool XLogRecGetBlockLastLsn(XLogReaderState* record, uint8 block_id, XLogRecPtr* lsn);
 extern char* XLogRecGetBlockImage(XLogReaderState* record, uint8 block_id, uint16* hole_offset, uint16* hole_length);
+extern void XLogRecGetPhysicalBlock(const XLogReaderState *record, uint8 blockId,
+                                    uint8 *segFileno, BlockNumber *segBlockno);
+extern void XLogRecGetVMPhysicalBlock(const XLogReaderState *record, uint8 blockId,
+                                    uint8 *vmFileno, BlockNumber *vmblock, bool *has_vm_loc);
 
 /* Invalidate read state */
 extern void XLogReaderInvalReadState(XLogReaderState* state);
 
-extern XLogRecPtr XLogFindNextRecord(XLogReaderState* state, XLogRecPtr RecPtr);
-extern XLogRecPtr FindMaxLSN(char* workingpath, char* returnmsg, int msg_len, pg_crc32* maxLsnCrc);
+extern XLogRecPtr XLogFindNextRecord(XLogReaderState* state, XLogRecPtr RecPtr, XLogRecPtr *endPtr = NULL, char* xlog_path = NULL);
+extern XLogRecPtr FindMaxLSN(char* workingpath, char* returnmsg, int msg_len, pg_crc32* maxLsnCrc, 
+    uint32 *maxLsnLen = NULL, TimeLineID *returnTli = NULL);
+extern XLogRecPtr FindMinLSN(char *workingPath, char *returnMsg, int msgLen, pg_crc32 *minLsnCrc);
 extern void CloseXlogFile(void);
 extern int SimpleXLogPageRead(XLogReaderState* xlogreader, XLogRecPtr targetPagePtr, int reqLen,
-    XLogRecPtr targetRecPtr, char* readBuf, TimeLineID* pageTLI);
+    XLogRecPtr targetRecPtr, char* readBuf, TimeLineID* pageTLI, char* xlog_path = NULL);
 extern void CloseXlogFile(void);
 
 /* Functions for decoding an XLogRecord */
-extern bool DecodeXLogRecord(XLogReaderState* state, XLogRecord* record, char** errmsg, bool readoldversion);
+extern bool DecodeXLogRecord(XLogReaderState* state, XLogRecord* record, char** errmsg);
 
 #define XLogRecGetTotalLen(decoder) ((decoder)->decoded_record->xl_tot_len)
 #define XLogRecGetPrev(decoder) ((decoder)->decoded_record->xl_prev)
 #define XLogRecGetInfo(decoder) ((decoder)->decoded_record->xl_info)
+#define XLogRecGetTdeInfo(decoder) ((decoder)->isTde)
 #define XLogRecGetRmid(decoder) ((decoder)->decoded_record->xl_rmid)
 #define XLogRecGetXid(decoder) ((decoder)->decoded_record->xl_xid)
-#define XLogRecGetTerm(decoder) ((decoder)->decoded_record->xl_term)
+#define XLogRecGetTerm(decoder) ((decoder)->decoded_record->xl_term & XLOG_MASK_TERM)
 #define XLogRecGetBucketId(decoder) ((decoder)->decoded_record->xl_bucket_id - 1)
 #define XLogRecGetCrc(decoder) ((decoder)->decoded_record->xl_crc)
 #define XLogRecGetOrigin(decoder) ((decoder)->record_origin)
@@ -85,7 +88,7 @@ extern char* XLogRecGetBlockData(XLogReaderState* record, uint8 block_id, Size* 
 extern bool allocate_recordbuf(XLogReaderState* state, uint32 reclength);
 extern bool XlogFileIsExisted(const char* workingPath, XLogRecPtr inputLsn, TimeLineID timeLine);
 extern void ResetDecoder(XLogReaderState* state);
-bool ValidXLogPageHeader(XLogReaderState* state, XLogRecPtr recptr, XLogPageHeader hdr, bool readoldversion);
+bool ValidXLogPageHeader(XLogReaderState* state, XLogRecPtr recptr, XLogPageHeader hdr);
 void report_invalid_record(XLogReaderState* state, const char* fmt, ...)
     /*
      * This extension allows gcc to check the format string for consistency with
@@ -96,5 +99,7 @@ void report_invalid_record(XLogReaderState* state, const char* fmt, ...)
 bool ValidXLogRecordHeader(
     XLogReaderState* state, XLogRecPtr RecPtr, XLogRecPtr PrevRecPtr, XLogRecord* record, bool randAccess);
 bool ValidXLogRecord(XLogReaderState* state, XLogRecord* record, XLogRecPtr recptr);
-
+Size SimpleValidatePage(XLogRecPtr targetPagePtr, char* page,  XLogPageReadCB pagereadfunc);
+extern int read_library(char *bufptr, int nlibrary);
+extern char *GetRepOriginPtr(char *xnodes, uint64 xinfo, int nsubxacts, int nmsgs, int nrels, int nlibrary);
 #endif /* XLOGREADER_H */

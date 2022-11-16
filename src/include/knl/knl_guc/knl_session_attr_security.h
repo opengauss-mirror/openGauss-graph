@@ -85,7 +85,9 @@ typedef struct knl_session_attr_security {
     double Password_lock_time;
     char* pg_krb_server_keyfile;
     char* pg_krb_srvnam;
+    char* tde_cmk_id;    
     bool Enable_Security_Policy;
+    int audit_xid_info;
 } knl_session_attr_security;
 
 #endif /* SRC_INCLUDE_KNL_KNL_SESSION_ATTR_SECURITY_H_ */

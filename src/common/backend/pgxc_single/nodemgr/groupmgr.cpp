@@ -59,6 +59,7 @@
 #include "storage/proc.h"
 #include "utils/elog.h"
 #include "utils/snapmgr.h"
+#include "utils/knl_relcache.h"
 
 #define CHAR_BUF_SIZE 512
 #define BUCKET_MAP_SIZE 32
@@ -77,6 +78,7 @@ typedef struct BucketMapCache {
 
     /* bucketmap content, palloc()-ed form top memory context */
     uint2* bucketmap;
+    int    bucketcnt;
 } NodeGroupBucketMap;
 
 static void BucketMapCacheAddEntry(Oid groupoid, Datum groupanme_datum, Datum bucketmap_datum, ItemPointer ctid);
@@ -201,6 +203,7 @@ static void contractBucketMap(Relation rel, HeapTuple old_group, oidvector* new_
     oidvector* old_nodes = NULL;
     text* old_bucket_str = NULL;
     uint2* old_bucket_ptr = NULL;
+    int bktlen = 0;
     nodeinfo* node_array = NULL;
     bool need_free = false;
 
@@ -214,7 +217,7 @@ static void contractBucketMap(Relation rel, HeapTuple old_group, oidvector* new_
     old_bucket_str = (text*)heap_getattr(old_group, Anum_pgxc_group_buckets, RelationGetDescr(rel), &isNull);
     if (isNull)
         ereport(ERROR, (errcode(ERRCODE_SYSTEM_ERROR), errmsg("can't get old group buckets.")));
-    text_to_bktmap(old_bucket_str, old_bucket_ptr, BUCKETDATALEN);
+    text_to_bktmap(old_bucket_str, old_bucket_ptr, &bktlen);
 
     node_array = (nodeinfo*)palloc0(old_nodes->dim1 * sizeof(nodeinfo));
 
@@ -934,7 +937,7 @@ static List* PgxcGetRelationRoleList()
 
         roles_list = list_append_unique_oid(roles_list, shdepend->refobjid);
 
-        tuple =  (HeapTuple) tableam_scan_getnexttuple(scan, ForwardScanDirection);
+        tuple = (HeapTuple) tableam_scan_getnexttuple(scan, ForwardScanDirection);
     }
 
     tableam_scan_end(scan);
@@ -943,7 +946,8 @@ static List* PgxcGetRelationRoleList()
     /* Include all roles related to resource pool (excluding default resource pool). */
     rel = heap_open(AuthIdRelationId, AccessShareLock);
     scan = tableam_scan_begin(rel, SnapshotNow, 0, NULL);
-    tuple =  (HeapTuple) tableam_scan_getnexttuple(scan, ForwardScanDirection);
+
+    tuple = (HeapTuple) tableam_scan_getnexttuple(scan, ForwardScanDirection);
 
     while (tuple) {
         rpoid = InvalidOid;
@@ -1114,7 +1118,7 @@ oidvector* PgxcGetRedisNodes(Relation rel, char redist_kind)
         if (need_free)
             pfree_ext(gmember);
 
-        tuple =  (HeapTuple) tableam_scan_getnexttuple(scan, ForwardScanDirection);
+        tuple = (HeapTuple) tableam_scan_getnexttuple(scan, ForwardScanDirection);
     }
     tableam_scan_end(scan);
 
@@ -1334,7 +1338,7 @@ bool IsNodeInLogicCluster(Oid* oid_array, int count, Oid excluded)
     relation = heap_open(PgxcGroupRelationId, AccessShareLock);
     scan = tableam_scan_begin(relation, SnapshotNow, 0, NULL);
 
-    tuple =  (HeapTuple) tableam_scan_getnexttuple(scan, ForwardScanDirection);
+    tuple = (HeapTuple) tableam_scan_getnexttuple(scan, ForwardScanDirection);
 
     while (tuple) {
         group_oid = HeapTupleGetOid(tuple);
@@ -1963,7 +1967,9 @@ static void PgxcGroupConvertVCGroup(const char* group_name, const char* lcname)
     }
 
     /* check whether other node group exist or not. */
-    tuple =  (HeapTuple) tableam_scan_getnexttuple(scan, ForwardScanDirection);
+
+    tuple = (HeapTuple) tableam_scan_getnexttuple(scan, ForwardScanDirection);
+
     if (tuple) {
         ereport(ERROR,
             (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
@@ -2068,7 +2074,9 @@ static void PgxcGroupSetVCGroup(const char* group_name, const char* install_name
     }
 
     /* check whether other node group exist or not. */
-    tuple =  (HeapTuple) tableam_scan_getnexttuple(scan, ForwardScanDirection);
+
+    tuple = (HeapTuple) tableam_scan_getnexttuple(scan, ForwardScanDirection);
+
     if (tuple) {
         ereport(ERROR,
             (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
@@ -2684,7 +2692,7 @@ static void PgxcGroupSetSeqNodes(const char* group_name, bool allnodes)
                 appendStringInfoString(&str, query);
             }
 
-            ReleaseCatCache(tp);
+            ReleaseSysCache(tp);
             relation_close(relseq, AccessShareLock);
 
             if (seqName != relName)
@@ -3574,7 +3582,7 @@ char* PgxcGroupGetStmtExecGroupInRedis()
 static void BucketMapCacheAddEntry(Oid groupoid, Datum groupanme_datum, Datum bucketmap_datum, ItemPointer ctid)
 {
     /* BucketmapCache and its underlying element is allocated in u_sess.MEMORY_CONTEXT_EXECUTOR */
-    MemoryContext oldcontext = MemoryContextSwitchTo(SESS_GET_MEM_CXT_GROUP(MEMORY_CONTEXT_EXECUTOR));
+    MemoryContext oldcontext = MemoryContextSwitchTo(LocalGBucketMapMemCxt());
 
     /* Create bucketmap element */
     BucketMapCache* bmc = (BucketMapCache*)palloc0(sizeof(BucketMapCache));
@@ -3586,12 +3594,12 @@ static void BucketMapCacheAddEntry(Oid groupoid, Datum groupanme_datum, Datum bu
     securec_check(rc, "\0", "\0");
     bmc->bucketmap = (uint2*)palloc0(BUCKETDATALEN * sizeof(uint2));
     ItemPointerCopy(ctid, &bmc->ctid);
-    text_to_bktmap((text*)bucketmap_datum, bmc->bucketmap, BUCKETDATALEN);
+    text_to_bktmap((text*)bucketmap_datum, bmc->bucketmap, &bmc->bucketcnt);
 
     elog(DEBUG2, "Add [%s][%u]'s bucketmap to BucketMapCache", bmc->groupname, groupoid);
 
     /* Insert element into bucketmap */
-    u_sess->relcache_cxt.g_bucketmap_cache = lappend(u_sess->relcache_cxt.g_bucketmap_cache, bmc);
+    AppendLocalRelCacheGBucketMapCache((ListCell *)bmc);
 
     /* Swith back to original memory context */
     MemoryContextSwitchTo(oldcontext);
@@ -3609,7 +3617,7 @@ static void BucketMapCacheAddEntry(Oid groupoid, Datum groupanme_datum, Datum bu
  */
 static void BucketMapCacheRemoveEntry(Oid groupoid)
 {
-    if (u_sess->relcache_cxt.g_bucketmap_cache == NIL) {
+    if (LocalRelCacheGBucketMapCache() == NIL) {
         /*
          * We may run into here, when a new node group is drop but no table access
          * of its table happened.
@@ -3624,7 +3632,7 @@ static void BucketMapCacheRemoveEntry(Oid groupoid)
     ListCell* next = NULL;
     bool found = false;
 
-    for (cell = list_head(u_sess->relcache_cxt.g_bucketmap_cache); cell; cell = next) {
+    for (cell = list_head(LocalRelCacheGBucketMapCache()); cell; cell = next) {
         BucketMapCache* bmc = (BucketMapCache*)lfirst(cell);
         next = lnext(cell);
         if (bmc->groupoid == groupoid) {
@@ -3635,8 +3643,7 @@ static void BucketMapCacheRemoveEntry(Oid groupoid)
             pfree_ext(bmc->groupname);
 
             /* Remove it from global bucketmap cache list */
-            u_sess->relcache_cxt.g_bucketmap_cache =
-                list_delete_cell(u_sess->relcache_cxt.g_bucketmap_cache, cell, prev);
+            DeteleLocalRelCacheGBucketMapCache(cell, prev);
             pfree_ext(bmc);
             break;
         } else {
@@ -3688,7 +3695,7 @@ static void BucketMapCacheUpdate(BucketMapCache* bmc)
     /* update bucketmap and groupname but don't repalloc memory */
     rc = strcpy_s(bmc->groupname, NAMEDATALEN, (const char*)DatumGetCString(groupname_datum));
     securec_check(rc, "\0", "\0");
-    text_to_bktmap((text*)bucketmap_datum, bmc->bucketmap, BUCKETDATALEN);
+    text_to_bktmap((text*)bucketmap_datum, bmc->bucketmap, &bmc->bucketcnt);
 
     ReleaseSysCache(htup);
     heap_close(rel, AccessShareLock);
@@ -3697,7 +3704,7 @@ static void BucketMapCacheUpdate(BucketMapCache* bmc)
 /*
  * Name: ClearInvalidBucketMapCache()
  *
- * Brief: clear invalid cell in t_thrd.pgxc_cxt.g_bucketmap_cache
+ * Brief: clear invalid cell in LocalRelCacheGBucketMapCache
  *
  * Parameters:
  *    none
@@ -3710,7 +3717,7 @@ static void ClearInvalidBucketMapCache(void)
     ListCell* cell = NULL;
     ListCell* next = NULL;
 
-    for (cell = list_head(u_sess->relcache_cxt.g_bucketmap_cache); cell; cell = next) {
+    for (cell = list_head(LocalRelCacheGBucketMapCache()); cell; cell = next) {
         next = lnext(cell);
         BucketMapCache* bmc = (BucketMapCache*)lfirst(cell);
         HeapTuple tuple = SearchSysCache1(PGXCGROUPOID, ObjectIdGetDatum(bmc->groupoid));
@@ -3721,8 +3728,8 @@ static void ClearInvalidBucketMapCache(void)
         }
         ReleaseSysCache(tuple);
     }
-    if ((unsigned int)list_length(u_sess->relcache_cxt.g_bucketmap_cache) >= u_sess->relcache_cxt.max_bucket_map_size) {
-        u_sess->relcache_cxt.max_bucket_map_size *= 2;
+    if ((unsigned int)list_length(LocalRelCacheGBucketMapCache()) >= LocalRelCacheMaxBucketMapSize()) {
+        EnlargeLocalRelCacheMaxBucketMapSize(2);
     }
 }
 
@@ -3758,27 +3765,27 @@ void BucketMapCacheDestroy(void)
  * Return:
  *    bucketmap that is found
  */
-uint2* BucketMapCacheGetBucketmap(Oid groupoid)
+uint2* BucketMapCacheGetBucketmap(Oid groupoid, int *bucketlen)
 {
     Assert(groupoid != InvalidOid);
 
-    if (u_sess->relcache_cxt.g_bucketmap_cache == NIL) {
+    if (LocalRelCacheGBucketMapCache() == NIL) {
         elog(DEBUG2, "Global bucketmap cache is not setup");
     }
-    if ((unsigned int)list_length(u_sess->relcache_cxt.g_bucketmap_cache) >= u_sess->relcache_cxt.max_bucket_map_size) {
+    if ((unsigned int)list_length(LocalRelCacheGBucketMapCache()) >= LocalRelCacheMaxBucketMapSize()) {
         ClearInvalidBucketMapCache();
     }
-    while (u_sess->relcache_cxt.max_bucket_map_size / 2 >
-               (unsigned int)list_length(u_sess->relcache_cxt.g_bucketmap_cache) &&
-           u_sess->relcache_cxt.max_bucket_map_size / 2 > BUCKET_MAP_SIZE) {
-        u_sess->relcache_cxt.max_bucket_map_size /= 2;
+    while (LocalRelCacheMaxBucketMapSize() / 2 >
+               (unsigned int)list_length(LocalRelCacheGBucketMapCache()) &&
+           LocalRelCacheMaxBucketMapSize() / 2 > BUCKET_MAP_SIZE) {
+        EnlargeLocalRelCacheMaxBucketMapSize(0.5);
     }
 
     ListCell* cell = NULL;
     uint2* bucketmap = NULL;
 
     /* Search bucketmap from cache */
-    foreach (cell, u_sess->relcache_cxt.g_bucketmap_cache) {
+    foreach (cell, LocalRelCacheGBucketMapCache()) {
         BucketMapCache* bmc = (BucketMapCache*)lfirst(cell);
 
         if (bmc->groupoid == groupoid) {
@@ -3802,6 +3809,7 @@ uint2* BucketMapCacheGetBucketmap(Oid groupoid)
                 BucketMapCacheUpdate(bmc);
             }
             bucketmap = bmc->bucketmap;
+            *bucketlen = bmc->bucketcnt;
 
             ReleaseSysCache(tup);
 
@@ -3839,7 +3847,7 @@ uint2* BucketMapCacheGetBucketmap(Oid groupoid)
         heap_close(rel, AccessShareLock);
 
         /* Re-search from bucketmap cache */
-        bucketmap = BucketMapCacheGetBucketmap(groupoid);
+        bucketmap = BucketMapCacheGetBucketmap(groupoid, bucketlen);
 
         Assert(bucketmap != NULL);
     }
@@ -3858,12 +3866,12 @@ uint2* BucketMapCacheGetBucketmap(Oid groupoid)
  * Return:
  *    bucketmap that is found
  */
-uint2* BucketMapCacheGetBucketmap(const char* groupname)
+uint2* BucketMapCacheGetBucketmap(const char* groupname, int *bucketlen)
 {
     Assert(groupname != NULL);
 
     Oid groupoid = get_pgxc_groupoid(groupname, false /* Missing not OK */);
-    return BucketMapCacheGetBucketmap(groupoid);
+    return BucketMapCacheGetBucketmap(groupoid, bucketlen);
 }
 
 /*
@@ -3973,6 +3981,7 @@ static void generateConsistentHashBucketmap(CreateGroupStmt* stmt, oidvector* no
     int2 *new_node_array = NULL;
     int skip_bucket, target_bucket, tmp_skip_bucket;
     uint2* old_bucket_map = NULL;
+    int old_bucket_cnt = 0;
     int j, new_member_count, old_member_count, b_node, b_nnode;
     int len = BUCKETDATALEN * sizeof(uint2);
     text* groupbucket = NULL;
@@ -4015,7 +4024,7 @@ static void generateConsistentHashBucketmap(CreateGroupStmt* stmt, oidvector* no
             groupbucket =
                 (text*)heap_getattr(tuple, Anum_pgxc_group_buckets, RelationGetDescr(pgxc_group_rel), &isNull);
             if (!isNull) {
-                text_to_bktmap(groupbucket, old_bucket_map, BUCKETDATALEN);
+                text_to_bktmap(groupbucket, old_bucket_map, &old_bucket_cnt);
             }
 
             new_node_array = (int2*)palloc(new_member_count * sizeof(int2));
@@ -4407,7 +4416,7 @@ List* GetNodeGroupOidCompute(Oid role_id)
     return objects;
 }
 
-uint2* GetBucketMapByGroupName(const char* groupname)
+uint2* GetBucketMapByGroupName(const char* groupname, int *bucketlen)
 {
     Relation rel;
     HeapTuple htup;
@@ -4423,7 +4432,7 @@ uint2* GetBucketMapByGroupName(const char* groupname)
 
     groupbucket = heap_getattr(htup, Anum_pgxc_group_buckets, RelationGetDescr(rel), &isNull);
     if (!isNull) {
-        text_to_bktmap((text*)groupbucket, bktmap, BUCKETDATALEN);
+        text_to_bktmap((text*)groupbucket, bktmap, bucketlen);
     }
 
     ReleaseSysCache(htup);
@@ -4683,7 +4692,7 @@ List* PgxcGroupGetLogicClusterList(Bitmapset* nodeids)
 
 /*
  * gs_get_nodegroup_tablecount
- *	get total table numbers of a nodegroup.
+ *	marked unsupported for centralized
  *
  * Parameters:
  *	@in node group name
@@ -4692,66 +4701,10 @@ List* PgxcGroupGetLogicClusterList(Bitmapset* nodeids)
  */
 Datum gs_get_nodegroup_tablecount(PG_FUNCTION_ARGS)
 {
-    Name str = PG_GETARG_NAME(0);
-    int32 count = 0;
-    char* group_name = NULL;
-    char* database_name = NULL;
-    Relation pg_database_rel = NULL;
-    TableScanDesc scan;
-    HeapTuple tup = NULL;
-    Datum datum;
-    bool isNull = false;
-    Oid group_oid;
-    errno_t rc;
-    char cmd[CHAR_BUF_SIZE];
-
-    if (str == NULL) {
-        ereport(ERROR,
-            (errcode(ERRCODE_INVALID_ATTRIBUTE),
-                errmsg("Invalid null pointer attribute for gs_get_nodegroup_tablecount()")));
-    }
-
-    group_name = NameStr(*str);
-
-    group_oid = get_pgxc_groupoid(group_name, true);
-    if (!OidIsValid(group_oid))
-        PG_RETURN_INT32(0);
-
-    rc = snprintf_s(cmd,
-        CHAR_BUF_SIZE,
-        CHAR_BUF_SIZE - 1,
-        "select count(*) from pgxc_class, pgxc_group "
-        "where pgroup=group_name and pgxc_group.oid=%u;",
-        group_oid);
-
-    securec_check_ss(rc, "\0", "\0");
-
-    pg_database_rel = heap_open(DatabaseRelationId, AccessShareLock);
-
-    if (!pg_database_rel) {
-        ereport(ERROR, (errcode(ERRCODE_SYSTEM_ERROR), errmsg("can not open pg_database")));
-    }
-
-    scan = tableam_scan_begin(pg_database_rel, SnapshotNow, 0, NULL);
-    while ((tup = (HeapTuple) tableam_scan_getnexttuple(scan, ForwardScanDirection)) != NULL) {
-        datum = heap_getattr(tup, Anum_pg_database_datname, RelationGetDescr(pg_database_rel), &isNull);
-        Assert(!isNull);
-
-        database_name = (char*)DatumGetCString(datum);
-        if (strcmp(database_name, "template0") == 0) {
-            continue;
-        }
-
-        int tmpCount = GetTableCountByDatabase(database_name, cmd);
-        if (INT_MAX - tmpCount < count) {
-            ereport(ERROR, (errcode(ERRCODE_SYSTEM_ERROR), 
-                errmsg("count is invalid, count:%d, tmpCount:%d", count, tmpCount)));
-        }
-        count += tmpCount;
-    }
-
-    tableam_scan_end(scan);
-    heap_close(pg_database_rel, AccessShareLock);
-
-    PG_RETURN_INT32(count);
+    ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+        (errmsg("Unsupport feature"),
+            errdetail("gs_get_nodegroup_tablecount is not supported for centralize deployment"),
+            errcause("The function is not implemented."),
+            erraction("Do not use this function with centralize deployment."))));
+    PG_RETURN_INT32(0);
 }

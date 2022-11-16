@@ -1,6 +1,8 @@
+create database pl_test_cursor_part8 DBCOMPATIBILITY 'pg';
+\c pl_test_cursor_part8;
 CREATE schema hw_cursor_part8;
 SET current_schema = hw_cursor_part8;
-
+set behavior_compat_options = 'skip_insert_gs_source';
 CREATE TABLE TEST_TB(ID INTEGER);
 INSERT INTO TEST_TB VALUES(123);
 INSERT INTO TEST_TB VALUES(124);
@@ -322,7 +324,7 @@ END;
 
 create table t1(a int);
 --test with query
-create or replace procedure test_cursor() as
+create or replace procedure test_cursor_8() as
 declare
 	cursor cursor1 is 
 	with recursive StepCTE(a)
@@ -351,7 +353,7 @@ select * from pro_cursor_c0019();
 create table test_cursor_table(c1 int,c2 varchar);
 insert into test_cursor_table values(1,'Jack'),(2,'Rose');
 
-create or replace procedure test_cursor() as
+create or replace procedure test_cursor_8() as
 declare
 		type ref_cur is ref cursor;
 		cur1 ref_cur;
@@ -369,9 +371,9 @@ begin
 		CLOSE cur1;
 end
 /
-call test_cursor();
+call test_cursor_8();
 
-create or replace procedure test_cursor() as
+create or replace procedure test_cursor_8() as
 declare
 type ref_cur is ref cursor;
 		cur1 ref_cur;
@@ -392,7 +394,7 @@ begin
 		CLOSE cur1;
 end
 /
-call test_cursor();
+call test_cursor_8();
 
 create type pro_type_04 as ( v_tablefield character varying, v_tablefield2 character varying, v_tablename character varying, v_cur refcursor);
 
@@ -430,7 +432,6 @@ AS $$ DECLARE
 	return;
 end$$;
 select pro_base12_01() from test_cursor_table;
-
-
 drop schema hw_cursor_part8 CASCADE;
-
+\c regression;
+drop database IF EXISTS pl_test_cursor_part8;

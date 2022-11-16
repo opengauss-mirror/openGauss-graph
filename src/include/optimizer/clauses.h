@@ -4,6 +4,7 @@
  *	  prototypes for clauses.c.
  *
  *
+ * Portions Copyright (c) 2021, openGauss Contributors
  * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
@@ -20,6 +21,12 @@
 
 #define is_opclause(clause) ((clause) != NULL && IsA(clause, OpExpr))
 #define is_funcclause(clause) ((clause) != NULL && IsA(clause, FuncExpr))
+
+#ifdef ENABLE_MULTIPLE_NODES
+#define AFORMAT_NULL_TEST_MODE false
+#else
+#define AFORMAT_NULL_TEST_MODE (u_sess->attr.attr_sql.sql_compatibility == A_FORMAT && AFORMAT_NULL_TEST)
+#endif
 
 typedef struct {
     int numWindowFuncs; /* total number of WindowFuncs found */
@@ -63,7 +70,7 @@ extern double tlist_returns_set_rows(List* tlist);
 extern bool contain_subplans(Node* clause);
 
 extern bool contain_mutable_functions(Node* clause);
-extern bool contain_volatile_functions(Node* clause);
+extern bool contain_volatile_functions(Node* clause, bool deep = false);
 extern bool contain_specified_function(Node* clause, Oid funcid);
 extern bool contain_nonstrict_functions(Node* clause, bool check_agg = false);
 extern bool contain_leaky_functions(Node* clause);
@@ -91,7 +98,6 @@ extern Node* eval_const_expressions_params(PlannerInfo* root, Node* node, ParamL
 extern Node* estimate_expression_value(PlannerInfo* root, Node* node, EState* estate = NULL);
 
 extern Query* inline_set_returning_function(PlannerInfo* root, RangeTblEntry* rte);
-extern Query* search_cte_by_parse_tree(Query* parse, RangeTblEntry* rte, bool under_recursive_tree);
 extern bool filter_cstore_clause(PlannerInfo* root, Expr* clause);
 /* evaluate_expr used to be a  static function */
 extern Expr* evaluate_expr(Expr* expr, Oid result_type, int32 result_typmod, Oid result_collation);
@@ -107,18 +113,15 @@ extern bool treat_as_join_clause(Node* clause, RestrictInfo* rinfo, int varRelid
 extern List* extract_function_outarguments(Oid funcid, List* parameters, List* funcname);
 extern bool need_adjust_agg_inner_func_type(Aggref* aggref);
 
-#ifndef ENABLE_MULTIPLE_NODES
+
 extern bool contain_rownum_walker(Node *node, void *context); 
 
-static inline bool contain_rownum_expr(Node *node) 
-{
-    return contain_rownum_walker(node, NULL);
-}
+extern bool ContainRownumExpr(Node *node);
 
 /* Check if it includes Rownum */
 static inline void ExcludeRownumExpr(ParseState* pstate, Node* expr)
 {
-    if (contain_rownum_expr(expr))                                                          
+    if (ContainRownumExpr(expr))                                                          
             ereport(ERROR,                                                                      
                 (errcode(ERRCODE_SYNTAX_ERROR),                                                 
                 errmsg("specified ROWNUM is not allowed here."),                                
@@ -126,5 +129,7 @@ static inline void ExcludeRownumExpr(ParseState* pstate, Node* expr)
 }
 
 extern List* get_quals_lists(Node *jtnode);
-#endif
+
+extern bool isTableofType(Oid typeOid, Oid* base_oid, Oid* indexbyType);
+
 #endif /* CLAUSES_H */

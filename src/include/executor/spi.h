@@ -6,6 +6,7 @@
  * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
+ * Portions Copyright (c) 2021, openGauss Contributors
  * src/include/executor/spi.h
  *
  * -------------------------------------------------------------------------
@@ -28,6 +29,13 @@ typedef struct SPITupleTable {
 
 /* Plans are opaque structs for standard users of SPI */
 typedef struct _SPI_plan* SPIPlanPtr;
+
+typedef struct SPICachedPlanStack {
+    CachedPlan* cplan;
+    SPICachedPlanStack* previous;
+    SubTransactionId subtranid;
+    ResourceOwner owner;
+} SPIPlanStack;
 
 #define SPI_ERROR_CONNECT (-1)
 #define SPI_ERROR_COPY (-2)
@@ -71,7 +79,7 @@ extern void SPI_pop(void);
 extern bool SPI_push_conditional(void);
 extern void SPI_pop_conditional(bool pushed);
 extern void SPI_restore_connection(void);
-extern int SPI_execute(const char* src, bool read_only, long tcount);
+extern int SPI_execute(const char* src, bool read_only, long tcount, bool isCollectParam = false);
 extern int SPI_execute_plan(SPIPlanPtr plan, Datum* Values, const char* Nulls, bool read_only, long tcount);
 extern int SPI_execute_plan_with_paramlist(SPIPlanPtr plan, ParamListInfo params, bool read_only, long tcount);
 extern int SPI_exec(const char* src, long tcount);
@@ -118,15 +126,16 @@ extern void SPI_freetuptable(SPITupleTable* tuptable);
 extern Portal SPI_cursor_open(const char* name, SPIPlanPtr plan, Datum* Values, const char* Nulls, bool read_only);
 extern Portal SPI_cursor_open_with_args(const char* name, const char* src, int nargs, Oid* argtypes, Datum* Values,
     const char* Nulls, bool read_only, int cursorOptions);
-extern Portal SPI_cursor_open_with_paramlist(const char* name, SPIPlanPtr plan, ParamListInfo params, bool read_only);
+extern Portal SPI_cursor_open_with_paramlist(const char* name, SPIPlanPtr plan, ParamListInfo params,
+                                             bool read_only, bool isCollectParam = false);
 extern Portal SPI_cursor_find(const char* name);
 extern void SPI_cursor_fetch(Portal portal, bool forward, long count);
 extern void SPI_cursor_move(Portal portal, bool forward, long count);
 extern void SPI_scroll_cursor_fetch(Portal, FetchDirection direction, long count);
 extern void SPI_scroll_cursor_move(Portal, FetchDirection direction, long count);
 extern void SPI_cursor_close(Portal portal);
-extern void SPI_start_transaction(void);
-extern void SPI_stp_transaction_check(bool read_only);
+extern void SPI_start_transaction(List* transactionHead);
+extern void SPI_stp_transaction_check(bool read_only, bool savepoint = false);
 extern void SPI_commit();
 extern void SPI_rollback();
 extern void SPI_save_current_stp_transaction_state();
@@ -139,15 +148,38 @@ extern void AtEOXact_SPI(bool isCommit, bool STP_rollback, bool STP_commit);
 extern void AtEOSubXact_SPI(bool isCommit, SubTransactionId mySubid, bool STP_rollback, bool STP_commit);
 extern void AtEOSubXact_SPI(bool isCommit, SubTransactionId mySubid);
 extern DestReceiver* createAnalyzeSPIDestReceiver(CommandDest dest);
+
+extern void ReleaseSpiPlanRef();
 /* SPI execution helpers */
 extern void spi_exec_with_callback(CommandDest dest, const char* src, bool read_only, long tcount, bool direct_call,
     void (*callbackFn)(void*), void* clientData);
 
 extern void _SPI_error_callback(void *arg);
 
+extern List* _SPI_get_querylist(SPIPlanPtr plan);
 #ifdef PGXC
 extern int SPI_execute_direct(const char* src, char* nodename);
 #endif
+extern int _SPI_begin_call(bool execmem);
 extern int _SPI_end_call(bool procmem);
 extern void _SPI_hold_cursor();
+extern void _SPI_prepare_oneshot_plan_for_validator(const char* src, SPIPlanPtr plan);
+extern void InitSPIPlanCxt();
+extern void _SPI_prepare_plan(const char *src, SPIPlanPtr plan);
+extern ParamListInfo _SPI_convert_params(int nargs, Oid *argtypes, Datum *Values, const char *Nulls,
+    Cursor_Data *cursor_data = NULL);
+extern void _SPI_prepare_oneshot_plan(const char *src, SPIPlanPtr plan);
+extern int _SPI_execute_plan(SPIPlanPtr plan, ParamListInfo paramLI, Snapshot snapshot, Snapshot crosscheck_snapshot,
+    bool read_only, bool fire_triggers, long tcount, bool from_lock = false);
+
+extern int SPI_connectid();
+extern void SPI_disconnect(int connect);
+extern void SPI_savepoint_create(const char* spName);
+extern void SPI_savepoint_rollback(const char* spName);
+extern void SPI_savepoint_release(const char* spName);
+extern void SPI_savepoint_rollbackAndRelease(const char *spName, SubTransactionId subXid);
+extern Datum SPI_datumTransfer(Datum value, bool typByVal, int typLen);
+
+extern ResourceOwner AddCplanRefAgainIfNecessary(SPIPlanPtr plan,
+    CachedPlanSource* plansource, CachedPlan* cplan, TransactionId oldTransactionId, ResourceOwner oldOwner);
 #endif /* SPI_H */

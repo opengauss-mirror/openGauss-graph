@@ -6,6 +6,7 @@
  *
  * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
+ * Portions Copyright (c) 2021, openGauss Contributors
  *
  * src/include/commands/tablecmds.h
  *
@@ -30,15 +31,15 @@
 
 #define FOREIGNTABLE_SUPPORT_AT_CMD(cmd)                                                                           \
     ((cmd) == AT_ChangeOwner || (cmd) == AT_AddNodeList || (cmd) == AT_SubCluster || (cmd) == AT_DeleteNodeList || \
-        (cmd) == AT_GenericOptions)
+        (cmd) == AT_UpdateSliceLike || (cmd) == AT_GenericOptions)
 
 #define DIST_OBS_SUPPORT_AT_CMD(cmd)                                                                               \
     ((cmd) == AT_ChangeOwner || (cmd) == AT_AddNodeList || (cmd) == AT_DeleteNodeList || (cmd) == AT_SubCluster || \
         (cmd) == AT_GenericOptions || (cmd) == AT_DropNotNull || (cmd) == AT_SetNotNull ||                         \
         (cmd) == AT_SetStatistics || (cmd) == AT_AlterColumnType || (cmd) == AT_AlterColumnGenericOptions ||       \
-        (cmd) == AT_AddIndex || (cmd) == AT_DropConstraint)
+        (cmd) == AT_AddIndex || (cmd) == AT_DropConstraint || (cmd) == AT_UpdateSliceLike)
 
-extern Oid DefineRelation(CreateStmt* stmt, char relkind, Oid ownerId);
+extern Oid DefineRelation(CreateStmt* stmt, char relkind, Oid ownerId, bool isCTAS = false);
 
 extern void RemoveRelationsonMainExecCN(DropStmt* drop, ObjectAddresses* objects);
 
@@ -113,6 +114,7 @@ extern void checkPartNotInUse(Partition part, const char* stmt);
 extern List* transformConstIntoTargetType(Form_pg_attribute* attrs, int2vector* partitionKey, List* boundary);
 extern List* transformIntoTargetType(Form_pg_attribute* attrs, int2 pos, List* boundary);
 
+extern void RenameDistributedTable(Oid distributedTableOid, const char* distributedTableNewName);
 extern void renamePartitionedTable(Oid partitionedTableOid, const char* partitionedTableNewName);
 extern void renamePartition(RenameStmt* stmt);
 extern void renamePartitionIndex(RenameStmt* stmt);
@@ -126,10 +128,13 @@ extern bool checkRelationLocalIndexesUsable(Relation relation);
 extern List* GetPartitionkeyPos(List* partitionkeys, List* schema);
 
 extern void ComparePartitionValue(List* pos, Form_pg_attribute* attrs, List *partitionList, bool isPartition = true);
+extern void CompareListValue(const List* pos, Form_pg_attribute* attrs, List *partitionList);
 extern void clearAttrInitDefVal(Oid relid);
 
 extern void AlterDfsCreateTables(Oid relOid, Datum toast_options, CreateStmt* mainTblStmt);
 extern void ATMatviewGroup(List* stmts, Oid mvid, LOCKMODE lockmode);
+extern void AlterCreateChainTables(Oid relOid, Datum reloptions, CreateStmt *mainTblStmt);
+
 /**
  * @Description: Whether judge the column is partition column.
  * @in rel, A relation.
@@ -141,6 +146,12 @@ extern Const* GetPartitionValue(List* pos, Form_pg_attribute* attrs, List* value
 extern Node* GetTargetValue(Form_pg_attribute attrs, Const* src, bool isinterval);
 extern void ATExecEnableDisableRls(Relation rel, RelationRlsStatus changeType, LOCKMODE lockmode);
 extern bool isQueryUsingTempRelation(Query *query);
-extern void addToastTableForNewPartition(Relation relation, Oid newPartId);
-extern void fastDropPartition(Relation rel, Oid partOid, const char* stmt, Oid intervalPartOid = InvalidOid);
+extern void addToastTableForNewPartition(Relation relation, Oid newPartId, bool isForSubpartition = false);
+extern void fastDropPartition(Relation rel, Oid partOid, const char *stmt, Oid intervalPartOid = InvalidOid,
+    bool sendInvalid = true);
+extern void ExecutePurge(PurgeStmt* stmt);
+extern void ExecuteTimeCapsule(TimeCapsuleStmt* stmt);
+extern void truncate_check_rel(Relation rel);
+extern void CheckDropViewValidity(ObjectType stmtType, char relKind, const char* relname);
+extern int getPartitionElementsIndexByOid(Relation partTableRel, Oid partOid);
 #endif /* TABLECMDS_H */

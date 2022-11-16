@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2020 Huawei Technologies Co.,Ltd.
+ * Portions Copyright (c) 2021, openGauss Contributors
  *
  * openGauss is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
@@ -75,6 +76,14 @@ void CreateSynonym(CreateSynonymStmt* stmt)
 
     if (aclResult != ACLCHECK_OK) {
         aclcheck_error(aclResult, ACL_KIND_NAMESPACE, get_namespace_name(synNamespace));
+    }
+
+    if (synNamespace == PG_PUBLIC_NAMESPACE && !isRelSuperuser()) {
+        ereport(ERROR,
+            (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+                errmsg("permission denied to create synonym \"%s\"", synName),
+                errhint("must be %s to create a synonym in public schema.",
+                    g_instance.attr.attr_security.enablePrivilegesSeparate  ? "initial user" : "sysadmin")));
     }
 
     /* Deconstruct the referenced qualified-name. */
@@ -318,6 +327,44 @@ void AlterSynonymOwner(List* name, Oid newOwnerId)
 }
 
 /*
+ * AlterSynonymOwnerByOid - ALTER Synonym OWNER TO newowner by Oid
+ * This is currently only used to propagate ALTER PACKAGE OWNER to a
+ * package. Package will build Synonym for ref cursor type.
+ * It assumes the caller has done all needed checks.
+ */
+void AlterSynonymOwnerByOid(Oid synonymOid, Oid newOwnerId)
+{
+    HeapTuple tuple = NULL;
+    Relation rel = NULL;
+
+    rel = heap_open(PgSynonymRelationId, RowExclusiveLock);
+    tuple = SearchSysCache1(SYNOID, ObjectIdGetDatum(synonymOid));
+    if (!HeapTupleIsValid(tuple)) {
+        ereport(
+            ERROR, (errcode(ERRCODE_CACHE_LOOKUP_FAILED), errmsg("cache lookup failed for synonym %u", synonymOid)));
+    }
+    Form_pg_synonym synForm = (Form_pg_synonym)GETSTRUCT(tuple);
+
+    /*
+     * If the new owner is the same as the existing owner, consider the command to have succeeded.
+     * ps. This is for dump restoration purposes.
+     */
+    if (synForm->synowner != newOwnerId) {
+        /* Change its owner */
+        synForm->synowner = newOwnerId;
+
+        simple_heap_update(rel, &tuple->t_self, tuple);
+        CatalogUpdateIndexes(rel, tuple);
+
+        /* Update owner dependency reference. */
+        changeDependencyOnOwner(PgSynonymRelationId, HeapTupleGetOid(tuple), newOwnerId);
+    }
+
+    ReleaseSysCache(tuple);
+    heap_close(rel, NoLock);
+}
+
+/*
  * RemoveSynonymById
  * Given synonym oid, remove the synonym tuple.
  *
@@ -433,8 +480,10 @@ char* CheckReferencedObject(Oid relOid, RangeVar* objVar, const char* synName)
                 &detail, _("Maybe you want to use synonym to reference a type object, but it is not yet supported."));
             break;
         case RELKIND_SEQUENCE:
+        case RELKIND_LARGE_SEQUENCE:
             appendStringInfo(&detail,
-                _("Maybe you want to use synonym to reference a sequence object, but it is not yet supported."));
+                _("Maybe you want to use synonym to reference a (large) sequence object, "
+                  "but it is not yet supported."));
             break;
         default:
             appendStringInfo(&detail,

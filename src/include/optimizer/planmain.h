@@ -36,12 +36,24 @@ typedef enum AggOrientation {
 /* row threshold to apply having filter */
 #define HAVING_THRESHOLD 1e6
 
+/* query_planner callback to compute query_pathkeys */
+typedef void (*query_pathkeys_callback) (PlannerInfo *root, void *extra);
+
 /*
  * prototypes for plan/planmain.c
  */
-extern void query_planner(PlannerInfo* root, List* tlist, double tuple_fraction, double limit_tuples,
-    Path** cheapest_path, Path** sorted_path, double* num_groups, List* rollup_groupclauses = NULL,
-    List* rollup_lists = NULL);
+extern RelOptInfo* query_planner(PlannerInfo* root, List* tlist,
+                    query_pathkeys_callback qp_callback, void *qp_extra);
+
+extern bool get_number_of_groups(PlannerInfo* root, RelOptInfo* final_rel, double* num_groups, 
+    List* rollup_groupclauses = NULL, List* rollup_lists = NULL);
+
+extern void update_tuple_fraction(PlannerInfo* root, RelOptInfo* final_rel, double* numdistinct);
+
+extern void generate_cheapest_and_sorted_path(PlannerInfo* root, RelOptInfo* final_rel, Path** cheapest_path, 
+    Path** sorted_path, double* num_groups, bool has_groupby);
+
+
 
 /*
  * prototypes for plan/planagg.c
@@ -154,7 +166,11 @@ extern bool useInformationalConstraint(PlannerInfo* root, List* qualClause, Reli
 extern List* remove_useless_joins(PlannerInfo* root, List* joinlist);
 extern bool query_supports_distinctness(Query* query);
 extern bool query_is_distinct_for(Query* query, List* colnos, List* opids);
-
+#ifdef GS_GRAPH
+extern bool innerrel_is_unique(PlannerInfo *root,
+							   Relids joinrelids, Relids outerrelids, RelOptInfo *innerrel,
+							   JoinType jointype, List *restrictlist, bool force_cache);
+#endif
 /*
  * prototypes for plan/setrefs.c
  */
@@ -187,5 +203,12 @@ extern void expand_internal_rtentry(PlannerInfo* root, RangeTblEntry* rte, Index
 extern List* find_all_internal_tableOids(Oid parentOid);
 extern bool check_agg_optimizable(Aggref* aggref, int16* strategy);
 extern void check_hashjoinable(RestrictInfo* restrictinfo);
-
+#ifdef GS_GRAPH
+extern ModifyGraph *make_modifygraph(PlannerInfo *root, GraphWriteOp operation,
+									 bool last, List *targets,
+									 Plan *subplan, uint32 nr_modify,
+									 bool detach, bool eagerness,
+									 List *pattern, List *exprs, List *sets);
+extern SparqlLoadPlan* make_sparqlLoadPlan(PlannerInfo *root, Plan* subplan);
+#endif
 #endif /* PLANMAIN_H */

@@ -38,7 +38,7 @@
 #include <unordered_map>
 
 #ifdef ENABLE_THREAD_SAFETY
-#ifdef WIN32
+#if defined(WIN32) && !defined(_MINGW32) 
 #include "pthread-win32.h"
 #else
 #include <pthread.h>
@@ -55,8 +55,11 @@
 #include "cipher.h"
 #include "../../include/securec.h"
 #include "../../include/securec_check.h"
+#ifndef WIN32
+#define NO_COMPILE_CLASS_FDCOLLECTION
 #include "libcomm/libcomm.h"
-
+#undef NO_COMPILE_CLASS_FDCOLLECTION
+#endif
 #ifdef ENABLE_GSS
 #if defined(HAVE_GSSAPI_H)
 #include <gssapi.h>
@@ -93,7 +96,7 @@ typedef struct {
 #endif
 
 /*
- * POSTGRES backend dependent Constants.
+ * openGauss backend dependent Constants.
  */
 #define CMDSTATUS_LEN 64 /* should match COMPLETION_TAG_BUFSIZE */
 #define MAX_ERRMSG_LENGTH 1024
@@ -284,6 +287,51 @@ typedef struct pgDataValue {
     const char* value; /* data value, without zero-termination */
 } PGdataValue;
 
+typedef enum pg_conn_host_type
+{
+   CHT_HOST_NAME,
+   CHT_HOST_ADDRESS,
+   CHT_UNIX_SOCKET
+} pg_conn_host_type;
+
+/*
+ * pg_conn_host stores all information about one of possibly several hosts
+ * mentioned in the connection string.  Derived by splitting the pghost
+ * on the comma character and then parsing each segment.
+ */
+typedef struct pg_conn_host
+{
+   pg_conn_host_type type;      /* type of host */
+   char              *hostaddr; /* host numeric IP address */
+   char*       host;           /* host name or address, or socket path */
+   char*       port;           /* port number for this host; if not NULL,
+                                * overrrides the PGConn's pgport */
+   char*       password;       /* password for this host, read from the
+                                * password file.  only set if the PGconn's
+                                * pgpass field is NULL. */
+} pg_conn_host;
+
+/* Target server type (decoded value of target_session_attrs) */
+typedef enum
+{
+    SERVER_TYPE_ANY = 0,        /* Any server (default) */
+    SERVER_TYPE_READ_WRITE,     /* Read-write server */
+    SERVER_TYPE_READ_ONLY,      /* Read-only server */
+    SERVER_TYPE_PRIMARY,        /* Primary server */
+    SERVER_TYPE_STANDBY,        /* Standby server */
+    SERVER_TYPE_PREFER_STANDBY, /* Prefer standby server */
+    SERVER_TYPE_PREFER_STANDBY_PASS2    /* second pass - behaves same as ANY */
+} PGTargetServerType;
+
+/* Boolean value plus a not-known state, for GUCs we might have to fetch */
+typedef enum
+{
+    PG_BOOL_UNKNOWN = 0,        /* Currently unknown */
+    PG_BOOL_YES,                /* Yes (true) */
+    PG_BOOL_NO                  /* No (false) */
+} PGTernaryBool;
+
+
 /*
  * PGconn stores all the state data associated with a single connection
  * to a backend.
@@ -332,6 +380,12 @@ struct pg_conn {
     char* krbsrvname; /* Kerberos service name */
 #endif
 
+    char* target_session_attrs; /* Type of connection to make
+                                 * Possible values any, read-write. */
+    PGTargetServerType target_server_type;       /* desired session properties */
+    PGTernaryBool default_transaction_read_only; /* default_transaction_read_only */
+    PGTernaryBool in_hot_standby;    /* in_hot_standby */
+
     /* Optional file to write trace info to */
     FILE* Pfdebug;
 
@@ -359,6 +413,11 @@ struct pg_conn {
                             * OUT */
     PGnotify* notifyHead;  /* oldest unreported Notify msg */
     PGnotify* notifyTail;  /* newest unreported Notify msg */
+
+    /* Support for multiple hosts in connection string */
+    int nconnhost;         /* # of possible hosts */
+    int whichhost;         /* host we're currently considering */
+    pg_conn_host *connhost; /* details about each possible host */
 
     /* Connection data */
     int sock;                 /* Unix FD for socket, -1 if not connected */
@@ -472,7 +531,9 @@ struct pg_conn {
     /* flag to identify the logic connection between cn and dn */
     bool is_logic_conn;
     /* logic connection address between cn and dn */
+#ifndef WIN32
     libcommaddrinfo libcomm_addrinfo;
+#endif
     /* Connection_info is a json string containing driver_name, driver_version, driver_path and os_user.
      * If connection_info is not NULL, use connection_info and ignore the value of connection_extra_info.
      * If connection_info is NULL:
@@ -606,7 +667,7 @@ extern int pqWriteReady(PGconn* conn);
 /* === in fe-secure.c === */
 
 extern int pqsecure_initialize(PGconn*);
-extern void pqsecure_destroy(void);
+extern void pqsecure_destroy(PGconn*);
 extern PostgresPollingStatusType pqsecure_open_client(PGconn*);
 extern void pqsecure_close(PGconn*);
 extern ssize_t pqsecure_read(PGconn*, void* ptr, size_t len);

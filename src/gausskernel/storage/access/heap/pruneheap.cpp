@@ -29,6 +29,7 @@
 #include "utils/snapmgr.h"
 #include "gstrace/gstrace_infra.h"
 #include "gstrace/access_gstrace.h"
+#include "storage/procarray.h"
 
 /* Working data for heap_page_prune and subroutines */
 typedef struct {
@@ -73,6 +74,7 @@ void heap_page_prune_opt(Relation relation, Buffer buffer)
     Page page = BufferGetPage(buffer);
     Size minfree;
     TransactionId oldest_xmin;
+    TransactionId CatalogXmin;
     /*
      * We can't write WAL in recovery mode, so there's no point trying to
      * clean the page. The master will likely issue a cleaning WAL record soon
@@ -81,12 +83,15 @@ void heap_page_prune_opt(Relation relation, Buffer buffer)
     if (RecoveryInProgress())
         return;
 
+    oldest_xmin = u_sess->utils_cxt.RecentGlobalXmin;
     if (IsCatalogRelation(relation) ||
         RelationIsAccessibleInLogicalDecoding(relation)) {
-        oldest_xmin = u_sess->utils_cxt.RecentGlobalXmin;
-    } else {
-        oldest_xmin = u_sess->utils_cxt.RecentGlobalDataXmin;
+        CatalogXmin = GetReplicationSlotCatalogXmin();
+        if (CatalogXmin != 0 && CatalogXmin < oldest_xmin) {
+            oldest_xmin = CatalogXmin;
+        }
     }
+
 
     Assert(TransactionIdIsValid(oldest_xmin));
 
@@ -99,8 +104,7 @@ void heap_page_prune_opt(Relation relation, Buffer buffer)
      * Keep prune page can be done in single mode (standlone --single), so just in PostmasterEnvironment.
      */
     if ((t_thrd.xact_cxt.useLocalSnapshot && IsPostmasterEnvironment) ||
-        g_instance.attr.attr_storage.IsRoachStandbyCluster || u_sess->attr.attr_common.upgrade_mode == 1 ||
-        InplaceUpgradePrecommit)
+        g_instance.attr.attr_storage.IsRoachStandbyCluster || u_sess->attr.attr_common.upgrade_mode == 1)
         return;
 
     /*
@@ -200,7 +204,7 @@ int heap_page_prune(Relation relation, Buffer buffer, TransactionId oldest_xmin,
             continue;
 
         /* Nothing to do if slot is empty or already dead */
-        itemid = PageGetItemId(page, offnum);
+        itemid = HeapPageGetItemId(page, offnum);
         if (!ItemIdIsUsed(itemid) || ItemIdIsDead(itemid))
             continue;
 
@@ -340,6 +344,7 @@ static int heap_prune_chain(Relation relation, Buffer buffer, OffsetNumber rooto
     HeapTupleData tup;
     tup.t_tableOid = RelationGetRelid(relation);
     tup.t_bucketId = RelationGetBktid(relation);
+    bool keepInvisible = false;
 
     gstrace_entry(GS_TRC_ID_heap_prune_chain);
 
@@ -385,7 +390,7 @@ static int heap_prune_chain(Relation relation, Buffer buffer, OffsetNumber rooto
             if (HeapTupleSatisfiesVacuum(&tup, oldest_xmin, buffer) == HEAPTUPLE_DEAD &&
                 !HeapTupleHeaderIsHotUpdated(htup)) {
 
-                if (HeapKeepInvisbleTuple(&tup, RelationGetDescr(relation))) {
+                if (HeapKeepInvisibleTuple(&tup, RelationGetDescr(relation))) {
                     return ndeleted;
                 }
 
@@ -481,9 +486,8 @@ static int heap_prune_chain(Relation relation, Buffer buffer, OffsetNumber rooto
         }
         switch (HeapTupleSatisfiesVacuum(&tup, oldest_xmin, buffer)) {
             case HEAPTUPLE_DEAD:
-                if (!HeapKeepInvisbleTuple(&tup, RelationGetDescr(relation))) {
-                    tupdead = true;
-                }
+                keepInvisible = HeapKeepInvisibleTuple(&tup, RelationGetDescr(relation));
+                tupdead = true;
                 break;
 
             case HEAPTUPLE_RECENTLY_DEAD:
@@ -493,7 +497,7 @@ static int heap_prune_chain(Relation relation, Buffer buffer, OffsetNumber rooto
                  * This tuple may soon become DEAD.  Update the hint field so
                  * that the page is reconsidered for pruning in future.
                  */
-                heap_prune_record_prunable(prstate, HeapTupleGetRawXmax(&tup));
+                heap_prune_record_prunable(prstate, HeapTupleGetUpdateXid(&tup));
                 break;
 
             case HEAPTUPLE_DELETE_IN_PROGRESS:
@@ -502,7 +506,7 @@ static int heap_prune_chain(Relation relation, Buffer buffer, OffsetNumber rooto
                  * This tuple may soon become DEAD.  Update the hint field so
                  * that the page is reconsidered for pruning in future.
                  */
-                heap_prune_record_prunable(prstate, HeapTupleGetRawXmax(&tup));
+                heap_prune_record_prunable(prstate, HeapTupleGetUpdateXid(&tup));
                 break;
 
             case HEAPTUPLE_LIVE:
@@ -550,7 +554,12 @@ static int heap_prune_chain(Relation relation, Buffer buffer, OffsetNumber rooto
          */
         Assert(ItemPointerGetBlockNumber(&htup->t_ctid) == BufferGetBlockNumber(buffer));
         offnum = ItemPointerGetOffsetNumber(&htup->t_ctid);
-        prior_xmax = HeapTupleGetRawXmax(&tup);
+        prior_xmax = HeapTupleGetUpdateXid(&tup);
+    }
+
+    /* There is only one dead tuple that needs to be retained and no processing is performed */
+    if (keepInvisible && (nchain == 1)) {
+        latestdead = InvalidOffsetNumber;
     }
 
     /*
@@ -567,6 +576,10 @@ static int heap_prune_chain(Relation relation, Buffer buffer, OffsetNumber rooto
          * right candidate for redirection.
          */
         for (i = 1; (i < nchain) && (chainitems[i - 1] != latestdead); i++) {
+            // The entire chain is dead, but need to keep invisble tuple
+            if (keepInvisible && (i == nchain - 1)) {
+                break;
+            }
             heap_prune_record_unused(prstate, chainitems[i]);
             ndeleted++;
         }
@@ -710,7 +723,7 @@ void heap_get_root_tuples(Page page, OffsetNumber *root_offsets)
 
             /* Set up to scan the HOT-chain */
             nextoffnum = ItemPointerGetOffsetNumber(&htup->t_ctid);
-            prior_xmax = HeapTupleGetRawXmax(&tup);
+            prior_xmax = HeapTupleGetUpdateXid(&tup);
         } else {
             /* Must be a redirect item. We do not set its root_offsets entry */
             Assert(ItemIdIsRedirected(lp));
@@ -747,7 +760,7 @@ void heap_get_root_tuples(Page page, OffsetNumber *root_offsets)
                 break;
 
             nextoffnum = ItemPointerGetOffsetNumber(&htup->t_ctid);
-            prior_xmax = HeapTupleGetRawXmax(&tup);
+            prior_xmax = HeapTupleGetUpdateXid(&tup);
         }
     }
 }

@@ -1,4 +1,4 @@
-#!/bin/bash
+ #!/bin/bash
 #Copyright (c) 2020 Huawei Technologies Co.,Ltd.
 #
 #openGauss is licensed under Mulan PSL v2.

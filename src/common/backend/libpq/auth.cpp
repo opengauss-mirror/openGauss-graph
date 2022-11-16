@@ -51,6 +51,11 @@
 #include "cipher.h"
 #include "openssl/rand.h"
 #include "pgstat.h"
+#include "communication/commproxy_interface.h"
+
+#ifdef ENABLE_UT
+#define static
+#endif
 
 extern bool dummyStandbyMode;
 extern GlobalNodeDefinition* global_node_definition;
@@ -59,11 +64,17 @@ extern GlobalNodeDefinition* global_node_definition;
  * Global authentication functions
  * ----------------------------------------------------------------
  */
+#ifndef ENABLE_UT
 static void sendAuthRequest(Port* port, AuthRequest areq);
 static void auth_failed(Port* port, int status);
 static char* recv_password_packet(Port* port);
 static int recv_and_check_password_packet(Port* port);
-static void clear_gss_info(pg_gssinfo* gss);
+#else
+void sendAuthRequest(Port* port, AuthRequest areq);
+void auth_failed(Port* port, int status);
+char* recv_password_packet(Port* port);
+int recv_and_check_password_packet(Port* port);
+#endif
 
 /* ----------------------------------------------------------------
  * Ident authentication
@@ -141,7 +152,9 @@ static int CheckLDAPAuth(Port* port);
 static int CheckCertAuth(Port* port);
 #endif
 
+#ifdef USE_IAM
 static int CheckIAMAuth(Port* port);
+#endif
 
 /* ----------------------------------------------------------------
  * MIT Kerberos authentication system - protocol version 5
@@ -167,8 +180,15 @@ static int pg_krb5_recvauth(Port* port);
 #else
 #include <gssapi/gssapi.h>
 #endif
-
+#ifndef ENABLE_UT
 static int pg_GSS_recvauth(Port* port);
+static void clear_gss_info(pg_gssinfo* gss);
+static void clear_gssconn_info(GssConn *gss);
+#else
+int pg_GSS_recvauth(Port* port);
+void clear_gss_info(pg_gssinfo* gss);
+void clear_gssconn_info(GssConn *gss);
+#endif
 #endif /* ENABLE_GSS */
 
 /* ----------------------------------------------------------------
@@ -219,7 +239,10 @@ THR_LOCAL ClientAuthentication_hook_type ClientAuthentication_hook = NULL;
  * Note that many sorts of failure report additional information in the
  * postmaster log, which we hope is only readable by good guys.
  */
-static void auth_failed(Port* port, int status)
+#ifndef ENABLE_UT
+static
+#endif
+ void auth_failed(Port* port, int status)
 {
     const char* errstr = NULL;
     int errcode_return = ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION;
@@ -604,7 +627,6 @@ void ClientAuthentication(Port* port)
                     (errcode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION),
                         errmsg("Forbid remote connection with initial user.")));
             }
-
             rc = memset_s(port->token, TOKEN_LENGTH * 2 + 1, 0, TOKEN_LENGTH * 2 + 1);
             securec_check(rc, "\0", "\0");
             /* Functions which alloc memory need hold interrupts for safe. */
@@ -623,7 +645,7 @@ void ClientAuthentication(Port* port)
                 sendAuthRequest(port, AUTH_REQ_SM3);
             }
             status = recv_and_check_password_packet(port);
-            break;           
+            break;
         case uaPAM:
 #ifdef USE_PAM
             status = CheckPAMAuth(port, port->user_name, "");
@@ -642,13 +664,23 @@ void ClientAuthentication(Port* port)
 
         case uaCert:
 #ifdef USE_SSL
+            /* Forbid remote connection with initial user. */
+            if (isRemoteInitialUser(port)) {
+                ereport(FATAL,
+                    (errcode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION),
+                        errmsg("Forbid remote connection with initial user.")));
+            }
             status = CheckCertAuth(port);
 #else
             Assert(false);
 #endif
             break;
         case uaIAM:
+#ifdef USE_IAM
             status = CheckIAMAuth(port);
+#else
+            Assert(false);
+#endif
             break;
         case uaTrust:
             status = STATUS_OK;
@@ -659,7 +691,7 @@ void ClientAuthentication(Port* port)
     }
 
     /* Database Security: Support lock/unlock account */
-    if (!AM_WAL_SENDER) {
+    if (!AM_NOT_HADR_SENDER) {
         /*
          * Disable immediate response to SIGTERM/SIGINT/timeout interrupts as there are
          * some cache and memory operations which can not be interrupted. And nothing will
@@ -780,16 +812,19 @@ void GenerateFakeSaltBytes(const char* user_name, char* fake_salt_bytes, int sal
 /*
  * Send an authentication request packet to the frontend.
  */
-static bool gs_generateFakeEncryptString(char* encrypt_string, Port* port)
+#ifndef ENABLE_UT
+static
+#endif
+ bool GsGenerateFakeEncryptString(char* encrypt_string, const Port* port, int len)
 {
     int retval = 0;
     errno_t rc = EOK;
     char fake_salt_bytes[SALT_LENGTH + 1] = {0};
-    char fake_salt[SALT_LENGTH * 2 + 1] = {0};
+    char fake_salt[SALT_LENGTH * ENCRY_LENGTH_DOUBLE + 1] = {0};
     char fake_serverkey_bytes[HMAC_LENGTH + 1] = {0};
-    char fake_serverkey[HMAC_LENGTH * 2 + 1] = {0};
+    char fake_serverkey[HMAC_LENGTH * ENCRY_LENGTH_DOUBLE + 1] = {0};
     char fake_storedkey_bytes[STORED_KEY_LENGTH + 1] = {0};
-    char fake_storedkey[STORED_KEY_LENGTH * 2 + 1] = {0};
+    char fake_storedkey[STORED_KEY_LENGTH * ENCRY_LENGTH_DOUBLE + 1] = {0};
     
     GenerateFakeSaltBytes(port->user_name, fake_salt_bytes, SALT_LENGTH);
     retval = RAND_priv_bytes((GS_UCHAR*)fake_serverkey_bytes, (GS_UINT32)(HMAC_LENGTH));
@@ -797,7 +832,7 @@ static bool gs_generateFakeEncryptString(char* encrypt_string, Port* port)
         ereport(ERROR,
             (errcode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION),
                 errmsg("Failed to Generate the random storedkey,errcode:%d", retval)));
-    }	
+    }
 
     retval = RAND_priv_bytes((GS_UCHAR*)fake_storedkey_bytes, (GS_UINT32)(STORED_KEY_LENGTH));
     if (retval != 1) {
@@ -809,7 +844,7 @@ static bool gs_generateFakeEncryptString(char* encrypt_string, Port* port)
     sha_bytes_to_hex64((uint8*)fake_serverkey_bytes, fake_serverkey);
     sha_bytes_to_hex64((uint8*)fake_storedkey_bytes, fake_storedkey);
     rc = snprintf_s(encrypt_string,
-        ENCRYPTED_STRING_LENGTH + 1,
+        len,
         ENCRYPTED_STRING_LENGTH,
         "%s%s%s",
         fake_salt,
@@ -818,12 +853,15 @@ static bool gs_generateFakeEncryptString(char* encrypt_string, Port* port)
     securec_check_ss(rc, "\0", "\0");
     return true;
 }
-static void sendAuthRequest(Port* port, AuthRequest areq)
+#ifndef ENABLE_UT
+static
+#endif
+ void sendAuthRequest(Port* port, AuthRequest areq)
 {
     /* Database Security:  Support SHA256.*/
     int32 stored_method = 0;
     StringInfoData buf;
-    char encrypt_string[ENCRYPTED_STRING_LENGTH + 1] = {0};
+    char encryptString[ENCRYPTED_STRING_LENGTH + 1] = {0};
     char token[TOKEN_LENGTH + 1] = {0};
     char server_key_string[HMAC_LENGTH * 2 + 1] = {0};
     char sever_key[HMAC_LENGTH + 1] = {0};
@@ -847,19 +885,21 @@ static void sendAuthRequest(Port* port, AuthRequest areq)
     t_thrd.int_cxt.ImmediateInterruptOK = false;
     
 #ifdef ENABLE_MULTIPLE_NODES
-    if (IsDSorHaWalSender()) {
+    if (IsDSorHaWalSender() && !AM_WAL_HADR_SENDER && !AM_WAL_HADR_CN_SENDER) {
 #else        
-    if (IsDSorHaWalSender() && is_node_internal_connection(port)) {
+    if (IsDSorHaWalSender() && is_node_internal_connection(port) && !AM_WAL_HADR_SENDER) {
 #endif        
         stored_method = SHA256_PASSWORD;
+        if (u_sess->attr.attr_security.Password_encryption_type == PASSWORD_TYPE_SM3) {
+            stored_method = SM3_PASSWORD;
+        }
     } else {
-        if (!IsRoleExist(port->user_name)) {			
+        if (!IsRoleExist(port->user_name)) {
             /*
              * When login failed, let the server quit at the same place regardless of right or wrong
              * username. We construct a fake encrypted password here and send it the client.
              */
-
-            if (!gs_generateFakeEncryptString(encrypt_string , port)) {
+            if (!GsGenerateFakeEncryptString(encryptString, port, ENCRYPTED_STRING_LENGTH + 1)) {
 
                 ereport(ERROR,
                     (errcode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION),
@@ -870,9 +910,11 @@ static void sendAuthRequest(Port* port, AuthRequest areq)
             if (PG_PROTOCOL_MINOR(FrontendProtocol) < PG_PROTOCOL_GAUSS_BASE) {
                 stored_method = MD5_PASSWORD;
             } else {
-                stored_method = SHA256_PASSWORD;
-                if (u_sess->attr.attr_security.Password_encryption_type == PASSWORD_TYPE_SM3) {			
-                    stored_method = SM3_PASSWORD;		        
+                
+                if (u_sess->attr.attr_security.Password_encryption_type == PASSWORD_TYPE_SM3) {
+                    stored_method = SM3_PASSWORD;
+                } else {
+                    stored_method = SHA256_PASSWORD;
                 }
             }
         } else {
@@ -935,16 +977,16 @@ static void sendAuthRequest(Port* port, AuthRequest areq)
             /*Get the stored method and the encrypted string, the first part is the salt(also named token1,length is
             SALT_LENGTH), the second part is the sever key(length is HMAC_LENGTH), the third part is the stored
             key(length is STORED_KEY_LENGTH)*/
-            stored_method = get_password_stored_method(port->user_name, encrypt_string, ENCRYPTED_STRING_LENGTH + 1);
+            stored_method = get_password_stored_method(port->user_name, encryptString, ENCRYPTED_STRING_LENGTH + 1);
         }
     }
 
     /* Check password stored method and there is no need to check for send only AUTH_REQ_OK. */
     if (areq != AUTH_REQ_OK && MD5_PASSWORD != stored_method && SHA256_PASSWORD != stored_method &&
-        stored_method != COMBINED_PASSWORD && port->hba->auth_method != uaGSS && 
+        stored_method != COMBINED_PASSWORD && port->hba->auth_method != uaGSS &&
         stored_method != SM3_PASSWORD) {
         t_thrd.int_cxt.ImmediateInterruptOK = save_ImmediateInterruptOK;
-        rc = memset_s(encrypt_string, ENCRYPTED_STRING_LENGTH + 1, 0, ENCRYPTED_STRING_LENGTH + 1);
+        rc = memset_s(encryptString, ENCRYPTED_STRING_LENGTH + 1, 0, ENCRYPTED_STRING_LENGTH + 1);
         securec_check(rc, "\0", "\0");
         ereport(FATAL,
             (errcode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION), errmsg("Invalid username/password,login denied.")));
@@ -959,15 +1001,15 @@ static void sendAuthRequest(Port* port, AuthRequest areq)
     if (AUTH_REQ_MD5 == areq && SHA256_PASSWORD == stored_method) {
         pq_sendint32(&buf, (int32)AUTH_REQ_MD5_SHA256);
 
-        rc = strncpy_s(salt, sizeof(salt), encrypt_string, sizeof(salt) - 1);
+        rc = strncpy_s(salt, sizeof(salt), encryptString, sizeof(salt) - 1);
         securec_check(rc, "\0", "\0");
         salt[sizeof(salt) - 1] = '\0';
 
         /* Here send the sha256 salt for authenication. */
         pq_sendbytes(&buf, salt, SALT_LENGTH * 2);
-    } else if ((AUTH_REQ_SM3 != areq && SM3_PASSWORD == stored_method && AUTH_REQ_OK != areq) ||  
-               (AUTH_REQ_SM3 == areq && SM3_PASSWORD != stored_method )) {
-       if (!gs_generateFakeEncryptString(encrypt_string , port)) {
+    } else if ((AUTH_REQ_SM3 != areq && SM3_PASSWORD == stored_method && AUTH_REQ_OK != areq) ||
+               (AUTH_REQ_SM3 == areq && SM3_PASSWORD != stored_method)) {
+        if (!GsGenerateFakeEncryptString(encryptString, port, ENCRYPTED_STRING_LENGTH + 1)) {
             ereport(ERROR,
                 (errcode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION),
                     errmsg("Failed to Generate Encrypt String")));
@@ -1012,7 +1054,8 @@ static void sendAuthRequest(Port* port, AuthRequest areq)
     if (areq == AUTH_REQ_SHA256 && (stored_method == SHA256_PASSWORD || stored_method == COMBINED_PASSWORD)) {
         /*calculate SeverSignature */
         rc = strncpy_s(
-            server_key_string, sizeof(server_key_string), &encrypt_string[SALT_LENGTH * 2], sizeof(server_key_string) - 1);
+            server_key_string, sizeof(server_key_string), &encryptString[SALT_LENGTH * ENCRY_LENGTH_DOUBLE],
+            sizeof(server_key_string) - 1);
         securec_check(rc, "\0", "\0");
         server_key_string[sizeof(server_key_string) - 1] = '\0';
         sha_hex_to_bytes32(sever_key, server_key_string);
@@ -1033,7 +1076,7 @@ static void sendAuthRequest(Port* port, AuthRequest areq)
         Assert(!CRYPT_hmac_result);
 #endif
 
-        rc = strncpy_s(salt, sizeof(salt), encrypt_string, sizeof(salt) - 1);
+        rc = strncpy_s(salt, sizeof(salt), encryptString, sizeof(salt) - 1);
         securec_check(rc, "\0", "\0");
         salt[sizeof(salt) - 1] = '\0';
         sha_bytes_to_hex64((uint8*)sever_signature, sever_signature_string);
@@ -1045,7 +1088,7 @@ static void sendAuthRequest(Port* port, AuthRequest areq)
          * Send the sever_signature before client_signature is not safe.
          * The rfc5802 authentication protocol need be enhanced.
          */
-        /* For M.N, N < 50  means older version of Gauss200 or Postgres versions */
+        /* For M.N, N < 50  means older version of Gauss200 or openGauss versions */
         if (PG_PROTOCOL_MINOR(FrontendProtocol) < PG_PROTOCOL_GAUSS_BASE)
             pq_sendbytes(&buf, sever_signature_string, HMAC_LENGTH * 2);
 
@@ -1068,7 +1111,8 @@ static void sendAuthRequest(Port* port, AuthRequest areq)
     if (areq == AUTH_REQ_SM3 && stored_method == SM3_PASSWORD) {
         /*calculate SeverSignature */
         rc = strncpy_s(
-            server_key_string, sizeof(server_key_string), &encrypt_string[SALT_LENGTH * 2], sizeof(server_key_string) - 1);
+            server_key_string, sizeof(server_key_string), &encryptString[SALT_LENGTH * ENCRY_LENGTH_DOUBLE],
+            sizeof(server_key_string) - 1);
         securec_check(rc, "\0", "\0");
         server_key_string[sizeof(server_key_string) - 1] = '\0';
         sha_hex_to_bytes32(sever_key, server_key_string);
@@ -1088,7 +1132,7 @@ static void sendAuthRequest(Port* port, AuthRequest areq)
 #ifdef USE_ASSERT_CHECKING
         Assert(!CRYPT_hmac_result);
 #endif
-        rc = strncpy_s(salt, sizeof(salt), encrypt_string, sizeof(salt) - 1);
+        rc = strncpy_s(salt, sizeof(salt), encryptString, sizeof(salt) - 1);
         securec_check(rc, "\0", "\0");
         salt[sizeof(salt) - 1] = '\0';
         sha_bytes_to_hex64((uint8*)sever_signature, sever_signature_string);
@@ -1142,7 +1186,7 @@ static void sendAuthRequest(Port* port, AuthRequest areq)
         pq_flush();
 
     t_thrd.int_cxt.ImmediateInterruptOK = save_ImmediateInterruptOK;
-    rc = memset_s(encrypt_string, ENCRYPTED_STRING_LENGTH + 1, 0, ENCRYPTED_STRING_LENGTH + 1);
+    rc = memset_s(encryptString, ENCRYPTED_STRING_LENGTH + 1, 0, ENCRYPTED_STRING_LENGTH + 1);
     securec_check(rc, "\0", "\0");
 }
 
@@ -1151,7 +1195,10 @@ static void sendAuthRequest(Port* port, AuthRequest areq)
  *
  * Returns NULL if couldn't get password, else palloc'd string.
  */
-static char* recv_password_packet(Port* port)
+#ifndef ENABLE_UT
+static
+#endif
+ char* recv_password_packet(Port* port)
 {
     StringInfoData buf;
 
@@ -1228,7 +1275,10 @@ static char* recv_password_packet(Port* port)
  * Called when we have sent an authorization request for a password.
  * Get the response and check it.
  */
-static int recv_and_check_password_packet(Port* port)
+#ifndef ENABLE_UT
+static
+#endif
+ int recv_and_check_password_packet(Port* port)
 {
     int result;
     int rcs = 0;
@@ -1348,7 +1398,7 @@ static int pg_krb5_init(Port* port)
  * We still need to compare the username obtained from the client's setup
  * packet to the authenticated name.
  *
- * We have our own keytab file because postgres is unlikely to run as root,
+ * We have our own keytab file because openGauss is unlikely to run as root,
  * and so cannot read the default keytab.
  */
 static int pg_krb5_recvauth(Port* port)
@@ -1463,7 +1513,10 @@ static GSS_DLLIMP gss_OID GSS_C_NT_USER_NAME = &GSS_C_NT_USER_NAME_desc;
  * Generate an error for GSSAPI authentication.  The caller should apply
  * _() to errmsg to make it translatable.
  */
-static void pg_GSS_error(int severity, char* errmsg, OM_uint32 maj_stat, OM_uint32 min_stat)
+#ifndef ENABLE_UT
+static
+#endif
+ void pg_GSS_error(int severity, char* errmsg, OM_uint32 maj_stat, OM_uint32 min_stat)
 {
     gss_buffer_desc gmsg;
     OM_uint32 lmin_s, msg_ctx;
@@ -1504,7 +1557,10 @@ static void pg_GSS_error(int severity, char* errmsg, OM_uint32 maj_stat, OM_uint
     ereport(severity, (errmsg_internal("%s", errmsg), errdetail_internal("%s: %s", msg_major, msg_minor)));
 }
 
-static int pg_GSS_recvauth(Port* port)
+#ifndef ENABLE_UT
+static
+#endif
+ int pg_GSS_recvauth(Port* port)
 {
     OM_uint32 maj_stat, min_stat, gflags;
     int mtype;
@@ -1593,6 +1649,7 @@ static int pg_GSS_recvauth(Port* port)
      */
     do {
         char* krbconfig = NULL;
+        char real_krbconfig[PATH_MAX + 1] = {0};
 
         /* Keep pq_getbyte can be interrupted. */
         t_thrd.int_cxt.ImmediateInterruptOK = true;
@@ -1643,8 +1700,13 @@ static int pg_GSS_recvauth(Port* port)
 
         /* Krb5 config file priority : setpath > env(MPPDB_KRB5_FILE_PATH) > default(/etc/krb5.conf).*/
         if ((krbconfig = gs_getenv_r("MPPDB_KRB5_FILE_PATH")) != NULL) {
-            check_backend_env(krbconfig);
-            krb5_set_profile_path(krbconfig);
+            if (realpath(krbconfig, real_krbconfig) == NULL) {
+                ereport(ERROR, (errmodule(MOD_SEC), errcode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION),
+                    errmsg("Failed to canonicalization path of MPPDB_KRB5_FILE_PATH."), errdetail("N/A"),
+                        errcause("INVALID MPPDB_KRB5_FILE_PATH."), erraction("Contact engineer to support.")));
+            }
+            check_backend_env(real_krbconfig);
+            krb5_set_profile_path(real_krbconfig);
         }
 
         maj_stat = gss_accept_sec_context(&min_stat,
@@ -1790,7 +1852,10 @@ static int pg_GSS_recvauth(Port* port)
  * @in size : the size of data which need to be sent.
  * @return : the number of bytes sent or -1 for error.
  */
-static int GssInternalSend(int fd, const void* data, int size)
+#ifndef ENABLE_UT
+static
+#endif
+ int GssInternalSend(int fd, const void* data, int size)
 {
     ssize_t nbytes;
     ssize_t nSend = 0;
@@ -1802,7 +1867,9 @@ static int GssInternalSend(int fd, const void* data, int size)
     while (nSend != size) {
         PGSTAT_INIT_TIME_RECORD();
         PGSTAT_START_TIME_RECORD();
-        nbytes = send(fd, (const void*)((char*)data + nSend), size - nSend, 0);
+
+        /* CommProxy Interface Support */
+        nbytes = comm_send(fd, (const void*)((char*)data + nSend), size - nSend, 0);
         END_NET_SEND_INFO(nbytes);
 
         if (nbytes <= 0) {
@@ -1825,7 +1892,10 @@ static int GssInternalSend(int fd, const void* data, int size)
  * @in size : the size of data which need recv.
  * @return : the number of bytes received or -1 for error.
  */
-static int GssInternalRecv(int fd, void* data, int size)
+#ifndef ENABLE_UT
+static
+#endif
+ int GssInternalRecv(int fd, void* data, int size)
 {
 #define MSG_NOTIFICATION 0x8000
 
@@ -1846,7 +1916,9 @@ static int GssInternalRecv(int fd, void* data, int size)
         inmsg.msg_iovlen = 1;
         inmsg.msg_control = NULL;
         inmsg.msg_controllen = 0;
-        error = recvmsg(fd, &inmsg, flags);
+
+        /* CommProxy Interface Support */
+        error = comm_recvmsg(fd, &inmsg, flags);
 
         /* We should ignore MSG_NOTIFICATION msg of SCTP here. */
         if (MSG_NOTIFICATION & (unsigned int)inmsg.msg_flags)
@@ -1912,7 +1984,10 @@ static int GssSendWithType(GssConn* gss_conn, char type)
  * @in type : the data type need to recv.
  * @return : 0 for success and -1 for failed.
  */
-static int GssRecvWithType(GssConn* gss_conn, char type)
+#ifndef ENABLE_UT
+static
+#endif
+ int GssRecvWithType(GssConn* gss_conn, char type)
 {
 #define MSG_HEAD_LEN 5 /* sizeof(char)+sizeof(int) */
 
@@ -2067,7 +2142,10 @@ static char* GssGetKerberosHostName()
  * @in server_host : the server ip.
  * @return : 0 for success and -1 for error.
  */
-static int GssImportName(GssConn* gss_conn, char* server_host)
+#ifndef ENABLE_UT
+static
+#endif
+ int GssImportName(GssConn* gss_conn, char* server_host)
 {
 #define MAXENVLEN 1024
 
@@ -2112,16 +2190,18 @@ static int GssImportName(GssConn* gss_conn, char* server_host)
  * @in gss_conn : stored the messages used in authentication.
  * @return : 0 for success and -1 for error.
  */
+
 static int GssClientInit(GssConn* gss_conn)
 {
 #define MAX_KERBEROS_CAPACITY 3000      /* The max capacity of kerberos is 3000 per second */
 #define RESERVED_KERBEROS_CAPACITY 1000 /* Reserved 1000 capacity of kerberos for other service */
 
-    OM_uint32 maj_stat, min_stat, lmin_s;
+    OM_uint32 maj_stat, min_stat;
     char* krbconfig = NULL;
     instr_time before, after;
     double elapsed_msec = 0;
     int retry_count = 0;
+    char real_krbconfig[PATH_MAX + 1] = {0};
 
 retry_init:
     /*
@@ -2140,8 +2220,11 @@ retry_init:
     /* Krb5 config file priority : setpath > env(MPPDB_KRB5_FILE_PATH) > default(/etc/krb5.conf).*/
     krbconfig = gs_getenv_r("MPPDB_KRB5_FILE_PATH");
     if (krbconfig != NULL) {
-        check_backend_env(krbconfig);
-        krb5_set_profile_path(krbconfig);
+        if (realpath(krbconfig, real_krbconfig) == NULL) {
+            return -1;
+        }
+        check_backend_env(real_krbconfig);
+        krb5_set_profile_path(real_krbconfig);
     }
 
     int num_nodes = global_node_definition ? global_node_definition->num_nodes : (u_sess->pgxc_cxt.NumDataNodes);
@@ -2199,8 +2282,10 @@ retry_init:
          * first or subsequent packet, just send the same kind of password
          * packet.
          */
-        if (GssSendWithType(gss_conn, 'p') < 0)
+        if (GssSendWithType(gss_conn, 'p') < 0) {
+            clear_gssconn_info(gss_conn);
             return -1;
+        }
     }
 
     if (maj_stat != GSS_S_COMPLETE && maj_stat != GSS_S_CONTINUE_NEEDED) {
@@ -2213,19 +2298,20 @@ retry_init:
             goto retry_init;
         }
 
-        gss_release_name(&lmin_s, &gss_conn->gtarg_nam);
-        if (gss_conn->gctx)
-            gss_delete_sec_context(&lmin_s, &gss_conn->gctx, GSS_C_NO_BUFFER);
-
+        clear_gssconn_info(gss_conn);
         errno = EPERM;
         return -1;
     }
 
-    if (maj_stat == GSS_S_CONTINUE_NEEDED)
+    if (maj_stat == GSS_S_CONTINUE_NEEDED) {
         return 1;
+    }
 
-    gss_release_name(&lmin_s, &gss_conn->gtarg_nam);
-
+    /* 
+     * for kerberos client side, gss security context should be released 
+     * under scenarios success & fail as connection(need continue handshake) holds target name
+     */
+    clear_gssconn_info(gss_conn);
     return 0;
 }
 
@@ -2303,17 +2389,20 @@ int GssClientAuth(int socket, char* server_host)
  */
 static int GssServerAccept(GssConn* gss_conn)
 {
-    OM_uint32 maj_stat, min_stat, lmin_s, gflags;
+    OM_uint32 maj_stat, min_stat, gflags;
     char* krbconfig = NULL;
-
+    char real_krbconfig[PATH_MAX + 1] = {0};
     /* Clean the config cache and ticket cache set by hadoop remote read. */
     krb5_clean_cache_profile_path();
 
     /* Krb5 config file priority : setpath > env(MPPDB_KRB5_FILE_PATH) > default(/etc/krb5.conf).*/
     krbconfig = gs_getenv_r("MPPDB_KRB5_FILE_PATH");
     if (NULL != krbconfig) {
-        check_backend_env(krbconfig);
-        krb5_set_profile_path(krbconfig);
+        if (realpath(krbconfig, real_krbconfig) == NULL) {
+            return -1;
+        }
+        check_backend_env(real_krbconfig);
+        krb5_set_profile_path(real_krbconfig);
     }
 
     maj_stat = gss_accept_sec_context(&min_stat,
@@ -2340,21 +2429,30 @@ static int GssServerAccept(GssConn* gss_conn)
          * first or subsequent packet, just send the same kind of password
          * packet.
          */
-        if (GssSendWithType(gss_conn, 'R') < 0)
+        if (GssSendWithType(gss_conn, 'R') < 0) {
+            clear_gssconn_info(gss_conn);
             return -1;
+        }
     }
 
     if (maj_stat != GSS_S_COMPLETE && maj_stat != GSS_S_CONTINUE_NEEDED) {
         GSSLog("server accept fail", maj_stat, min_stat);
-        gss_delete_sec_context(&lmin_s, &gss_conn->gctx, GSS_C_NO_BUFFER);
+        clear_gssconn_info(gss_conn);
 
         errno = EPERM;
         return -1;
     }
 
-    if (maj_stat == GSS_S_CONTINUE_NEEDED)
+    if (maj_stat == GSS_S_CONTINUE_NEEDED) {
+        clear_gssconn_info(gss_conn);
         return 1;
+    }
 
+    /* 
+     * for kerberos server side, gss security context should be released 
+     * under all scenarios such as success\fail\continue as connection not need hold any status
+     */
+    clear_gssconn_info(gss_conn);
     return GssSendWithType(gss_conn, 'R');
 }
 
@@ -2363,7 +2461,10 @@ static int GssServerAccept(GssConn* gss_conn)
  * @in gss_conn : to stored the messages used in gss authentication.
  * @return : 0 for success and -1 for error.
  */
-static int GssServerContinue(GssConn* gss_conn)
+#ifndef ENABLE_UT
+static
+#endif
+ int GssServerContinue(GssConn* gss_conn)
 {
     int re = -1;
 
@@ -2437,6 +2538,42 @@ int GssServerAuth(int socket, const char* krb_keyfile)
     return GssServerContinue(&gss_conn);
 }
 
+/*
+ * release kerberos gss connection info 
+ * if the handle to be released is specified GSS_C_NO_CREDENTIAL or GSS_C_NO_CONTEXT(which is initial status), 
+ * the function will complete successfully but do nothing, so that it's safe to invoke the function without pre-judge
+ */
+#ifndef ENABLE_UT
+static
+#endif
+ void clear_gss_info(pg_gssinfo* gss)
+{
+    /* status codes coming from gss interface */
+    OM_uint32 lmin_s = 0;
+    /* Release service principal credentials */
+    (void)gss_release_cred(&lmin_s, &gss->cred);
+    /* Release gss security context and name after server authentication finished */
+    (void)gss_delete_sec_context(&lmin_s, &gss->ctx, GSS_C_NO_BUFFER);
+    /* Release gss_name and gss_buf */
+    (void)gss_release_name(&lmin_s, &gss->name);
+}
+
+/*
+ * release kerberos gss stream connection info 
+ * the function will complete successfully but do nothing, so that it's safe to invoke the function without pre-judge
+ */
+#ifndef ENABLE_UT
+static
+#endif
+ void clear_gssconn_info(GssConn *gss)
+{
+    /* status codes coming from gss interface */
+    OM_uint32 lmin_s = 0;
+    /* Release gss security context and name after server authentication finished */
+    (void)gss_delete_sec_context(&lmin_s, &gss->gctx, GSS_C_NO_BUFFER);
+    /* Release gss_name and gss_buf */
+    (void)gss_release_name(&lmin_s, &gss->gtarg_nam);
+}
 #endif /* ENABLE_GSS */
 
 /* ----------------------------------------------------------------
@@ -2856,7 +2993,8 @@ static int ident_inet(hbaPort* port)
         goto ident_inet_done;
     }
 
-    sock_fd = socket(ident_serv->ai_family, ident_serv->ai_socktype, ident_serv->ai_protocol);
+    /* CommProxy Interface Support */
+    sock_fd = comm_socket(ident_serv->ai_family, ident_serv->ai_socktype, ident_serv->ai_protocol);
     if (sock_fd < 0) {
         ereport(LOG, (errcode_for_socket_access(), errmsg("could not create socket for Ident connection: %m")));
         ident_return = false;
@@ -2864,7 +3002,8 @@ static int ident_inet(hbaPort* port)
     }
 
 #ifdef F_SETFD
-    if (fcntl(sock_fd, F_SETFD, FD_CLOEXEC) == -1) {
+    /* CommProxy Interface Support */
+    if (comm_fcntl(sock_fd, F_SETFD, FD_CLOEXEC) == -1) {
         ereport(LOG, (errcode_for_socket_access(), errmsg("setsockopt(FD_CLOEXEC) failed: %m")));
         ident_return = false;
         goto ident_inet_done;
@@ -2874,16 +3013,18 @@ static int ident_inet(hbaPort* port)
     /*
      * Bind to the address which the client originally contacted, otherwise
      * the ident server won't be able to match up the right connection. This
-     * is necessary if the PostgreSQL server is running on an IP alias.
+     * is necessary if the openGauss server is running on an IP alias.
      */
-    rc = bind(sock_fd, la->ai_addr, la->ai_addrlen);
+    /* CommProxy Interface Support */
+    rc = comm_bind(sock_fd, la->ai_addr, la->ai_addrlen);
     if (rc != 0) {
         ereport(LOG, (errcode_for_socket_access(), errmsg("could not bind to local address \"%s\": %m", local_addr_s)));
         ident_return = false;
         goto ident_inet_done;
     }
 
-    rc = connect(sock_fd, ident_serv->ai_addr, ident_serv->ai_addrlen);
+    /* CommProxy Interface Support */
+    rc = comm_connect(sock_fd, ident_serv->ai_addr, ident_serv->ai_addrlen);
     if (rc != 0) {
         ereport(LOG,
             (errcode_for_socket_access(),
@@ -2900,7 +3041,9 @@ static int ident_inet(hbaPort* port)
     do {
         PGSTAT_INIT_TIME_RECORD();
         PGSTAT_START_TIME_RECORD();
-        rc = send(sock_fd, ident_query, strlen(ident_query), 0);
+
+        /* CommProxy Interface Support */
+        rc = comm_send(sock_fd, ident_query, strlen(ident_query), 0);
         END_NET_SEND_INFO(rc);
     } while (rc < 0 && errno == EINTR);
 
@@ -2916,7 +3059,9 @@ static int ident_inet(hbaPort* port)
     do {
         PGSTAT_INIT_TIME_RECORD();
         PGSTAT_START_TIME_RECORD();
-        rc = recv(sock_fd, ident_response, sizeof(ident_response) - 1, 0);
+
+        /* CommProxy Interface Support */
+        rc = comm_recv(sock_fd, ident_response, sizeof(ident_response) - 1, 0);
         END_NET_RECV_INFO(rc);
     } while (rc < 0 && errno == EINTR);
 
@@ -2936,8 +3081,10 @@ static int ident_inet(hbaPort* port)
         ereport(LOG, (errmsg("invalidly formatted response from Ident server: \"%s\"", ident_response)));
 
 ident_inet_done:
-    if (sock_fd >= 0)
-        closesocket(sock_fd);
+    if (sock_fd >= 0) {
+        /* CommProxy Interface Support */
+        comm_closesocket(sock_fd);
+    }
     if (ident_serv != NULL)
         pg_freeaddrinfo_all(remote_addr.addr.ss_family, ident_serv);
     if (la != NULL)
@@ -2960,7 +3107,10 @@ ident_inet_done:
  */
 #ifdef HAVE_UNIX_SOCKETS
 
-static int auth_peer(hbaPort* port)
+#ifndef ENABLE_UT
+static
+#endif
+ int auth_peer(hbaPort* port)
 {
     char ident_user[IDENT_USERNAME_MAX + 1];
     uid_t uid;
@@ -3488,7 +3638,10 @@ static int CheckLDAPAuth(Port* port)
  * ----------------------------------------------------------------
  */
 #ifdef USE_SSL
-static int CheckCertAuth(Port* port)
+#ifndef ENABLE_UT
+static
+#endif
+ int CheckCertAuth(Port* port)
 {
     Assert(port->ssl);
 
@@ -3505,6 +3658,7 @@ static int CheckCertAuth(Port* port)
 }
 #endif
 
+#ifdef USE_IAM
 /*
  * @Description: the main function for iam authenication check.
  * @in port : the port which contain socket info for recv password from client.
@@ -3587,20 +3741,4 @@ static int CheckIAMAuth(Port* port)
     passwd = NULL;
     return STATUS_OK;
 }
-
-/*
- * release kerberos gss connection info 
- * if the handle to be released is specified GSS_C_NO_CREDENTIAL or GSS_C_NO_CONTEXT(which is initial status), 
- * the function will complete successfully but do nothing, so that it's safe to invoke the function without pre-judge
- */
-static void clear_gss_info(pg_gssinfo* gss)
-{
-    /* status codes coming from gss interface */
-    OM_uint32 lmin_s = 0;
-    /* Release service principal credentials */
-    (void)gss_release_cred(&lmin_s, &gss->cred);
-    /* Release gss security context and name after server authentication finished */
-    (void)gss_delete_sec_context(&lmin_s, &gss->ctx, GSS_C_NO_BUFFER);
-    /* Release gss_name and gss_buf */
-    (void)gss_release_name(&lmin_s, &gss->name);
-}
+#endif

@@ -27,6 +27,7 @@ extern void DefineEnum(CreateEnumStmt* stmt);
 extern void DefineRange(CreateRangeStmt* stmt);
 extern void AlterEnum(AlterEnumStmt* stmt);
 extern Oid DefineCompositeType(RangeVar* typevar, List* coldeflist);
+extern void DefineTableOfType(const TableOfTypeStmt* stmt);
 extern Oid AssignTypeArrayOid(void);
 
 extern void AlterDomainDefault(List* names, Node* defaultRaw);
@@ -46,5 +47,7 @@ extern void AlterTypeNamespace(List* names, const char* newschema, ObjectType ob
 extern Oid AlterTypeNamespace_oid(Oid typeOid, Oid nspOid, ObjectAddresses* objsMoved);
 extern Oid AlterTypeNamespaceInternal(
     Oid typeOid, Oid nspOid, bool isImplicitArray, bool errorOnTableType, ObjectAddresses* objsMoved);
+extern void AlterTypeOwnerByPkg(Oid pkgOid, Oid newOwnerId);
+extern void AlterTypeOwnerByFunc(Oid funcOid, Oid newOwnerId);
 
 #endif /* TYPECMDS_H */

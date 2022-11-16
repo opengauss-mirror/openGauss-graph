@@ -343,7 +343,7 @@ static bool ReadKeyContentFromFile(KeyMode mode, const char* cipherkeyfile, cons
         /* Note: Data Source use initdb key file by default (datasource.key.* not given) */
         global_rand_file = &g_rand_file_content[INITDB_NOCLOUDOBS_TYPE];
         global_cipher_file = &g_cipher_file_content[INITDB_NOCLOUDOBS_TYPE];
-    } else if (mode == SOURCE_MODE) {
+    } else if (mode == SOURCE_MODE || mode == HADR_MODE|| mode == USER_MAPPING_MODE || mode == SUBSCRIPTION_MODE) {
         /*
          * For Data Source:
          * read key from file (datasource.key.*): we do not cache these keys here
@@ -464,8 +464,9 @@ static bool WriteContentToFile(const char* filename, const void* content, size_t
 /* Judge if the KeyMode is legal */
 static bool isModeExists(KeyMode mode)
 {
-    if (mode != SERVER_MODE && mode != CLIENT_MODE && 
-        mode != OBS_MODE && mode != SOURCE_MODE && mode != GDS_MODE) {
+    if (mode != SERVER_MODE && mode != CLIENT_MODE && mode != HADR_MODE &&
+        mode != OBS_MODE && mode != SOURCE_MODE && mode != GDS_MODE &&
+        mode != USER_MAPPING_MODE && mode != SUBSCRIPTION_MODE) {
 #ifndef ENABLE_LLT
         (void)fprintf(stderr, _("AK/SK encrypt/decrypt encounters invalid key mode.\n"));
         return false;
@@ -608,11 +609,11 @@ static bool gen_cipher_file(KeyMode mode, /* SERVER_MODE or CLIENT_MODE or OBS_M
         ret = chmod(cipherkeyfile, 0600);
 #endif
         if (ret != 0) {
+#ifndef ENABLE_LLT
             (void)fprintf(
                 stderr, _("could not set permissions of file \"%s\": %s\n"), cipherkeyfile, gs_strerror(errno));
-            ret = memset_s(ciphertext, CIPHER_LEN, 0, CIPHER_LEN);
-            securec_check_c(ret, "\0", "\0");
-            return false;
+            goto RETURNFALSE;
+#endif
         }
     }
 
@@ -828,6 +829,16 @@ void decode_cipher_files(
         ret = snprintf_s(cipherkeyfile, MAXPGPATH, MAXPGPATH - 1, "%s/usermapping%s", datadir, CIPHER_KEY_FILE);
         securec_check_ss_c(ret, "\0", "\0");
         ret = snprintf_s(randfile, MAXPGPATH, MAXPGPATH - 1, "%s/usermapping%s", datadir, RAN_KEY_FILE);
+        securec_check_ss_c(ret, "\0", "\0");
+    } else if (mode == SUBSCRIPTION_MODE) {
+        ret = snprintf_s(cipherkeyfile, MAXPGPATH, MAXPGPATH - 1, "%s/subscription%s", datadir, CIPHER_KEY_FILE);
+        securec_check_ss_c(ret, "\0", "\0");
+        ret = snprintf_s(randfile, MAXPGPATH, MAXPGPATH - 1, "%s/subscription%s", datadir, RAN_KEY_FILE);
+        securec_check_ss_c(ret, "\0", "\0");
+    } else if (mode == HADR_MODE) {
+        ret = snprintf_s(cipherkeyfile, MAXPGPATH, MAXPGPATH - 1, "%s/hadr%s", datadir, CIPHER_KEY_FILE);
+        securec_check_ss_c(ret, "\0", "\0");
+        ret = snprintf_s(randfile, MAXPGPATH, MAXPGPATH - 1, "%s/hadr%s", datadir, RAN_KEY_FILE);
         securec_check_ss_c(ret, "\0", "\0");
     }
     /*
@@ -1203,26 +1214,19 @@ err:
 GS_UINT32 CRYPT_hmac(GS_UINT32 ulAlgType, const GS_UCHAR* pucKey, GS_UINT32 upucKeyLen, const GS_UCHAR* pucData,
     GS_UINT32 ulDataLen, GS_UCHAR* pucDigest, GS_UINT32* pulDigestLen)
 {
-    HMAC_CTX* ctx = NULL;
-    if ((ctx = HMAC_CTX_new()) == NULL)
-        return 1;
     const EVP_MD* evp_md = get_evp_md_by_id(ulAlgType);
     if (evp_md == NULL) {
-        HMAC_CTX_free(ctx);
         return 1;
     }
 #ifndef WIN32
     if (!HMAC(evp_md, pucKey, (int)upucKeyLen, pucData, ulDataLen, pucDigest, pulDigestLen)) {
-        HMAC_CTX_free(ctx);
         return 1;
     }
 #else
     if (!HMAC(evp_md, pucKey, (int)upucKeyLen, pucData, ulDataLen, pucDigest, (unsigned int*)pulDigestLen)) {
-        HMAC_CTX_free(ctx);
         return 1;
     }
 #endif
-    HMAC_CTX_free(ctx);
     return 0;
 }
 

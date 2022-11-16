@@ -27,6 +27,7 @@
 #include "common/build_query/build_query.h"
 #include "replication/replicainternal.h"
 
+#include <memory>
 #define BLOCKSIZE (8 * 1024)
 
 /*
@@ -36,6 +37,8 @@ static int dstfd = -1;
 static char dstpath[MAXPGPATH] = "";
 static bool g_isRelDataFile = false;
 
+static PageCompression* g_pageCompression = NULL;
+
 static void create_target_dir(const char* path);
 static void remove_target_dir(const char* path);
 static void create_target_symlink(const char* path, const char* slink);
@@ -44,7 +47,6 @@ static void remove_target_symlink(const char* path);
 static bool is_special_dir(const char* path);
 static void get_file_path(const char* path, const char* file_name, char* file_path);
 static bool directory_is_empty(const char* path);
-static void copy_file(const char* fromfile, char* tofile);
 static void copy_dir(const char* fromdir, char* todir);
 static void restore_gaussdb_state(void);
 
@@ -99,9 +101,10 @@ void close_target_file(void)
     }
 
     dstfd = -1;
+    CompressFileClose();
 }
 
-void write_target_range(char* buf, off_t begin, size_t size, int space)
+void write_target_range(char* buf, off_t begin, size_t size, int space, bool compressed)
 {
     int writeleft;
     char* p = NULL;
@@ -112,7 +115,7 @@ void write_target_range(char* buf, off_t begin, size_t size, int space)
     if (dry_run)
         return;
 
-    if (begin % BLOCKSIZE != 0) {
+    if (!compressed && begin % BLOCKSIZE != 0) {
         (void)close(dstfd);
         dstfd = -1;
         pg_fatal("seek position %ld in target file \"%s\" is not in BLOCKSIZEs\n", size, dstpath);
@@ -429,6 +432,7 @@ char* slurpFile(const char* datadir, const char* path, size_t* filesize)
     if (read(fd, buffer, len) != len) {
         (void)close(fd);
         pg_free(buffer);
+        buffer = NULL;
         pg_fatal("could not read file \"%s\": %s\n", fullpath, strerror(errno));
         return NULL;
     }
@@ -1038,7 +1042,7 @@ go_exit:
 }
 
 #define COPY_BUF_SIZE (8 * BLCKSZ)
-static void copy_file(const char* fromfile, char* tofile)
+void copy_file(const char* fromfile, char* tofile)
 {
     char* buffer = NULL;
     int srcfd = 0;
@@ -1124,6 +1128,10 @@ static void copy_file(const char* fromfile, char* tofile)
     }
     return;
 go_exit:
+    if (buffer != NULL) {
+        free(buffer);
+        buffer = NULL;
+    }
     pg_log(PG_PRINT, _("%s"), errmsg);
     exit(1);
     return; /* suppress compile warning. */
@@ -1220,4 +1228,81 @@ bool tablespaceDataIsValid(const char* path)
     }
 
     return true;
+}
+
+void CompressedFileTruncate(const char *path, const RewindCompressInfo *rewindCompressInfo)
+{
+    if (dry_run) {
+        return;
+    }
+    /* sanity check */
+    BlockNumber oldBlockNumber = rewindCompressInfo->oldBlockNumber;
+    BlockNumber newBlockNumber = rewindCompressInfo->newBlockNumber;
+    Assert(oldBlockNumber > newBlockNumber);
+
+    /* construct full path */
+    char fullPath[MAXPGPATH];
+    errno_t rc = snprintf_s(fullPath, MAXPGPATH, MAXPGPATH - 1, "%s/%s", pg_data, path);
+    securec_check_ss_c(rc, "\0", "\0");
+    /* call truncate of pageCompression */
+    std::unique_ptr<PageCompression> pageCompression = std::make_unique<PageCompression>();
+    /* segno is no used here */
+    auto result = pageCompression->Init(fullPath, MAXPGPATH, -1, rewindCompressInfo->chunkSize);
+    FileProcessErrorReport(fullPath, result);
+    result = pageCompression->TruncateFile(oldBlockNumber, newBlockNumber);
+    FileProcessErrorReport(fullPath, result);
+    pg_log(PG_DEBUG, "CompressedFileTruncate: %s\n", path);
+}
+
+void FetchCompressedFile(char* buf, BlockNumber blockNumber, int32 size)
+{
+    g_pageCompression->WriteBufferToCurrentBlock(buf, blockNumber, size);
+}
+
+void CompressedFileInit(const char* fileName, int32 chunkSize, int32 algorithm, bool rebuild)
+{
+    if (dry_run) {
+        return;
+    }
+
+    if (g_pageCompression != NULL && strcmp(fileName, &g_pageCompression->GetInitPath()[strlen(pg_data) + 1]) == 0) {
+        /* already open */
+        return;
+    }
+    CompressFileClose();
+    /* format full poth */
+    char dstPath[MAXPGPATH];
+    error_t rc = snprintf_s(dstPath, sizeof(dstPath), sizeof(dstPath) - 1, "%s/%s", pg_data, fileName);
+    securec_check_ss_c(rc, "\0", "\0");
+
+    g_pageCompression = new PageCompression();
+    /* segment number only used for checksum */
+    auto state = g_pageCompression->Init(dstPath, strlen(dstPath), -1, chunkSize, rebuild);
+    FileProcessErrorReport(dstPath, state);
+    if (rebuild) {
+        PageCompressHeader* header = g_pageCompression->GetPageCompressHeader();
+        header->algorithm = algorithm;
+        header->chunk_size= chunkSize;
+    }
+}
+
+void CompressFileClose()
+{
+    if (g_pageCompression != NULL) {
+        delete g_pageCompression;
+        g_pageCompression = NULL;
+    }
+}
+
+bool FileProcessErrorReport(const char *path, COMPRESS_ERROR_STATE errorState)
+{
+    auto errorStr = strerror(errno);
+    switch (errorState) {
+        case SUCCESS:
+            return true;
+        default:
+            pg_fatal("process compressed file \"%s\": %s\n", path, errorStr);
+            break;
+    }
+    return false;
 }

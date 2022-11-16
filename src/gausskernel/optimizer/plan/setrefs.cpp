@@ -7,6 +7,7 @@
  * Portions Copyright (c) 2020 Huawei Technologies Co.,Ltd.
  * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
+ * Portions Copyright (c) 2021, openGauss Contributors
  *
  *
  * IDENTIFICATION
@@ -21,7 +22,7 @@
 #include "catalog/pg_type.h"
 #include "catalog/pg_partition_fn.h"
 #include "catalog/pg_proc.h"
-#include "executor/nodeRecursiveunion.h"
+#include "executor/node/nodeRecursiveunion.h"
 #include "foreign/foreign.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
@@ -544,6 +545,9 @@ static Plan* set_plan_refs(PlannerInfo* root, Plan* plan, int rtoffset)
         } break;
         case T_NestLoop:
         case T_VecNestLoop:
+#ifdef GS_GRAPH
+        case T_NestLoopVLE:
+#endif        
         case T_MergeJoin:
         case T_VecMergeJoin:
         case T_HashJoin:
@@ -575,6 +579,10 @@ static Plan* set_plan_refs(PlannerInfo* root, Plan* plan, int rtoffset)
                 default:
                     set_dummy_tlist_references(plan, rtoffset);
             }
+        } break;
+
+        case T_StartWithOp: {
+            set_dummy_tlist_references(plan, rtoffset);
         } break;
 
         case T_Hash:
@@ -840,6 +848,10 @@ static Plan* set_plan_refs(PlannerInfo* root, Plan* plan, int rtoffset)
                 itlist = build_tlist_index(splan->exclRelTlist);
                 splan->updateTlist = fix_join_expr(root, splan->updateTlist, NULL,
                     itlist, linitial_int(splan->resultRelations), rtoffset);
+                splan->upsertWhere = (Node*)fix_join_expr(root, (List*)splan->upsertWhere, NULL,
+                    itlist, linitial_int(splan->resultRelations), rtoffset);
+                splan->exclRelTlist =
+                        fix_scan_list(root, splan->exclRelTlist, rtoffset);
             }
 
             splan->exclRelRTIndex += rtoffset;
@@ -1019,6 +1031,16 @@ static Plan* set_plan_refs(PlannerInfo* root, Plan* plan, int rtoffset)
 
             if (stream->skew_list != NIL)
                 fix_skew_quals(root, plan, subplan_itlist, rtoffset);
+        } break;
+#endif
+#ifdef GS_GRAPH
+        case T_ModifyGraph: {
+            ModifyGraph *splan = (ModifyGraph *) plan;
+            splan->subplan = set_plan_refs(root, splan->subplan, rtoffset);
+        } break;
+        case T_SparqlLoadPlan: {
+            SparqlLoadPlan *sl = (SparqlLoadPlan*) plan;
+            sl->subplan = set_plan_refs(root, sl->subplan, rtoffset);
         } break;
 #endif
         default: {
@@ -1544,7 +1566,11 @@ static void set_join_references(PlannerInfo* root, Join* join, int rtoffset)
     join->plan.qual = fix_join_expr(root, join->plan.qual, outer_itlist, inner_itlist, (Index)0, rtoffset);
 
     /* Now do join-type-specific stuff */
+#ifdef GS_GRAPH
+    if (IsA(join, NestLoop) || IsA(join, VecNestLoop) || IsA(join, NestLoopVLE)) {
+#else
     if (IsA(join, NestLoop) || IsA(join, VecNestLoop)) {
+#endif
         NestLoop* nl = (NestLoop*)join;
         ListCell* lc = NULL;
 
@@ -2371,9 +2397,11 @@ static bool extract_query_dependencies_walker(Node* node, PlannerInfo* context)
                  * On transaction start, if this table has been altered. Plansource->is_valid will be set
                  * to false.
                  */
-                List* partitionOid = getPartitionObjectIdList(rte->relid, PART_OBJ_TYPE_TABLE_PARTITION);
-                if (partitionOid != NULL) {
-                    context->glob->relationOids = list_concat(context->glob->relationOids, partitionOid);
+                if (rte->ispartrel) {
+                    List* partitionOid = getPartitionObjectIdList(rte->relid, PART_OBJ_TYPE_TABLE_PARTITION);
+                    if (partitionOid != NULL) {
+                        context->glob->relationOids = list_concat(context->glob->relationOids, partitionOid);
+                    }
                 }
             }
         }

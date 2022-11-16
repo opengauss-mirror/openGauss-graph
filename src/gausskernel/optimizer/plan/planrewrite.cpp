@@ -414,6 +414,18 @@ void fix_vars_plannode(PlannerInfo* root, Plan* node)
             fix_var_expr(root, (Node*)nl->join.nulleqqual);
             fix_var_expr(root, (Node*)node->var_list);
         } break;
+#ifdef GS_GRAPH
+        case T_NestLoopVLE: {
+            NestLoopVLE* nlv = (NestLoopVLE*)node;
+            foreach (lc, nlv->nl.nestParams) {
+                NestLoopParam* nlp = (NestLoopParam*)lfirst(lc);
+                fix_var_expr(root, (Node*)nlp->paramval);
+            }
+            fix_var_expr(root, (Node*)nlv->nl.join.joinqual);
+            fix_var_expr(root, (Node*)nlv->nl.join.nulleqqual);
+            fix_var_expr(root, (Node*)node->var_list);
+        } break;
+#endif
         case T_MergeJoin:
         case T_VecMergeJoin: {
             MergeJoin* mj = (MergeJoin*)node;
@@ -1103,6 +1115,8 @@ static char* get_attr_name(int attrnum)
             return (char*)"xc_node_id";
         case BucketIdAttributeNumber:
             return (char*)"tablebucketid";
+        case UidAttributeNumber:
+            return (char*)"gs_tuple_uid";
 #endif
         default:
             ereport(ERROR,
@@ -1344,6 +1358,7 @@ static void rebuild_subquery(PlannerInfo* root, RelOptInfo* rel, RangeTblEntry* 
             param->paramtypmod = -1;
             param->paramcollid = listvar->varcollid;
             param->location = -1;
+            param->tableOfIndexType = InvalidOid;
             args_in_opexpr = lappend(args_in_opexpr, param);
 
             OpExpr* opexpr = makeNode(OpExpr);

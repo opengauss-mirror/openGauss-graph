@@ -158,6 +158,14 @@ Datum file_fdw_handler(PG_FUNCTION_ARGS)
     PG_RETURN_POINTER(fdwroutine);
 }
 
+void check_file_fdw_permission()
+{
+    if ((!initialuser()) && !(isOperatoradmin(GetUserId()) && u_sess->attr.attr_security.operation_mode)) {
+        ereport(ERROR, (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+            errmsg("Dist fdw are only available for the supper user and Operatoradmin")));
+    }
+}
+
 /*
  * Validate the generic options given to a FOREIGN DATA WRAPPER, SERVER,
  * USER MAPPING or FOREIGN TABLE that uses file_fdw.
@@ -173,6 +181,7 @@ Datum file_fdw_validator(PG_FUNCTION_ARGS)
     List* other_options = NIL;
     ListCell* cell = NULL;
 
+    check_file_fdw_permission();
     if (catalog == UserMappingRelationId) {
         ereport(
             ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("file_fdw doesn't support in USER MAPPING.")));
@@ -192,9 +201,8 @@ Datum file_fdw_validator(PG_FUNCTION_ARGS)
      * security hole.
      */
     if (catalog == ForeignTableRelationId && !superuser())
-            ereport(ERROR,
-                            (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-                             errmsg("only superuser can change options of a file_fdw foreign table")));
+        ereport(ERROR, (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+            errmsg("only superuser can change options of a file_fdw foreign table")));
 
     /*
      * Check that only options supported by file_fdw, and allowed for the
@@ -242,10 +250,13 @@ Datum file_fdw_validator(PG_FUNCTION_ARGS)
         } else if (strcmp(def->defname, "format") == 0) {
             char* fmt = defGetString(def);
             if (strcasecmp(fmt, "fixed") == 0) {
-                ereport(ERROR, (errcode(ERRCODE_SYNTAX_ERROR), errmsg("file_fdw doesn't support fixed option in format")));
+                ereport(ERROR, (errcode(ERRCODE_SYNTAX_ERROR),
+                    errmsg("file_fdw doesn't support fixed option in format")));
             }
-        } else
             other_options = lappend(other_options, def);
+        } else {
+            other_options = lappend(other_options, def);
+        }
     }
 
     /*
@@ -525,7 +536,7 @@ static void fileBeginForeignScan(ForeignScanState* node, int eflags)
      * Create CopyState from FDW options.  We always acquire all columns, so
      * as to match the expected ScanTupleSlot signature.
      */
-    cstate = BeginCopyFrom(node->ss.ss_currentRelation, filename, NIL, options, NULL);
+    cstate = BeginCopyFrom(node->ss.ss_currentRelation, filename, NIL, options, NULL, NULL);
 
     /*
      * Save state in node->fdw_state.  We must save enough information to call
@@ -590,7 +601,7 @@ static void fileReScanForeignScan(ForeignScanState* node)
 
     EndCopyFrom(festate->cstate);
 
-    festate->cstate = BeginCopyFrom(node->ss.ss_currentRelation, festate->filename, NIL, festate->options, NULL);
+    festate->cstate = BeginCopyFrom(node->ss.ss_currentRelation, festate->filename, NIL, festate->options, NULL, NULL);
 }
 
 /*
@@ -787,7 +798,7 @@ static int file_acquire_sample_rows(Relation onerel, int elevel, HeapTuple* rows
     /*
      * Create CopyState from FDW options.
      */
-    cstate = BeginCopyFrom(onerel, filename, NIL, options, NULL);
+    cstate = BeginCopyFrom(onerel, filename, NIL, options, NULL, NULL);
 
     /*
      * Use per-tuple memory context to prevent leak of memory used to read

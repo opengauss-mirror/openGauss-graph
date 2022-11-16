@@ -46,7 +46,7 @@
 #include "knl/knl_variable.h"
 
 #include "executor/executor.h"
-#include "executor/nodeResult.h"
+#include "executor/node/nodeResult.h"
 #include "utils/memutils.h"
 
 /* ----------------------------------------------------------------
@@ -293,3 +293,16 @@ void ExecReScanResult(ResultState* node)
         ExecReScan(node->ps.lefttree);
     }
 }
+#ifdef GS_GRAPH
+void ExecNextResultContext(ResultState *node)
+{
+	if (node->ps.lefttree != NULL)
+		ExecNextContext(node->ps.lefttree);
+}
+
+void ExecPrevResultContext(ResultState *node)
+{
+	if (node->ps.lefttree != NULL)
+		ExecPrevContext(node->ps.lefttree);
+}
+#endif

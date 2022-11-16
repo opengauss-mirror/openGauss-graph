@@ -8,6 +8,7 @@
  * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  * Portions Copyright (c) 2010-2012 Postgres-XC Development Group
+ * Portions Copyright (c) 2021, openGauss Contributors
  *
  * src/include/catalog/dependency.h
  *
@@ -94,21 +95,6 @@ struct ObjectAddresses {
 	int			maxrefs; /* current size of palloc'd array(s) */
 };
 
-/* typedef ObjectAddresses appears in dependency.h */
-
-/* threaded list of ObjectAddresses, for recursion detection */
-typedef struct ObjectAddressStack {
-    const ObjectAddress* object;     /* object being visited */
-    int flags;                       /* its current flag bits */
-    struct ObjectAddressStack* next; /* next outer stack level */
-} ObjectAddressStack;
-
-/* for find_expr_references_walker */
-typedef struct {
-    ObjectAddresses* addrs; /* addresses being accumulated */
-    List* rtables;          /* list of rangetables to resolve Vars */
-} find_expr_references_context;
-
 /*
  * There is also a SharedDependencyType enum type that determines the exact
  * semantics of an entry in pg_shdepend.  Just like regular dependency entries,
@@ -136,8 +122,11 @@ typedef struct {
  * is the role mentioned in a policy object. The referenced object must be a
  * pg_authid entry.
  *
- * (m) a SHARED_DEPENDENCY_MOT_TABLE entry means that the referenced object
+ * (e) a SHARED_DEPENDENCY_MOT_TABLE entry means that the referenced object
  * is the database holding FDW table. The dependent object must be a FDW table entry.
+ *
+ * (f) a SHARED_DEPENDENCY_DBPRIV entry means that the referenced object is
+ * a role mentioned in the gs_db_privilege.  The referenced object must be a pg_authid entry.
  *
  * SHARED_DEPENDENCY_INVALID is a value used as a parameter in internal
  * routines, and is not valid in the catalog itself.
@@ -148,11 +137,25 @@ typedef enum SharedDependencyType {
 	SHARED_DEPENDENCY_ACL = 'a',
 	SHARED_DEPENDENCY_RLSPOLICY = 'r',
 	SHARED_DEPENDENCY_MOT_TABLE = 'm',
+	SHARED_DEPENDENCY_DBPRIV = 'd',
 	SHARED_DEPENDENCY_INVALID = 0
 } SharedDependencyType;
 
 /* expansible list of ObjectAddresses (private in dependency.c) */
 typedef struct ObjectAddresses ObjectAddresses;
+
+/* threaded list of ObjectAddresses, for recursion detection */
+typedef struct ObjectAddressStack {
+    const ObjectAddress* object;     /* object being visited */
+    int flags;                       /* its current flag bits */
+    struct ObjectAddressStack* next; /* next outer stack level */
+} ObjectAddressStack;
+
+/* for find_expr_references_walker */
+typedef struct {
+    ObjectAddresses* addrs; /* addresses being accumulated */
+    List* rtables;          /* list of rangetables to resolve Vars */
+} find_expr_references_context;
 
 /*
  * This enum covers all system catalogs whose OIDs can appear in
@@ -199,18 +202,26 @@ typedef enum ObjectClass {
     OCLASS_GLOBAL_SETTING_ARGS,        /* global setting args */
     OCLASS_COLUMN_SETTING_ARGS,        /* column setting args */
 	OCLASS_DEFACL,           /* pg_default_acl */
+    OCLASS_DB_PRIVILEGE,     /* gs_db_privilege */
 	OCLASS_EXTENSION,        /* pg_extension */
 	OCLASS_DATA_SOURCE,      /* data source */
 	OCLASS_DIRECTORY,        /* pg_directory */
 	OCLASS_PG_JOB,           /* pg_job */
 	OCLASS_RLSPOLICY,        /* pg_rlspolicy */
 	OCLASS_DB4AI_MODEL,      /* gs_model_warehouse */
-	MAX_OCLASS               /* MUST BE LAST */
+    OCLASS_GS_CL_PROC,       /* client logic procedures */
+    OCLASS_PACKAGE,          /* gs_package */
+    OCLASS_PUBLICATION,      /* pg_publication */
+    OCLASS_PUBLICATION_REL,  /* pg_publication_rel */
+    OCLASS_SUBSCRIPTION,     /* pg_subscription */
+    OCLASS_GRAPH,				/* gs_graph */
+	OCLASS_LABEL,				/* gs_label */
+	MAX_OCLASS,               /* MUST BE LAST */
 } ObjectClass;
 
 
 /* in dependency.c */
-
+#define PERFORM_DELETION_INVALID            0x0000
 #define PERFORM_DELETION_INTERNAL			0x0001
 #define PERFORM_DELETION_CONCURRENTLY		0x0002
 
@@ -229,7 +240,8 @@ extern void performDeletion(const ObjectAddress *object,
 
 extern void performMultipleDeletions(const ObjectAddresses *objects,
                                      DropBehavior behavior,
-                                     uint32 flags);
+                                     uint32 flags,
+                                     bool isPkgDropTypes = false);
 
 extern void deleteWhatDependsOn(const ObjectAddress *object,
                                 bool showNotices);
@@ -279,6 +291,10 @@ extern void recordDependencyOnCurrentExtension(const ObjectAddress *object,
 
 extern void recordPinnedDependency(const ObjectAddress *object);
 
+extern bool IsPackageDependType(Oid typOid, Oid pkgOid, bool isRefCur = false);
+
+extern long DeleteTypesDenpendOnPackage(Oid classId, Oid objectId, bool isSpec = true);
+
 extern long deleteDependencyRecordsFor(Oid classId,
                                        Oid objectId,
                                        bool skipExtensionDeps);
@@ -317,6 +333,7 @@ extern void deleteSharedDependencyRecordsFor(Oid classId,
                                              int32 objectSubId);
 
 extern void recordDependencyOnOwner(Oid classId, Oid objectId, Oid owner, const char *objfile = NULL);
+extern void recordDependencyOnPackage(Oid classId, Oid objectId, List* pkgOidList);
 #ifdef ENABLE_MOT
 extern void recordDependencyOnDatabase(Oid classId, Oid objectId, Oid serverId, Oid owner, const char *objfile = NULL);
 #endif
@@ -366,4 +383,13 @@ namespace Tsdb {
 extern void performTsCudescDeletion(List* cudesc_oids);
 }
 #endif   /* ENABLE_MULTIPLE_NODES */
+
+extern void findDependentObjects(const ObjectAddress* object, int flags, ObjectAddressStack* stack,
+    ObjectAddresses* targetObjects, const ObjectAddresses* pendingObjects, Relation* depRel);
+extern void reportDependentObjects(
+    const ObjectAddresses* targetObjects, DropBehavior behavior, int msglevel, const ObjectAddress* origObject);
+extern void AcquireDeletionLock(const ObjectAddress* object, int flags);
+extern void add_object_address_ext(Oid classId, Oid objectId, int32 subId, char deptype, ObjectAddresses* addrs);
+extern void add_object_address_ext1(const ObjectAddress *obj, ObjectAddresses* addrs);
+
 #endif   /* DEPENDENCY_H */

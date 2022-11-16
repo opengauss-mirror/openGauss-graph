@@ -1,6 +1,9 @@
+create database pl_test_cursor_part1 DBCOMPATIBILITY 'pg';
+\c pl_test_cursor_part1;
+
 create schema hw_cursor_part1;
 set current_schema = hw_cursor_part1;
-
+set behavior_compat_options = 'skip_insert_gs_source';
 create table company(name varchar(100), loc varchar(100), no integer);
 
 insert into company values ('macrosoft',    'usa',          001);
@@ -471,15 +474,15 @@ DECLARE
     CURSOR CURS1 IS SELECT * FROM TEST_TB order by 1;
  TEMP INTEGER:=0;
 BEGIN
-	if not CURS1%isopen then
+    if not CURS1%isopen then
                 raise notice '%','curosr is open';
-	end if;
-	FOR VARA IN CURS1 LOOP
+    end if;
+    FOR VARA IN CURS1 LOOP
                 raise notice '%',CURS1%ROWCOUNT;
-	END LOOP;
-	if not CURS1%isopen then
+    END LOOP;
+    if not CURS1%isopen then
                 raise notice '%','curosr is open';
-	end if;
+    end if;
 END;
 /
 
@@ -534,10 +537,10 @@ BEGIN
     sqlstr := 'select first_name,phone_number,salary from staffs
          where section_id = :1';
     OPEN my_cur FOR sqlstr USING '30'; 
-	if (my_cur%isopen) then
+    if (my_cur%isopen) then
                 raise notice '%','cursor is open';
-	end if;
-	
+    end if;
+
     FETCH my_cur INTO name, phone_number, salary; 
     WHILE my_cur%FOUND LOOP
           raise notice '% # % # %',name,phone_number,salary;
@@ -790,6 +793,41 @@ close c;
 end;
 /
 
+create table t1_refcursor(a int);
+insert into t1_refcursor values (1);
+insert into t1_refcursor values (2);
+create or replace procedure p3_refcursor (c1 out sys_refcursor) as
+va t1_refcursor;
+i int;
+begin
+open c1 for select * from t1_refcursor;
+i = 1/0;
+exception 
+when others then
+    raise info '%', 'exception';
+end;
+/
+select * from  p3_refcursor();
+
+create or replace procedure p3 (c4 in int,c2 out int,c3 out int,c1 out sys_refcursor,cc2 out sys_refcursor) as
+va t1_refcursor;
+i int;
+begin
+begin
+open cc2 for select * from t1_refcursor;
+i = 1/0;
+exception 
+when others then
+    raise info '%', 'exception2';
+end;
+open c1 for select * from t1_refcursor;
+c3:=1;
+c2:=2;
+end;
+/
+
+select * from  p3(1);
+
 START TRANSACTION;
 CURSOR sc  FOR select * from generate_series(3, 13) i where i <> all (values (1),(2),(4));
 MOVE FORWARD 10 IN sc;
@@ -798,3 +836,5 @@ END;
 
  -- clean up
 DROP SCHEMA hw_cursor_part1 CASCADE;
+\c regression;
+drop database IF EXISTS pl_test_cursor_part1;

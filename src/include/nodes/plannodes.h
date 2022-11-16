@@ -4,6 +4,7 @@
  *	  definitions for query plan nodes
  *
  *
+ * Portions Copyright (c) 2021, openGauss Contributors
  * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
@@ -26,28 +27,8 @@
 #include "bulkload/dist_fdw.h"
 #include "utils/bloom_filter.h"
 
-#define MAX_SPECIAL_BUCKETMAP_NUM 2
-#define BUCKETMAP_DEFAULT_INDEX -1
-
-/*
- * Determines if query has to be launched
- * on Coordinators only (SEQUENCE DDL),
- * on Datanodes (normal Remote Queries),
- * or on all Postgres-XC nodes (Utilities and DDL).
- */
-typedef enum
-{
-    EXEC_ON_DATANODES,
-    EXEC_ON_COORDS,
-    EXEC_ON_ALL_NODES,
-    EXEC_ON_NONE
-} RemoteQueryExecType;
-
-#define EXEC_CONTAIN_COORDINATOR(exec_type) \
-    ((exec_type) == EXEC_ON_ALL_NODES || (exec_type) == EXEC_ON_COORDS)
-
-#define EXEC_CONTAIN_DATANODE(exec_type) \
-    ((exec_type) == EXEC_ON_ALL_NODES || (exec_type) == EXEC_ON_DATANODES)
+#define MAX_SPECIAL_BUCKETMAP_NUM    20
+#define BUCKETMAP_DEFAULT_INDEX_BIT (1 << 31)
 
 /*
  * Determines the position where the RemoteQuery node will run.
@@ -164,6 +145,8 @@ typedef struct PlannedStmt {
 
     uint2* bucketMap[MAX_SPECIAL_BUCKETMAP_NUM]; /* the map information need to be get */
 
+    int    bucketCnt[MAX_SPECIAL_BUCKETMAP_NUM]; /* the map bucket count */
+
     char* query_string; /* convey the query string to backend/stream thread of DataNode for debug purpose */
 
     List* subplan_ids; /* in which plan id subplan should be inited */
@@ -204,11 +187,19 @@ typedef struct PlannedStmt {
     bool multi_node_hint;
 
     uint64 uniqueSQLId;
+#ifdef GS_GRAPH
+    /* statement location in source string (copied from Query) */
+	int			stmt_location;	/* start location, or -1 if unknown */
+	int			stmt_len;		/* length in bytes; 0 means "rest of string" */
+
+    bool		hasGraphwriteClause; /* has modify graph type? */
+#endif /* GS_GRAPH */
 } PlannedStmt;
 
 typedef struct NodeGroupInfoContext {
     Oid groupOids[MAX_SPECIAL_BUCKETMAP_NUM];
     uint2* bucketMap[MAX_SPECIAL_BUCKETMAP_NUM];
+    int    bucketCnt[MAX_SPECIAL_BUCKETMAP_NUM];
     int num_bucketmaps;
 } NodeGroupInfoContext;
 
@@ -310,6 +301,7 @@ typedef struct Plan {
 
     bool ispwj;  /* is it special for partitionwisejoin? */
     int paramno; /* the partition'sn that it is scaning */
+    int subparamno; /* the subpartition'sn that it is scaning */
 
     List* initPlan;    /* Init Plan nodes (un-correlated expr
                         * subselects) */
@@ -361,6 +353,9 @@ typedef struct Plan {
     int ng_num;
     double innerdistinct; /* join inner rel distinct estimation value */
     double outerdistinct; /* join outer rel distinct estimation value */
+
+    /* used for ustore partial seq scan */
+    List* flatList = NULL; /* flattened targetlist representing columns in query */
 } Plan;
 
 /* ----------------
@@ -432,7 +427,7 @@ typedef struct ModifyTable {
     List* updateTlist;			/* List of UPDATE target */
     List* exclRelTlist;		   /* target list of the EXECLUDED pseudo relation */
     Index exclRelRTIndex;			 /* RTI of the EXCLUDED pseudo relation */
-    bool partKeyUpsert;
+    Node* upsertWhere;          /* Qualifiers for upsert's update clause to check */
 
     OpMemInfo mem_info;    /*  Memory info for modify node */
 } ModifyTable;
@@ -488,7 +483,58 @@ typedef struct RecursiveUnion {
     bool is_correlated;    /* indicate if the recursive union contains correlated term,
                             * in case of correlated term involved, we need broadcast data
                             * to one datanode to execute the recursive CTE in one-DN mode */
+
+    /*
+     * StartWith Support containt the pseudo target entry, also not-null indicates
+     * a start-with converted recursive union
+     *  1. RUITR
+     *  2. array_key
+     *  3. array_col_nn
+     *  4. array_col_nn
+     *   ...
+     */
+    List *internalEntryList;
 } RecursiveUnion;
+
+/* ----------------
+ *	 StartWithOp node -
+ *		Generate the start with connect by operator
+ *
+ * xxxxxxxxxxxx
+ * ----------------
+ */
+
+struct CteScan;
+typedef struct StartWithOp
+{
+    Plan plan;
+    
+    /* other ref attributes */
+    CteScan        *cteplan;
+    RecursiveUnion *ruplan;
+
+    List *keyEntryList;
+    List *colEntryList;
+    List *internalEntryList;    /* RUITR, array_key, array_col */
+    List *fullEntryList;        /* level, isleaf, iscycle, RUITR, array_key, array_col */
+
+    /*
+     * swoptions, normally store some static information that derived from SQL parsing
+     * stage, e.g. nocycle, connect_by_type, sibling clause
+     */
+    StartWithOptions  *swoptions;
+
+    /*
+     * swExecOptions, exeuction options for StartWithOp operator
+     *
+     * store some hint-bit level information supports SWCB runing efficiently, currently
+     * we only use last 4-bits to indicate if we need skip some pseudo return column
+     * computation
+     */
+    uint16      swExecOptions;
+
+    List *prcTargetEntryList;
+} StartWithOp;
 
 /* ----------------
  *	 BitmapAnd node -
@@ -501,6 +547,7 @@ typedef struct RecursiveUnion {
 typedef struct BitmapAnd {
     Plan plan;
     List* bitmapplans;
+    bool is_ustore;
 } BitmapAnd;
 
 /* ----------------
@@ -514,6 +561,7 @@ typedef struct BitmapAnd {
 typedef struct BitmapOr {
     Plan plan;
     List* bitmapplans;
+    bool is_ustore;
 } BitmapOr;
 
 /*
@@ -543,11 +591,11 @@ typedef struct Scan {
     /* use struct pointer to avoid including parsenodes.h here */
     TableSampleClause* tablesample;
 
-    /* Memory info for scan node, now it just used on indexscan, indexonlyscan, bitmapscan, dfsindexscan */
+    /*  Memory info for scan node, now it just used on indexscan, indexonlyscan, bitmapscan, dfsindexscan */
     OpMemInfo mem_info;
-
-    /* use vector engine to execute this scan */
-    bool executeBatch;
+    bool is_inplace;
+    bool scanBatchMode;
+    double tableRows;
 } Scan;
 
 /* ----------------
@@ -650,6 +698,7 @@ typedef struct IndexScan {
     List* cstorequal;            /* quals that can be pushdown to cstore base table */
     List* targetlist;            /* Hack for column store index, target list to be computed at this node */
     bool index_only_scan;
+    bool is_ustore;
 } IndexScan;
 
 /* ----------------
@@ -701,6 +750,7 @@ typedef struct BitmapIndexScan {
     char* indexname;     /*	name of index to scan */
     List* indexqual;     /* list of index quals (OpExprs) */
     List* indexqualorig; /* the same in original form */
+    bool is_ustore;
 } BitmapIndexScan;
 
 /* ----------------
@@ -838,6 +888,32 @@ typedef struct CteScan {
     int ctePlanId;           /* ID of init SubPlan for CTE */
     int cteParam;            /* ID of Param representing CTE output */
     RecursiveUnion* subplan; /* subplan of CteScan, must be RecursiveUnion */
+
+    CommonTableExpr *cteRef; /* Reference of curernt CteScan node's expr */
+
+    /* These fields are only valid for Hierarchical Query(start with) only */
+
+    /*
+     * - pseudoReturnTargetEntryList
+     *
+     * Hold the TargetEntry reference for PRC a.w.k. "pseudo return columns"
+     * [1]. level
+     * [2]. connect_by_isleaf
+     * [3]. connect_by_iscycle
+     * [4]. rownum
+     */
+    List *prcTargetEntryList;
+
+    /*
+     * - internalEntryList
+     *
+     * Hold the internal TargetEntry for Hierarchical Query execution (not visible)
+     *  1. RUITR
+     *  2. array_column1
+     *  3. array_column2
+     *   ...
+     */
+    List *internalEntryList;
 } CteScan;
 
 /* ----------------
@@ -847,6 +923,9 @@ typedef struct CteScan {
 typedef struct WorkTableScan {
     Scan scan;
     int wtParam; /* ID of Param representing work table */
+
+    /* indicate it is workable from start-with */
+    bool forStartWith;
 } WorkTableScan;
 
 /* ----------------
@@ -949,6 +1028,11 @@ typedef struct ExtensiblePlan {
  * (But plan.qual is still applied before actually returning a tuple.)
  * For an outer join, only joinquals are allowed to be used as the merge
  * or hash condition of a merge or hash join.
+ * 
+ * inner_unique is set if the joinquals are such that no more than one inner
+ * tuple could match any given outer tuple.  This allows the executor to
+ * skip searching for additional matches.  (This must be provable from just
+ * the joinquals, ignoring plan.qual, due to where the executor tests it.)
  * ----------------
  */
 typedef struct Join {
@@ -964,6 +1048,9 @@ typedef struct Join {
     List* nulleqqual;
 
     uint32 skewoptimize;
+#ifdef GS_GRAPH
+    bool inner_unique;
+#endif /* GS_GRAPH */
 } Join;
 
 /* ----------------
@@ -1005,6 +1092,9 @@ typedef struct NestLoopParam {
  */
 typedef struct MergeJoin {
     Join join;
+#ifdef GS_GRAPH
+    bool skip_mark_restore;	/* Can we skip mark/restore calls? */
+#endif
     List* mergeclauses; /* mergeclauses as expression trees */
     /* these are arrays, but have the same length as the mergeclauses list: */
     Oid* mergeFamilies;    /* per-clause OIDs of btree opfamilies */
@@ -1027,6 +1117,7 @@ typedef struct HashJoin {
     bool rebuildHashTable;
     bool isSonicHash;
     OpMemInfo mem_info; /* Memory info for inner hash table */
+    double joinRows;
 } HashJoin;
 
 /* ----------------
@@ -1249,7 +1340,7 @@ typedef struct VecLimit : public Limit {
  * RowMarkType -
  *	  enums for types of row-marking operations
  *
- * When doing UPDATE, DELETE, or SELECT FOR UPDATE/SHARE, we have to uniquely
+ * When doing UPDATE, DELETE, or SELECT FOR [KEY] UPDATE/SHARE, we have to uniquely
  * identify all the source rows, not only those from the target relations, so
  * that we can perform EvalPlanQual rechecking at need.  For plain tables we
  * can just fetch the TID, the same as for a target relation.  Otherwise (for
@@ -1258,22 +1349,24 @@ typedef struct VecLimit : public Limit {
  * performance-critical in practice.
  */
 typedef enum RowMarkType {
-    ROW_MARK_EXCLUSIVE, /* obtain exclusive tuple lock */
-    ROW_MARK_SHARE,     /* obtain shared tuple lock */
-    ROW_MARK_REFERENCE, /* just fetch the TID */
-    ROW_MARK_COPY,      /* physically copy the row value */
-    ROW_MARK_COPY_DATUM /* physically copy the datum of every row column */
+    ROW_MARK_EXCLUSIVE,      /* obtain exclusive tuple lock */
+    ROW_MARK_NOKEYEXCLUSIVE, /* obtain no-key exclusive tuple lock */
+    ROW_MARK_SHARE,          /* obtain shared tuple lock */
+    ROW_MARK_KEYSHARE,       /* obtain keyshare tuple lock */
+    ROW_MARK_REFERENCE,      /* just fetch the TID */
+    ROW_MARK_COPY,           /* physically copy the row value */
+    ROW_MARK_COPY_DATUM      /* physically copy the datum of every row column */
 } RowMarkType;
 
-#define RowMarkRequiresRowShareLock(marktype) ((marktype) <= ROW_MARK_SHARE)
+#define RowMarkRequiresRowShareLock(marktype) ((marktype) <= ROW_MARK_KEYSHARE)
 
 /*
  * PlanRowMark -
- *	   plan-time representation of FOR UPDATE/SHARE clauses
+ *	   plan-time representation of FOR [KEY] UPDATE/SHARE clauses
  *
- * When doing UPDATE, DELETE, or SELECT FOR UPDATE/SHARE, we create a separate
+ * When doing UPDATE, DELETE, or SELECT FOR [KEY] UPDATE/SHARE, we create a separate
  * PlanRowMark node for each non-target relation in the query.	Relations that
- * are not specified as FOR UPDATE/SHARE are marked ROW_MARK_REFERENCE (if
+ * are not specified as FOR [KEY] UPDATE/SHARE are marked ROW_MARK_REFERENCE (if
  * real tables) or ROW_MARK_COPY (if not).
  *
  * Initially all PlanRowMarks have rti == prti and isParent == false.
@@ -1308,6 +1401,7 @@ typedef struct PlanRowMark {
     Index rowmarkId;      /* unique identifier for resjunk columns */
     RowMarkType markType; /* see enum above */
     bool noWait;          /* NOWAIT option */
+    int waitSec;      /* WAIT time Sec */
     bool isParent;        /* true if this is a "dummy" parent entry */
     int numAttrs;         /* number of attributes in subplan */
     Bitmapset* bms_nodeids;
@@ -1334,6 +1428,7 @@ typedef struct PlanInvalItem {
 typedef struct PartIteratorParam {
     NodeTag type;
     int paramno;
+    int subPartParamno;
 } PartIteratorParam;
 
 typedef struct PartIterator {
@@ -1403,107 +1498,233 @@ static inline bool IsJoinPlan(Node* node)
  * DB4AI
  */
  
-
-// GD optimizers
-typedef enum {
-    OPTIMIZER_GD,   // simple mini-batch
-    OPTIMIZER_NGD,  // normalized gradient descent
-} OptimizerML;
-
-inline void optimizer_ml_setter(const char* str, void* optimizer_ml){
-    OptimizerML* optimizer = (OptimizerML*) optimizer_ml;
-    if (strcmp(str, "gd") == 0)
-        *optimizer = OPTIMIZER_GD;
-    else if (strcmp(str, "ngd") == 0)
-        *optimizer = OPTIMIZER_NGD;
-    else
-        elog(ERROR, "Invalid optimizer. Current candidates are: gd (default), ngd");
-    return;
-}
-
-// Gradient Descent node
-typedef struct GradientDescent {
+// Training model node
+struct ModelHyperparameters;
+typedef struct TrainModel {
     Plan        plan;
     AlgorithmML algorithm;
-    int         targetcol;
-    
-    // generic hyperparameters
-    OptimizerML optimizer;      // default GD/mini-batch
-    int         max_seconds;    // 0 to disable
-    bool        verbose;
-    int         max_iterations; // maximum number of iterations
-    int         batch_size;
-    double      learning_rate;
-    double      decay;          // (0:1], learning rate decay
-    double      tolerance;      // [0:1], 0 means to run all iterations
-    int         seed;           // [0:N], random seed
-    
-    // for SVM
-    double      lambda;         // regularization strength
-} GradientDescent;
+    int         configurations;     // 1..N configurations for HPO
+    const ModelHyperparameters **hyperparameters;  // one for each configuration
+    MemoryContext cxt;              // to store models
+} TrainModel;
+
+
+
+#ifdef GS_GRAPH
+/*
+ * Struct for extra information passed to subroutines of add_paths_to_joinrel
+ *
+ * restrictlist contains all of the RestrictInfo nodes for restriction
+ *		clauses that apply to this join
+ * mergeclause_list is a list of RestrictInfo nodes for available
+ *		mergejoin clauses in this join
+ * inner_unique is true if each outer tuple provably matches no more
+ *		than one inner tuple
+ * sjinfo is extra info about special joins for selectivity estimation
+ * semifactors is as shown above (only valid for SEMI/ANTI/inner_unique joins)
+ * param_source_rels are OK targets for parameterization of result paths
+ */
+typedef struct JoinPathExtraData
+{
+	List	   *restrictlist;
+	List	   *mergeclause_list;
+	bool		inner_unique;
+	SpecialJoinInfo *sjinfo;
+	SemiAntiJoinFactors semifactors;
+	Relids		param_source_rels;
+} JoinPathExtraData;
+
+/* note:wq */
+/* ----------------
+ *	 ProjectSet node -
+ *		Apply a projection that includes set-returning functions to the
+ *		output tuples of the outer plan.
+ * ----------------
+ */
+typedef struct ProjectSet
+{
+	Plan		plan;
+} ProjectSet;
+
+/* ------------
+ *		gather node
+ *
+ * Note: rescan_param is the ID of a PARAM_EXEC parameter slot.  That slot
+ * will never actually contain a value, but the Gather node must flag it as
+ * having changed whenever it is rescanned.  The child parallel-aware scan
+ * nodes are marked as depending on that parameter, so that the rescan
+ * machinery is aware that their output is likely to change across rescans.
+ * In some cases we don't need a rescan Param, so rescan_param is set to -1.
+ * ------------
+ */
+typedef struct Gather
+{
+	Plan		plan;
+	int			num_workers;	/* planned number of worker processes */
+	int			rescan_param;	/* ID of Param that signals a rescan, or -1 */
+	bool		single_copy;	/* don't execute plan more than once */
+	bool		invisible;		/* suppress EXPLAIN display (for testing)? */
+} Gather;
+
+/* ------------
+ *		gather merge node
+ * ------------
+ */
+typedef struct GatherMerge
+{
+	Plan		plan;
+	int			num_workers;	/* planned number of worker processes */
+	int			rescan_param;	/* ID of Param that signals a rescan, or -1 */
+	/* remaining fields are just like the sort-key info in struct Sort */
+	int			numCols;		/* number of sort-key columns */
+	AttrNumber *sortColIdx;		/* their indexes in the target list */
+	Oid		   *sortOperators;	/* OIDs of operators to sort them by */
+	Oid		   *collations;		/* OIDs of collations */
+	bool	   *nullsFirst;		/* NULLS FIRST/LAST directions */
+} GatherMerge;
+
+/* ----------------
+ *		table sample scan node
+ * ----------------
+ */
+typedef struct SampleScan
+{
+	Scan		scan;
+	/* use struct pointer to avoid including parsenodes.h here */
+	struct TableSampleClause *tablesample;
+} SampleScan;
 
 /*
- * DB4AI k-means
+ * TableFunc - node for a table function, such as XMLTABLE.
  */
+typedef struct TableFunc
+{
+	NodeTag		type;
+	List	   *ns_uris;		/* list of namespace uri */
+	List	   *ns_names;		/* list of namespace names */
+	Node	   *docexpr;		/* input document expression */
+	Node	   *rowexpr;		/* row filter expression */
+	List	   *colnames;		/* column names (list of String) */
+	List	   *coltypes;		/* OID list of column type OIDs */
+	List	   *coltypmods;		/* integer list of column typmods */
+	List	   *colcollations;	/* OID list of column collation OIDs */
+	List	   *colexprs;		/* list of column filter expressions */
+	List	   *coldefexprs;	/* list of column default expressions */
+	Bitmapset  *notnulls;		/* nullability flag for each output column */
+	int			ordinalitycol;	/* counts from 0; -1 if none specified */
+	int			location;		/* token location, or -1 if unknown */
+} TableFunc;
+
+/* ----------------
+ *		TableFunc scan node
+ * ----------------
+ */
+typedef struct TableFuncScan
+{
+	Scan		scan;
+	TableFunc  *tablefunc;		/* table function node */
+} TableFuncScan;
+
+/* ----------------
+ *		NamedTuplestoreScan node
+ * ----------------
+ */
+typedef struct NamedTuplestoreScan
+{
+	Scan		scan;
+	char	   *enrname;		/* Name given to Ephemeral Named Relation */
+} NamedTuplestoreScan;
+
+
+typedef struct CustomScan
+{
+	Scan		scan;
+	uint32		flags;			/* mask of CUSTOMPATH_* flags, see
+								 * nodes/extensible.h */
+	List	   *custom_plans;	/* list of Plan nodes, if any */
+	List	   *custom_exprs;	/* expressions that custom code may evaluate */
+	List	   *custom_private; /* private data for custom code */
+	List	   *custom_scan_tlist;	/* optional tlist describing scan tuple */
+	Bitmapset  *custom_relids;	/* RTIs generated by this scan */
+	const struct CustomScanMethods *methods;
+} CustomScan;
+
+typedef struct NestLoopVLE
+{
+	NestLoop	nl;
+	int			minHops;
+	int			maxHops;
+} NestLoopVLE;
 
 /*
- * current available distance functions
+ * Graph nodes
  */
-typedef enum : uint32_t {
-    KMEANS_L1 = 0U,
-    KMEANS_L2,
-    KMEANS_L2_SQUARED,
-    KMEANS_LINF
-} DistanceFunction;
+typedef struct ModifyGraph
+{
+	Plan		plan;
+	GraphWriteOp operation;
+	bool		last;			/* is this for the last clause? */
+	List	   *targets;		/* relation OID's of target labels */
+	Plan	   *subplan;		/* plan producing source data */
+	uint32		nr_modify;		/* number of clauses that modifies graph
+								   before this */
+	bool		detach;			/* DETACH DELETE */
+	bool		eagerness;		/* need eager mode? */
+	List	   *pattern;		/* graph pattern (list of paths) for CREATE */
+	List	   *exprs;			/* expression list for DELETE */
+	List	   *sets;			/* list of GraphSetProp's for SET/REMOVE */
+	int			ert_base_index;	/* base index into the es_range_table */
+	int			ert_rtes_added;	/* number of RTEs added to es_range_table */
+} ModifyGraph;
 
-/*
- * current available seeding method
- */
-typedef enum : uint32_t {
-    KMEANS_RANDOM_SEED = 0U,
-    KMEANS_BB
-} SeedingFunction;
-
-/*
- * Verbosity level
- */
-typedef enum : uint32_t {
-    NO_OUTPUT = 0U,
-    FASTCHECK_OUTPUT,
-    VERBOSE_OUTPUT
-} Verbosity;
-
-/*
- * description of the k-means instance
- */
-struct KMeansDescription {
-    char const* model_name = nullptr;
-    SeedingFunction seeding = KMEANS_RANDOM_SEED;
-    DistanceFunction distance = KMEANS_L2_SQUARED;
-    Verbosity verbosity = NO_OUTPUT;
-    uint32_t n_features = 0U;
-    uint32_t batch_size = 0U;
-};
-
-/*
- * current hyper-parameters
- */
-struct KMeansHyperParameters {
-    uint32_t num_centroids = 0U;
-    uint32_t num_iterations = 0U;
-    uint64_t external_seed = 0ULL;
-    double tolerance = 0.00001;
-};
-
-/*
- * the actual k-means operator
- */
-typedef struct KMeans {
+typedef struct SparqlLoadPlan
+{
     Plan plan;
-    AlgorithmML algorithm;
-    KMeansDescription description;
-    KMeansHyperParameters parameters;
-} KMeans;
+    Plan *subplan;      /* plan producing source data */
+} SparqlLoadPlan;
+
+
+
+typedef struct Shortestpath
+{
+	Join		join;
+	List	   *hashclauses;
+	AttrNumber  end_id_left;
+	AttrNumber  end_id_right;
+	AttrNumber  tableoid_left;
+	AttrNumber  tableoid_right;
+	AttrNumber  ctid_left;
+	AttrNumber  ctid_right;
+	Node	   *source;
+	Node	   *target;
+	long        minhops;
+	long        maxhops;
+	long        limit;
+} Shortestpath;
+
+typedef struct Hash2Side
+{
+	Plan		plan;
+	Oid			skewTable;		/* outer join key's table OID, or InvalidOid */
+	AttrNumber	skewColumn;		/* outer join key's column #, or zero */
+	bool		skewInherit;	/* is outer join rel an inheritance tree? */
+	Oid			skewColType;	/* datatype of the outer key column */
+	int32		skewColTypmod;	/* typmod of the outer key column */
+	/* all other info is in the parent HashJoin node */
+} Hash2Side;
+
+typedef struct Dijkstra
+{
+	Plan		plan;
+	AttrNumber  weight;
+	bool		weight_out;
+	AttrNumber  end_id;
+	AttrNumber  edge_id;
+	Node	   *source;
+	Node	   *target;
+	Node	   *limit;
+} Dijkstra;
+#endif
 
 #endif /* PLANNODES_H */
 

@@ -388,6 +388,33 @@ static bool find_minmax_aggs_walker(Node* node, List** context)
     return expression_tree_walker(node, (bool (*)())find_minmax_aggs_walker, (void*)context);
 }
 
+static bool HasNOTNULLConstraint(Query* parse, NullTest* ntest)
+{
+    if (IsA(ntest->arg, Var)) {
+        /* Check whether NOT NULL check can be guaranteed by table defination */
+        RangeTblEntry* rte = rt_fetch(((Var*)ntest->arg)->varno, parse->rtable);
+        Oid reloid = rte->relid;
+        AttrNumber attno = ((Var*)ntest->arg)->varoattno;
+        if (reloid != InvalidOid && attno != InvalidAttrNumber) {
+            HeapTuple atttuple =
+                SearchSysCacheCopy2(ATTNUM, ObjectIdGetDatum(reloid), Int16GetDatum(attno));
+            if (!HeapTupleIsValid(atttuple)) {
+                ereport(ERROR,
+                    (errcode(ERRCODE_CACHE_LOOKUP_FAILED),
+                        errmsg("cache lookup failed for attribute %u of relation %hd",
+                        attno, reloid)));
+            }
+            Form_pg_attribute attStruct = (Form_pg_attribute)GETSTRUCT(atttuple);
+            if (attStruct->attnotnull) {
+                heap_freetuple_ext(atttuple);
+                return true;
+            }
+            heap_freetuple_ext(atttuple);
+        }
+    }
+    return false;
+}
+
 /*
  * build_minmax_path
  *		Given a MIN/MAX aggregate, try to build an indexscan Path it can be
@@ -409,6 +436,8 @@ static bool build_minmax_path(PlannerInfo* root, MinMaxAggInfo* mminfo, Oid eqop
     Cost path_cost;
     double path_fraction;
     errno_t errorno = EOK;
+    RelOptInfo* final_rel = NULL;
+    standard_qp_extra qp_extra;
 
     /* ----------
      * Generate modified query of the form
@@ -454,7 +483,7 @@ static bool build_minmax_path(PlannerInfo* root, MinMaxAggInfo* mminfo, Oid eqop
     ntest->argisrow = false;
 
     /* User might have had that in WHERE already */
-    if (!list_member((List*)parse->jointree->quals, ntest))
+    if (!list_member((List*)parse->jointree->quals, ntest) && !HasNOTNULLConstraint(parse, ntest))
         parse->jointree->quals = (Node*)lcons(ntest, (List*)parse->jointree->quals);
 
     /* Build suitable ORDER BY clause */
@@ -471,22 +500,52 @@ static bool build_minmax_path(PlannerInfo* root, MinMaxAggInfo* mminfo, Oid eqop
     parse->limitCount =
         (Node*)makeConst(INT8OID, -1, InvalidOid, sizeof(int64), Int64GetDatum(1), false, FLOAT8PASSBYVAL);
 
-    /*
-     * Set up requested pathkeys.
-     */
-    subroot->group_pathkeys = NIL;
-    subroot->window_pathkeys = NIL;
-    subroot->distinct_pathkeys = NIL;
-
-    subroot->sort_pathkeys = make_pathkeys_for_sortclauses(subroot, parse->sortClause, parse->targetList, false);
-
-    subroot->query_pathkeys = subroot->sort_pathkeys;
+    /* Initialize the pathkeys */
+    standard_qp_init(subroot, &qp_extra, parse->targetList, NULL, NULL);
 
     /*
      * Generate the best paths for this query, telling query_planner that we
      * have LIMIT 1.
      */
-    query_planner(subroot, parse->targetList, 1.0, 1.0, &cheapest_path, &sorted_path, dNumGroups);
+
+    /* Make tuple_fraction, limit_tuples accessible to lower-level routines */
+    subroot->tuple_fraction = 1.0;
+    subroot->limit_tuples = 1.0;
+
+    /* 
+     * Generate pathlist by query_planner for final_rel and canonicalize 
+     * all the pathkeys.
+     */
+    final_rel = query_planner(subroot, parse->targetList,
+                              standard_qp_callback, &qp_extra);
+
+    /* 
+     * In the following, generate the best unsorted and presorted paths for 
+     * this Query (but note there may not be any presorted path). 
+     */
+    bool has_groupby = true;
+
+    /* First of all, estimate the number of groups in the query. */
+    has_groupby = get_number_of_groups(subroot, 
+                                       final_rel, 
+                                       dNumGroups);
+
+    /* Then update the tuple_fraction by the number of groups in the query. */
+    update_tuple_fraction(subroot, 
+                          final_rel, 
+                          dNumGroups);
+
+    /* 
+     * Finally, generate the best unsorted and presorted paths for 
+     * this Query. 
+     */
+    generate_cheapest_and_sorted_path(subroot, 
+                                      final_rel,
+                                      &cheapest_path, 
+                                      &sorted_path, 
+                                      dNumGroups, 
+                                      has_groupby);
+
 
     /*
      * Fail if no presorted path.  However, if query_planner determines that

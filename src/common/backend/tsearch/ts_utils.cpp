@@ -55,7 +55,7 @@ char* get_tsfile_prefix_tmp(bool isExecCN)
         "%s/tsearch_data/%ld%lu",
         tmpSharepath,
         GetCurrentTransactionStartTimestamp(),
-        (GTM_MODE) ? (GetCurrentTransactionId()) : (isExecCN ? GetCurrentTransactionId() : t_thrd.xact_cxt.cn_xid));
+        (isExecCN ? GetCurrentTransactionId() : t_thrd.xact_cxt.cn_xid));
 
     /* We need to check for my_exec_path */
     check_backend_env(strinfo.data);
@@ -190,7 +190,7 @@ char* get_tsearch_config_filename(const char* basename, char* pathname, const ch
                 appendStringInfo(&strinfo, "%s", pname);
                 pfree_ext(pname);
             } else {
-                /* original logic as postgres */
+                /* original logic as openGauss */
                 char sharepath[MAXPGPATH];
                 get_share_path(my_exec_path, sharepath);
                 appendStringInfo(&strinfo, "%s/tsearch_data", sharepath);
@@ -485,7 +485,7 @@ void copy_tsfile_to_remote(List* filenames, List* postfixes)
                 ereport(ERROR,
                     (errcode(ERRCODE_NAME_TOO_LONG), errmsg("The name of internal dictionary file is too long")));
             }
-            appendStringInfo(&strinfo, "python %s %d %s %s%s", transfer_path, SENDTOOTHERNODE, fname, prefix, postfix);
+            appendStringInfo(&strinfo, "%s %d %s %s%s", transfer_path, SENDTOOTHERNODE, fname, prefix, postfix);
 
             if (system(strinfo.data) != 0) {
                 ereport(ERROR,
@@ -528,7 +528,7 @@ void copy_tsfile_to_backup(List* filenames)
         foreach (cell, filenames) {
             fname = (char*)lfirst(cell);
             appendStringInfo(&strinfo,
-                "python %s %d %s %s",
+                "%s %d %s %s",
                 transfer_path,
                 SENDTOBACKUP,
                 fname,

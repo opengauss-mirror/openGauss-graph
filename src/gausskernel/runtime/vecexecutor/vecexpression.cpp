@@ -28,9 +28,9 @@
 #include "access/tupconvert.h"
 #include "catalog/pg_type.h"
 #include "commands/typecmds.h"
-#include "executor/execdebug.h"
-#include "executor/nodeSubplan.h"
-#include "executor/nodeAgg.h"
+#include "executor/exec/execdebug.h"
+#include "executor/node/nodeSubplan.h"
+#include "executor/node/nodeAgg.h"
 #include "funcapi.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
@@ -55,6 +55,7 @@
 #include "pgxc/pgxc.h"
 #endif
 #include "postmaster/fencedudf.h"
+#include "catalog/pg_proc_fn.h"
 
 extern void initVectorFcache(Oid foid, Oid input_collation, FuncExprState* fcache, MemoryContext fcacheCxt);
 
@@ -102,8 +103,7 @@ static ScalarVector* ExecEvalVecVar(
             break;
     }
 
-    // Sys column branch
-    //
+    /* Sys column branch */
     Assert(batch != NULL);
     if (attnum < 0) {
         ScalarVector* pVec = batch->GetSysVector(attnum);
@@ -228,6 +228,22 @@ static ScalarVector* ExecEvalVecNot(
     return pVector;
 }
 
+static ScalarVector* ExecEvalVecRownum(
+    RownumState* exprstate, ExprContext* econtext, bool* pSelection, ScalarVector* pVector, ExprDoneCond* isDone)
+{
+    Assert(pSelection != NULL);
+    ScalarValue* pDest = pVector->m_vals;
+    int64 ps_rownum = exprstate->ps->ps_rownum;
+    
+    for (int i = 0; i < econtext->align_rows; i++) {
+        SET_NOTNULL(pVector->m_flag[i]);
+        pDest[i] = ++ps_rownum ;
+    }
+
+    pVector->m_rows = econtext->align_rows;
+
+    return pVector;
+}
 // TRUE means we deal with or
 // false means we deal with and
 template <bool AndOrFLag>
@@ -1497,9 +1513,6 @@ static ScalarVector* ExecEvalVecHashFilter(
     int null_value_dn_index = (NULL != hfstate->nodelist) ? hfstate->nodelist[0]
                                                           : /* fetch first dn in group's dn list */
                                   0;                        /* fetch first dn index */
-#ifdef ENABLE_MULTIPLE_NODES
-    CheckBucketMapLenValid();
-#endif
 
     /* Get hash value for each row, and deside whether it filter or not. */
     for (rowindex = 0; rowindex < econtext->align_rows; rowindex++) {
@@ -1514,7 +1527,8 @@ static ScalarVector* ExecEvalVecHashFilter(
             }
         } else {
             // pick up exec node based on bucket list in pgxc_group
-            modulo = hfstate->bucketMap[(unsigned int)abs((int)hashValue[rowindex]) & (uint32)(BUCKETDATALEN - 1)];
+            modulo = hfstate->bucketMap[(unsigned int)abs((int)hashValue[rowindex]) & 
+                                        (uint32)(hfstate->bucketCnt - 1)];
             nodeIndex = hfstate->nodelist[modulo];
 
             SET_NOTNULL(pVector->m_flag[rowindex]);
@@ -2335,7 +2349,7 @@ static ScalarVector* ExecEvalVecCoerceViaIO(
 
     pVector->m_rows = econtext->align_rows;
     pVector->m_desc.typeId = iostate->infunc.fn_rettype;
-    pVector->m_desc.encoded = COL_IS_ENCODE_T<retType>();
+    pVector->m_desc.encoded = COL_IS_ENCODE(retType);
 
     return pVector;
 }
@@ -2752,6 +2766,10 @@ ExprState* ExecInitVecExpr(Expr* node, PlanState* parent)
                         ptr = DispatchCoerceIOFunc<CSTRINGOID>(outputFunc);
                         break;
 
+                    case NAMEOID:
+                        ptr = DispatchCoerceIOFunc<NAMEOID>(outputFunc);
+                        break;
+                    
                     default:
                         ptr = DispatchCoerceIOFunc<VARCHAROID>(outputFunc);
                         break;
@@ -2866,11 +2884,12 @@ ExprState* ExecInitVecExpr(Expr* node, PlanState* parent)
                 if (HeapTupleIsValid(tp)) {
                     Form_pg_proc functup = (Form_pg_proc)GETSTRUCT(tp);
                     int nargs;
+                    oidvector* proargs = ProcedureGetArgTypes(tp);
                     nargs = functup->pronargs;
                     mstate->cfunc.genericRuntime = (GenericFunRuntime*)palloc0(sizeof(GenericFunRuntime));
                     InitGenericFunRuntimeInfo(*(mstate->cfunc.genericRuntime), nargs);
                     for (int j = 0; j < nargs; j++) {
-                        mstate->cfunc.genericRuntime->args[j].argType = functup->proargtypes.values[j];
+                        mstate->cfunc.genericRuntime->args[j].argType = proargs->values[j];
                     }
 
                     ReleaseSysCache(tp);
@@ -2921,7 +2940,9 @@ ExprState* ExecInitVecExpr(Expr* node, PlanState* parent)
             }
 
             hstate->arg = outlist;
-            hstate->bucketMap = get_bucketmap_by_execnode(parent->plan->exec_nodes, parent->state->es_plannedstmt);
+            hstate->bucketMap = get_bucketmap_by_execnode(parent->plan->exec_nodes, 
+                                                          parent->state->es_plannedstmt, 
+                                                          &hstate->bucketCnt);
             hstate->nodelist = (uint2*)palloc(list_length(htest->nodeList) * sizeof(uint2));
             foreach (l, htest->nodeList)
                 hstate->nodelist[idx++] = lfirst_int(l);
@@ -3127,11 +3148,12 @@ ExprState* ExecInitVecExpr(Expr* node, PlanState* parent)
                     if (HeapTupleIsValid(tp)) {
                         Form_pg_proc functup = (Form_pg_proc)GETSTRUCT(tp);
                         int nargs;
+                        oidvector* proargs = ProcedureGetArgTypes(tp);
                         nargs = functup->pronargs;
                         rstate->funcs[i].genericRuntime = (GenericFunRuntime*)palloc0(sizeof(GenericFunRuntime));
                         InitGenericFunRuntimeInfo(*(rstate->funcs[i].genericRuntime), nargs);
                         for (int j = 0; j < nargs; j++) {
-                            rstate->funcs[i].genericRuntime->args[j].argType = functup->proargtypes.values[j];
+                            rstate->funcs[i].genericRuntime->args[j].argType = proargs->values[j];
                         }
 
                         ReleaseSysCache(tp);
@@ -3158,6 +3180,12 @@ ExprState* ExecInitVecExpr(Expr* node, PlanState* parent)
                 (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
                     errmodule(MOD_VEC_EXECUTOR),
                     errmsg("Unsupported array coerce expression in vector engine")));
+        case T_Rownum: {
+            RownumState* rnstate = (RownumState*)makeNode(RownumState);
+            rnstate->ps = parent;
+            state = (ExprState*)rnstate;
+            state->vecExprFun = (VectorExprFun)ExecEvalVecRownum;
+        } break;
         default:
             ereport(ERROR,
                 (errcode(ERRCODE_UNRECOGNIZED_NODE_TYPE),
@@ -3530,44 +3558,40 @@ static inline void SetAlignRowsForProject(ExprContext* econtext, VectorBatch* ba
  *      it in the previously specified VectorBatch.
  * @in projInfo: ProjectionInfo node information
  * @in selReSet: Sign projInfo->pi_batch's m_sel if need reset.
+ * @in batchReset: True if pProjBatch is used for multi-entry.
  * @return: Return project result.
  */
 VectorBatch* ExecVecProject(ProjectionInfo* projInfo, bool selReSet, ExprDoneCond* isDone)
 {
-    VectorBatch* pProjBatch = NULL;
-    VectorBatch* srcBatch = NULL;
-    ExprContext* econtext = NULL;
-    int numSimpleVars;
-
     Assert(projInfo != NULL);
 
-    // get the projection info we want
-    //
-    pProjBatch = projInfo->pi_batch;
-    econtext = projInfo->pi_exprContext;
+    VectorBatch* pProjBatch = projInfo->pi_batch;
+    VectorBatch* srcBatch = NULL;
+    ExprContext* econtext = projInfo->pi_exprContext;
+    int numSimpleVars;
 
     /* Assume single result row until proven otherwise */
     if (isDone != NULL)
         *isDone = ExprSingleResult;
 
-    // Clear any former contents of the result pProjBatch
-    //
+    /* Clear any former contents of the result pProjBatch */
     pProjBatch->Reset();
 
     if (selReSet) {
         pProjBatch->ResetSelection(true);
     }
 
-    // align rows
+    /* align rows */
     econtext->align_rows = 0;
     SetAlignRowsForProject(econtext, econtext->ecxt_outerbatch);
     SetAlignRowsForProject(econtext, econtext->ecxt_innerbatch);
     SetAlignRowsForProject(econtext, econtext->ecxt_aggbatch);
     SetAlignRowsForProject(econtext, econtext->ecxt_scanbatch);
     Assert(econtext->align_rows != 0);
-    // Assign simple Vars to result by direct extraction of fields from source
-    // slots ... a mite ugly, but fast ...
-    //
+    /*
+     * Assign simple Vars to result by direct extraction of fields from source
+     * slots ... a mite ugly, but fast ...
+     */
     numSimpleVars = projInfo->pi_numSimpleVars;
     if (numSimpleVars > 0) {
         ScalarVector* values = pProjBatch->m_arr;
@@ -3601,16 +3625,14 @@ VectorBatch* ExecVecProject(ProjectionInfo* projInfo, bool selReSet, ExprDoneCon
             }
         }
 
-        // Set the number of rows on which batch is used
-        //
+        /* Set the number of rows on which batch is used */
         pProjBatch->m_rows = srcBatch->m_rows;
         for (i = 0; i < pProjBatch->m_cols; i++) {
             pProjBatch->m_arr[i].m_rows = srcBatch->m_rows;
         }
     }
 
-    // If there are any generic expressions, evaluate them.
-    //
+    /* If there are any generic expressions, evaluate them. */
     if (projInfo->pi_targetlist) {
         if (projInfo->jitted_vectarget) {
             projInfo->jitted_vectarget(econtext, pProjBatch);
@@ -3635,20 +3657,14 @@ VectorBatch* ExecVecProject(ProjectionInfo* projInfo, bool selReSet, ExprDoneCon
         }
     }
 
-    // Kludge: this is to fix some cases only const evaluation in target list, thus
-    // we may get a over sized batch. Adjust it back here.
-    //
+    /*
+     * Kludge: this is to fix some cases only const evaluation in target list, thus
+     * we may get a over sized batch. Adjust it back here.
+     */
     if (srcBatch != NULL)
         pProjBatch->m_rows = Min(pProjBatch->m_rows, srcBatch->m_rows);
 
-    // Successfully formed a result batch
-    //
-    if (econtext->have_vec_set_fun) {
-        return projInfo->pi_setFuncBatch;
-    } else {
-        Assert(pProjBatch->IsValid());
-        return pProjBatch;
-    }
+    return (econtext->have_vec_set_fun) ? projInfo->pi_setFuncBatch : pProjBatch;
 }
 
 static ScalarVector* ExecEvalVecGroupingFuncExpr(GroupingFuncExprState* gstate, ExprContext* econtext,

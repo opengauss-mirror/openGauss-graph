@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2020 Huawei Technologies Co.,Ltd.
+ * Portions Copyright (c) 2021, openGauss Contributors
  *
  * openGauss is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
@@ -25,10 +26,11 @@
 #include "codegen/gscodegen.h"
 #include "codegen/vecexprcodegen.h"
 #include "catalog/pg_operator.h"
+#include "catalog/pg_partition_fn.h"
 #include "catalog/pg_proc.h"
 #include "vecexecutor/vectsstorescan.h"
 #include "executor/executor.h"
-#include "executor/nodeModifyTable.h"
+#include "executor/node/nodeModifyTable.h"
 #include "nodes/plannodes.h"
 #include "nodes/nodeFuncs.h"
 #include "utils/snapmgr.h"
@@ -265,6 +267,7 @@ static TsStoreScanState* build_tsstore_scan_state(TsStoreScan* node, EState* est
     scanstate->tag_id_num = 0;
     scanstate->only_scan_tag = (node->series_func_calls > 0);
     scanstate->ts_store_search = New(CurrentMemoryContext) TsStoreSearch();
+    scanstate->only_const_col = false;
     if (!node->tablesample) {
         scanstate->isSampleScan = false;
     } else {

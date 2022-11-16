@@ -20,9 +20,12 @@
  * -------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "client_logic/client_logic_proc.h"
+#include "utils/syscache.h"
 #include "knl/knl_variable.h"
 
 #include "access/tableam.h"
+#include "catalog/pg_type.h"
 #include "access/tupconvert.h"
 #include "utils/builtins.h"
 
@@ -61,7 +64,7 @@
  * outdesc as the "expected" rowtype.  This is okay for current uses but
  * might need generalization in future.
  */
-TupleConversionMap *convert_tuples_by_position(TupleDesc indesc, TupleDesc outdesc, const char *msg)
+TupleConversionMap *convert_tuples_by_position(TupleDesc indesc, TupleDesc outdesc, const char *msg, const Oid func_id)
 {
     TupleConversionMap *map = NULL;
     AttrNumber *attrMap = NULL;
@@ -71,7 +74,6 @@ TupleConversionMap *convert_tuples_by_position(TupleDesc indesc, TupleDesc outde
     int i;
     int j;
     bool same = false;
-
     /* Verify compatibility and prepare attribute-number map */
     n = outdesc->natts;
     attrMap = (AttrNumber *)palloc0(n * sizeof(AttrNumber));
@@ -93,12 +95,13 @@ TupleConversionMap *convert_tuples_by_position(TupleDesc indesc, TupleDesc outde
             if (att->attisdropped)
                 continue;
             nincols++;
-            /* Found matching column, check type */
-            if (atttypid != att->atttypid || (atttypmod != att->atttypmod && atttypmod >= 0))
+            if (!IsClientLogicType(att->atttypid) &&
+                (atttypid != att->atttypid || (atttypmod != att->atttypmod && atttypmod >= 0))) {
                 ereport(ERROR, (errcode(ERRCODE_DATATYPE_MISMATCH), errmsg_internal("%s", _(msg)),
                                 errdetail("Returned type %s does not match expected type %s in column %d.",
                                           format_type_with_typemod(att->atttypid, att->atttypmod),
                                           format_type_with_typemod(atttypid, atttypmod), noutcols)));
+            }
             attrMap[i] = (AttrNumber)(j + 1);
             j++;
             break;

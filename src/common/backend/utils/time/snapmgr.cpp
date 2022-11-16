@@ -1,6 +1,6 @@
 /* -------------------------------------------------------------------------
  * snapmgr.c
- *		PostgreSQL snapshot manager
+ *		openGauss snapshot manager
  *
  * We keep track of snapshots in two ways: those "registered" by resowner.c,
  * and the "active snapshot" stack.  All snapshots in either of them live in
@@ -33,6 +33,7 @@
  *
  * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
+ * Portions Copyright (c) 2021, openGauss Contributors
  *
  * IDENTIFICATION
  *	  src/backend/utils/time/snapmgr.c
@@ -63,7 +64,6 @@
 #endif
 SnapshotData CatalogSnapshotData = {SNAPSHOT_MVCC};
 
-extern THR_LOCAL bool need_reset_xmin;
 /*
  * Elements of the active snapshot stack.
  *
@@ -79,6 +79,7 @@ typedef struct ActiveSnapshotElt {
 } ActiveSnapshotElt;
 
 static THR_LOCAL bool RegisterStreamSnapshot = false;
+TransactionId TransactionXmin = FirstNormalTransactionId;
 
 /* Define pathname of exported-snapshot files */
 #define SNAPSHOT_EXPORT_DIR "pg_snapshots"
@@ -101,6 +102,9 @@ THR_LOCAL SnapshotData SnapshotNowData = {SNAPSHOT_NOW};
 THR_LOCAL SnapshotData SnapshotSelfData = {SNAPSHOT_SELF};
 THR_LOCAL SnapshotData SnapshotAnyData = {SNAPSHOT_ANY};
 THR_LOCAL SnapshotData SnapshotToastData = {SNAPSHOT_TOAST};
+#ifdef ENABLE_MULTIPLE_NODES
+THR_LOCAL SnapshotData SnapshotNowNoSyncData = {SNAPSHOT_NOW_NO_SYNC};
+#endif
 
 /* local functions */
 static Snapshot CopySnapshot(Snapshot snapshot);
@@ -188,28 +192,19 @@ bool XidVisibleInSnapshot(TransactionId xid, Snapshot snapshot, TransactionIdSta
 
     *hintstatus = XID_INPROGRESS;
 
+#ifdef XIDVIS_DEBUG
     ereport(DEBUG1,
         (errmsg("XidVisibleInSnapshot xid %ld cur_xid %ld snapshot csn %lu xmax %ld",
             xid,
             GetCurrentTransactionIdIfAny(),
             snapshot->snapshotcsn,
             snapshot->xmax)));
-
-    /*
-     * Any xid >= xmax is in-progress (or aborted, but we don't distinguish
-     * that here).
-     *
-     * We can't do anything useful with xmin, because the xmin only tells us
-     * whether we see it as completed. We have to check the transaction log to
-     * see if the transaction committed or aborted, in any case.
-     */
-    if (GTM_MODE && TransactionIdFollowsOrEquals(xid, snapshot->xmax)) {
-            return false;
-    }
+#endif
 
 loop:
-    csn = TransactionIdGetCommitSeqNo(xid, false, true, false);
+    csn = TransactionIdGetCommitSeqNo(xid, false, true, false, snapshot);
 
+#ifdef XIDVIS_DEBUG
     ereport(DEBUG1,
         (errmsg("XidVisibleInSnapshot xid %ld cur_xid %ld csn %ld snapshot"
                 "csn %ld xmax %ld",
@@ -218,6 +213,7 @@ loop:
             csn,
             snapshot->snapshotcsn,
             snapshot->xmax)));
+#endif
 
     if (COMMITSEQNO_IS_COMMITTED(csn)) {
         *hintstatus = XID_COMMITTED;
@@ -275,79 +271,49 @@ loop:
     }
 }
 
-/*
- * XidVisibleInLocalSnapshot
- *		Is the given XID visible according to the local multi-version snapshot?
- *
- * On return whether or not it's not visible to us.
- */
-bool XidVisibleInLocalSnapshot(TransactionId xid, Snapshot snapshot)
+bool UHeapXidVisibleInSnapshot(TransactionId xid, Snapshot snapshot,
+    TransactionIdStatus *hintstatus, Buffer buffer, bool *sync)
+{
+    if (!GTM_LITE_MODE || snapshot->gtm_snapshot_type == GTM_SNAPSHOT_TYPE_LOCAL) {
+        /*
+         * Make a quick range check to eliminate most XIDs without looking at the
+         * CSN log.
+         */
+        if (TransactionIdPrecedes(xid, snapshot->xmin)) {
+            return true;
+        }
+
+        /*
+         * Any xid >= xmax is in-progress (or aborted, but we don't distinguish
+         * that here.
+         */
+        if (GTM_MODE && TransactionIdFollowsOrEquals(xid, snapshot->xmax)) {
+            return false;
+        }
+    }
+
+    return XidVisibleInSnapshot(xid, snapshot, hintstatus, buffer, sync);
+}
+
+bool XidVisibleInDecodeSnapshot(TransactionId xid, Snapshot snapshot, TransactionIdStatus* hintstatus, Buffer buffer)
 {
     volatile CommitSeqNo csn;
-    bool looped = false;
-    TransactionId parentXid = InvalidTransactionId;
+    *hintstatus = XID_INPROGRESS;
 
-    ereport(DEBUG1,
-        (errmsg("XidVisibleInSnapshot xid " XID_FMT " cur_xid " XID_FMT " snapshot csn " CSN_FMT " xmax " XID_FMT,
-            xid,
-            GetCurrentTransactionIdIfAny(),
-            snapshot->snapshotcsn,
-            snapshot->xmax)));
-
-    /*
-     * Any xid >= xmax is in-progress (or aborted, but we don't distinguish
-     * that here).
-     *
-     * We can't do anything useful with xmin, because the xmin only tells us
-     * whether we see it as completed. We have to check the transaction log to
-     * see if the transaction committed or aborted, in any case.
-     */
-    if (GTM_MODE && TransactionIdFollowsOrEquals(xid, snapshot->xmax)) {
-            return false;
-    }
-
-loop:
-    csn = TransactionIdGetCommitSeqNoNCache(xid, false, true, false);
-
-    ereport(DEBUG1,
-        (errmsg("XidVisibleInSnapshot xid " XID_FMT " cur_xid " XID_FMT " csn " CSN_FMT " snapshot"
-                "csn " CSN_FMT " xmax " XID_FMT,
-            xid,
-            GetCurrentTransactionIdIfAny(),
-            csn,
-            snapshot->snapshotcsn,
-            snapshot->xmax)));
-
+    csn = TransactionIdGetCommitSeqNo(xid, false, true, false, snapshot);
     if (COMMITSEQNO_IS_COMMITTED(csn)) {
-        if (csn < snapshot->snapshotcsn)
+        *hintstatus = XID_COMMITTED;
+        if (csn < snapshot->snapshotcsn) {
             return true;
-        else
-            return false;
-    } else if (COMMITSEQNO_IS_COMMITTING(csn)) {
-        if (looped) {
-            ereport(DEBUG1, (errmsg("transaction id " XID_FMT "'s csn " CSN_FMT " is changed to ABORT after lockwait.", xid, csn)));
-            return false;
         } else {
-            if (COMMITSEQNO_IS_SUBTRANS(csn)) {
-                parentXid = (TransactionId)GET_PARENTXID(csn);
-            }
-
-            if (u_sess->attr.attr_common.xc_maintenance_mode) {
-                return false;
-            }
-
-            /* Wait for txn end and check again. */
-            if (TransactionIdIsValid(parentXid))
-                SyncLocalXidWait(parentXid);
-            else
-                SyncLocalXidWait(xid);
-            looped = true;
-            parentXid = InvalidTransactionId;
-            goto loop;
+            return false;
         }
     } else {
-        return false;
+        if (csn == COMMITSEQNO_ABORTED) {
+            *hintstatus = XID_ABORTED;
+        }
     }
+    return false;
 }
 
 /*
@@ -371,18 +337,10 @@ bool CommittedXidVisibleInSnapshot(TransactionId xid, Snapshot snapshot, Buffer 
          */
         if (TransactionIdPrecedes(xid, snapshot->xmin))
             return true;
-
-        /*
-         * Any xid >= xmax is in-progress (or aborted, but we don't distinguish
-         * that here.
-         */
-        if (GTM_MODE && TransactionIdFollowsOrEquals(xid, snapshot->xmax)) {
-            return false;
-        }
     }
 
 loop:
-    csn = TransactionIdGetCommitSeqNo(xid, true, true, false);
+    csn = TransactionIdGetCommitSeqNo(xid, true, true, false, snapshot);
 
     if (COMMITSEQNO_IS_COMMITTING(csn)) {
         if (looped) {
@@ -444,6 +402,32 @@ loop:
         return false;
 }
 
+bool CommittedXidVisibleInDecodeSnapshot(TransactionId xid, Snapshot snapshot, Buffer buffer)
+{
+    CommitSeqNo csn;
+
+    csn = TransactionIdGetCommitSeqNo(xid, true, true, false, snapshot);
+    if (COMMITSEQNO_IS_COMMITTING(csn)) {
+        return false;
+    } else if (!COMMITSEQNO_IS_COMMITTED(csn)) {
+        ereport(WARNING,
+            (errmsg("transaction/csn %lu/%lu was hinted as "
+                    "committed, but was not marked as committed in "
+                    "the transaction log",
+                xid, csn)));
+        /*
+         * We have contradicting evidence on whether the transaction committed or
+         * not. Let's assume that it did. That seems better than erroring out.
+         */
+        return true;
+    }
+
+    if (csn < snapshot->snapshotcsn) {
+        return true;
+    } else {
+        return false;
+    }
+}
 
 /*
  * GetTransactionSnapshot
@@ -612,40 +596,6 @@ Snapshot GetCatalogSnapshot()
 }
 
 /*
- * GetNonHistoricCatalogSnapshot
- *      Get a snapshot that is sufficiently up-to-date for scan of the system
- *      catalog with the specified OID, even while historic snapshots are set
- *      up.
- */
-Snapshot GetNonHistoricCatalogSnapshot(Oid relid)
-{
-    /*
-     * If the caller is trying to scan a relation that has no syscache,
-     * no catcache invalidations will be sent when it is updated.  For a
-     * a few key relations, snapshot invalidations are sent instead.  If
-     * we're trying to scan a relation for which neither catcache nor
-     * snapshot invalidations are sent, we must refresh the snapshot every
-     * time.
-     */
-    if (!u_sess->utils_cxt.CatalogSnapshotStale && !RelationInvalidatesSnapshotsOnly(relid) &&
-        !RelationHasSysCache(relid))
-        u_sess->utils_cxt.CatalogSnapshotStale = true;
-
-    if (u_sess->utils_cxt.CatalogSnapshotStale) {
-        /* Get new snapshot. */
-        u_sess->utils_cxt.CatalogSnapshot = GetSnapshotData(&CatalogSnapshotData, false);
-
-        /*
-         * Mark new snapshost as valid.  We must do this last, in case an
-         * ERROR occurs inside GetSnapshotData().
-         */
-        u_sess->utils_cxt.CatalogSnapshotStale = false;
-    }
-
-    return u_sess->utils_cxt.CatalogSnapshot;
-}
-
-/*
  * SnapshotSetCommandId
  *		Propagate CommandCounterIncrement into the static snapshots, if set
  */
@@ -810,6 +760,32 @@ static void FreeSnapshot(Snapshot snapshot)
     }
 
     pfree_ext(snapshot);
+}
+
+
+/*
+ * FreeSnapshot
+ *		Free the memory associated with snapshot members exclude snapshot struct.
+ */
+void FreeSnapshotDeepForce(Snapshot snap)
+{
+    if (snap->xip) {
+        pfree_ext(snap->xip);
+    }
+
+    if (snap->subxip) {
+        pfree_ext(snap->subxip);
+    }
+
+    if (snap->prepared_array) {
+        pfree_ext(snap->prepared_array);
+    }
+
+    if (snap->user_data) {
+        pfree_ext(snap->user_data);
+    }
+
+    pfree_ext(snap);
 }
 
 /*
@@ -1002,14 +978,14 @@ void UnregisterSnapshotFromOwner(Snapshot snapshot, ResourceOwner owner)
     if (snapshot == NULL)
         return;
 
-    Assert(snapshot->regd_count > 0);
-    Assert(u_sess->utils_cxt.RegisteredSnapshots > 0);
-
-    ResourceOwnerForgetSnapshot(owner, snapshot);
-    u_sess->utils_cxt.RegisteredSnapshots--;
-    if (--snapshot->regd_count == 0 && snapshot->active_count == 0) {
-        FreeSnapshot(snapshot);
-        SnapshotResetXmin();
+    if (ResourceOwnerForgetSnapshot(owner, snapshot, true)) {
+        Assert(u_sess->utils_cxt.RegisteredSnapshots > 0);
+        Assert(snapshot->regd_count > 0);
+        u_sess->utils_cxt.RegisteredSnapshots--;
+        if (--snapshot->regd_count == 0 && snapshot->active_count == 0) {
+            FreeSnapshot(snapshot);
+            SnapshotResetXmin();
+        }
     }
 }
 
@@ -1041,7 +1017,7 @@ static void SnapshotResetXmin(void)
     if (u_sess->utils_cxt.RegisteredSnapshots == 0 && u_sess->utils_cxt.ActiveSnapshot == NULL) {
         t_thrd.pgxact->xmin = InvalidTransactionId;
         t_thrd.pgxact->csn_min = InvalidCommitSeqNo;
-        need_reset_xmin = true;
+        t_thrd.pgxact->csn_dr = InvalidCommitSeqNo;
     }
 }
 

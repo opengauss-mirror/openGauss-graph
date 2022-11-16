@@ -507,6 +507,9 @@ static inline bool IsScan(Plan* plan)
 static inline bool IsJoin(Plan* plan)
 {
     return IsA(plan, VecNestLoop) || IsA(plan, VecMergeJoin) || IsA(plan, VecHashJoin) || IsA(plan, NestLoop) ||
+#ifdef GS_GRAPH
+           IsA(plan, NestLoopVLE) ||
+#endif           
            IsA(plan, MergeJoin) || IsA(plan, HashJoin) || IsA(plan, Join);
 }
 
@@ -927,6 +930,9 @@ static void GetSpecialPlanOptCondition(PlanState* planstate, StringInfo conditio
             break;
         case T_VecNestLoop:
         case T_NestLoop:
+#ifdef GS_GRAPH
+        case T_NestLoopVLE:
+#endif
             GetPlanOptConditionFromQual(((NestLoop*)plan)->join.joinqual, planstate, condition, maxlen, rtable);
             break;
         case T_VecMergeJoin:
