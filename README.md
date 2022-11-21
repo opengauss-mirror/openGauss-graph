@@ -25,10 +25,6 @@
 ## 什么是openGauss-graph
 
 openGauss-graph是基于[openGauss(3.0.0)](https://gitee.com/opengauss/openGauss-server)关系型存储的图引擎，提供海量图数据的存储和分析能力，支持万亿边PB级数据存储与毫秒级点边查询能力，支持Cypher和SPARQL语言查询，同时处理RDF图和属性图。兼容关系型数据库。携手社区生态伙伴，共建开源开放的图数据库内核和生态。
-### 架构图
-<img src="doc/openGauss-graph-architecture.png" alt="openGauss-graph架构" width="600"/>
-
-
 
 ### 特性说明
 
