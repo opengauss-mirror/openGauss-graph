@@ -131,7 +131,7 @@ sudo yum install flex bison readline-devel ncurses-devel glibc-devel libaio-deve
 2.配置环境变量
 
 ```
-   export CODE_BASE=/home/omm/openGauss-server/     # Path of the openGauss-server file
+   export CODE_BASE=/home/omm/openGauss-graph/     # Path of the openGauss-server file
    export BINARYLIBS=/home/omm/binarylibs/    # Path of the binarylibs file
    export GAUSSHOME=$CODE_BASE/dest/     
    export GCC_PATH=$BINARYLIBS/buildtools/openeuler_x86_64[这里替换成操作系统对应的文件夹]/gcc7.3/
