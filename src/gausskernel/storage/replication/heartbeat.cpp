@@ -109,18 +109,32 @@ OUT:
 
 static int deal_with_sigup()
 {
+    int j;
     if (t_thrd.heartbeat_cxt.got_SIGHUP) {
         t_thrd.heartbeat_cxt.got_SIGHUP = false;
         ProcessConfigFile(PGC_SIGHUP);
-        if (g_heartbeat_server != NULL) {
-            if (!g_heartbeat_server->Restart()) {
-                return 1;
+        /*
+         * when Ha replconninfo have changed and current_mode is not NORMAL,
+         * dynamically modify the ha socket.
+         */
+        for (j = 1; j < MAX_REPLNODE_NUM; j++) {
+            if (t_thrd.postmaster_cxt.ReplConnChangeType[j] == OLD_REPL_CHANGE_IP_OR_PORT) {
+                break;
             }
         }
-
-        if (g_heartbeat_client != NULL) {
-            /* The client will auto connect later. */
-            g_heartbeat_client->DisConnect();
+        if (j < MAX_REPLNODE_NUM) {
+            if (g_heartbeat_server != NULL) {
+                if (!g_heartbeat_server->Restart()) {
+                    return 1;
+                }
+            }
+            for (int i = 1; i < MAX_REPLNODE_NUM; i++) {
+                t_thrd.postmaster_cxt.ReplConnChangeType[i] = NO_CHANGE;
+            }
+            if (g_heartbeat_client != NULL) {
+                /* The client will auto connect later. */
+                g_heartbeat_client->DisConnect();
+            }
         }
     }
     return 0;
@@ -222,6 +236,9 @@ static void heartbeat_handle_exception(MemoryContext heartbeat_context)
     /* Report the error to the server log */
     EmitErrorReport();
 
+    /* release resource held by lsc */
+    AtEOXact_SysDBCache(false);
+
     /* Buffer pins are released here: */
     ResourceOwnerRelease(t_thrd.utils_cxt.CurrentResourceOwner, RESOURCE_RELEASE_BEFORE_LOCKS, false, true);
 
@@ -292,7 +309,8 @@ void heartbeat_main(void)
     /*
      * Create a resource owner to keep track of our resources.
      */
-    t_thrd.utils_cxt.CurrentResourceOwner = ResourceOwnerCreate(NULL, "Heartbeat", MEMORY_CONTEXT_STORAGE);
+    t_thrd.utils_cxt.CurrentResourceOwner = ResourceOwnerCreate(NULL, "Heartbeat",
+        THREAD_GET_MEM_CXT_GROUP(MEMORY_CONTEXT_STORAGE));
 
     /*
      * Create a memory context that we will do all our work in.  We do this so
@@ -394,12 +412,18 @@ TimestampTz get_last_reply_timestamp(int replindex)
         return last_reply_time;
     }
 
-    if (replindex < START_REPLNODE_NUM || replindex >= MAX_REPLNODE_NUM) {
+    if (replindex < START_REPLNODE_NUM || replindex >= DOUBLE_MAX_REPLNODE_NUM) {
         ereport(COMMERROR, (errmsg("Invalid channel id: %d.", replindex)));
         return last_reply_time;
     }
 
-    if (t_thrd.postmaster_cxt.ReplConnArray[replindex] == NULL) {
+    ReplConnInfo* replconninfo = NULL;
+    if (replindex >= MAX_REPLNODE_NUM)
+            replconninfo = t_thrd.postmaster_cxt.CrossClusterReplConnArray[replindex - MAX_REPLNODE_NUM];
+        else
+            replconninfo = t_thrd.postmaster_cxt.ReplConnArray[replindex]; 
+
+    if (replconninfo == NULL) {
         ereport(COMMERROR, (errmsg("The reliconninfo is not find.")));
         return last_reply_time;
     }
@@ -427,9 +451,13 @@ void InitHeartbeatTimestamp()
 {
     volatile heartbeat_state *stat = t_thrd.heartbeat_cxt.state;
 
+    ReplConnInfo* replconninfo = NULL;
     SpinLockAcquire(&stat->mutex);
-    for (int i = 1; i < MAX_REPLNODE_NUM; i++) {
-        ReplConnInfo* replconninfo = t_thrd.postmaster_cxt.ReplConnArray[i];
+    for (int i = 1; i < DOUBLE_MAX_REPLNODE_NUM; i++) {
+        if (i >= MAX_REPLNODE_NUM)
+            replconninfo = t_thrd.postmaster_cxt.CrossClusterReplConnArray[i - MAX_REPLNODE_NUM];
+        else
+            replconninfo = t_thrd.postmaster_cxt.ReplConnArray[i];        
         if (replconninfo == NULL) {
             continue;
         }
@@ -487,8 +515,8 @@ static void heartbeat_kill(int code, Datum arg)
     stat->pid = 0;
     stat->lwpId = 0;
 
-    rc = memset_s(stat->channel_array, sizeof(channel_info) * MAX_REPLNODE_NUM, 0,
-                  sizeof(channel_info) * MAX_REPLNODE_NUM);
+    rc = memset_s(stat->channel_array, sizeof(channel_info) * DOUBLE_MAX_REPLNODE_NUM, 0,
+                  sizeof(channel_info) * DOUBLE_MAX_REPLNODE_NUM);
     securec_check_c(rc, "", "");
     SpinLockRelease(&stat->mutex);
 

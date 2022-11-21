@@ -32,11 +32,15 @@
 #include "storage/sinval.h"
 #include "utils/plancache.h"
 
+#ifndef ENABLE_LITE_MODE
 #define GPC_NUM_OF_BUCKETS (128)
+#else
+#define GPC_NUM_OF_BUCKETS (2)
+#endif
+
 #define GPC_HTAB_SIZE (128)
 #define GLOBALPLANCACHEKEY_MAGIC (953717831)
 #define CAS_SLEEP_DURATION (2)
-#define GPC_CLEAN_WAIT_TIME (u_sess->attr.attr_common.gpc_clean_timeout)
 
 #define ENABLE_GPC (g_instance.attr.attr_common.enable_global_plancache == true && \
                        g_instance.attr.attr_common.enable_thread_pool == true)
@@ -50,9 +54,11 @@
 #define ENABLE_CN_GPC (IS_PGXC_COORDINATOR && \
                        g_instance.attr.attr_common.enable_global_plancache == true && \
                        g_instance.attr.attr_common.enable_thread_pool == true)
+#define IN_GPC_GRAYRELEASE_CHANGE (u_sess->attr.attr_common.enable_gpc_grayrelease_mode == true)
 #else
 #define ENABLE_CN_GPC (g_instance.attr.attr_common.enable_global_plancache == true && \
                        g_instance.attr.attr_common.enable_thread_pool == true)
+#define IN_GPC_GRAYRELEASE_CHANGE (false)
 #endif
 
 typedef enum PGXCNode_HandleGPC
@@ -122,6 +128,7 @@ typedef struct GPCEnv
 
     /* vary name.*/
     int num_params;
+    Oid* param_types;
     struct OverrideSearchPath* search_path;
     char schema_name[NAMEDATALEN];
     char expected_computing_nodegroup[NAMEDATALEN];    // QUERY_TUNING_METHOD
@@ -204,6 +211,7 @@ extern void GPCResetAll();
 void GPCCleanDatanodeStatement(int dn_stmt_num, const char* stmt_name);
 void GPCReGplan(CachedPlanSource* plansource);
 void CNGPCCleanUpSession();
+void GPCCleanUpSessionSavedPlan();
 List* CopyLocalStmt(const List* stmt_list, const MemoryContext parent_cxt, MemoryContext* plan_context);
 bool SPIParseEnableGPC(const Node *node);
 void CleanSessGPCPtr(knl_session_context* currentSession);

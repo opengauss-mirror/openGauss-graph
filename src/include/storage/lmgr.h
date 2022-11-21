@@ -1,7 +1,7 @@
 /* -------------------------------------------------------------------------
  *
  * lmgr.h
- *	  POSTGRES lock manager definitions.
+ *	  openGauss lock manager definitions.
  *
  *
  * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
@@ -37,6 +37,7 @@ extern void LockRelation(Relation relation, LOCKMODE lockmode);
 extern bool ConditionalLockRelation(Relation relation, LOCKMODE lockmode);
 extern void UnlockRelation(Relation relation, LOCKMODE lockmode);
 extern bool LockHasWaitersRelation(Relation relation, LOCKMODE lockmode);
+extern bool LockHasWaitersPartition(Relation relation, LOCKMODE lockmode);
 
 extern void LockRelationIdForSession(LockRelId* relid, LOCKMODE lockmode);
 extern void UnlockRelationIdForSession(LockRelId* relid, LOCKMODE lockmode);
@@ -56,18 +57,25 @@ extern bool ConditionalLockPage(Relation relation, BlockNumber blkno, LOCKMODE l
 extern void UnlockPage(Relation relation, BlockNumber blkno, LOCKMODE lockmode);
 
 /* Lock a tuple (see heap_lock_tuple before assuming you understand this) */
-extern void LockTuple(Relation relation, ItemPointer tid, LOCKMODE lockmode, bool allow_con_update = false);
+extern void LockTuple(Relation relation, ItemPointer tid, LOCKMODE lockmode, bool allow_con_update = false, int waitSec = 0);
+extern void LockTupleUid(Relation relation, uint64 uid, LOCKMODE lockmode, bool allow_con_update, bool lockTuple);
 extern bool ConditionalLockTuple(Relation relation, ItemPointer tid, LOCKMODE lockmode);
 extern void UnlockTuple(Relation relation, ItemPointer tid, LOCKMODE lockmode);
 
 /* Lock an XID (used to wait for a transaction to finish) */
 extern void XactLockTableInsert(TransactionId xid);
 extern void XactLockTableDelete(TransactionId xid);
-extern void XactLockTableWait(TransactionId xid, bool allow_con_update = false);
+extern void XactLockTableWait(TransactionId xid, bool allow_con_update = false, int waitSec = 0);
 extern bool ConditionalXactLockTableWait(TransactionId xid, bool waitparent = true, bool bCareNextxid = false);
+
+/* Lock a SubXID */
+extern void SubXactLockTableInsert(SubTransactionId subxid);
+extern void SubXactLockTableWait(TransactionId xid, SubTransactionId subxid, int waitSec = 0);
+extern bool ConditionalSubXactLockTableWait(TransactionId xid, SubTransactionId subxid);
 
 /* Lock a general object (other than a relation) of the current database */
 extern void LockDatabaseObject(Oid classid, Oid objid, uint16 objsubid, LOCKMODE lockmode);
+extern bool ConditionalLockDatabaseObject(Oid classid, Oid objid, uint16 objsubid, LOCKMODE lockmode);
 extern void UnlockDatabaseObject(Oid classid, Oid objid, uint16 objsubid, LOCKMODE lockmode);
 
 /* Lock a shared-across-databases object (other than a relation) */
@@ -90,6 +98,7 @@ extern void UnlockPartitionOid(Oid relid, uint32 seq, LOCKMODE lockmode);
 extern void LockPartitionSeq(Oid relid, uint32 seq, LOCKMODE lockmode);
 extern bool ConditionalLockPartitionSeq(Oid relid, uint32 seq, LOCKMODE lockmode);
 extern void UnlockPartitionSeq(Oid relid, uint32 seq, LOCKMODE lockmode);
+extern void UnlockPartitionSeqIfHeld(Oid relid, uint32 seq, LOCKMODE lockmode);
 
 extern bool ConditionalLockPartitionWithRetry(Relation relation, Oid partitionId, LOCKMODE lockmode);
 

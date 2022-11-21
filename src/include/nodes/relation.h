@@ -4,6 +4,7 @@
  *	  Definitions for planner's internal data structures.
  *
  *
+ * Portions Copyright (c) 2021, openGauss Contributors
  * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
@@ -18,7 +19,6 @@
 #include "lib/stringinfo.h"
 #include "nodes/params.h"
 #include "nodes/parsenodes.h"
-#include "parser/parsetree.h"
 #include "storage/buf/block.h"
 #include "utils/partitionmap.h"
 #include "utils/partitionmap_gs.h"
@@ -26,10 +26,36 @@
 #include "optimizer/bucketinfo.h"
 
 /*
+ * Determines if query has to be launched
+ * on Coordinators only (SEQUENCE DDL),
+ * on Datanodes (normal Remote Queries),
+ * or on all openGauss nodes (Utilities and DDL).
+ */
+typedef enum
+{
+    EXEC_ON_DATANODES,
+    EXEC_ON_COORDS,
+    EXEC_ON_ALL_NODES,
+    EXEC_ON_NONE
+} RemoteQueryExecType;
+
+#define EXEC_CONTAIN_COORDINATOR(exec_type) \
+    ((exec_type) == EXEC_ON_ALL_NODES || (exec_type) == EXEC_ON_COORDS)
+
+#define EXEC_CONTAIN_DATANODE(exec_type) \
+    ((exec_type) == EXEC_ON_ALL_NODES || (exec_type) == EXEC_ON_DATANODES)
+
+/*
  * When looking for a "cheapest path", this enum specifies whether we want
  * cheapest startup cost or cheapest total cost.
  */
 typedef enum CostSelector { STARTUP_COST, TOTAL_COST } CostSelector;
+
+/* Different rules are used for path generation */
+typedef enum {
+    NO_PATH_GEN_RULE = 0,
+    BTREE_INDEX_CONTAIN_UNIQUE_COLS = 1 /* an equivalence constraint btree index scan contains unique cols */
+} RulesForPathGen;
 
 /*
  * The cost estimate produced by cost_qual_eval() includes both a one-time
@@ -82,6 +108,8 @@ typedef struct {
 typedef struct PlannerContext {
     MemoryContext plannerMemContext;
     MemoryContext dataSkewMemContext;
+    MemoryContext tempMemCxt;
+    int refCounter; /* tempMemCxt invoked Times */
 } PlannerContext;
 
 /*
@@ -195,6 +223,9 @@ typedef struct PlannerGlobal {
 #define SUBQUERY_IS_SUBLINK(pr) (((pr->subquery_type & SUBQUERY_SUBLINK) == SUBQUERY_SUBLINK))
 
 #define SUBQUERY_PREDPUSH(pr) ((SUBQUERY_IS_RESULT(pr)) || (SUBQUERY_IS_PARAM(pr)))
+
+#define WITHIN_SUBQUERY(root, rte) (IS_STREAM_PLAN && root->is_correlated && \
+            (GetLocatorType(rte->relid) != LOCATOR_TYPE_REPLICATED || ng_is_multiple_nodegroup_scenario()))
 
 /* ----------
  * PlannerInfo
@@ -340,7 +371,7 @@ typedef struct PlannerInfo {
     int rs_alias_index; /* used to build the alias reference */
 
     /*
-     * In Postgres-XC Coordinators are supposed to skip the handling of
+     * In openGauss Coordinators are supposed to skip the handling of
      * row marks of type ROW_MARK_EXCLUSIVE & ROW_MARK_SHARE.
      * In order to do that we simply remove such type
      * of row marks from the list rowMarks. Instead they are saved
@@ -359,6 +390,8 @@ typedef struct PlannerInfo {
     List* curOuterParams; /* not-yet-assigned NestLoopParams */
 
     Index curIteratorParamIndex;
+    bool isPartIteratorPruning;
+    Index curSubPartIteratorParamIndex;
     bool isPartIteratorPlanning;
     int curItrs;
     List* subqueryRestrictInfo; /* Subquery RestrictInfo, which only be used in wondows agg. */
@@ -404,6 +437,13 @@ typedef struct PlannerInfo {
     Bitmapset *param_upper;
 	
 	bool hasRownumQual;
+    List *origin_tlist;
+
+#ifdef GS_GRAPH
+    List *processed_tlist;
+    bool hasVLEJoinRTE;  /* has VLE join or a child node of VLE join */
+#endif
+
 } PlannerInfo;
 
 /*
@@ -578,6 +618,7 @@ typedef struct RelOptInfo {
     List* distribute_keys; /* distribute key */
     List* pathlist;        /* Path structures */
     List* ppilist;         /* ParamPathInfos used in pathlist */
+    struct Path* cheapest_gather_path;
     struct Path* cheapest_startup_path;
     List* cheapest_total_path; /* contain all cheapest total paths from different distribute key */
     struct Path* cheapest_unique_path;
@@ -618,6 +659,16 @@ typedef struct RelOptInfo {
     struct FdwRoutine* fdwroutine; /* if foreign table */
     void* fdw_private;             /* if foreign table */
 
+#ifdef GS_GRAPH
+    /* cache space for remembering if we have proven this relation unique */
+	List	   *unique_for_rels;	/* known unique for these other relid
+									 * set(s) */
+	List	   *non_unique_for_rels;	/* known not unique for these set(s) */
+    bool		consider_parallel;	/* consider parallel paths? */
+    Relids		top_parent_relids;	/* Relids of topmost parents (if "other" rel) */
+    // List	   *partial_pathlist;	/* partial Paths */
+#endif
+
     /* used by various scans and joins: */
     List* baserestrictinfo;          /* RestrictInfo structures (if base
                                       * rel) */
@@ -635,6 +686,8 @@ typedef struct RelOptInfo {
     ItstDisKey rel_dis_keys;         /* interesting key info for current relation */
     List* varratio;                  /* rel tuples ratio after join to different relation */
     List* varEqRatio;
+
+    bool is_ustore;
 
     /*
      * The alternative rel for cost-based query rewrite
@@ -713,6 +766,7 @@ typedef struct IndexOptInfo {
     List* indextlist; /* targetlist representing index columns */
 
     bool isGlobal;       /* true if index is global partition index */
+    bool crossbucket;    /* true if index is crossbucket */
     bool predOK;         /* true if predicate matches query */
     bool unique;         /* true if a unique index */
     bool immediate;      /* is uniqueness enforced immediately? */
@@ -909,7 +963,9 @@ typedef struct Path {
 
     RelOptInfo* parent;        /* the relation this path can build */
     ParamPathInfo* param_info; /* parameterization info, or NULL if none */
-
+#ifdef GS_GRAPH
+    bool parallel_safe;	/* OK to use as part of parallel plan? */
+#endif
     /* estimated size/costs for path (see costsize.c for more info) */
     double rows; /* estimated number of global result tuples */
     double multiple;
@@ -920,6 +976,7 @@ typedef struct Path {
     List* pathkeys;        /* sort ordering of path's output */
     List* distribute_keys; /* distribute key, Var list */
     char locator_type;
+    RemoteQueryExecType exec_type;
     Oid rangelistOid;
     int dop; /* degree of parallelism */
     /* pathkeys is a List of PathKey nodes; see above */
@@ -970,6 +1027,10 @@ typedef struct Path {
  * of the same length as 'indexorderbys', showing which index column each
  * ORDER BY expression is meant to be used with.  (There is no restriction
  * on which index column each ORDER BY can be used with.)
+ * 
+ * 'rulesforindexgen' is a bitmapset. It is used for recording some rules which 
+ * are satisfied in current index path. These recorded rules will be used for 
+ * filtering paths. We can consider it as the supplement of CBO (cost based optimize).
  *
  * 'indexscandir' is one of:
  *		ForwardScanDirection: forward scan of an ordered index
@@ -993,9 +1054,11 @@ typedef struct IndexPath {
     List* indexqualcols;
     List* indexorderbys;
     List* indexorderbycols;
+    int rulesforindexgen = NO_PATH_GEN_RULE;
     ScanDirection indexscandir;
     Cost indextotalcost;
     Selectivity indexselectivity;
+    bool is_ustore;
 } IndexPath;
 
 typedef struct PartIteratorPath {
@@ -1043,6 +1106,7 @@ typedef struct BitmapAndPath {
     Path path;
     List* bitmapquals; /* IndexPaths and BitmapOrPaths */
     Selectivity bitmapselectivity;
+    bool is_ustore;
 } BitmapAndPath;
 
 /*
@@ -1055,6 +1119,7 @@ typedef struct BitmapOrPath {
     Path path;
     List* bitmapquals; /* IndexPaths and BitmapAndPaths */
     Selectivity bitmapselectivity;
+    bool is_ustore;
 } BitmapOrPath;
 
 /*
@@ -1243,6 +1308,12 @@ typedef struct JoinPath {
      * parent RelOptInfo.
      */
     int skewoptimize;
+#ifdef GS_GRAPH
+    bool inner_unique;	/* each outer tuple provably matches no more
+						 * than one inner tuple */
+    int	minhops;
+	int	maxhops;
+#endif    
 } JoinPath;
 
 /*
@@ -1274,6 +1345,13 @@ typedef JoinPath NestPath;
  * mergejoin.  If it is not NIL then it is a PathKeys list describing
  * the ordering that must be created by an explicit Sort node.
  *
+ * skip_mark_restore is true if the executor need not do mark/restore calls.
+ * Mark/restore overhead is usually required, but can be skipped if we know
+ * that the executor need find only one match per outer tuple, and that the
+ * mergeclauses are sufficient to identify a match.  In such cases the
+ * executor can immediately advance the outer relation after processing a
+ * match, and therefore it need never back up the inner relation.
+ * 
  * materialize_inner is TRUE if a Material node should be placed atop the
  * inner input.  This may appear with or without an inner Sort step.
  */
@@ -1282,6 +1360,9 @@ typedef struct MergePath {
     List* path_mergeclauses;  /* join clauses to be used for merge */
     List* outersortkeys;      /* keys for explicit sort, if any */
     List* innersortkeys;      /* keys for explicit sort, if any */
+#ifdef GS_GRAPH
+    bool skip_mark_restore;	/* can executor skip mark/restore? */
+#endif
     bool materialize_inner;   /* add Materialize to inner? */
     OpMemInfo outer_mem_info; /* Mem info for outer explicit sort */
     OpMemInfo inner_mem_info; /* Mem info for inner explicit sort */
@@ -1301,6 +1382,7 @@ typedef struct HashPath {
     List* path_hashclauses; /* join clauses used for hashing */
     int num_batches;        /* number of batches expected */
     OpMemInfo mem_info;     /* Mem info for hash table */
+    double joinRows;
 } HashPath;
 
 #ifdef PGXC
@@ -1681,6 +1763,11 @@ typedef struct SpecialJoinInfo {
     bool delay_upper_joins; /* can't commute with upper RHS */
     List* join_quals;       /* join quals, in implicit-AND list format */
     bool varratio_cached;   /* decide chach selec or not. */
+#ifdef GS_GRAPH
+    /* Fields for JOIN_VLE */
+	int			min_hops;
+	int			max_hops;
+#endif
 } SpecialJoinInfo;
 
 /*
@@ -1927,6 +2014,7 @@ typedef struct SemiAntiJoinFactors {
     Selectivity match_count;
 } SemiAntiJoinFactors;
 
+
 /*
  * For speed reasons, cost estimation for join paths is performed in two
  * phases: the first phase tries to quickly derive a lower bound for the
@@ -1967,5 +2055,27 @@ typedef struct JoinCostWorkspace {
     OpMemInfo outer_mem_info;
     OpMemInfo inner_mem_info;
 } JoinCostWorkspace;
+
+/*
+ * ModifyGraphPath
+ */
+#ifdef GS_GRAPH
+typedef struct ModifyGraphPath
+{
+	Path		path;
+	bool		canSetTag;		/* do we set the command tag/es_processed? */
+	bool		last;			/* is this for the last clause? */
+	bool		detach;			/* DETACH DELETE */
+	bool		eagerness;			/* eagerness */
+	GraphWriteOp operation;		/* CREATE or DELETE */
+	Path	   *subpath;		/* Path producing source data */
+	List	   *pattern;		/* graph pattern (list of paths) for CREATE */
+	List	   *targets;		/* relation Oid's of target labels */
+	List	   *exprs;			/* expression list for DELETE */
+	List	   *sets;			/* list of GraphSetProp's for SET/REMOVE */
+    uint32		nr_modify;		/* number of clauses that modifies graph
+								   before this */
+} ModifyGraphPath;
+#endif /* GS_GRAPH */
 
 #endif /* RELATION_H */

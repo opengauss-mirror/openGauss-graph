@@ -394,7 +394,12 @@ bool plan_tree_walker(Node* node, MethodWalker walker, void* context)
             if (walk_join_node_fields((Join*)node, walker, context))
                 return true;
             break;
-
+#ifdef GS_GRAPH
+        case T_NestLoopVLE:
+            if (walk_join_node_fields((Join*)((NestLoop*)node), walker, context))
+                return true;
+            break;
+#endif 
         case T_VecMergeJoin:
         case T_MergeJoin:
             if (walk_join_node_fields((Join*)node, walker, context))

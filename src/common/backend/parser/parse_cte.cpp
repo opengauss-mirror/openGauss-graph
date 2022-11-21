@@ -128,6 +128,7 @@ List* transformWithClause(ParseState* pstate, WithClause* withClause)
 
         cte->cterecursive = false;
         cte->cterefcount = 0;
+        cte->referenced_by_subquery = false;
 
         if (!IsA(cte->ctequery, SelectStmt)) {
             /* must be a data-modifying statement */
@@ -793,6 +794,10 @@ static bool checkWellFormedRecursionWalker(Node* node, CteState* cstate)
                 (void)checkWellFormedRecursionWalker(j->quals, cstate);
                 break;
             case JOIN_LEFT:
+#ifdef GS_GRAPH
+            case JOIN_CYPHER_MERGE:
+		    case JOIN_CYPHER_DELETE:
+#endif  
                 (void)checkWellFormedRecursionWalker(j->larg, cstate);
                 if (save_context == RECURSION_OK) {
                     cstate->context = RECURSION_OUTERJOIN;

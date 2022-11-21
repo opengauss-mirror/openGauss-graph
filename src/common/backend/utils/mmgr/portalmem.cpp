@@ -10,6 +10,7 @@
  *
  * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
+ * Portions Copyright (c) 2021, openGauss Contributors
  *
  * IDENTIFICATION
  *	  src/backend/utils/mmgr/portalmem.c
@@ -220,7 +221,7 @@ Portal CreatePortal(const char* name, bool allowDup, bool dupSilent, bool is_fro
 
     /* create a resource owner for the portal */
     portal->resowner = ResourceOwnerCreate(t_thrd.utils_cxt.CurTransactionResourceOwner, "Portal",
-        MEMORY_CONTEXT_EXECUTOR);
+        THREAD_GET_MEM_CXT_GROUP(MEMORY_CONTEXT_EXECUTOR));
 
     /* initialize portal fields that don't start off zero */
     portal->status = PORTAL_NEW;
@@ -242,8 +243,11 @@ Portal CreatePortal(const char* name, bool allowDup, bool dupSilent, bool is_fro
                       CURSOR_ATTRIBUTE_NUMBER * sizeof(void*));
     securec_check(rc, "\0", "\0");
     portal->funcUseCount = 0;
+    portal->hasStreamForPlpgsql = false;
 #ifndef ENABLE_MULTIPLE_NODES
     portal->streamInfo.Reset();
+    portal->isAutoOutParam = false;
+    portal->isPkgCur = false;
 #endif
     /* put portal in table (sets portal->name) */
     PortalHashTableInsert(portal, name);
@@ -368,11 +372,23 @@ void PortalCreateHoldStore(Portal portal)
      * Create the memory context that is used for storage of the tuple set.
      * Note this is NOT a child of the portal's heap memory.
      */
+#ifndef ENABLE_MULTIPLE_NODES
+    if (portal->isAutoOutParam) {
+        portal->holdContext = GetAvailableHoldContext(u_sess->plsql_cxt.auto_parent_session_pkgs->portalContext);
+    } else {
+        portal->holdContext = AllocSetContextCreate(u_sess->top_portal_cxt,
+            "PortalHoldContext",
+            ALLOCSET_DEFAULT_MINSIZE,
+            ALLOCSET_DEFAULT_INITSIZE,
+            ALLOCSET_DEFAULT_MAXSIZE);
+    }
+#else
     portal->holdContext = AllocSetContextCreate(u_sess->top_portal_cxt,
         "PortalHoldContext",
         ALLOCSET_DEFAULT_MINSIZE,
         ALLOCSET_DEFAULT_INITSIZE,
         ALLOCSET_DEFAULT_MAXSIZE);
+#endif
 
     /*
      * Create the tuple store, selecting cross-transaction temp files, and
@@ -425,6 +441,9 @@ void MarkPortalActive(Portal portal)
             (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("portal \"%s\" cannot be run", portal->name)));
     /* Perform the state transition */
     portal->status = PORTAL_ACTIVE;
+    ereport(DEBUG2, (errmodule(MOD_SPI), errcode(ERRCODE_LOG),
+                     errmsg("MarkPortalActive(portal name:%s, status %d, portalPinned %d, autoHeld %d)",
+                                portal->name, portal->status, portal->portalPinned, portal->autoHeld)));
     portal->activeSubid = GetCurrentSubTransactionId();
 }
 
@@ -439,6 +458,9 @@ void MarkPortalDone(Portal portal)
     /* Perform the state transition */
     Assert(portal->status == PORTAL_ACTIVE);
     portal->status = PORTAL_DONE;
+    ereport(DEBUG2, (errmodule(MOD_SPI), errcode(ERRCODE_LOG),
+                     errmsg("MarkPortalDone(portal:%p, portal name:%s, status %d, portalPinned %d, autoHeld %d)",
+                                portal, portal->name, portal->status, portal->portalPinned, portal->autoHeld)));
 
     /*
      * Allow portalcmds.c to clean up the state it knows about.  We might as
@@ -465,6 +487,9 @@ void MarkPortalFailed(Portal portal)
     /* Perform the state transition */
     Assert(portal->status != PORTAL_DONE);
     portal->status = PORTAL_FAILED;
+    ereport(DEBUG2, (errmodule(MOD_SPI), errcode(ERRCODE_LOG),
+                     errmsg("MarkPortalFailed(portal:%p, portal name:%s, status %d, portalPinned %d, autoHeld %d)",
+                                portal, portal->name, portal->status, portal->portalPinned, portal->autoHeld)));
 
     /*
      * Allow portalcmds.c to clean up the state it knows about.  We might as
@@ -542,7 +567,6 @@ void PortalDrop(Portal portal, bool isTopCommit)
      */
     if (portal->resowner && (!isTopCommit || portal->status == PORTAL_FAILED)) {
         bool isCommit = (portal->status != PORTAL_FAILED);
-
         ResourceOwnerRelease(portal->resowner, RESOURCE_RELEASE_BEFORE_LOCKS, isCommit, false);
         ResourceOwnerRelease(portal->resowner, RESOURCE_RELEASE_LOCKS, isCommit, false);
         ResourceOwnerRelease(portal->resowner, RESOURCE_RELEASE_AFTER_LOCKS, isCommit, false);
@@ -555,7 +579,12 @@ void PortalDrop(Portal portal, bool isTopCommit)
      * conditions; since the tuplestore would have been using cross-
      * transaction storage, its temp files need to be explicitly deleted.
      */
+#ifndef ENABLE_MULTIPLE_NODES
+    /* autonomous transactions procedure out param portal cleaned by its parent session */
+    if (portal->holdStore && !portal->isAutoOutParam) {
+#else
     if (portal->holdStore) {
+#endif
         MemoryContext oldcontext;
 
         oldcontext = MemoryContextSwitchTo(portal->holdContext);
@@ -580,7 +609,11 @@ void PortalDrop(Portal portal, bool isTopCommit)
 #endif
 
     /* delete tuplestore storage, if any */
+#ifndef ENABLE_MULTIPLE_NODES
+    if (portal->holdContext && !portal->isAutoOutParam)
+#else
     if (portal->holdContext)
+#endif
         MemoryContextDelete(portal->holdContext);
 
     /* release subsidiary storage */
@@ -591,11 +624,14 @@ void PortalDrop(Portal portal, bool isTopCommit)
         MemoryContextDelete(portal->copyCxt);
 
     u_sess->parser_cxt.param_message = NULL;
-
     if (IS_PGXC_COORDINATOR && !IsConnFromCoord()) {
         u_sess->parser_cxt.param_info = NULL;
     }
 
+#ifndef ENABLE_MULTIPLE_NODES
+    /* reset portal cursor attribute */
+    ResetCursorAtrribute(portal);
+#endif
     /* release portal struct (it's in u_sess->portal_mem_cxt) */
     pfree(portal);
 }
@@ -632,7 +668,7 @@ void PortalHashTableDeleteAll(void)
 /*
  * "Hold" a portal.  Prepare it for access by later transactions.
  */
-static void HoldPortal(Portal portal)
+void HoldPortal(Portal portal)
 {
     /*
      * Note that PersistHoldablePortal() must release all resources
@@ -837,7 +873,7 @@ void AtAbort_Portals(bool STP_rollback)
          * upcoming transaction-wide cleanup; they will be gone before we run
          * PortalDrop. Can not reset resonwer to NUll if
          * we are in STP_rollback, because the Portal is still alive. If we set 
-	 * resowner to NUll it will cause leak snapshots reference error, because
+         * resowner to NUll it will cause leak snapshots reference error, because
          * the new snapshots does not have owner.
          */
         if(!STP_rollback) {
@@ -971,8 +1007,8 @@ void AtSubCommit_Portals(SubTransactionId mySubid, SubTransactionId parentSubid,
  *
  * We don't destroy any portals here; that's done in AtSubCleanup_Portals.
  */
-void AtSubAbort_Portals(
-    SubTransactionId mySubid, SubTransactionId parentSubid, ResourceOwner myXactOwner, ResourceOwner parentXactOwner)
+void AtSubAbort_Portals(SubTransactionId mySubid, SubTransactionId parentSubid,
+    ResourceOwner myXactOwner, ResourceOwner parentXactOwner, bool inSTP)
 {
     HASH_SEQ_STATUS status;
     PortalHashEnt* hentry = NULL;
@@ -1036,35 +1072,57 @@ void AtSubAbort_Portals(
          * changed in the failed subtransaction, leading to crashes within
          * ExecutorEnd when portalcmds.cpp tries to close down the portal.
          */
-        if (portal->status == PORTAL_READY || portal->status == PORTAL_ACTIVE)
+        if (portal->status == PORTAL_READY)
             MarkPortalFailed(portal);
 
-        /*
-         * Allow portalcmds.c to clean up the state it knows about, if we
-         * haven't already.
-         */
-        if (PointerIsValid(portal->cleanup)) {
-            (*portal->cleanup)(portal);
-            portal->cleanup = NULL;
+        if (!inSTP || portal->is_from_spi) {
+            /*
+             * Force any active portals into FAILED state, see comments above.
+             */
+            if (portal->status == PORTAL_ACTIVE) {
+                MarkPortalFailed(portal);
+            }
+
+            /*
+             * Allow portalcmds.c to clean up the state it knows about, if we
+             * haven't already.
+             */
+            if (PointerIsValid(portal->cleanup)) {
+                (*portal->cleanup)(portal);
+                portal->cleanup = NULL;
+            }
+
+            /* drop cached plan reference, if any */
+            PortalReleaseCachedPlan(portal);
+
+            /*
+             * Any resources belonging to the portal will be released in the
+             * upcoming transaction-wide cleanup; they will be gone before we run
+             * PortalDrop.
+             */
+             portal->resowner = NULL;
+
+            /*
+             * Although we can't delete the portal data structure proper, we can
+             * release any memory in subsidiary contexts, such as executor state.
+             * The cleanup hook was the last thing that might have needed data
+             * there.
+             */
+            MemoryContextDeleteChildren(PortalGetHeapMemory(portal));
+        } else {
+            /* clean up snapshots before release its reource owner. */
+            if (portal->resowner != NULL) {
+                ResourceOwnerDecrementNsnapshots(portal->resowner, portal->queryDesc);
+            }
+
+            /*
+             * While rollback to savepoint outside STP, stmt top portal is still active.
+             * don't destory its memory context.
+             */
+            if (portal->status != PORTAL_ACTIVE) {
+                MemoryContextDeleteChildren(PortalGetHeapMemory(portal));
+            }
         }
-
-        /* drop cached plan reference, if any */
-        PortalReleaseCachedPlan(portal);
-
-        /*
-         * Any resources belonging to the portal will be released in the
-         * upcoming transaction-wide cleanup; they will be gone before we run
-         * PortalDrop.
-         */
-        portal->resowner = NULL;
-
-        /*
-         * Although we can't delete the portal data structure proper, we can
-         * release any memory in subsidiary contexts, such as executor state.
-         * The cleanup hook was the last thing that might have needed data
-         * there.
-         */
-        MemoryContextDeleteChildren(PortalGetHeapMemory(portal));
     }
 }
 
@@ -1089,6 +1147,14 @@ void AtSubCleanup_Portals(SubTransactionId mySubid)
 
         if (portal->createSubid != mySubid)
             continue;
+
+        /*
+         * Do not touch active portals --- this can only happen in the case of
+         * a multi-transaction command.
+         */
+        if (portal->status == PORTAL_ACTIVE) {
+            continue;
+        }
 
         /*
          * If a portal is still pinned, forcibly unpin it. PortalDrop will not
@@ -1163,6 +1229,7 @@ Datum pg_cursor(PG_FUNCTION_ARGS)
         Portal portal = hentry->portal;
         Datum values[6];
         bool nulls[6];
+        char* mask_string = NULL;
 
         /* report only "visible" entries */
         if (!portal->visible)
@@ -1172,7 +1239,13 @@ Datum pg_cursor(PG_FUNCTION_ARGS)
         securec_check(ss_rc, "\0", "\0");
 
         values[0] = CStringGetTextDatum(portal->name);
-        values[1] = CStringGetTextDatum(portal->sourceText);
+        mask_string = maskPassword(portal->sourceText);
+        if (mask_string == NULL) {
+            values[1] = CStringGetTextDatum(portal->sourceText);
+        } else {
+            values[1] = CStringGetTextDatum(mask_string);
+            pfree_ext(mask_string);
+        }
         values[2] = BoolGetDatum(portal->cursorOptions & CURSOR_OPT_HOLD);
         values[3] = BoolGetDatum(portal->cursorOptions & CURSOR_OPT_BINARY);
         values[4] = BoolGetDatum(portal->cursorOptions & CURSOR_OPT_SCROLL);
@@ -1214,9 +1287,10 @@ bool ThereAreNoReadyPortals(void)
  * @in mySubid: current transaction Id.
  * @in funOid: function oid, 0 if in exception block.
  * @in funUseCount：times of function had been used,  0 if in exception block.
+ * @in reset: wether reset cursor's option or not.
  * Return: void
  */
-void ResetPortalCursor(SubTransactionId mySubid, Oid funOid, int funUseCount)
+void ResetPortalCursor(SubTransactionId mySubid, Oid funOid, int funUseCount, bool reset)
 {
     HASH_SEQ_STATUS status;
     PortalHashEnt *hentry = NULL;
@@ -1242,7 +1316,7 @@ void ResetPortalCursor(SubTransactionId mySubid, Oid funOid, int funUseCount)
             continue;
         }
 
-        ResetCursorOption(portal, true);
+        ResetCursorOption(portal, reset);
     }
 }
 
@@ -1280,10 +1354,15 @@ HoldPinnedPortals(void)
                 ereport(ERROR, (errcode(ERRCODE_INVALID_TRANSACTION_TERMINATION),
                     errmsg("cannot perform transaction commands inside a cursor loop that is not read-only")));
             }
-       
+
+            /* skip portal got error */
+            if (portal->status == PORTAL_FAILED)
+                continue;
+
             /* Verify it's in a suitable state to be held */
             if (portal->status != PORTAL_READY)
-                ereport(ERROR, (errmsg("pinned portal is not ready to be auto-held")));
+                ereport(ERROR, (errmsg("pinned portal(%s) is not ready to be auto-held, with status[%d]",
+                                portal->name, portal->status)));
        
             HoldPortal(portal);
             portal->autoHeld = true;

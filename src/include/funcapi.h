@@ -3,11 +3,12 @@
  * funcapi.h
  *	  Definitions for functions which return composite type and/or sets
  *
- * This file must be included by all Postgres modules that either define
+ * This file must be included by all openGauss modules that either define
  * or call FUNCAPI-callable functions or macros.
  *
  *
  * Copyright (c) 2002-2012, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2021, openGauss Contributors
  *
  * src/include/funcapi.h
  *
@@ -152,8 +153,10 @@ typedef enum TypeFuncClass {
 } TypeFuncClass;
 
 extern TypeFuncClass get_call_result_type(FunctionCallInfo fcinfo, Oid* resultTypeId, TupleDesc* resultTupleDesc);
-extern TypeFuncClass get_expr_result_type(Node* expr, Oid* resultTypeId, TupleDesc* resultTupleDesc);
+extern TypeFuncClass get_expr_result_type(Node* expr, Oid* resultTypeId, TupleDesc* resultTupleDesc,
+    int4* resultTypeId_orig = NULL);
 extern TypeFuncClass get_func_result_type(Oid functionId, Oid* resultTypeId, TupleDesc* resultTupleDesc);
+extern void construct_func_param_desc(Oid funcid, TypeFuncClass* typclass, TupleDesc* tupdesc, Oid* resultTypeId);
 
 extern bool resolve_polymorphic_argtypes(int numargs, Oid* argtypes, const char* argmodes, Node* call_expr);
 
@@ -163,8 +166,10 @@ extern int get_func_input_arg_names(Datum proargnames, Datum proargmodes, char**
 
 extern char* get_func_result_name(Oid functionId);
 
-extern TupleDesc build_function_result_tupdesc_d(Datum proallargtypes, Datum proargmodes, Datum proargnames);
+extern TupleDesc build_function_result_tupdesc_d(Datum proallargtypes, Datum proargmodes, Datum proargnames,
+    Datum funcid);
 extern TupleDesc build_function_result_tupdesc_t(HeapTuple procTuple);
+extern TupleDesc get_func_param_desc(HeapTuple tp, Oid resultTypeId, int* return_out_args_num = NULL);
 
 /* ----------
  *	Support to ease writing functions returning composite types
@@ -258,6 +263,7 @@ extern TupleTableSlot* TupleDescGetSlot(TupleDesc tupdesc);
 extern FuncCallContext* init_MultiFuncCall(PG_FUNCTION_ARGS);
 extern FuncCallContext* per_MultiFuncCall(PG_FUNCTION_ARGS);
 extern void end_MultiFuncCall(PG_FUNCTION_ARGS, FuncCallContext* funcctx);
+extern bool is_function_with_plpgsql_language_and_outparam(Oid funcid);
 
 #define SRF_IS_FIRSTCALL() (fcinfo->flinfo->fn_extra == NULL)
 

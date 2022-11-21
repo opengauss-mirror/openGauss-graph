@@ -25,9 +25,11 @@
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include "utils/elog.h"
+#include "knl/knl_variable.h"
 #include "libpq/ip.h"
 #include "replication/heartbeat/libpq/libpq-fe.h"
 #include "utils/palloc.h"
+#include "utils/timestamp.h"
 
 #define SOCK_ERRNO errno
 #define SOCK_ERRNO_SET(e) (errno = (e))
@@ -82,6 +84,7 @@ static PQconninfoOption *conninfo_parse(const char *conninfo, bool use_defaults)
 static char *conninfo_getval(PQconninfoOption *connOptions, const char *keyword);
 static bool parseConnParam(const char *conninfo, ConnParam *param);
 static int internalConnect(ConnParam *param);
+static int internalConnect_v6(ConnParam *param);
 static void PQconninfoFree(PQconninfoOption *connOptions);
 static int connectNoDelay(int sock);
 static void ConnParamFree(ConnParam *param);
@@ -96,6 +99,7 @@ Port *PQconnect(const char *conninfo)
 {
     Port *port = NULL;
     ConnParam *param = (ConnParam *)palloc0(sizeof(ConnParam));
+    int sock = 0;
 
     /*
      * Parse the conninfo string
@@ -105,7 +109,12 @@ Port *PQconnect(const char *conninfo)
         return NULL;
     }
 
-    int sock = internalConnect(param);
+    if (strchr(param->remoteIp, ':') != NULL) {
+        sock = internalConnect_v6(param);
+    } else {
+        sock = internalConnect(param);
+    }
+
     ConnParamFree(param);
     if (sock < 0) {
         return NULL;
@@ -131,6 +140,9 @@ static int internalConnect(ConnParam *param)
     int sock = -1;
     errno_t rc = 0;
     struct sockaddr_in remoteAddr;
+    TimestampTz nowFailedTimestamp = 0;
+    long secs = 0;
+    int msecs = 0;
     rc = memset_s(&remoteAddr, sizeof(remoteAddr), 0, sizeof(remoteAddr));
     securec_check(rc, "", "");
     remoteAddr.sin_family = AF_INET;
@@ -205,9 +217,133 @@ static int internalConnect(ConnParam *param)
      * are in nonblock mode.  If it does, well, too bad.
      */
     if (connect(sock, (struct sockaddr *)&remoteAddr, sizeof(struct sockaddr)) < 0) {
+        t_thrd.heartbeat_cxt.total_failed_times++;
+        nowFailedTimestamp = GetCurrentTimestamp();
+        TimestampDifference(t_thrd.heartbeat_cxt.last_failed_timestamp, nowFailedTimestamp, &secs, &msecs);
+        if (secs > 1) {
+            t_thrd.heartbeat_cxt.last_failed_timestamp = nowFailedTimestamp;
+            ereport(COMMERROR, (errmsg("Connect failed, total failed times is %d.",
+                t_thrd.heartbeat_cxt.total_failed_times)));
+        }
+        close(sock);
+        return -1;
+    }
+
+    return sock;
+}
+
+/* support IPV6 */
+static int internalConnect_v6(ConnParam *param)
+{
+    int sock = -1;
+    errno_t rc = 0;
+    int res = 0;
+    char   portstr[MAXPGPATH];
+    struct addrinfo *addrs = NULL;
+    struct addrinfo *addrs_local = NULL;
+    struct addrinfo hint, hint_local;
+    errno_t ss_rc = 0;
+
+    /* Initialize hint structure */
+    ss_rc = memset_s(&hint, sizeof(hint), 0, sizeof(struct addrinfo));
+    securec_check(ss_rc, "\0", "\0");
+    hint.ai_socktype = SOCK_STREAM;
+    hint.ai_family = AF_UNSPEC;
+
+    snprintf_s(portstr, MAXPGPATH, MAXPGPATH - 1, "%d", param->remotePort);
+
+    /* Use pg_getaddrinfo_all() to resolve the address */
+    res = pg_getaddrinfo_all(param->remoteIp, portstr, &hint, &addrs);
+    if (res || !addrs) {
+        ereport(WARNING, (errmsg("pg_getaddrinfo_all remoteAddr address %s failed\n", param->remoteIp)));
+        return -1;
+    }
+
+    /* Initialize hint structure */
+    ss_rc = memset_s(&hint_local, sizeof(hint_local), 0, sizeof(struct addrinfo));
+    securec_check(ss_rc, "\0", "\0");
+    hint_local.ai_socktype = SOCK_STREAM;
+    hint_local.ai_family = AF_UNSPEC;
+    hint_local.ai_flags = AI_PASSIVE;
+
+    /* Use pg_getaddrinfo_all() to resolve the address */
+    res = pg_getaddrinfo_all(param->localIp, NULL, &hint_local, &addrs_local);
+    if (res || !addrs_local) {
+        ereport(WARNING, (errmsg("pg_getaddrinfo_all localAddr address %s failed\n", param->localIp)));
+        return -1;
+    }
+
+    /* Open a socket */
+    sock = socket(addrs->ai_family, SOCK_STREAM, 0);
+    if (sock < 0) {
+        ereport(COMMERROR, (errmsg("could not create socket.")));
+        return sock;
+    }
+
+    rc = bind(sock, addrs_local->ai_addr, addrs_local->ai_addrlen);
+    if (rc != 0) {
+        ereport(COMMERROR, (errmsg("could not bind localhost:%s, result is %d", param->localIp, rc)));
+        close(sock);
+        return -1;
+    }
+
+#ifdef F_SETFD
+    if (fcntl(sock, F_SETFD, FD_CLOEXEC) == -1) {
+        ereport(COMMERROR, (errmsg("could not set socket(FD_CLOEXEC): %d", SOCK_ERRNO)));
+        close(sock);
+        return -1;
+    }
+#endif /* F_SETFD */
+
+    /*
+     * Random_Port_Reuse need set SO_REUSEADDR on.
+     * Random_Port_Reuse must not use bind interface,
+     * because socket owns a random port private when used bind interface.
+     * SO_REUSEPORT solve this problem in kernel 3.9.
+     */
+    if (!IS_AF_UNIX(addrs->ai_family)) {
+        int on = 1;
+
+        if ((setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, (char *)&on, sizeof(on))) == -1) {
+            ereport(COMMERROR, (errmsg("could not set socket(FD_CLOEXEC): %d", SOCK_ERRNO)));
+            close(sock);
+            return -1;
+        }
+    }
+
+    /*
+     * Select socket options: no delay of outgoing data for
+     * TCP sockets, nonblock mode, close-on-exec. Fail if any
+     * of this fails.
+     */
+    if (!IS_AF_UNIX(addrs->ai_family)) {
+        if (!connectNoDelay(sock)) {
+            close(sock);
+            return -1;
+        }
+    }
+
+    if (param->connTimeout > 0) {
+        struct timeval timeout = { 0, 0 };
+        timeout.tv_sec = param->connTimeout;
+        (void)setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+    }
+
+    /*
+     * Start/make connection.  This should not block, since we
+     * are in nonblock mode.  If it does, well, too bad.
+     */
+    if (connect(sock, addrs->ai_addr, addrs->ai_addrlen) < 0) {
         ereport(COMMERROR, (errmsg("Connect failed.")));
         close(sock);
         return -1;
+    }
+
+    if (addrs) {
+        pg_freeaddrinfo_all(hint.ai_family, addrs);
+    }
+    if (addrs_local) {
+        pg_freeaddrinfo_all(hint_local.ai_family, addrs_local);
     }
 
     return sock;

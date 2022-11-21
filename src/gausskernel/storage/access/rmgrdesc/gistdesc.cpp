@@ -18,11 +18,30 @@
 
 #include "access/gist_private.h"
 #include "lib/stringinfo.h"
-#include "storage/relfilenode.h"
+#include "storage/smgr/relfilenode.h"
 
 static void out_gistxlogPageSplit(StringInfo buf, gistxlogPageSplit *xlrec)
 {
     appendStringInfo(buf, "page_split: splits to %hu pages", xlrec->npage);
+}
+
+const char* gist_type_name(uint8 subtype)
+{
+    uint8 info = subtype & ~XLR_INFO_MASK;
+    switch (info) {
+        case XLOG_GIST_PAGE_UPDATE:
+            return "gist_page_update";
+            break;
+        case XLOG_GIST_PAGE_SPLIT:
+            return "gist_page_split";
+            break;
+        case XLOG_GIST_CREATE_INDEX:
+            return "gist_create_index";
+            break;
+        default:
+            break;
+    }
+    return "unknow_type";
 }
 
 void gist_desc(StringInfo buf, XLogReaderState *record)

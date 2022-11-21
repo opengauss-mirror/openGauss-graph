@@ -1,7 +1,7 @@
 /* -------------------------------------------------------------------------
  *
  * mcxt.c
- *	  POSTGRES memory context management code.
+ *	  openGauss memory context management code.
  *
  * This module handles context management operations that are independent
  * of the particular kind of context being operated on.  It calls
@@ -52,6 +52,7 @@ MemoryContext ProcSubXidCacheContext = NULL;
 MemoryContext PmTopMemoryContext = NULL;  // save the topm of postmaster thread
 /* Shared memory context for stream thread connection info. */
 MemoryContext StreamInfoContext = NULL;
+MemoryContext TopTransactionContext = NULL;
 
 /*
  * Standard top-level contexts. For a description of the purpose of each
@@ -64,7 +65,6 @@ THR_LOCAL MemoryContext AlignMemoryContext = NULL;
 
 static void MemoryContextStatsInternal(MemoryContext context, int level);
 static void FreeMemoryContextList(List* context_list);
-static void* MemoryAllocFromContext(MemoryContext context, Size size, const char* file, int line);
 
 #ifdef PGXC
 void* allocTopCxt(size_t s);
@@ -73,7 +73,6 @@ void* allocTopCxt(size_t s);
 /*****************************************************************************
  *	  EXPORTED ROUTINES														 *
  *****************************************************************************/
-
 static inline void InsertMemoryAllocInfo(const void* pointer, MemoryContext context,
                                          const char* file, int line, Size size)
 {
@@ -115,7 +114,6 @@ static inline void RemoveMemoryContextInfo(MemoryContext context)
         }
     }
 }
-    
 
 /*
  * MemoryContextInit
@@ -370,6 +368,13 @@ void MemoryContextDelete(MemoryContext context)
 
     if (!IsTopMemCxt(context)) {
         PreventActionOnSealedContext(context);
+    } else {
+#ifdef MEMORY_CONTEXT_CHECKING
+        /* before delete top memcxt, you should close lsc */
+        if (EnableGlobalSysCache() && context == t_thrd.top_mem_cxt && t_thrd.lsc_cxt.lsc != NULL) {
+            Assert(t_thrd.lsc_cxt.lsc->is_closed);
+        }
+#endif
     }
 
     MemoryContext old_context = MemoryContextSwitchTo(t_thrd.top_mem_cxt);
@@ -379,7 +384,7 @@ void MemoryContextDelete(MemoryContext context)
     (void)MemoryContextSwitchTo(old_context);
 
     /* u_sess->top_mem_cxt may be reused by other threads, set it null before the memory it points to be freed. */
-    if (context == u_sess->top_mem_cxt) {
+    if (u_sess != NULL && context == u_sess->top_mem_cxt) {
         u_sess->top_mem_cxt = NULL;
     }
 
@@ -430,6 +435,13 @@ void MemoryContextResetAndDeleteChildren(MemoryContext context)
     AssertArg(MemoryContextIsValid(context));
     if (!IsTopMemCxt(context)) {
         PreventActionOnSealedContext(context);
+    } else {
+#ifdef MEMORY_CONTEXT_CHECKING
+        /* before delete top memcxt,  you should close lsc */
+        if (EnableGlobalSysCache() && context == t_thrd.top_mem_cxt && t_thrd.lsc_cxt.lsc != NULL) {
+            Assert(t_thrd.lsc_cxt.lsc->is_closed);
+        }
+#endif
     }
 
     List context_list = {T_List, 0, NULL, NULL};
@@ -499,6 +511,23 @@ void MemoryContextSetParent(MemoryContext context, MemoryContext new_parent)
         context->prevchild = NULL;
         context->nextchild = NULL;
     }
+}
+
+/*
+ * MemoryContextAllowInCriticalSection
+ *      Allow/disallow allocations in this memory context within a critical
+ *      section.
+ *
+ * Normally, memory allocations are not allowed within a critical section,
+ * because a failure would lead to PANIC.  There are a few exceptions to
+ * that, like allocations related to debugging code that is not supposed to
+ * be enabled in production.  This function can be used to exempt specific
+ * memory contexts from the assertion in palloc().
+ */
+void MemoryContextAllowInCriticalSection(MemoryContext context, bool allow)
+{
+    AssertArg(MemoryContextIsValid(context));
+    context->allowInCritSection = allow;
 }
 
 /*
@@ -648,6 +677,13 @@ static void MemoryContextStatsInternal(MemoryContext context, int level)
 void MemoryContextCheck(MemoryContext context, bool own_by_session)
 {
     MemoryContext child;
+
+    if (!g_instance.attr.attr_memory.enable_memory_context_check_debug) {
+        return;
+    }
+    if (unlikely(context == NULL)) {
+        elog(PANIC, "Switch to Invalid memory context");
+    }
     AssertArg(MemoryContextIsValid(context));
 
     uint64 id = 0;
@@ -932,16 +968,17 @@ void MemoryContextCheckMaxSize(MemoryContext context, Size size, const char* fil
 void MemoryContextCheckSessionMemory(MemoryContext context, Size size, const char* file, int line)
 {
     /* libcomm permanent thread don't need to check session memory */
-    if (STATEMENT_MAX_MEM && (t_thrd.shemem_ptr_cxt.mySessionMemoryEntry != NULL) &&
+    if ((t_thrd.shemem_ptr_cxt.mySessionMemoryEntry != NULL) &&
         (t_thrd.comm_cxt.LibcommThreadType == LIBCOMM_NONE) && (context->level >= MEMORY_CONTEXT_CONTROL_LEVEL) &&
         !t_thrd.int_cxt.CritSectionCount && !(AmPostmasterProcess()) && IsNormalProcessingMode()) {
         int used = (t_thrd.shemem_ptr_cxt.mySessionMemoryEntry->queryMemInChunks << (chunkSizeInBits - BITS_IN_MB)) 
             << BITS_IN_KB;
-        if (STATEMENT_MAX_MEM < used)
+        if (u_sess->attr.attr_sql.statement_max_mem < used)
             ereport(ERROR,
                 (errcode(ERRCODE_INSUFFICIENT_RESOURCES),
                     errmsg(
-                        "Session used memory %d Kbytes is beyond the limitation %d Kbytes.", used, STATEMENT_MAX_MEM),
+                        "Session used memory %d Kbytes is beyond the limitation %d Kbytes.", used,
+                        u_sess->attr.attr_sql.statement_max_mem),
                     errdetail("Session estimated memory is %d Mbytes and MemoryContext %s request of size %lu "
                               "bytes.[file:%s,line:%d]",
                         t_thrd.shemem_ptr_cxt.mySessionMemoryEntry->estimate_memory,
@@ -952,13 +989,13 @@ void MemoryContextCheckSessionMemory(MemoryContext context, Size size, const cha
     }
 }
 
-static void* MemoryAllocFromContext(MemoryContext context, Size size, const char* file, int line)
+void* MemoryAllocFromContext(MemoryContext context, Size size, const char* file, int line)
 {
     void* ret = NULL;
     if (!AllocSizeIsValid(size)) {
         ereport(ERROR,
             (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-                errmsg("invalid memory alloc request size %lu", (unsigned long)size)));
+                errmsg("invalid memory alloc request size %lu in %s:%d.", (unsigned long)size, file, line)));
     }
 
     context->isReset = false;
@@ -980,7 +1017,9 @@ static void* MemoryAllocFromContext(MemoryContext context, Size size, const char
 #endif
 
     /* check if the session used memory is beyond the limitation */
-    MemoryContextCheckSessionMemory(context, size, file, line);
+    if (unlikely(STATEMENT_MAX_MEM)) {
+        MemoryContextCheckSessionMemory(context, size, file, line);
+    }
 
     InsertMemoryAllocInfo(ret, context, file, line, size);
 
@@ -996,11 +1035,10 @@ static void* MemoryAllocFromContext(MemoryContext context, Size size, const char
 void* MemoryContextAllocDebug(MemoryContext context, Size size, const char* file, int line)
 {
     AssertArg(MemoryContextIsValid(context));
-
     PreventActionOnSealedContext(context);
+
     return MemoryAllocFromContext(context, size, file, line);
 }
-
 /*
  * MemoryContextAllocZero
  *		Like MemoryContextAlloc, but clears allocated memory
@@ -1013,13 +1051,13 @@ void* MemoryContextAllocZeroDebug(MemoryContext context, Size size, const char* 
     void* ret = NULL;
 
     AssertArg(MemoryContextIsValid(context));
-
+#ifdef MEMORY_CONTEXT_CHECKING
     PreventActionOnSealedContext(context);
-
+#endif
     if (!AllocSizeIsValid(size)) {
         ereport(ERROR,
             (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-                errmsg("invalid memory alloc request size %lu", (unsigned long)size)));
+                errmsg("invalid memory alloc request size %lu in %s:%d", (unsigned long)size, file, line)));
     }
 
     context->isReset = false;
@@ -1041,8 +1079,9 @@ void* MemoryContextAllocZeroDebug(MemoryContext context, Size size, const char* 
 #endif
 
     /* check if the session used memory is beyond the limitation */
-    MemoryContextCheckSessionMemory(context, size, file, line);
-
+    if (unlikely(STATEMENT_MAX_MEM)) {
+        MemoryContextCheckSessionMemory(context, size, file, line);
+    }
     MemSetAligned(ret, 0, size);
 
     InsertMemoryAllocInfo(ret, context, file, line, size);
@@ -1068,7 +1107,7 @@ void* MemoryContextAllocZeroAlignedDebug(MemoryContext context, Size size, const
     if (!AllocSizeIsValid(size)) {
         ereport(ERROR,
             (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-                errmsg("invalid memory alloc request size %lu", (unsigned long)size)));
+                errmsg("invalid memory alloc request size %lu in %s:%d", (unsigned long)size, file, line)));
     }
 
     context->isReset = false;
@@ -1090,8 +1129,9 @@ void* MemoryContextAllocZeroAlignedDebug(MemoryContext context, Size size, const
 #endif
 
     /* check if the session used memory is beyond the limitation */
-    MemoryContextCheckSessionMemory(context, size, file, line);
-
+    if (unlikely(STATEMENT_MAX_MEM)) {
+        MemoryContextCheckSessionMemory(context, size, file, line);
+    }
     MemSetLoop(ret, 0, size);
 
     InsertMemoryAllocInfo(ret, context, file, line, size);
@@ -1108,8 +1148,9 @@ void* palloc_extended(Size size, int flags)
     void* ret = NULL;
 
     AssertArg(MemoryContextIsValid(CurrentMemoryContext));
+#ifdef MEMORY_CONTEXT_CHECKING
     PreventActionOnSealedContext(CurrentMemoryContext);
-
+#endif
     if (!AllocSizeIsValid(size)) {
         ereport(ERROR,
             (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
@@ -1130,8 +1171,9 @@ void* palloc_extended(Size size, int flags)
         MemSetAligned(ret, 0, size);
 
     /* check if the session used memory is beyond the limitation */
-    MemoryContextCheckSessionMemory(CurrentMemoryContext, size, __FILE__, __LINE__);
-
+    if (unlikely(STATEMENT_MAX_MEM)) {
+        MemoryContextCheckSessionMemory(CurrentMemoryContext, size, __FILE__, __LINE__);
+    }
     InsertMemoryAllocInfo(ret, CurrentMemoryContext, __FILE__, __LINE__, size);
 
     return ret;
@@ -1174,11 +1216,12 @@ void pfree(void* pointer)
 #endif
 
     AssertArg(MemoryContextIsValid(context));
+#ifdef MEMORY_CONTEXT_CHECKING
     if (!IsTopMemCxt(context)) {
         /* No prevent on top memory context as they may be sealed. */
         PreventActionOnSealedContext(context);
     }
-
+#endif
     RemoveMemoryAllocInfo(pointer, context);
 
     (*context->methods->free_p)(context, pointer);
@@ -1192,7 +1235,7 @@ void* repalloc_noexcept_Debug(void* pointer, Size size, const char* file, int li
     if (!AllocSizeIsValid(size)) {
         ereport(ERROR,
             (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-                errmsg("invalid memory alloc request size %lu", (unsigned long)size)));
+                errmsg("invalid memory alloc request size %lu in %s:%d", (unsigned long)size, file, line)));
     }
 
     /*
@@ -1226,8 +1269,9 @@ void* repalloc_noexcept_Debug(void* pointer, Size size, const char* file, int li
         return NULL;
     }
     /* check if the session used memory is beyond the limitation */
-    MemoryContextCheckSessionMemory(context, size, file, line);
-
+    if (unlikely(STATEMENT_MAX_MEM)) {
+        MemoryContextCheckSessionMemory(context, size, file, line);
+    }
     InsertMemoryAllocInfo(ret, context, file, line, size);
 
     return ret;
@@ -1245,7 +1289,7 @@ void* repallocDebug(void* pointer, Size size, const char* file, int line)
     if (!AllocSizeIsValid(size)) {
         ereport(ERROR,
             (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-                errmsg("invalid memory alloc request size %lu", (unsigned long)size)));
+                errmsg("invalid memory alloc request size %lu in %s:%d", (unsigned long)size, file, line)));
     }
 
     /*
@@ -1288,8 +1332,9 @@ void* repallocDebug(void* pointer, Size size, const char* file, int line)
 #endif
 
     /* check if the session used memory is beyond the limitation */
-    MemoryContextCheckSessionMemory(context, size, file, line);
-
+    if (unlikely(STATEMENT_MAX_MEM)) {
+        MemoryContextCheckSessionMemory(context, size, file, line);
+    }
     InsertMemoryAllocInfo(ret, context, file, line, size);
 
     return ret;
@@ -1308,7 +1353,7 @@ void* MemoryContextMemalignAllocDebug(MemoryContext context, Size align, Size si
     if (!AllocSizeIsValid(size)) {
         ereport(ERROR,
             (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-                errmsg("invalid memory alloc request size %lu", (unsigned long)size)));
+                errmsg("invalid memory alloc request size %lu in %s:%d", (unsigned long)size, file, line)));
     }
 
     context->isReset = false;
@@ -1330,8 +1375,9 @@ void* MemoryContextMemalignAllocDebug(MemoryContext context, Size align, Size si
 #endif
 
     /* check if the session used memory is beyond the limitation */
-    MemoryContextCheckSessionMemory(context, size, file, line);
-
+    if (unlikely(STATEMENT_MAX_MEM)) {
+        MemoryContextCheckSessionMemory(context, size, file, line);
+    }
     InsertMemoryAllocInfo(ret, context, file, line, size);
 
     return ret;
@@ -1352,8 +1398,8 @@ void* MemoryContextAllocHugeDebug(MemoryContext context, Size size, const char* 
     AssertArg(MemoryContextIsValid(context));
 
     if (!AllocHugeSizeIsValid(size)) {
-        ereport(
-            ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("invalid memory alloc request size %zu", size)));
+        ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), 
+                errmsg("invalid memory alloc request size %zu in %s:%d", size, file, line)));
     }
 
     context->isReset = false;
@@ -1375,8 +1421,9 @@ void* MemoryContextAllocHugeDebug(MemoryContext context, Size size, const char* 
 #endif
 
     /* check if the session used memory is beyond the limitation */
-    MemoryContextCheckSessionMemory(context, size, file, line);
-
+    if (unlikely(STATEMENT_MAX_MEM)) {
+        MemoryContextCheckSessionMemory(context, size, file, line);
+    }
     InsertMemoryAllocInfo(ret, context, file, line, size);
 
     return ret;
@@ -1396,8 +1443,8 @@ void* repallocHugeDebug(void* pointer, Size size, const char* file, int line)
     void* ret = NULL;
 
     if (!AllocHugeSizeIsValid(size)) {
-        ereport(
-            ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("invalid memory alloc request size %lu", size)));
+        ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                errmsg("invalid memory alloc request size %lu in %s:%d", size, file, line)));
     }
 
     /*
@@ -1440,7 +1487,9 @@ void* repallocHugeDebug(void* pointer, Size size, const char* file, int line)
 #endif
 
     /* check if the session used memory is beyond the limitation */
-    MemoryContextCheckSessionMemory(context, size, file, line);
+    if (unlikely(STATEMENT_MAX_MEM)) {
+        MemoryContextCheckSessionMemory(context, size, file, line);
+    }
 
     InsertMemoryAllocInfo(ret, context, file, line, size);
 
@@ -1601,6 +1650,13 @@ void MemoryContextDestroyAtThreadExit(MemoryContext context)
     MemoryContext pContext = context;
     if (!IsTopMemCxt(context)) {
         PreventActionOnSealedContext(context);
+    } else {
+#ifdef MEMORY_CONTEXT_CHECKING
+        /* before delete top memcxt,  you should close lsc */
+        if (EnableGlobalSysCache() && context == t_thrd.top_mem_cxt && t_thrd.lsc_cxt.lsc != NULL) {
+            Assert(t_thrd.lsc_cxt.lsc->is_closed);
+        }
+#endif
     }
 
     if (pContext != NULL) {

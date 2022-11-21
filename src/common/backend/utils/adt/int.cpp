@@ -5,6 +5,7 @@
  *
  * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
+ * Portions Copyright (c) 2021, openGauss Contributors
  *
  *
  * IDENTIFICATION
@@ -248,6 +249,26 @@ Datum int2vectorrecv(PG_FUNCTION_ARGS)
 Datum int2vectorsend(PG_FUNCTION_ARGS)
 {
     return array_send(fcinfo);
+}
+
+Datum int2vectorin_extend(PG_FUNCTION_ARGS)
+{
+    return int2vectorin(fcinfo);
+}
+
+Datum int2vectorout_extend(PG_FUNCTION_ARGS)
+{
+    return int2vectorout(fcinfo);
+}
+
+Datum int2vectorrecv_extend(PG_FUNCTION_ARGS)
+{
+    return int2vectorrecv(fcinfo);
+}
+
+Datum int2vectorsend_extend(PG_FUNCTION_ARGS)
+{
+    return int2vectorsend(fcinfo);
 }
 
 /*

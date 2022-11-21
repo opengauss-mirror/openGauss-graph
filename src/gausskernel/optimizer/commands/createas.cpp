@@ -13,6 +13,7 @@
  * Portions Copyright (c) 2020 Huawei Technologies Co.,Ltd.
  * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
+ * Portions Copyright (c) 2021, openGauss Contributors
  *
  *
  * IDENTIFICATION
@@ -35,10 +36,11 @@
 #include "commands/prepare.h"
 #include "commands/tablecmds.h"
 #include "commands/view.h"
+#include "optimizer/planner.h"
 #include "parser/analyze.h"
 #include "parser/parse_clause.h"
 #include "rewrite/rewriteHandler.h"
-#include "storage/smgr.h"
+#include "storage/smgr/smgr.h"
 #include "tcop/tcopprot.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
@@ -156,7 +158,19 @@ void ExecCreateTableAs(CreateTableAsStmt* stmt, const char* queryString, ParamLi
     query = SetupForCreateTableAs(query, into, queryString, params, dest);
 
     /* plan the query */
-    plan = pg_plan_query(query, 0, params);
+    int nest_level = apply_set_hint(query);
+    PG_TRY();
+    {
+        plan = pg_plan_query(query, 0, params);
+    }
+    PG_CATCH();
+    {
+        recover_set_hint(nest_level);
+        PG_RE_THROW();
+    }
+    PG_END_TRY();
+
+    recover_set_hint(nest_level);
 
     /*
      * Use a snapshot with an updated command ID to ensure this query sees
@@ -357,6 +371,7 @@ static void intorel_startup(DestReceiver* self, int operation, TupleDesc typeinf
         coltype->typemod = attribute->atttypmod;
         coltype->arrayBounds = NIL;
         coltype->location = -1;
+        coltype->pct_rowtype = false;
 
         /*
          * It's possible that the column is of a collatable type but the
@@ -515,7 +530,8 @@ static void intorel_shutdown(DestReceiver* self)
     FreeBulkInsertState(myState->bistate);
 
     /* If we skipped using WAL, must heap_sync before commit */
-    if ((myState->hi_options & TABLE_INSERT_SKIP_WAL) || enable_heap_bcm_data_replication())
+    if (((myState->hi_options & TABLE_INSERT_SKIP_WAL) || enable_heap_bcm_data_replication())
+        && !RelationIsSegmentTable(myState->rel))
         heap_sync(myState->rel);
 
     /* close rel, but keep lock until commit */

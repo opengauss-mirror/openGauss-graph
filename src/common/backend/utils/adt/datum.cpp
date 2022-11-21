@@ -1,7 +1,7 @@
 /* -------------------------------------------------------------------------
  *
  * datum.c
- *	  POSTGRES Datum (abstract data type) manipulation routines.
+ *	  openGauss Datum (abstract data type) manipulation routines.
  *
  * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
@@ -38,8 +38,11 @@
 
 #include "postgres.h"
 #include "knl/knl_variable.h"
+#include "utils/expandeddatum.h"
 
 #include "utils/datum.h"
+#include "access/tuptoaster.h"
+#include "fmgr.h"
 
 /* -------------------------------------------------------------------------
  * datumGetSize
@@ -125,6 +128,29 @@ Datum datumCopyInternal(Datum value, bool typByVal, int typLen, Size* copySize)
     return res;
 }
 
+/*-------------------------------------------------------------------------
+ * datumTransfer
+ *
+ * Transfer a non-NULL datum into the current memory context.
+ *
+ * This is equivalent to datumCopy() except when the datum is a read-write
+ * pointer to an expanded object.  In that case we merely reparent the object
+ * into the current context, and return its standard R/W pointer (in case the
+ * given one is a transient pointer of shorter lifespan).
+ *-------------------------------------------------------------------------
+ */
+Datum
+datumTransfer(Datum value, bool typByVal, int typLen)
+{
+	if (!typByVal && typLen == -1 &&
+		VARATT_IS_EXTERNAL_EXPANDED_RW(DatumGetPointer(value)))
+		value = TransferExpandedObject(value, CurrentMemoryContext);
+	else
+		value = datumCopy(value, typByVal, typLen);
+	return value;
+}
+
+
 Datum datumCopy(Datum value, bool typByVal, int typLen)
 {
     Size copySize = 0;
@@ -194,4 +220,59 @@ bool datumIsEqual(Datum value1, Datum value2, bool typByVal, int typLen)
         res = (memcmp(s1, s2, size1) == 0);
     }
     return res;
+}
+
+/* -------------------------------------------------------------------------
+ * DatumImageEq
+ *
+ * Compares two datums for identical contents, based on byte images.  Return
+ * true if the two datums are equal, false otherwise.
+ * -------------------------------------------------------------------------
+ */
+bool DatumImageEq(Datum value1, Datum value2, bool typByVal, int typLen)
+{
+    Size len1, len2;
+    bool result = true;
+
+    if (typByVal) {
+        result = (value1 == value2);
+    } else if (typLen > 0) {
+        result = (memcmp(DatumGetPointer(value1), DatumGetPointer(value2), typLen) == 0);
+    } else if (typLen == -1) {
+        len1 = toast_raw_datum_size(value1);
+        len2 = toast_raw_datum_size(value2);
+        /* No need to de-toast if lengths don't match. */
+        if (len1 != len2)
+            result = false;
+        else {
+            struct varlena *arg1val;
+            struct varlena *arg2val;
+
+            arg1val = PG_DETOAST_DATUM_PACKED(value1);
+            arg2val = PG_DETOAST_DATUM_PACKED(value2);
+
+            result = (memcmp(VARDATA_ANY(arg1val), VARDATA_ANY(arg2val), len1 - VARHDRSZ) == 0);
+
+            /* Only free memory if it's a copy made here. */
+            if ((Pointer)arg1val != (Pointer)value1)
+                pfree(arg1val);
+            if ((Pointer)arg2val != (Pointer)value2)
+                pfree(arg2val);
+        }
+    } else if (typLen == -2) {
+        char *s1, *s2;
+
+        /* Compare cstring datums */
+        s1 = DatumGetCString(value1);
+        s2 = DatumGetCString(value2);
+        len1 = strlen(s1) + 1;
+        len2 = strlen(s2) + 1;
+        if (len1 != len2)
+            return false;
+        result = (memcmp(s1, s2, len1) == 0);
+    } else {
+        elog(ERROR, "unexpected typLen: %d", typLen);
+    }
+
+    return result;
 }

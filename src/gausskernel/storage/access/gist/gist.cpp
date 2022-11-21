@@ -1,7 +1,7 @@
 /* -------------------------------------------------------------------------
  *
  * gist.cpp
- *	  interface routines for the postgres GiST index access method.
+ *	  interface routines for the openGauss GiST index access method.
  *
  *
  * Portions Copyright (c) 2020 Huawei Technologies Co.,Ltd.
@@ -251,7 +251,7 @@ bool gistplacetopage(Relation rel, Size freespace, GISTSTATE *giststate, Buffer 
 
             dist->buffer = buffer;
             dist->block.blkno = BufferGetBlockNumber(buffer);
-            dist->page = PageGetTempPageCopySpecial(BufferGetPage(buffer), false);
+            dist->page = PageGetTempPageCopySpecial(BufferGetPage(buffer));
 
             /* clean all flags except F_LEAF */
             GistPageGetOpaque(dist->page)->flags = (is_leaf) ? F_LEAF : 0;
@@ -285,7 +285,7 @@ bool gistplacetopage(Relation rel, Size freespace, GISTSTATE *giststate, Buffer 
             int ndownlinks = 0;
 
             rootpg.buffer = buffer;
-            rootpg.page = PageGetTempPageCopySpecial(BufferGetPage(rootpg.buffer), false);
+            rootpg.page = PageGetTempPageCopySpecial(BufferGetPage(rootpg.buffer));
             GistPageGetOpaque(rootpg.page)->flags = 0;
 
             /* Prepare a vector of all the downlinks */
@@ -599,7 +599,7 @@ void gistdoinsert(Relation r, IndexTuple itup, Size freespace, GISTSTATE *gistst
                         (errcode(ERRCODE_INDEX_CORRUPTED),
                          errmsg("index \"%s\" contains an inner tuple marked as invalid", RelationGetRelationName(r)),
                          errdetail("This is caused by an incomplete page split at crash recovery before upgrading to "
-                                   "PostgreSQL 9.1."),
+                                   "openGauss 1.0.0"),
                          errhint("Please REINDEX it.")));
 
             /*

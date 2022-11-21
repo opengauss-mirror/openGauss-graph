@@ -18,6 +18,9 @@
 #include "vecexecutor/vecnodes.h"
 #include "pgstat.h"
 
+#ifdef GS_GRAPH
+#include "optimizer/pathnode.h"
+#endif
 /* To avoid including explain.h here, reference ExplainState thus: */
 struct ExplainState;
 
@@ -114,6 +117,15 @@ typedef enum {
 typedef void (*BuildRuntimePredicate_function)(
     ForeignScanState* node, void* value, int colIdx, HDFS_RUNTIME_PREDICATE type);
 
+#ifdef GS_GRAPH
+typedef void (*GetForeignJoinPaths_function) (PlannerInfo *root,
+											  RelOptInfo *joinrel,
+											  RelOptInfo *outerrel,
+											  RelOptInfo *innerrel,
+											  JoinType jointype,
+											  JoinPathExtraData *extra);
+#endif
+
 /*
  * FdwRoutine is the struct returned by a foreign-data wrapper's handler
  * function.  It provides pointers to the callback functions needed by the
@@ -195,6 +207,11 @@ typedef struct FdwRoutine {
 
     /* Notify engine that envelope configuration changed */
     NotifyForeignConfigChange_function NotifyForeignConfigChange;
+
+#ifdef GS_GRAPH
+    /* Functions for remote-join planning */
+	GetForeignJoinPaths_function GetForeignJoinPaths;
+#endif
 } FdwRoutine;
 
 /* Functions in foreign/foreign.c */

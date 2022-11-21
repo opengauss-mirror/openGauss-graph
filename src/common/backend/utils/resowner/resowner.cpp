@@ -1,7 +1,7 @@
 /*-------------------------------------------------------------------------
  *
  * resowner.c
- *	  POSTGRES resource owner management code.
+ *	  openGauss resource owner management code.
  *
  * Query-lifespan resources are tracked by associating them with
  * ResourceOwner objects.  This provides a simple mechanism for ensuring
@@ -11,6 +11,7 @@
  *
  * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
+ * Portions Copyright (c) 2021, openGauss Contributors
  *
  *
  * IDENTIFICATION
@@ -22,8 +23,13 @@
 #include "knl/knl_variable.h"
 
 #include "access/hash.h"
+#include "access/ustore/knl_uundovec.h"
+#include "access/ustore/undo/knl_uundoapi.h"
 #include "storage/predicate.h"
 #include "storage/proc.h"
+#include "storage/smgr/segment.h"
+#include "utils/knl_partcache.h"
+#include "utils/knl_relcache.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/rel_gs.h"
@@ -31,8 +37,11 @@
 #include "storage/cucache_mgr.h"
 #include "executor/executor.h"
 #include "catalog/pg_hashbucket_fn.h"
+
 /*
- * ResourceOwner objects look like this
+ * ResourceOwner objects look like this. When tracking new types of resource,
+ * you must at least add the 'Remember' interface for that resource and adapt
+ * the 'ResourceOwnerConcat' function.
  */
 typedef struct ResourceOwnerData {
     ResourceOwner parent;     /* NULL if no parent (toplevel owner) */
@@ -44,6 +53,35 @@ typedef struct ResourceOwnerData {
     int nbuffers;    /* number of owned buffer pins */
     Buffer* buffers; /* dynamically allocated array */
     int maxbuffers;  /* currently allocated array size */
+
+
+    int nlocalcatclist;
+    LocalCatCList** localcatclists;
+    int maxlocalcatclists;
+
+    int nlocalcatctup;
+    LocalCatCTup** localcatctups;
+    int maxlocalcatctups;
+
+    int nglobalcatctup;
+    GlobalCatCTup** globalcatctups;
+    int maxglobalcatctups;
+
+    int nglobalcatclist;
+    GlobalCatCList** globalcatclists;
+    int maxglobalcatclist;
+
+    int nglobalbaseentry;
+    GlobalBaseEntry** globalbaseentries;
+    int maxglobalbaseentry;
+
+    int nglobaldbentry;
+    GlobalSysDBCacheEntry** globaldbentries;
+    int maxglobaldbentry;
+
+    int nglobalisexclusive;
+    volatile uint32** globalisexclusives;
+    int maxglobalisexclusive;
 
     /* We have built-in support for remembering catcache references */
     int ncatrefs;       /* number of owned catcache pins */
@@ -106,6 +144,11 @@ typedef struct ResourceOwnerData {
     pthread_mutex_t** pThdMutexs;
     int maxPThdMutexs;
 
+    /* We have built-in support for remembering pthread_rwlock */
+    int nPthreadRWlock;
+    pthread_rwlock_t** pThdRWlocks;
+    int maxPThdRWlocks;
+
     /* We have built-in support for remembering partition map references */
     int npartmaprefs;
     PartitionMap** partmaprefs;
@@ -115,18 +158,24 @@ typedef struct ResourceOwnerData {
     int nglobalMemContext;
     MemoryContext* globalMemContexts;
     int maxGlobalMemContexts;
+
+    MemoryContext memCxt;
+
+    /* whether this is a complete one. FALSE is setted while its transaction finishes. */
+    bool valid;
 } ResourceOwnerData;
 
 THR_LOCAL ResourceOwner IsolatedResourceOwner = NULL;
-
-/*
- * List of add-on callbacks for resource releasing
- */
-typedef struct ResourceReleaseCallbackItem {
-    struct ResourceReleaseCallbackItem* next;
-    ResourceReleaseCallback callback;
-    void* arg;
-} ResourceReleaseCallbackItem;
+#ifdef MEMORY_CONTEXT_CHECKING
+#define PrintGlobalSysCacheLeakWarning(owner, strinfo) \
+do { \
+    if (EnableLocalSysCache() && LOCAL_SYSDB_RESOWNER != (owner)) { \
+        ereport(WARNING, (errmsg("global syscache reference leak %s %s %d", strinfo, __FILE__, __LINE__))); \
+    } \
+} while(0)
+#else
+#define PrintGlobalSysCacheLeakWarning(owner, strinfo)
+#endif
 
 /* Internal routines */
 static void ResourceOwnerReleaseInternal(
@@ -153,21 +202,26 @@ extern void ReleaseMetaBlock(CacheSlotId_t slot);
  * All ResourceOwner objects are kept in t_thrd.top_mem_cxt, since they should
  * only be freed explicitly.
  */
-ResourceOwner ResourceOwnerCreate(ResourceOwner parent, const char* name, MemoryGroupType memGroup)
+ResourceOwner ResourceOwnerCreate(ResourceOwner parent, const char* name, MemoryContext memCxt)
 {
     ResourceOwner owner;
 
-    owner = (ResourceOwner)MemoryContextAllocZero(
-        THREAD_GET_MEM_CXT_GROUP(memGroup), sizeof(ResourceOwnerData));
+    MemoryContext context = AllocSetContextCreate(memCxt,
+                                                  "ResourceOwnerCxt",
+                                                  ALLOCSET_DEFAULT_MINSIZE,
+                                                  ALLOCSET_DEFAULT_INITSIZE,
+                                                  ALLOCSET_DEFAULT_MAXSIZE);
+    owner = (ResourceOwner)MemoryContextAllocZero(context, sizeof(ResourceOwnerData));
     owner->name = name;
-
+    owner->memCxt = context;
+    owner->valid = true;
     if (parent) {
         owner->parent = parent;
         owner->nextchild = parent->firstchild;
         parent->firstchild = owner;
     }
 
-    if (parent == NULL && strcmp(name, "TopTransaction") != 0)
+    if (parent == NULL && strcmp(name, "TopTransaction") != 0 && strcmp(name, "InitLocalSysCache") != 0)
         IsolatedResourceOwner = owner;
 
     return owner;
@@ -223,11 +277,11 @@ static void ResourceOwnerReleaseInternal(
 {
     ResourceOwner child;
     ResourceOwner save;
-    ResourceReleaseCallbackItem* item = NULL;
 
     /* Recurse to handle descendants */
-    for (child = owner->firstchild; child != NULL; child = child->nextchild)
+    for (child = owner->firstchild; child != NULL; child = child->nextchild) {
         ResourceOwnerReleaseInternal(child, phase, isCommit, isTopLevel);
+    }
 
     /*
      * Make CurrentResourceOwner point to me, so that ReleaseBuffer etc don't
@@ -238,6 +292,14 @@ static void ResourceOwnerReleaseInternal(
     t_thrd.utils_cxt.CurrentResourceOwner = owner;
 
     if (phase == RESOURCE_RELEASE_BEFORE_LOCKS) {
+        if (owner == t_thrd.utils_cxt.TopTransactionResourceOwner) {
+            if (u_sess->ustore_cxt.urecvec) {
+                u_sess->ustore_cxt.urecvec->Reset(false);
+            }
+            ReleaseUndoBuffers();
+            undo::ReleaseSlotBuffer();
+        }
+
         /*
          * Release buffer pins.  Note that ReleaseBuffer will remove the
          * buffer entry from my list, so I just have to iterate till there are
@@ -296,16 +358,8 @@ static void ResourceOwnerReleaseInternal(
          * As with buffer pins, warn if any are left at commit time, and
          * release back-to-front for speed.
          */
-        while (owner->nrelrefs > 0) {
-            if (isCommit)
-                PrintRelCacheLeakWarning(owner->relrefs[owner->nrelrefs - 1]);
-            RelationClose(owner->relrefs[owner->nrelrefs - 1]);
-        }
-        while (owner->npartrefs > 0) {
-            if (isCommit)
-                PrintPartCacheLeakWarning(owner->partrefs[owner->npartrefs - 1]);
-            PartitionClose(owner->partrefs[owner->npartrefs - 1]);
-        }
+        ResourceOwnerReleaseRelationRef(owner, isCommit);
+        ResourceOwnerReleasePartitionRef(owner, isCommit);
         // Ditto for pthread mutex
         //
         while (owner->nPthreadMutex > 0) {
@@ -313,6 +367,12 @@ static void ResourceOwnerReleaseInternal(
                 PrintPthreadMutexLeakWarning(owner->pThdMutexs[owner->nPthreadMutex - 1]);
             PthreadMutexUnlock(owner, owner->pThdMutexs[owner->nPthreadMutex - 1]);
         }
+        ResourceOwnerReleaseRWLock(owner, isCommit);
+        ResourceOwnerReleaseGlobalCatCList(owner, isCommit);
+        ResourceOwnerReleaseGlobalCatCTup(owner, isCommit);
+        ResourceOwnerReleaseGlobalBaseEntry(owner, isCommit);
+        ResourceOwnerReleaseGlobalDBEntry(owner, isCommit);
+        ResourceOwnerReleaseGlobalIsExclusive(owner, isCommit);
     } else if (phase == RESOURCE_RELEASE_LOCKS) {
         if (isTopLevel) {
             /*
@@ -321,7 +381,8 @@ static void ResourceOwnerReleaseInternal(
              * the top of the recursion.
              */
             if (owner == t_thrd.utils_cxt.TopTransactionResourceOwner) {
-                ProcReleaseLocks(isCommit);
+                if (!CanPerformUndoActions())
+                    ProcReleaseLocks(isCommit);
                 ReleasePredicateLocks(isCommit);
             }
         } else {
@@ -333,7 +394,7 @@ static void ResourceOwnerReleaseInternal(
             Assert(owner->parent != NULL);
             if (isCommit)
                 LockReassignCurrentOwner();
-            else
+            else if (!CanPerformUndoActions())
                 LockReleaseCurrentOwner();
         }
     } else if (phase == RESOURCE_RELEASE_AFTER_LOCKS) {
@@ -346,15 +407,19 @@ static void ResourceOwnerReleaseInternal(
          * release back-to-front for speed.
          */
         while (owner->ncatrefs > 0) {
+            Assert(!EnableLocalSysCache());
             if (isCommit)
                 PrintCatCacheLeakWarning(owner->catrefs[owner->ncatrefs - 1]);
             ReleaseCatCache(owner->catrefs[owner->ncatrefs - 1]);
         }
+        ResourceOwnerReleaseLocalCatCList(owner, isCommit);
+        ResourceOwnerReleaseLocalCatCTup(owner, isCommit);
         /* Ditto for catcache lists */
         while (owner->ncatlistrefs > 0) {
+            Assert(!EnableLocalSysCache());
             if (isCommit)
                 PrintCatCacheListLeakWarning(owner->catlistrefs[owner->ncatlistrefs - 1]);
-            ReleaseCatCacheList(owner->catlistrefs[owner->ncatlistrefs - 1]);
+            ReleaseSysCacheList(owner->catlistrefs[owner->ncatlistrefs - 1]);
         }
         /* Ditto for plancache references */
         while (owner->nplanrefs > 0) {
@@ -389,51 +454,55 @@ static void ResourceOwnerReleaseInternal(
             MemoryContextDelete(memContext);
             ResourceOwnerForgetGMemContext(t_thrd.utils_cxt.TopTransactionResourceOwner, memContext);
         }
-
-        /* Clean up index scans too */
-        ReleaseResources_hash();
     }
-
-    /* Let add-on modules get a chance too */
-    for (item = t_thrd.utils_cxt.ResourceRelease_callbacks; item; item = item->next)
-        (*item->callback)(phase, isCommit, isTopLevel, item->arg);
 
     t_thrd.utils_cxt.CurrentResourceOwner = save;
 }
 
-static void ResourceOwnerFreeOwner(ResourceOwner owner)
+static void ResourceOwnerFreeOwner(ResourceOwner owner, bool whole)
 {
-    if (owner->buffers)
-        pfree(owner->buffers);
-    if (owner->catrefs)
-        pfree(owner->catrefs);
-    if (owner->catlistrefs)
-        pfree(owner->catlistrefs);
-    if (owner->relrefs)
-        pfree(owner->relrefs);
-    if (owner->partrefs)
-        pfree(owner->partrefs);
-    if (owner->planrefs)
-        pfree(owner->planrefs);
-    if (owner->tupdescs)
-        pfree(owner->tupdescs);
-    if (owner->snapshots)
-        pfree(owner->snapshots);
-    if (owner->files)
-        pfree(owner->files);
-    if (owner->dataCacheSlots)
-        pfree(owner->dataCacheSlots);
-    if (owner->metaCacheSlots)
-        pfree(owner->metaCacheSlots);
-    if (owner->pThdMutexs)
-        pfree(owner->pThdMutexs);
-    if (owner->partmaprefs)
-        pfree(owner->partmaprefs);
-    if (owner->fakepartrefs)
-        pfree(owner->fakepartrefs);
-    if (owner->globalMemContexts)
-        pfree(owner->globalMemContexts);
-    pfree(owner);
+    if (owner->valid) {
+        if (owner->buffers)
+            pfree(owner->buffers);
+        if (owner->catrefs)
+            pfree(owner->catrefs);
+        if (owner->catlistrefs)
+            pfree(owner->catlistrefs);
+        if (owner->relrefs)
+            pfree(owner->relrefs);
+        if (owner->partrefs)
+            pfree(owner->partrefs);
+        if (owner->planrefs)
+            pfree(owner->planrefs);
+        if (owner->tupdescs)
+            pfree(owner->tupdescs);
+        if (owner->snapshots)
+            pfree(owner->snapshots);
+        if (owner->files)
+            pfree(owner->files);
+        if (owner->dataCacheSlots)
+            pfree(owner->dataCacheSlots);
+        if (owner->metaCacheSlots)
+            pfree(owner->metaCacheSlots);
+        if (owner->pThdMutexs)
+            pfree(owner->pThdMutexs);
+        if (owner->partmaprefs)
+            pfree(owner->partmaprefs);
+        if (owner->fakepartrefs)
+            pfree(owner->fakepartrefs);
+        if (owner->globalMemContexts)
+            pfree(owner->globalMemContexts);
+        pfree_ext(owner->localcatclists);
+        pfree_ext(owner->localcatctups);
+        pfree_ext(owner->globalcatctups);
+        pfree_ext(owner->globalcatclists);
+        pfree_ext(owner->globalbaseentries);
+        pfree_ext(owner->globaldbentries);
+        pfree_ext(owner->globalisexclusives);
+        pfree_ext(owner->pThdRWlocks);
+    }
+    if (whole && owner->memCxt)
+        MemoryContextDelete(owner->memCxt);
 }
 
 /*
@@ -448,20 +517,7 @@ void ResourceOwnerDelete(ResourceOwner owner)
     Assert(owner != t_thrd.utils_cxt.CurrentResourceOwner);
 
     /* And it better not own any resources, either */
-    Assert(owner->nbuffers == 0);
-    Assert(owner->ncatrefs == 0);
-    Assert(owner->ncatlistrefs == 0);
-    Assert(owner->nrelrefs == 0);
-    Assert(owner->npartrefs == 0);
-    Assert(owner->nfakerelrefs == 0);
-    Assert(owner->nfakepartrefs == 0);
-    Assert(owner->nplanrefs == 0);
-    Assert(owner->ntupdescs == 0);
-    Assert(owner->nsnapshots == 0);
-    Assert(owner->nfiles == 0);
-    Assert(owner->nDataCacheSlots == 0);
-    Assert(owner->nMetaCacheSlots == 0);
-    Assert(owner->nPthreadMutex == 0);
+    Assert(CurrentResourceOwnerIsEmpty(owner));
 
     /*
      * Delete children.  The recursive call will delink the child from me, so
@@ -485,7 +541,175 @@ void ResourceOwnerDelete(ResourceOwner owner)
     }
 
     /* And free the object. */
-    ResourceOwnerFreeOwner(owner);
+    ResourceOwnerFreeOwner(owner, true);
+}
+
+/*
+ * Part 1 of 'ResourceOwnerConcat'. Concatenate the top 12 resources of two owners.
+ */
+static void ResourceOwnerConcatPart1(ResourceOwner target, ResourceOwner source)
+{
+    int i;
+
+    for (i = 0; i < source->nbuffers; i++) {
+        ResourceOwnerEnlargeBuffers(target);
+        ResourceOwnerRememberBuffer(target, source->buffers[i]);
+    }
+
+    for (i = 0; i < source->nlocalcatclist; i++) {
+        ResourceOwnerEnlargeLocalCatCList(target);
+        ResourceOwnerRememberLocalCatCList(target, source->localcatclists[i]);
+    }
+
+    for (i = 0; i < source->nlocalcatctup; i++) {
+        ResourceOwnerEnlargeLocalCatCTup(target);
+        ResourceOwnerRememberLocalCatCTup(target, source->localcatctups[i]);
+    }
+
+    for (i = 0; i < source->nglobalcatctup; i++) {
+        ResourceOwnerEnlargeGlobalCatCTup(target);
+        ResourceOwnerRememberGlobalCatCTup(target, source->globalcatctups[i]);
+    }
+
+    for (i = 0; i < source->nglobalcatclist; i++) {
+        ResourceOwnerEnlargeGlobalCatCList(target);
+        ResourceOwnerRememberGlobalCatCList(target, source->globalcatclists[i]);
+    }
+
+    for (i = 0; i < source->nglobalbaseentry; i++) {
+        ResourceOwnerEnlargeGlobalBaseEntry(target);
+        ResourceOwnerRememberGlobalBaseEntry(target, source->globalbaseentries[i]);
+    }
+
+    for (i = 0; i < source->nglobaldbentry; i++) {
+        ResourceOwnerEnlargeGlobalDBEntry(target);
+        ResourceOwnerRememberGlobalDBEntry(target, source->globaldbentries[i]);
+    }
+
+    for (i = 0; i < source->nglobalisexclusive; i++) {
+        ResourceOwnerEnlargeGlobalIsExclusive(target);
+        ResourceOwnerRememberGlobalIsExclusive(target, source->globalisexclusives[i]);
+    }
+
+    for (i = 0; i < source->ncatrefs; i++) {
+        ResourceOwnerEnlargeCatCacheRefs(target);
+        ResourceOwnerRememberCatCacheRef(target, source->catrefs[i]);
+    }
+
+    for (i = 0; i < source->ncatlistrefs; i++) {
+        ResourceOwnerEnlargeCatCacheListRefs(target);
+        ResourceOwnerRememberCatCacheListRef(target, source->catlistrefs[i]);
+    }
+
+    for (i = 0; i < source->nrelrefs; i++) {
+        ResourceOwnerEnlargeRelationRefs(target);
+        ResourceOwnerRememberRelationRef(target, source->relrefs[i]);
+    }
+
+    for (i = 0; i < source->npartrefs; i++) {
+        ResourceOwnerEnlargePartitionRefs(target);
+        ResourceOwnerRememberPartitionRef(target, source->partrefs[i]);
+    }
+}
+
+/*
+ * Part 2 of 'ResourceOwnerConcat'. Concatenate the remaining resources of two owners.
+ */
+static void ResourceOwnerConcatPart2(ResourceOwner target, ResourceOwner source)
+{
+    int i;
+
+    for (i = 0; i < source->nfakerelrefs; i++) {
+        dlist_push_tail(&(target->fakerelrefs_list), dlist_pop_head_node(&(source->fakerelrefs_list)));
+        target->nfakerelrefs++;
+    }
+
+    for (i = 0; i < source->nfakepartrefs; i++) {
+        ResourceOwnerEnlargeFakepartRefs(target);
+        ResourceOwnerRememberFakepartRef(target, source->fakepartrefs[i]);
+    }
+
+    for (i = 0; i < source->nplanrefs; i++) {
+        ResourceOwnerEnlargePlanCacheRefs(target);
+        ResourceOwnerRememberPlanCacheRef(target, source->planrefs[i]);
+    }
+
+    for (i = 0; i < source->ntupdescs; i++) {
+        ResourceOwnerEnlargeTupleDescs(target);
+        ResourceOwnerRememberTupleDesc(target, source->tupdescs[i]);
+    }
+
+    for (i = 0; i < source->nsnapshots; i++) {
+        ResourceOwnerEnlargeSnapshots(target);
+        ResourceOwnerRememberSnapshot(target, source->snapshots[i]);
+    }
+
+    for (i = 0; i < source->nfiles; i++) {
+        ResourceOwnerEnlargeFiles(target);
+        ResourceOwnerRememberFile(target, source->files[i]);
+    }
+
+    for (i = 0; i < source->nDataCacheSlots; i++) {
+        ResourceOwnerEnlargeDataCacheSlot(target);
+        ResourceOwnerRememberDataCacheSlot(target, source->dataCacheSlots[i]);
+    }
+
+    for (i = 0; i < source->nMetaCacheSlots; i++) {
+        ResourceOwnerEnlargeMetaCacheSlot(target);
+        ResourceOwnerRememberMetaCacheSlot(target, source->metaCacheSlots[i]);
+    }
+
+    for (i = 0; i < source->nPthreadMutex; i++) {
+        ResourceOwnerEnlargePthreadMutex(target);
+        ResourceOwnerRememberPthreadMutex(target, source->pThdMutexs[i]);
+    }
+
+    for (i = 0; i < source->nPthreadRWlock; i++) {
+        ResourceOwnerEnlargePthreadRWlock(target);
+        ResourceOwnerRememberPthreadRWlock(target, source->pThdRWlocks[i]);
+    }
+
+    for (i = 0; i < source->npartmaprefs; i++) {
+        ResourceOwnerEnlargePartitionMapRefs(target);
+        ResourceOwnerRememberPartitionMapRef(target, source->partmaprefs[i]);
+    }
+
+    for (i = 0; i < source->nglobalMemContext; i++) {
+        ResourceOwnerEnlargeGMemContext(target);
+        ResourceOwnerRememberGMemContext(target, source->globalMemContexts[i]);
+    }
+}
+
+/* ResourceOwnerConcat
+ *              Concatenate two owners.
+ *
+ * The resources traced by the 'source' are placed in the 'target' for tracing.
+ * The advantage is that the memory occupied by the 'source' owner can be released
+ * to reduce the memory consumed by tracing resources. When using a stream-plan,
+ * this is useful for preventing "memory is temporarily unavailable" error when
+ * executing a large number of SQLs in a single transaction/procedure.
+ *
+ * Note: After the invoking is complete, the memory of the 'source' should be release.
+ */
+void ResourceOwnerConcat(ResourceOwner target, ResourceOwner source)
+{
+    Assert(target && source);
+    /*
+     * When modifying the structure of ResourceOwnerData, note that the ResourceOwnerConcat
+     * function needs to be adapted when tracing new types of resources.
+     */
+    Assert(sizeof(ResourceOwnerData) == 448); /* The current size of ResourceOwnerData is 448 */
+
+    while (source->firstchild != NULL) {
+        ResourceOwnerConcat(target, source->firstchild);
+    }
+
+    /*
+     * ResourceOwner traces too many resources. To reduce cyclomatic complexity,
+     * the Concatenate operation is divided into two parts.
+     */
+    ResourceOwnerConcatPart1(target, source);
+    ResourceOwnerConcatPart2(target, source);
 }
 
 /*
@@ -522,6 +746,14 @@ ResourceOwner ResourceOwnerGetFirstChild(ResourceOwner owner)
 }
 
 /*
+ * Fetch memory context of a ResourceOwner
+ */
+MemoryContext ResourceOwnerGetMemCxt(ResourceOwner owner)
+{
+    return owner->memCxt;
+}
+
+/*
  * Reassign a ResourceOwner to have a new parent
  */
 void ResourceOwnerNewParent(ResourceOwner owner, ResourceOwner newparent)
@@ -555,45 +787,6 @@ void ResourceOwnerNewParent(ResourceOwner owner, ResourceOwner newparent)
 }
 
 /*
- * Register or deregister callback functions for resource cleanup
- *
- * These functions are intended for use by dynamically loaded modules.
- * For built-in modules we generally just hardwire the appropriate calls.
- *
- * Note that the callback occurs post-commit or post-abort, so the callback
- * functions can only do noncritical cleanup.
- */
-void RegisterResourceReleaseCallback(ResourceReleaseCallback callback, void* arg)
-{
-    ResourceReleaseCallbackItem* item = NULL;
-
-    item = (ResourceReleaseCallbackItem*)MemoryContextAlloc(
-        THREAD_GET_MEM_CXT_GROUP(MEMORY_CONTEXT_STORAGE), sizeof(ResourceReleaseCallbackItem));
-    item->callback = callback;
-    item->arg = arg;
-    item->next = t_thrd.utils_cxt.ResourceRelease_callbacks;
-    t_thrd.utils_cxt.ResourceRelease_callbacks = item;
-}
-
-void UnregisterResourceReleaseCallback(ResourceReleaseCallback callback, const void* arg)
-{
-    ResourceReleaseCallbackItem* item = NULL;
-    ResourceReleaseCallbackItem* prev = NULL;
-
-    prev = NULL;
-    for (item = t_thrd.utils_cxt.ResourceRelease_callbacks; item; prev = item, item = item->next) {
-        if (item->callback == callback && item->arg == arg) {
-            if (prev != NULL)
-                prev->next = item->next;
-            else
-                t_thrd.utils_cxt.ResourceRelease_callbacks = item->next;
-            pfree(item);
-            break;
-        }
-    }
-}
-
-/*
  * Make sure there is room for at least one more entry in a ResourceOwner's
  * buffer array.
  *
@@ -612,8 +805,7 @@ void ResourceOwnerEnlargeBuffers(ResourceOwner owner)
 
     if (owner->buffers == NULL) {
         newmax = 16;
-        owner->buffers = (Buffer*)MemoryContextAlloc(
-            THREAD_GET_MEM_CXT_GROUP(MEMORY_CONTEXT_STORAGE), newmax * sizeof(Buffer));
+        owner->buffers = (Buffer*)MemoryContextAlloc(owner->memCxt, newmax * sizeof(Buffer));
         owner->maxbuffers = newmax;
     } else {
         newmax = owner->maxbuffers * 2;
@@ -641,8 +833,7 @@ void ResourceOwnerEnlargeDataCacheSlot(ResourceOwner owner)
 
     if (owner->dataCacheSlots == NULL) {
         newmax = 16;
-        owner->dataCacheSlots = (CacheSlotId_t*)MemoryContextAlloc(
-            THREAD_GET_MEM_CXT_GROUP(MEMORY_CONTEXT_STORAGE), newmax * sizeof(CacheSlotId_t));
+        owner->dataCacheSlots = (CacheSlotId_t*)MemoryContextAlloc(owner->memCxt, newmax * sizeof(CacheSlotId_t));
         owner->maxDataCacheSlots = newmax;
     } else {
         newmax = owner->maxDataCacheSlots * 2;
@@ -664,7 +855,7 @@ void ResourceOwnerEnlargeMetaCacheSlot(ResourceOwner owner)
     if (owner->metaCacheSlots == NULL) {
         newmax = 16;
         owner->metaCacheSlots = (CacheSlotId_t*)MemoryContextAlloc(
-            THREAD_GET_MEM_CXT_GROUP(MEMORY_CONTEXT_STORAGE), newmax * sizeof(CacheSlotId_t));
+            owner->memCxt, newmax * sizeof(CacheSlotId_t));
         owner->maxMetaCacheSlots = newmax;
     } else {
         newmax = owner->maxMetaCacheSlots * 2;
@@ -713,7 +904,7 @@ void ResourceOwnerRememberDataCacheSlot(ResourceOwner owner, CacheSlotId_t sloti
  */
 void ResourceOwnerRememberMetaCacheSlot(ResourceOwner owner, CacheSlotId_t slotid)
 {
-    if (owner != NULL) {
+    if (owner != NULL && owner->valid) {
         Assert(owner->nMetaCacheSlots < owner->maxMetaCacheSlots);
         owner->metaCacheSlots[owner->nMetaCacheSlots] = slotid;
         owner->nMetaCacheSlots++;
@@ -728,7 +919,7 @@ void ResourceOwnerRememberMetaCacheSlot(ResourceOwner owner, CacheSlotId_t sloti
  */
 void ResourceOwnerForgetDataCacheSlot(ResourceOwner owner, CacheSlotId_t slotid)
 {
-    if (owner != NULL) {
+    if (owner != NULL && owner->valid) {
         CacheSlotId_t* dataCacheSlots = owner->dataCacheSlots;
         int nb1 = owner->nDataCacheSlots - 1;
         int i;
@@ -759,7 +950,7 @@ void ResourceOwnerForgetDataCacheSlot(ResourceOwner owner, CacheSlotId_t slotid)
  */
 void ResourceOwnerForgetMetaCacheSlot(ResourceOwner owner, CacheSlotId_t slotid)
 {
-    if (owner != NULL) {
+    if (owner != NULL && owner->valid) {
         CacheSlotId_t* metaCacheSlots = owner->metaCacheSlots;
         int nb1 = owner->nMetaCacheSlots - 1;
         int i;
@@ -793,7 +984,7 @@ void ResourceOwnerForgetMetaCacheSlot(ResourceOwner owner, CacheSlotId_t slotid)
  */
 void ResourceOwnerForgetBuffer(ResourceOwner owner, Buffer buffer)
 {
-    if (owner != NULL) {
+    if (owner != NULL && owner->valid) {
         Buffer* buffers = owner->buffers;
         int nb1 = owner->nbuffers - 1;
         int i;
@@ -835,8 +1026,7 @@ void ResourceOwnerEnlargeCatCacheRefs(ResourceOwner owner)
 
     if (owner->catrefs == NULL) {
         newmax = 16;
-        owner->catrefs = (HeapTuple*)MemoryContextAlloc(
-            THREAD_GET_MEM_CXT_GROUP(MEMORY_CONTEXT_STORAGE), newmax * sizeof(HeapTuple));
+        owner->catrefs = (HeapTuple*)MemoryContextAlloc(owner->memCxt, newmax * sizeof(HeapTuple));
         owner->maxcatrefs = newmax;
     } else {
         newmax = owner->maxcatrefs * 2;
@@ -865,6 +1055,9 @@ void ResourceOwnerForgetCatCacheRef(ResourceOwner owner, HeapTuple tuple)
     HeapTuple* catrefs = owner->catrefs;
     int nc1 = owner->ncatrefs - 1;
     int i;
+
+    if (!owner->valid)
+        return;
 
     for (i = nc1; i >= 0; i--) {
         if (catrefs[i] == tuple) {
@@ -897,8 +1090,7 @@ void ResourceOwnerEnlargeCatCacheListRefs(ResourceOwner owner)
 
     if (owner->catlistrefs == NULL) {
         newmax = 16;
-        owner->catlistrefs = (CatCList**)MemoryContextAlloc(
-            THREAD_GET_MEM_CXT_GROUP(MEMORY_CONTEXT_STORAGE), newmax * sizeof(CatCList*));
+        owner->catlistrefs = (CatCList**)MemoryContextAlloc(owner->memCxt, newmax * sizeof(CatCList*));
         owner->maxcatlistrefs = newmax;
     } else {
         newmax = owner->maxcatlistrefs * 2;
@@ -927,6 +1119,9 @@ void ResourceOwnerForgetCatCacheListRef(ResourceOwner owner, CatCList* list)
     CatCList** catlistrefs = owner->catlistrefs;
     int nc1 = owner->ncatlistrefs - 1;
     int i;
+
+    if (!owner->valid)
+        return;
 
     for (i = nc1; i >= 0; i--) {
         if (catlistrefs[i] == list) {
@@ -959,8 +1154,7 @@ void ResourceOwnerEnlargeRelationRefs(ResourceOwner owner)
 
     if (owner->relrefs == NULL) {
         newmax = 16;
-        owner->relrefs = (Relation*)MemoryContextAlloc(
-            THREAD_GET_MEM_CXT_GROUP(MEMORY_CONTEXT_STORAGE), newmax * sizeof(Relation));
+        owner->relrefs = (Relation*)MemoryContextAlloc(owner->memCxt, newmax * sizeof(Relation));
         owner->maxrelrefs = newmax;
     } else {
         newmax = owner->maxrelrefs * 2;
@@ -989,6 +1183,9 @@ void ResourceOwnerForgetRelationRef(ResourceOwner owner, Relation rel)
     Relation* relrefs = owner->relrefs;
     int nr1 = owner->nrelrefs - 1;
     int i;
+
+    if (!owner->valid)
+        return;
 
     for (i = nr1; i >= 0; i--) {
         if (relrefs[i] == rel) {
@@ -1033,8 +1230,7 @@ void ResourceOwnerEnlargePartitionRefs(ResourceOwner owner)
 
     if (owner->partrefs == NULL) {
         newmax = 16;
-        owner->partrefs = (Partition*)MemoryContextAlloc(
-            THREAD_GET_MEM_CXT_GROUP(MEMORY_CONTEXT_STORAGE), newmax * sizeof(Partition));
+        owner->partrefs = (Partition*)MemoryContextAlloc(owner->memCxt, newmax * sizeof(Partition));
         owner->maxpartrefs = newmax;
     } else {
         newmax = owner->maxpartrefs * 2;
@@ -1070,6 +1266,9 @@ void ResourceOwnerForgetPartitionRef(ResourceOwner owner, Partition part)
     int nr1 = owner->npartrefs - 1;
     int i;
 
+    if (!owner->valid)
+        return;
+
     for (i = nr1; i >= 0; i--) {
         if (partrefs[i] == part) {
             while (i < nr1) {
@@ -1094,7 +1293,10 @@ void ResourceOwnerRememberFakerelRef(ResourceOwner owner, Relation fakerel)
 }
 
 void ResourceOwnerForgetFakerelRef(ResourceOwner owner, Relation fakerel)
-{    
+{
+    if (!owner->valid)
+        return;
+
     if (fakerel->node.next != NULL && fakerel->node.prev != NULL) {
         dlist_delete(&(fakerel->node));
         DListNodeInit(&(fakerel->node));
@@ -1118,8 +1320,7 @@ void ResourceOwnerEnlargeFakepartRefs(ResourceOwner owner)
 
     if (owner->fakepartrefs == NULL) {
         newmax = 512;
-        owner->fakepartrefs = (Partition*)MemoryContextAlloc(
-            THREAD_GET_MEM_CXT_GROUP(MEMORY_CONTEXT_STORAGE), newmax * sizeof(Partition));
+        owner->fakepartrefs = (Partition*)MemoryContextAlloc(owner->memCxt, newmax * sizeof(Partition));
         owner->maxfakepartrefs = newmax;
     } else {
         newmax = owner->maxfakepartrefs * 2;
@@ -1130,7 +1331,6 @@ void ResourceOwnerEnlargeFakepartRefs(ResourceOwner owner)
 
 void ResourceOwnerRememberFakepartRef(ResourceOwner owner, Partition fakepart)
 {
-    ResourceOwnerEnlargeFakepartRefs(owner);
     Assert(owner->nfakepartrefs < owner->maxfakepartrefs);
     owner->fakepartrefs[owner->nfakepartrefs] = fakepart;
     owner->nfakepartrefs++;
@@ -1141,6 +1341,9 @@ void ResourceOwnerForgetFakepartRef(ResourceOwner owner, Partition fakepart)
     Partition* fakepartrefs = owner->fakepartrefs;
     int nr1 = owner->nfakepartrefs - 1;
     int i;
+
+    if (!owner->valid)
+        return;
 
     for (i = nr1; i >= 0; i--) {
         if (fakepartrefs[i] == fakepart) {
@@ -1196,8 +1399,7 @@ void ResourceOwnerEnlargePlanCacheRefs(ResourceOwner owner)
 
     if (owner->planrefs == NULL) {
         newmax = 16;
-        owner->planrefs = (CachedPlan**)MemoryContextAlloc(
-            THREAD_GET_MEM_CXT_GROUP(MEMORY_CONTEXT_STORAGE), newmax * sizeof(CachedPlan*));
+        owner->planrefs = (CachedPlan**)MemoryContextAlloc(owner->memCxt, newmax * sizeof(CachedPlan*));
         owner->maxplanrefs = newmax;
     } else {
         newmax = owner->maxplanrefs * 2;
@@ -1227,6 +1429,10 @@ void ResourceOwnerForgetPlanCacheRef(ResourceOwner owner, CachedPlan* plan)
     int np1 = owner->nplanrefs - 1;
     int i;
 
+    if (!owner->valid) {
+        return;
+    }
+
     for (i = np1; i >= 0; i--) {
         if (planrefs[i] == plan) {
             while (i < np1) {
@@ -1237,7 +1443,8 @@ void ResourceOwnerForgetPlanCacheRef(ResourceOwner owner, CachedPlan* plan)
             return;
         }
     }
-    ereport(ERROR,
+    int elevel = t_thrd.proc_cxt.proc_exit_inprogress ? WARNING : ERROR;
+    ereport(elevel,
         (errcode(ERRCODE_WARNING_PRIVILEGE_NOT_GRANTED),
             errmsg("plancache reference is not owned by resource owner %s", owner->name)));
 }
@@ -1266,8 +1473,7 @@ void ResourceOwnerEnlargeTupleDescs(ResourceOwner owner)
 
     if (owner->tupdescs == NULL) {
         newmax = 16;
-        owner->tupdescs = (TupleDesc*)MemoryContextAlloc(
-            THREAD_GET_MEM_CXT_GROUP(MEMORY_CONTEXT_STORAGE), newmax * sizeof(TupleDesc));
+        owner->tupdescs = (TupleDesc*)MemoryContextAlloc(owner->memCxt, newmax * sizeof(TupleDesc));
         owner->maxtupdescs = newmax;
     } else {
         newmax = owner->maxtupdescs * 2;
@@ -1296,6 +1502,9 @@ void ResourceOwnerForgetTupleDesc(ResourceOwner owner, TupleDesc tupdesc)
     TupleDesc* tupdescs = owner->tupdescs;
     int nt1 = owner->ntupdescs - 1;
     int i;
+
+    if (!owner->valid)
+        return;
 
     for (i = nt1; i >= 0; i--) {
         if (tupdescs[i] == tupdesc) {
@@ -1339,8 +1548,7 @@ void ResourceOwnerEnlargeSnapshots(ResourceOwner owner)
 
     if (owner->snapshots == NULL) {
         newmax = 16;
-        owner->snapshots = (Snapshot*)MemoryContextAlloc(
-            THREAD_GET_MEM_CXT_GROUP(MEMORY_CONTEXT_STORAGE), newmax * sizeof(Snapshot));
+        owner->snapshots = (Snapshot*)MemoryContextAlloc(owner->memCxt, newmax * sizeof(Snapshot));
         owner->maxsnapshots = newmax;
     } else {
         newmax = owner->maxsnapshots * 2;
@@ -1364,11 +1572,14 @@ void ResourceOwnerRememberSnapshot(ResourceOwner owner, Snapshot snapshot)
 /*
  * Forget that a snapshot reference is owned by a ResourceOwner
  */
-void ResourceOwnerForgetSnapshot(ResourceOwner owner, Snapshot snapshot)
+bool ResourceOwnerForgetSnapshot(ResourceOwner owner, Snapshot snapshot, bool ereport)
 {
     Snapshot* snapshots = owner->snapshots;
     int ns1 = owner->nsnapshots - 1;
     int i;
+
+    if (!owner->valid)
+        return false;
 
     for (i = ns1; i >= 0; i--) {
         if (snapshots[i] == snapshot) {
@@ -1377,12 +1588,23 @@ void ResourceOwnerForgetSnapshot(ResourceOwner owner, Snapshot snapshot)
                 i++;
             }
             owner->nsnapshots = ns1;
-            return;
+            return true;
         }
     }
-    ereport(ERROR,
-        (errcode(ERRCODE_WARNING_PRIVILEGE_NOT_GRANTED),
-            errmsg("snapshot is not owned by resource owner %s", owner->name)));
+
+    for (ResourceOwner child = owner->firstchild; child != NULL; child = child->nextchild) {
+        if (ResourceOwnerForgetSnapshot(child, snapshot, false)) {
+            return true;
+        }
+    }
+
+    if (ereport && u_sess->plsql_cxt.spi_xact_context != NULL) {
+        ereport(ERROR,
+            (errcode(ERRCODE_WARNING_PRIVILEGE_NOT_GRANTED),
+                errmsg("snapshot is not owned by resource owner %s", owner->name)));
+    }
+
+    return false;
 }
 
 /*
@@ -1392,7 +1614,7 @@ void ResourceOwnerForgetSnapshot(ResourceOwner owner, Snapshot snapshot)
 void ResourceOwnerDecrementNsnapshots(ResourceOwner owner, void *queryDesc)
 {
     QueryDesc *queryDesc_temp = (QueryDesc *)queryDesc;
-    while(owner->nsnapshots > 0) {
+    while(owner->valid && owner->nsnapshots > 0) {
         if(queryDesc_temp) {
             // check if owner's snapshot is same as queryDesc's snapshot, need to set queryDesc
             // snapshot to null, because this function will clean up those snapshots.
@@ -1422,10 +1644,10 @@ void ResourceOwnerDecrementNsnapshots(ResourceOwner owner, void *queryDesc)
  */
 void ResourceOwnerDecrementNPlanRefs(ResourceOwner owner, bool useResOwner)
 {
-    if(!owner) {
+    if(!owner || !owner->valid) {
         return;
     }
-       
+
     while(owner->nplanrefs > 0) {
        ReleaseCachedPlan(owner->planrefs[owner->nplanrefs - 1], useResOwner);
     }
@@ -1455,8 +1677,7 @@ void ResourceOwnerEnlargeFiles(ResourceOwner owner)
 
     if (owner->files == NULL) {
         newmax = 16;
-        owner->files = (File*)MemoryContextAlloc(
-            THREAD_GET_MEM_CXT_GROUP(MEMORY_CONTEXT_STORAGE), newmax * sizeof(File));
+        owner->files = (File*)MemoryContextAlloc(owner->memCxt, newmax * sizeof(File));
         owner->maxfiles = newmax;
     } else {
         newmax = owner->maxfiles * 2;
@@ -1485,6 +1706,9 @@ void ResourceOwnerForgetFile(ResourceOwner owner, File file)
     File* files = owner->files;
     int ns1 = owner->nfiles - 1;
     int i;
+
+    if (!owner->valid)
+        return;
 
     for (i = ns1; i >= 0; i--) {
         if (files[i] == file) {
@@ -1524,8 +1748,7 @@ void ResourceOwnerEnlargePthreadMutex(ResourceOwner owner)
 
     if (owner->pThdMutexs == NULL) {
         newmax = 16;
-        owner->pThdMutexs = (pthread_mutex_t**)MemoryContextAlloc(
-            THREAD_GET_MEM_CXT_GROUP(MEMORY_CONTEXT_STORAGE), newmax * sizeof(pthread_mutex_t*));
+        owner->pThdMutexs = (pthread_mutex_t**)MemoryContextAlloc(owner->memCxt, newmax * sizeof(pthread_mutex_t*));
         owner->maxPThdMutexs = newmax;
     } else {
         newmax = owner->maxPThdMutexs * 2;
@@ -1553,6 +1776,9 @@ void ResourceOwnerForgetPthreadMutex(ResourceOwner owner, pthread_mutex_t* pMute
     pthread_mutex_t** mutexs = owner->pThdMutexs;
     int ns1 = owner->nPthreadMutex - 1;
     int i;
+
+    if (!owner->valid)
+        return;
 
     for (i = ns1; i >= 0; i--) {
         if (mutexs[i] == pMutex) {
@@ -1591,7 +1817,7 @@ void ResourceOwnerReleasePthreadMutex()
     ResourceOwner owner = t_thrd.utils_cxt.TopTransactionResourceOwner;
     ResourceOwner child;
 
-    if (owner) {
+    if (owner && owner->valid) {
         for (child = owner->firstchild; child != NULL; child = child->nextchild) {
             // Ditto for pthread mutex
             //
@@ -1620,8 +1846,7 @@ void ResourceOwnerEnlargePartitionMapRefs(ResourceOwner owner)
 
     if (owner->partmaprefs == NULL) {
         newmax = 16;
-        owner->partmaprefs = (PartitionMap**)MemoryContextAlloc(
-            THREAD_GET_MEM_CXT_GROUP(MEMORY_CONTEXT_STORAGE), newmax * sizeof(PartitionMap*));
+        owner->partmaprefs = (PartitionMap**)MemoryContextAlloc(owner->memCxt, newmax * sizeof(PartitionMap*));
         owner->maxpartmaprefs = newmax;
     } else {
         newmax = owner->maxpartmaprefs * 2;
@@ -1651,6 +1876,9 @@ void ResourceOwnerForgetPartitionMapRef(ResourceOwner owner, PartitionMap* partm
     int nr1 = owner->npartmaprefs - 1;
     int i;
 
+    if (!owner->valid)
+        return;
+
     for (i = nr1; i >= 0; i--) {
         if (partmaprefs[i] == partmap) {
             while (i < nr1) {
@@ -1678,6 +1906,9 @@ void ResourceOwnerForgetGMemContext(ResourceOwner owner, MemoryContext memcontex
     MemoryContext* gMemContexts = owner->globalMemContexts;
     int num = owner->nglobalMemContext - 1;
 
+    if (!owner->valid)
+        return;
+
     for (int i = num; i >= 0; i--) {
         if (memcontext == gMemContexts[i]) {
             int j = i;
@@ -1701,8 +1932,7 @@ void ResourceOwnerEnlargeGMemContext(ResourceOwner owner)
 
     if (owner->globalMemContexts == NULL) {
         newmax = 2;
-        owner->globalMemContexts = (MemoryContext*)MemoryContextAlloc(
-            THREAD_GET_MEM_CXT_GROUP(MEMORY_CONTEXT_EXECUTOR), newmax * sizeof(MemoryContext));
+        owner->globalMemContexts = (MemoryContext*)MemoryContextAlloc(owner->memCxt, newmax * sizeof(MemoryContext));
     } else {
         newmax = owner->maxGlobalMemContexts * 2;
         owner->globalMemContexts = (MemoryContext*)repalloc(owner->globalMemContexts, newmax * sizeof(MemoryContext));
@@ -1714,4 +1944,570 @@ void PrintGMemContextLeakWarning(MemoryContext memcontext)
 {   
     char *name = memcontext->name;
     ereport(WARNING, (errmsg("global memory context: %s leak", name)));
+}
+
+/*
+ * Mark this ResourceOwner and its children as incomplete ones.
+ */
+void ResourceOwnerMarkInvalid(ResourceOwner owner)
+{
+    if (owner->valid) {
+        for (ResourceOwner child = owner->firstchild; child != NULL; child = child->nextchild) {
+            ResourceOwnerMarkInvalid(child);
+        }
+
+        ResourceOwnerFreeOwner(owner, false);
+        owner->valid = false;
+    }
+}
+
+/*
+ * whether this ResourceOwner is a complete one.
+ *
+ * NOTE: it doesn't take child ResourceOwner into consideration.
+ */
+bool ResourceOwnerIsValid(ResourceOwner owner)
+{
+    return owner->valid;
+}
+
+/* Make sure there is room for at least one more entry in a ResourceOwner's
+ * pthread rwlock array.
+ * This is separate from actually inserting an entry because if we run out
+ * of memory, it's critical to do so *before* acquiring the resource.
+ */
+void ResourceOwnerEnlargePthreadRWlock(ResourceOwner owner)
+{
+    int newmax;
+    if (owner->nPthreadRWlock < owner->maxPThdRWlocks)
+        return; /* nothing to do */
+    if (owner->pThdRWlocks == NULL) {
+        newmax = 16;
+        owner->pThdRWlocks = (pthread_rwlock_t**)MemoryContextAlloc(owner->memCxt,
+            newmax * sizeof(pthread_rwlock_t*));
+        owner->maxPThdRWlocks = newmax;
+    } else {
+        newmax = owner->maxPThdRWlocks * 2;
+        owner->pThdRWlocks = (pthread_rwlock_t**)repalloc(owner->pThdRWlocks, newmax * sizeof(pthread_rwlock_t*));
+        owner->maxPThdRWlocks = newmax;
+    }
+}
+
+/* ResourceOwnerRememberPthreadRWlock
+ * Remember that a pthread rwlock is owned by a ResourceOwner
+ */
+void ResourceOwnerRememberPthreadRWlock(ResourceOwner owner, pthread_rwlock_t* pRWlock)
+{
+    Assert(owner->nPthreadRWlock < owner->maxPThdRWlocks);
+    owner->pThdRWlocks[owner->nPthreadRWlock] = pRWlock;
+    owner->nPthreadRWlock++;
+}
+/* ResourceOwnerForgetPthreadRWlock
+ * Forget that a pthread mutex is owned by a ResourceOwner
+ */
+void ResourceOwnerForgetPthreadRWlock(ResourceOwner owner, pthread_rwlock_t* pRWlock)
+{
+    pthread_rwlock_t** rwlocks = owner->pThdRWlocks;
+    int ns1 = owner->nPthreadRWlock - 1;
+    int i;
+    for (i = ns1; i >= 0; i--) {
+        if (rwlocks[i] == pRWlock) {
+            while (i < ns1) {
+                rwlocks[i] = rwlocks[i + 1];
+                i++;
+            }
+            owner->nPthreadRWlock = ns1;
+            return;
+        }
+    }
+    ereport(ERROR,
+        (errcode(ERRCODE_WARNING_PRIVILEGE_NOT_GRANTED),
+            errmsg("pthread rwlock is not owned by resource owner %s", owner->name)));
+}
+
+void ResourceOwnerEnlargeLocalCatCList(ResourceOwner owner)
+{
+    int newmax;
+    if (owner->nlocalcatclist < owner->maxlocalcatclists)
+        return; /* nothing to do */
+    if (owner->localcatclists == NULL) {
+        newmax = 16;
+        owner->localcatclists = (LocalCatCList**)MemoryContextAlloc(owner->memCxt,
+            newmax * sizeof(LocalCatCList*));
+        owner->maxlocalcatclists = newmax;
+    } else {
+        newmax = owner->maxlocalcatclists * 2;
+        owner->localcatclists = (LocalCatCList**)repalloc(owner->localcatclists, newmax * sizeof(LocalCatCList*));
+        owner->maxlocalcatclists = newmax;
+    }
+}
+
+void ResourceOwnerRememberLocalCatCList(ResourceOwner owner, LocalCatCList* list)
+{
+    Assert(owner->nlocalcatclist < owner->maxlocalcatclists);
+    owner->localcatclists[owner->nlocalcatclist] = list;
+    owner->nlocalcatclist++;
+}
+void ResourceOwnerForgetLocalCatCList(ResourceOwner owner, LocalCatCList* list)
+{
+    LocalCatCList** localcatclist = owner->localcatclists;
+    int nc1 = owner->nlocalcatclist - 1;
+    int i;
+    for (i = nc1; i >= 0; i--) {
+        if (localcatclist[i] == list) {
+            while (i < nc1) {
+                localcatclist[i] = localcatclist[i + 1];
+                i++;
+            }
+            owner->nlocalcatclist = nc1;
+            return;
+        }
+    }
+    ereport(ERROR,
+        (errcode(ERRCODE_WARNING_PRIVILEGE_NOT_GRANTED),
+            errmsg("localcatcache list is not owned by resource owner %s", owner->name)));
+}
+void ResourceOwnerEnlargeLocalCatCTup(ResourceOwner owner)
+{
+    int newmax;
+    if (owner->nlocalcatctup < owner->maxlocalcatctups)
+        return; /* nothing to do */
+    if (owner->localcatctups == NULL) {
+        newmax = 16;
+        owner->localcatctups = (LocalCatCTup**)MemoryContextAlloc(owner->memCxt,
+            newmax * sizeof(LocalCatCTup*));
+        owner->maxlocalcatctups = newmax;
+    } else {
+        newmax = owner->maxlocalcatctups * 2;
+        owner->localcatctups = (LocalCatCTup**)repalloc(owner->localcatctups, newmax * sizeof(LocalCatCTup*));
+        owner->maxlocalcatctups = newmax;
+    }
+}
+void ResourceOwnerRememberLocalCatCTup(ResourceOwner owner, LocalCatCTup* tup)
+{
+    Assert(owner->nlocalcatctup < owner->maxlocalcatctups);
+    owner->localcatctups[owner->nlocalcatctup] = tup;
+    owner->nlocalcatctup++;
+}
+LocalCatCTup* ResourceOwnerForgetLocalCatCTup(ResourceOwner owner, HeapTuple tup)
+{
+    LocalCatCTup** localcatctup = owner->localcatctups;
+    LocalCatCTup* find = NULL;
+    int nc1 = owner->nlocalcatctup - 1;
+    int i;
+    for (i = nc1; i >= 0; i--) {
+        if (&localcatctup[i]->global_ct->tuple == tup) {
+            find = localcatctup[i];
+            while (i < nc1) {
+                localcatctup[i] = localcatctup[i + 1];
+                i++;
+            }
+            owner->nlocalcatctup = nc1;
+            return find;
+        }
+    }
+    ereport(ERROR,
+        (errcode(ERRCODE_WARNING_PRIVILEGE_NOT_GRANTED),
+            errmsg("localcatcache tuple is not owned by resource owner %s", owner->name)));
+    return NULL; /* keep compiler quiet */
+}
+
+void ResourceOwnerEnlargeGlobalCatCTup(ResourceOwner owner)
+{
+    int newmax;
+    if (owner->nglobalcatctup < owner->maxglobalcatctups)
+        return; /* nothing to do */
+    if (owner->globalcatctups == NULL) {
+        newmax = 16;
+        owner->globalcatctups = (GlobalCatCTup**)MemoryContextAlloc(owner->memCxt,
+            newmax * sizeof(GlobalCatCTup*));
+        owner->maxglobalcatctups = newmax;
+    } else {
+        newmax = owner->maxglobalcatctups * 2;
+        owner->globalcatctups = (GlobalCatCTup**)repalloc(owner->globalcatctups, newmax * sizeof(GlobalCatCTup*));
+        owner->maxglobalcatctups = newmax;
+    }
+}
+void ResourceOwnerRememberGlobalCatCTup(ResourceOwner owner, GlobalCatCTup* tup)
+{
+    Assert(owner->nglobalcatctup < owner->maxglobalcatctups);
+    owner->globalcatctups[owner->nglobalcatctup] = tup;
+    owner->nglobalcatctup++;
+}
+void ResourceOwnerForgetGlobalCatCTup(ResourceOwner owner, GlobalCatCTup* tup)
+{
+    GlobalCatCTup** global_cts = owner->globalcatctups;
+    int nc1 = owner->nglobalcatctup - 1;
+    int i;
+    for (i = nc1; i >= 0; i--) {
+        if (global_cts[i] == tup) {
+            while (i < nc1) {
+                global_cts[i] = global_cts[i + 1];
+                i++;
+            }
+            owner->nglobalcatctup = nc1;
+            return;
+        }
+    }
+    ereport(ERROR,
+        (errcode(ERRCODE_WARNING_PRIVILEGE_NOT_GRANTED),
+            errmsg("bad global tuple is not owned by resource owner %s", owner->name)));
+}
+void ResourceOwnerEnlargeGlobalCatCList(ResourceOwner owner)
+{
+    int newmax;
+    if (owner->nglobalcatclist < owner->maxglobalcatclist)
+        return; /* nothing to do */
+    if (owner->globalcatclists == NULL) {
+        newmax = 16;
+        owner->globalcatclists = (GlobalCatCList**)MemoryContextAlloc(owner->memCxt,
+            newmax * sizeof(GlobalCatCList*));
+        owner->maxglobalcatclist = newmax;
+    } else {
+        newmax = owner->maxglobalcatclist * 2;
+        owner->globalcatclists = (GlobalCatCList**)repalloc(owner->globalcatclists, newmax * sizeof(GlobalCatCList*));
+        owner->maxglobalcatclist = newmax;
+    }
+}
+void ResourceOwnerRememberGlobalCatCList(ResourceOwner owner, GlobalCatCList* list)
+{
+    Assert(owner->nglobalcatclist < owner->maxglobalcatclist);
+    owner->globalcatclists[owner->nglobalcatclist] = list;
+    owner->nglobalcatclist++;
+}
+void ResourceOwnerForgetGlobalCatCList(ResourceOwner owner, GlobalCatCList* list)
+{
+    GlobalCatCList** global_lists = owner->globalcatclists;
+    int nc1 = owner->nglobalcatclist - 1;
+    int i;
+    for (i = nc1; i >= 0; i--) {
+        if (global_lists[i] == list) {
+            while (i < nc1) {
+                global_lists[i] = global_lists[i + 1];
+                i++;
+            }
+            owner->nglobalcatclist = nc1;
+            return;
+        }
+    }
+    ereport(ERROR,
+        (errcode(ERRCODE_WARNING_PRIVILEGE_NOT_GRANTED),
+            errmsg("bad global list is not owned by resource owner %s", owner->name)));
+}
+void ResourceOwnerEnlargeGlobalBaseEntry(ResourceOwner owner)
+{
+    int newmax;
+    if (owner->nglobalbaseentry < owner->maxglobalbaseentry)
+        return; /* nothing to do */
+    if (owner->globalbaseentries == NULL) {
+        newmax = 16;
+        owner->globalbaseentries = (GlobalBaseEntry **)MemoryContextAlloc(owner->memCxt,
+            newmax * sizeof(GlobalBaseEntry *));
+        owner->maxglobalbaseentry = newmax;
+    } else {
+        newmax = owner->maxglobalbaseentry * 2;
+        owner->globalbaseentries =
+            (GlobalBaseEntry **)repalloc(owner->globalbaseentries, newmax * sizeof(GlobalBaseEntry *));
+        owner->maxglobalbaseentry = newmax;
+    }
+}
+void ResourceOwnerRememberGlobalBaseEntry(ResourceOwner owner, GlobalBaseEntry* entry)
+{
+    Assert(owner->nglobalbaseentry < owner->maxglobalbaseentry);
+    owner->globalbaseentries[owner->nglobalbaseentry] = entry;
+    owner->nglobalbaseentry++;
+}
+void ResourceOwnerForgetGlobalBaseEntry(ResourceOwner owner, GlobalBaseEntry* entry)
+{
+    GlobalBaseEntry** global_entries = owner->globalbaseentries;
+    int nc1 = owner->nglobalbaseentry - 1;
+    int i;
+    for (i = nc1; i >= 0; i--) {
+        if (global_entries[i] == entry) {
+            while (i < nc1) {
+                global_entries[i] = global_entries[i + 1];
+                i++;
+            }
+            owner->nglobalbaseentry = nc1;
+            return;
+        }
+    }
+    ereport(ERROR,
+        (errcode(ERRCODE_WARNING_PRIVILEGE_NOT_GRANTED),
+            errmsg("the global base entry is not owned by resource owner %s", owner->name)));
+}
+
+void ResourceOwnerReleaseRWLock(ResourceOwner owner, bool isCommit)
+{
+    while (owner->nPthreadRWlock > 0) {
+        if (isCommit) {
+            PrintGlobalSysCacheLeakWarning(owner, "RWLock");
+        }
+        /* unlock do -- */
+        PthreadRWlockUnlock(owner, owner->pThdRWlocks[owner->nPthreadRWlock - 1]);
+    }
+}
+
+void ResourceOwnerReleaseLocalCatCTup(ResourceOwner owner, bool isCommit)
+{
+    while (owner->nlocalcatctup > 0) {
+        LocalCatCTup *ct = owner->localcatctups[owner->nlocalcatctup - 1];
+        if (isCommit) {
+            PrintGlobalSysCacheLeakWarning(owner, "LocalCatCTup");
+        }
+        ct->Release();
+        owner->nlocalcatctup--;
+    }
+}
+
+void ResourceOwnerReleaseLocalCatCList(ResourceOwner owner, bool isCommit)
+{
+    while (owner->nlocalcatclist > 0) {
+        LocalCatCList *cl = owner->localcatclists[owner->nlocalcatclist - 1];
+        if (isCommit) {
+            PrintGlobalSysCacheLeakWarning(owner, "LocalCatCList");
+        }
+        cl->Release();
+        owner->nlocalcatclist--;
+    }
+}
+
+void ResourceOwnerReleaseRelationRef(ResourceOwner owner, bool isCommit)
+{
+    while (owner->nrelrefs > 0) {
+        Relation rel = owner->relrefs[owner->nrelrefs - 1];
+        if (isCommit) {
+            PrintGlobalSysCacheLeakWarning(owner, "Relation");
+            if (!EnableLocalSysCache()) {
+                PrintRelCacheLeakWarning(rel);
+            }
+        }
+        /* close do -- */
+        RelationClose(rel);
+    }
+}
+
+void ResourceOwnerReleasePartitionRef(ResourceOwner owner, bool isCommit)
+{
+    while (owner->npartrefs > 0) {
+        Partition part = owner->partrefs[owner->npartrefs - 1];
+        if (isCommit) {
+            PrintGlobalSysCacheLeakWarning(owner, "Partition");
+            PrintPartCacheLeakWarning(part);
+        }
+        /* close do -- */
+        PartitionClose(part);
+    }
+}
+
+void ResourceOwnerReleaseGlobalCatCTup(ResourceOwner owner, bool isCommit)
+{
+    while (owner->nglobalcatctup > 0) {
+        GlobalCatCTup* global_ct = owner->globalcatctups[owner->nglobalcatctup - 1];
+        if (isCommit) {
+            PrintGlobalSysCacheLeakWarning(owner, "GlobalCatCTup");
+        }
+        global_ct->Release();
+        owner->nglobalcatctup--;
+    }
+}
+
+void ResourceOwnerReleaseGlobalCatCList(ResourceOwner owner, bool isCommit)
+{
+    while (owner->nglobalcatclist > 0) {
+        GlobalCatCList* global_cl = owner->globalcatclists[owner->nglobalcatclist - 1];
+        if (isCommit) {
+            PrintGlobalSysCacheLeakWarning(owner, "GlobalCatCList");
+        }
+        global_cl->Release();
+        owner->nglobalcatclist--;
+}
+}
+
+void ResourceOwnerReleaseGlobalBaseEntry(ResourceOwner owner, bool isCommit)
+{
+    while (owner->nglobalbaseentry > 0) {
+        GlobalBaseEntry *entry = owner->globalbaseentries[owner->nglobalbaseentry - 1];
+        if (isCommit) {
+            PrintGlobalSysCacheLeakWarning(owner, "GlobalBaseEntry");
+        }
+        if (unlikely(entry->refcount == 0)) {
+            /* palloc fail */
+            entry->FreeError();
+        } else {
+            entry->Release();
+        }
+        owner->nglobalbaseentry--;
+    }
+}
+
+void ResourceOwnerEnlargeGlobalDBEntry(ResourceOwner owner)
+{
+    int newmax;
+    if (owner->nglobaldbentry < owner->maxglobaldbentry)
+        return; /* nothing to do */
+    if (owner->globaldbentries == NULL) {
+        newmax = 16;
+        owner->globaldbentries = (GlobalSysDBCacheEntry **)MemoryContextAlloc(owner->memCxt,
+            newmax * sizeof(GlobalSysDBCacheEntry *));
+        owner->maxglobaldbentry = newmax;
+    } else {
+        newmax = owner->maxglobaldbentry * 2;
+        owner->globaldbentries =
+            (GlobalSysDBCacheEntry **)repalloc(owner->globaldbentries, newmax * sizeof(GlobalSysDBCacheEntry *));
+        owner->maxglobaldbentry = newmax;
+    }
+}
+
+extern void ResourceOwnerRememberGlobalDBEntry(ResourceOwner owner, GlobalSysDBCacheEntry* entry)
+{
+    Assert(owner->nglobaldbentry < owner->maxglobaldbentry);
+    owner->globaldbentries[owner->nglobaldbentry] = entry;
+    owner->nglobaldbentry++;
+}
+
+extern void ResourceOwnerForgetGlobalDBEntry(ResourceOwner owner, GlobalSysDBCacheEntry* entry)
+{
+    Assert(entry->m_dbOid!= InvalidOid);
+    GlobalSysDBCacheEntry** global_entries = owner->globaldbentries;
+    int nc1 = owner->nglobaldbentry - 1;
+    int i;
+    for (i = nc1; i >= 0; i--) {
+        if (global_entries[i] == entry) {
+            while (i < nc1) {
+                global_entries[i] = global_entries[i + 1];
+                i++;
+            }
+            owner->nglobaldbentry = nc1;
+            return;
+        }
+    }
+    ereport(ERROR,
+        (errcode(ERRCODE_WARNING_PRIVILEGE_NOT_GRANTED),
+            errmsg("the global rel entry is not owned by resource owner %s", owner->name)));
+}
+
+extern void ResourceOwnerReleaseGlobalDBEntry(ResourceOwner owner, bool isCommit)
+{
+    Assert(owner->nglobaldbentry <= 1);
+    while (owner->nglobaldbentry > 0) {
+        GlobalSysDBCacheEntry *entry = owner->globaldbentries[owner->nglobaldbentry - 1];
+        if (isCommit) {
+            /* print some debug info */
+            PrintGlobalSysCacheLeakWarning(owner, "GlobalDBEntry");
+        }
+        if (unlikely(entry->m_refcount == 0)) {
+            // palloc failed entry
+            entry->Free(entry);
+        } else {
+            entry->Release();
+        }
+        owner->nglobaldbentry--;
+    }
+}
+
+void ResourceOwnerEnlargeGlobalIsExclusive(ResourceOwner owner)
+{
+    int newmax;
+    if (owner->nglobalisexclusive < owner->maxglobalisexclusive)
+        return; /* nothing to do */
+    if (owner->globalisexclusives == NULL) {
+        newmax = 16;
+        owner->globalisexclusives = (volatile uint32 **)MemoryContextAlloc(owner->memCxt, newmax * sizeof(uint32 *));
+        owner->maxglobalisexclusive = newmax;
+    } else {
+        newmax = owner->maxglobalisexclusive * 2;
+        owner->globalisexclusives =
+            (volatile uint32 **)repalloc(owner->globalisexclusives, newmax * sizeof(uint32 *));
+        owner->maxglobalisexclusive = newmax;
+    }
+}
+
+extern void ResourceOwnerRememberGlobalIsExclusive(ResourceOwner owner, volatile uint32 *isexclusive)
+{
+    Assert(owner->nglobalisexclusive < owner->maxglobalisexclusive);
+    Assert(*isexclusive == 1);
+    owner->globalisexclusives[owner->nglobalisexclusive] = isexclusive;
+    owner->nglobalisexclusive++;
+}
+
+extern void ResourceOwnerForgetGlobalIsExclusive(ResourceOwner owner, volatile uint32 *isexclusive)
+{
+    volatile uint32 **global_isexclusives = owner->globalisexclusives;
+    int nc1 = owner->nglobalisexclusive - 1;
+    int i;
+    for (i = nc1; i >= 0; i--) {
+        if (global_isexclusives[i] == isexclusive) {
+            while (i < nc1) {
+                global_isexclusives[i] = global_isexclusives[i + 1];
+                i++;
+            }
+            owner->nglobalisexclusive = nc1;
+            return;
+        }
+    }
+    ereport(ERROR,
+        (errcode(ERRCODE_WARNING_PRIVILEGE_NOT_GRANTED),
+            errmsg("the global isexclusive is not owned by resource owner %s", owner->name)));
+}
+
+extern void ResourceOwnerReleaseGlobalIsExclusive(ResourceOwner owner, bool isCommit)
+{
+    Assert(owner->nglobalisexclusive <= 1);
+    while (owner->nglobalisexclusive > 0) {
+        volatile uint32 *isexclusive = owner->globalisexclusives[owner->nglobalisexclusive - 1];
+        if (isCommit) {
+            /* print some debug info */
+            PrintGlobalSysCacheLeakWarning(owner, "Global IsExclusive");
+        }
+        Assert(*isexclusive == 1);
+        atomic_compare_exchange_u32(isexclusive, 1, 0);
+        owner->nglobalisexclusive--;
+    }
+}
+
+bool CurrentResourceOwnerIsEmpty(ResourceOwner owner)
+{
+    if (owner == NULL || !owner->valid) {
+        return true;
+    }
+    Assert(owner->nbuffers == 0);
+    Assert(owner->nlocalcatclist == 0);
+    Assert(owner->nlocalcatctup == 0);
+    Assert(owner->nglobalcatctup == 0);
+    Assert(owner->nglobalcatclist == 0);
+    Assert(owner->nglobalbaseentry == 0);
+    Assert(owner->nglobaldbentry == 0);
+    Assert(owner->nglobalisexclusive == 0);
+    Assert(owner->ncatrefs == 0);
+    Assert(owner->ncatlistrefs == 0);
+    Assert(owner->nrelrefs == 0);
+    Assert(owner->npartrefs == 0);
+    Assert(owner->nfakerelrefs == 0);
+    Assert(owner->nfakepartrefs == 0);
+    Assert(owner->nplanrefs == 0);
+    Assert(owner->ntupdescs == 0);
+    Assert(owner->nsnapshots == 0);
+    Assert(owner->nfiles == 0);
+    Assert(owner->nDataCacheSlots == 0);
+    Assert(owner->nMetaCacheSlots == 0);
+    Assert(owner->nPthreadMutex == 0);
+    Assert(owner->nPthreadRWlock == 0);
+    Assert(owner->npartmaprefs == 0);
+    Assert(owner->nglobalMemContext == 0);
+    return true;
+}
+/*
+ * ResourceOwnerReleaseAllPlanCacheRefs
+ *              Release the plancache references (only) held by this owner.
+ *
+ * We might eventually add similar functions for other resource types,
+ * but for now, only this is needed.
+ */
+void ResourceOwnerReleaseAllPlanCacheRefs(ResourceOwner owner)
+{
+    ResourceOwner save = t_thrd.utils_cxt.CurrentResourceOwner;
+    t_thrd.utils_cxt.CurrentResourceOwner = owner;
+    ResourceOwnerDecrementNPlanRefs(owner, true);
+    t_thrd.utils_cxt.CurrentResourceOwner = save;
 }

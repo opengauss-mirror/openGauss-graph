@@ -15,14 +15,18 @@ begin
 	res:=($1.f1::int,$1.f2::int);
 	return  res;
 end;$$ language plpgsql security invoker;
+ERROR:  permission denied to create function "text_int"
+HINT:  must be sysadmin to create a function in public schema.
 select public.text_int((111,222));
-ERROR:  Permission denied.
-CONTEXT:  SQL statement "alter USER user1 with sysadmin"
-PL/pgSQL function text_int(text111) line 5 at SQL statement
-referenced column: text_int
+ERROR:  function public.text_int(record) does not exist
+LINE 1: select public.text_int((111,222));
+               ^
+HINT:  No function matches the given name and argument types. You might need to add explicit type casts.
+CONTEXT:  referenced column: text_int
 CREATE CAST (text111 AS int111) WITH FUNCTION public.text_int(text111) AS IMPLICIT;
+ERROR:  function public.text_int(text111) does not exist
 reset role;
 select aa ,bb  from aa_int ,bb_text where aa_int.aa=bb_text.bb::int111;
-ERROR:  Permission denied.
-CONTEXT:  SQL statement "alter USER user1 with sysadmin"
-PL/pgSQL function text_int(text111) line 5 at SQL statement
+ERROR:  cannot cast type text111 to int111
+LINE 1: ...bb  from aa_int ,bb_text where aa_int.aa=bb_text.bb::int111;
+                                                              ^

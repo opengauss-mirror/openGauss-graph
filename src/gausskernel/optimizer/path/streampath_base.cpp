@@ -243,7 +243,7 @@ void JoinPathGenBase::init()
      * in order to release resources when catch the exception.
      */
     m_resourceOwner = ResourceOwnerCreate(t_thrd.utils_cxt.CurrentResourceOwner, "join_path_gen",
-        MEMORY_CONTEXT_OPTIMIZER);
+        THREAD_GET_MEM_CXT_GROUP(MEMORY_CONTEXT_OPTIMIZER));
 
     m_dop = 0;
     m_multipleInner = 1.0;
@@ -1126,6 +1126,8 @@ Path* HashJoinPathGen::createHashJoinPath()
     pathnode->jpath.skewoptimize = m_streamInfoPair->skew_optimize;
     pathnode->path_hashclauses = m_hashClauses;
 
+    pathnode->jpath.path.exec_type = SetExectypeForJoinPath(m_innerStreamPath, m_outerStreamPath);
+
 #ifdef STREAMPLAN
     pathnode->jpath.path.locator_type =
         locator_type_join(m_innerStreamPath->locator_type, m_outerStreamPath->locator_type);
@@ -1186,7 +1188,13 @@ void HashJoinPathGen::initialCostHashjoin()
  */
 void HashJoinPathGen::finalCostHashjoin(HashPath* path, bool hasalternative)
 {
+#ifdef GS_GRAPH
+    Assert(0);
+    JoinPathExtraData* extra;
+    final_cost_hashjoin(m_root, path, m_workspace, extra, m_sjinfo, m_semifactors, hasalternative, path->jpath.path.dop);
+#else
     final_cost_hashjoin(m_root, path, m_workspace, m_sjinfo, m_semifactors, hasalternative, path->jpath.path.dop);
+#endif
 }
 
 /*
@@ -1286,8 +1294,15 @@ void NestLoopPathGen::addNestloopPathToList()
  */
 void NestLoopPathGen::initialCostNestloop()
 {
+#ifdef GS_GRAPH
+    Assert(0);
+    JoinPathExtraData* extra;
+    initial_cost_nestloop(
+        m_root, m_workspace, m_jointype, m_outerStreamPath, m_innerStreamPath, extra, m_sjinfo, m_semifactors, m_dop);
+#else
     initial_cost_nestloop(
         m_root, m_workspace, m_jointype, m_outerStreamPath, m_innerStreamPath, m_sjinfo, m_semifactors, m_dop);
+#endif
 }
 
 /*
@@ -1297,7 +1312,13 @@ void NestLoopPathGen::initialCostNestloop()
  */
 void NestLoopPathGen::finalCostNestloop(NestPath* path, bool hasalternative)
 {
+#ifdef GS_GRAPH
+    Assert(0);
+    JoinPathExtraData* extra;
+    final_cost_nestloop(m_root, path, m_workspace, extra, m_sjinfo, m_semifactors, hasalternative, m_dop);
+#else
     final_cost_nestloop(m_root, path, m_workspace, m_sjinfo, m_semifactors, hasalternative, m_dop);
+#endif
 }
 
 /*
@@ -1371,6 +1392,8 @@ Path* NestLoopPathGen::createNestloopPath()
     pathnode->innerjoinpath = m_innerStreamPath;
     pathnode->joinrestrictinfo = m_joinClauses;
     pathnode->skewoptimize = m_streamInfoPair->skew_optimize;
+
+    pathnode->path.exec_type = SetExectypeForJoinPath(m_innerStreamPath, m_outerStreamPath);
 
 #ifdef STREAMPLAN
     pathnode->path.locator_type = locator_type_join(m_outerStreamPath->locator_type, m_innerStreamPath->locator_type);
@@ -1528,7 +1551,13 @@ void MergeJoinPathGen::initialCostMergejoin()
  */
 void MergeJoinPathGen::finalCostMergejoin(MergePath* path, bool hasalternative)
 {
+#ifdef GS_GRAPH
+    Assert(0);
+    JoinPathExtraData* extra;
+    final_cost_mergejoin(m_root, path, m_workspace, extra, m_sjinfo, hasalternative);
+#else
     final_cost_mergejoin(m_root, path, m_workspace, m_sjinfo, hasalternative);
+#endif
 }
 
 /*
@@ -1559,6 +1588,8 @@ Path* MergeJoinPathGen::createMergejoinPath()
     pathnode->outersortkeys = m_outerSortKeys;
     pathnode->innersortkeys = m_innerSortKeys;
     /* pathnode->materialize_inner will be set by final_cost_mergejoin */
+
+    pathnode->jpath.path.exec_type = SetExectypeForJoinPath(m_innerStreamPath, m_outerStreamPath);
 
 #ifdef STREAMPLAN
     pathnode->jpath.path.locator_type =

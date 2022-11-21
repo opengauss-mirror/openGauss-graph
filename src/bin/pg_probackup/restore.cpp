@@ -1104,6 +1104,27 @@ static void sync_restored_files(parray *dest_files,
     elog(INFO, "Restored backup files are synced, time elapsed: %s", pretty_time);
 }
 
+inline void RestoreCompressFile(FILE *out, char *to_fullpath, size_t pathLen, pgFile *dest_file)
+{
+    if (dest_file->is_datafile && dest_file->compressedFile && !dest_file->is_cfs) {
+        if (!fio_is_remote_file(out)) {
+            auto result = ConstructCompressedFile(to_fullpath, dest_file->segno, dest_file->compressedChunkSize,
+                                                  dest_file->compressedAlgorithm);
+            if (result != SUCCESS) {
+                elog(ERROR, "Cannot copy compressed file \"%s\": %s", to_fullpath, strerror(errno));
+            }
+        } else {
+            CompressCommunicate communicate;
+            errno_t rc = memcpy_s(communicate.path, MAXPGPATH, to_fullpath, MAXPGPATH);
+            securec_check(rc, "", "");
+            communicate.chunkSize = dest_file->compressedChunkSize;
+            communicate.segmentNo = dest_file->segno;
+            communicate.algorithm = dest_file->compressedAlgorithm;
+            fio_construct_compressed((void*)&communicate, sizeof(communicate));
+        }
+    }
+}
+
 /*
  * Restore files into $PGDATA.
  */
@@ -1260,6 +1281,7 @@ done:
             elog(ERROR, "Cannot close file \"%s\": %s", to_fullpath,
                  strerror(errno));
 
+        RestoreCompressFile(out, to_fullpath, MAXPGPATH, dest_file);
         /* free pagemap used for restore optimization */
         pg_free(dest_file->pagemap.bitmap);
 
@@ -1386,7 +1408,9 @@ create_recovery_conf(time_t backup_id,
         timestamp = (char *)pg_malloc(RESTORE_ARRAY_LEN);
         time2iso(timestamp, RESTORE_ARRAY_LEN, backup->end_time);
         oldtime = rt->time_string;
-        rt->time_string = timestamp;
+        if (rt->time_string) {
+            rt->time_string = timestamp;
+        }
         construct_restore_cmd(fp, rt, restore_command_provided, target_immediate);
         rt->time_string = oldtime;
         free(timestamp);
@@ -1399,13 +1423,13 @@ create_recovery_conf(time_t backup_id,
 
 #if PG_VERSION_NUM >= 120000
     /*
-     * Create "recovery.signal" to mark this recovery as PITR for PostgreSQL.
+     * Create "recovery.signal" to mark this recovery as PITR for openGauss.
      * In older versions presense of recovery.conf alone was enough.
      * To keep behaviour consistent with older versions,
      * we are forced to create "recovery.signal"
      * even when only restore_command is provided.
      * Presense of "recovery.signal" by itself determine only
-     * one thing: do PostgreSQL must switch to a new timeline
+     * one thing: do openGauss must switch to a new timeline
      * after successfull recovery or not?
      */
     if (pitr_requested)

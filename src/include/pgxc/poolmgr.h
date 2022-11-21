@@ -144,6 +144,7 @@ typedef struct {
     PoolNodeType node_type;         /* node type, dn or dn */
     PoolNodeMode* node_mode;        /* node mode: primary, standby or none */
     PoolConnDef* conndef;           /* pool conn def */
+    PoolConnDef* conndef_for_validate;  /* record cn/dn connections while in connecting process */
     bool is_retry;                  /* retry to connect */
     PoolAgent* agent;               /* reference to local PoolAgent struct */
 } PoolGeneralInfo;
@@ -197,16 +198,35 @@ typedef struct {
     int fdsock;
     ThreadId remote_pid;
     uint32 used_count; /*counting the times of the slot be used*/
+    int idx;
+    int streamid;
 } PoolConnectionInfo;
+
+/*
+ * Record global connection status for function 'comm_check_connection_status'
+ * This struct in g_instance.pooler_cxt is defined to g_GlobalConnStatus!
+ */
+typedef struct GlobalConnStatus {
+    /* Record connection status */
+    struct ConnectionStatus **connEntries;
+
+    /* Numbers of coordiantors and primary datanodes for connEntries */
+    int totalEntriesCount;
+
+    /* Lock of this struct */
+    pthread_mutex_t connectionStatusLock;
+} GlobalConnStatus;
 
 /*
  * ConnectionStatus entry for pg_conn_status view
  */
-typedef struct {
+typedef struct ConnectionStatus {
+    Oid remote_nodeoid;  /* remode node oid */
     char *remote_name;
     char *remote_host;
     int remote_port;
-    bool is_connected;
+    bool is_connected;  /* connection status flag, record by creating socket connection */
+    bool no_error_occur;  /* pooler connect status flag, record by creating pooler connection */
     int sock;
 } ConnectionStatus;
 
@@ -331,6 +351,11 @@ extern PoolAgent* get_poolagent(void);
 
 extern void release_connection(PoolAgent* agent, PGXCNodePoolSlot** ptrSlot, Oid node, bool force_destroy);
 
+extern void wait_connection_ready(int finish_cnt, int total_cnt, int epfd, int timeout);
+extern int fill_node_define(Oid *cn_oids, Oid *dn_oids, int cn_num, int dn_num,
+    NodeDefinition **nodeDef_list, Oid &result);
+extern ConnectionStatus *fill_conn_entry(int total_cnt, NodeDefinition **nodeDef_list, int epfd, int *finish_cnt);
+
 /* Send commands to alter the behavior of current transaction */
 extern int PoolManagerSendLocalCommand(int dn_count, const int* dn_list, int co_count, const int* co_list);
 extern void PoolManagerInitPoolerAgent();
@@ -345,13 +370,6 @@ extern const char* GetNodeNameByOid(Oid nodeOid);
 extern void InitOidNodeNameMappingCache();
 extern void CleanOidNodeNameMappingCache();
 extern int* StreamConnectNodes(libcommaddrinfo** addrArray, int connNum);
-
-extern int CommInitMutex(pthread_mutex_t* mutex, CommLockStatus* status);
-extern int CommLockMutex(pthread_mutex_t* mutex, CommLockStatus* status);
-extern int CommUnlockMutex(pthread_mutex_t* mutex, CommLockStatus* status);
-extern void CommFreeMutex(pthread_mutex_t* mutex, CommLockStatus* status);
-extern int CommDestroyMutex(pthread_mutex_t* mutex, CommLockStatus* status);
-extern void CommReleasePoolerLock();
 
 #ifdef ENABLE_MULTIPLE_NODES
 extern void free_agent(PoolAgent* agent);
@@ -403,6 +421,12 @@ extern PGXCNodePoolSlot* alloc_slot_mem(DatabasePool* dbpool);
 extern char* GenerateSqlCommand(int argCount, ...);
 extern void reload_user_name_pgoptions(PoolGeneralInfo* info, PoolAgent* agent, PGXCNodePoolSlot* slot);
 extern bool release_slot_to_nodepool(PGXCNodePool* nodePool, bool force_destroy, PGXCNodePoolSlot* slot);
+extern void free_pool_conn(PoolConnDef* conndef_for_validate);
+
+extern void FillNodeConnectionStatus(ConnectionStatus *connsEntry, int entryCnt);
+extern void RecreateGlobalConnEntries();
+extern void ResetPoolerConnectionStatus();
+extern void FlushPoolerConnectionStatus(Oid nodeOid);
 
 /* The root memory context */
 extern MemoryContext PoolerMemoryContext;
@@ -425,6 +449,9 @@ extern int agentCount;
 extern PoolAgent** poolAgents;
 extern pthread_mutex_t g_poolAgentsLock;
 extern int MaxAgentCount;
+
+/* GlobalConnStatus -- Record connection status in memory */
+#define g_GlobalConnStatus (g_instance.pooler_cxt.globalConnStatus)
 
 #define PROTO_TCP 1
 #define get_agent(handle) ((PoolAgent*)(handle))

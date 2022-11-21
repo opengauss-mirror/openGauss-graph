@@ -1,9 +1,9 @@
 /* -------------------------------------------------------------------------
  *
  * postgres_fe.h
- * Primary include file for PostgreSQL client-side .c files
+ * Primary include file for openGauss client-side .c files
  *
- * This should be the first file included by PostgreSQL client libraries and
+ * This should be the first file included by openGauss client libraries and
  * application programs --- but not by backend modules, which should include
  * postgres.h.
  *
@@ -30,15 +30,13 @@
 #ifndef Assert
 #ifndef USE_ASSERT_CHECKING
 #define Assert(p)
+#define AssertMacro(p) ((void) 0)
 #else
 #define Assert(p) assert(p)
+#define AssertMacro Assert
 #endif /* USE_ASSERT_CHECKING */
 #endif /* Assert */
 
-
-#ifndef AssertMacro
-#define AssertMacro Assert
-#endif
 
 #ifndef BoolGetDatum
 #define BoolGetDatum(X) /*lint -e506*/ ((Datum)((X) ? 1 : 0)) /*lint +e506*/

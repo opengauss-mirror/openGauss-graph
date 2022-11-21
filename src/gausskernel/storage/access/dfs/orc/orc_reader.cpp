@@ -21,11 +21,15 @@
  * -------------------------------------------------------------------------
  */
 #include "orc_rw.h"
+#ifndef ENABLE_LITE_MODE
 #include "orc/Adaptor.hh"
 #include "orc/Exceptions.hh"
 #include "orc/OrcFile.hh"
+#endif
 #include "OrcObsFile.h"
+#ifndef ENABLE_LITE_MODE
 #include "orc/Reader.hh"
+#endif
 #include "storage/dfs/dfscache_mgr.h"
 #include "storage/cucache_mgr.h"
 #include "access/dfs/dfs_common.h"

@@ -66,7 +66,7 @@ enum PrivType {
     T_LOGIN_SUCCESS,
     T_LOGIN_FAILURE,
     T_COPY,
-    T_OPEN,
+    T_CURSOR,
     T_FETCH,
     T_CLOSE,
     T_ALL
@@ -225,6 +225,12 @@ struct EqualToPolicyBase {
 
 int gs_policy_base_cmp(const void *key1, const void *key2);
 
+typedef gs_stl::gs_vector<Oid> func_types;
+typedef gs_stl::gs_vector<gs_stl::gs_string> func_params;
+
+bool get_function_parameters(HeapTuple tuple, func_types* types, int* default_params = NULL);
+bool verify_proc_params(const func_params* func_params, const func_types* proc_types);
+
 typedef gs_stl::gs_set<GsPolicyBase, gs_policy_base_cmp> gs_policy_base_set;
 /* policy id */
 typedef gs_stl::gs_map<long long, gs_policy_base_set> gs_policy_base_map;
@@ -260,8 +266,16 @@ bool get_function_name(long long funcid, PolicyLabelItem *name);
 int get_privilege_type(const char *name);
 int get_privilege_object_type(const char *name);
 const char *get_privilege_object_name(int type);
+void load_function_label(const Query *query, bool audit_exist);
 
 bool name_list_to_string(List *names, gs_stl::gs_string *name, int max_const_count = -1 /* unlimited */);
 bool name_list_to_label(PolicyLabelItem *item, List *names, char *name = NULL, size_t name_size = 0);
+
+/* build PolicyLabelItem helper function*/
+void gen_policy_labelitem(PolicyLabelItem &item, const ListCell *rel, int objtype);
+void gen_policy_label_for_commentstmt(PolicyLabelItem &item, const CommentStmt *commentstmt);
+int get_objtype(int object_type);
+CmdType get_rte_commandtype(RangeTblEntry *rte);
+const char *get_cursorinfo(CmdType type);
 
 #endif /* GS_POLICY_OBJECT_TYPES_H_ */

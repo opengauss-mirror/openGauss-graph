@@ -1,7 +1,7 @@
 /* -------------------------------------------------------------------------
  *
  * sinval.h
- *	  POSTGRES shared cache invalidation communication definitions.
+ *	  openGauss shared cache invalidation communication definitions.
  *
  *
  * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
@@ -16,7 +16,7 @@
 
 #include <signal.h>
 
-#include "storage/relfilenode.h"
+#include "storage/smgr/relfilenode.h"
 
 /*
  * We support several types of shared-invalidation messages:
@@ -116,7 +116,8 @@ typedef struct {
 typedef struct {
     int8 id;           /* type field --- must be first */
     Oid dbId;   /* database ID */
-    Oid funcOid; /* function ID */
+    int cacheId;
+    Oid objId; /* function ID or package ID */
 } SharedInvalFuncMsg;
 
 typedef union SharedInvalidationMessage {
@@ -135,8 +136,9 @@ typedef union SharedInvalidationMessage {
 extern THR_LOCAL volatile sig_atomic_t catchupInterruptPending;
 
 extern void SendSharedInvalidMessages(const SharedInvalidationMessage* msgs, int n);
+
 extern void ReceiveSharedInvalidMessages(
-    void (*invalFunction)(SharedInvalidationMessage* msg), void (*resetFunction)(void));
+    void (*invalFunction)(SharedInvalidationMessage* msg), void (*resetFunction)(void), bool worksession);
 
 /* signal handler for catchup events (PROCSIG_CATCHUP_INTERRUPT) */
 extern void HandleCatchupInterrupt(void);
@@ -151,5 +153,8 @@ extern void ProcessCatchupInterrupt(void);
 extern int xactGetCommittedInvalidationMessages(SharedInvalidationMessage** msgs, bool* RelcacheInitFileInval);
 extern void ProcessCommittedInvalidationMessages(
     SharedInvalidationMessage* msgs, int nmsgs, bool RelcacheInitFileInval, Oid dbid, Oid tsid);
-extern void LocalExecuteInvalidationMessage(SharedInvalidationMessage* msg);
+extern void LocalExecuteThreadAndSessionInvalidationMessage(SharedInvalidationMessage* msg);
+extern void LocalExecuteThreadInvalidationMessage(SharedInvalidationMessage* msg);
+extern void LocalExecuteSessionInvalidationMessage(SharedInvalidationMessage* msg);
+extern void GlobalExecuteSharedInvalidMessages(const SharedInvalidationMessage* msgs, int n);
 #endif /* SINVAL_H */

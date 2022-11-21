@@ -192,7 +192,8 @@ NON_EXEC_STATIC void PercentileMain()
 
     SetProcessingMode(NormalProcessing);
     on_shmem_exit(PGXCNodeCleanAndRelease, 0);
-    t_thrd.utils_cxt.CurrentResourceOwner = ResourceOwnerCreate(NULL, "Percentile", MEMORY_CONTEXT_DFX);
+    t_thrd.utils_cxt.CurrentResourceOwner = ResourceOwnerCreate(NULL, "Percentile",
+        THREAD_GET_MEM_CXT_GROUP(MEMORY_CONTEXT_DFX));
     /* initialize current pool handles, it's also only once */
     exec_init_poolhandles();
 
@@ -206,9 +207,9 @@ NON_EXEC_STATIC void PercentileMain()
     pgstat_report_activity(STATE_IDLE, NULL);
 
     while (!t_thrd.percentile_cxt.need_exit) {
-        if (u_sess->sig_cxt.got_PoolReload) {
+        if (IsGotPoolReload()) {
             processPoolerReload();
-            u_sess->sig_cxt.got_PoolReload = false;
+            ResetGotPoolReload(false);
         }
         if (t_thrd.percentile_cxt.got_SIGHUP) {
             t_thrd.percentile_cxt.got_SIGHUP = false;
@@ -286,6 +287,7 @@ void PercentileSpace::calculatePercentileOfSingleNode(void)
 
     if (!u_sess->attr.attr_common.enable_instr_rt_percentile)
         return;
+    MemoryContext oldcxt = CurrentMemoryContext;
     PG_TRY();
     {
         int LocalCount = pgstat_fetch_sql_rt_info_counter();;
@@ -297,6 +299,7 @@ void PercentileSpace::calculatePercentileOfSingleNode(void)
     }
     PG_CATCH();
     {
+        (void)MemoryContextSwitchTo(oldcxt);
         pfree_ext(sqlRT);
         FlushErrorState();
         elog(WARNING, "Percentile job failed");
@@ -306,6 +309,7 @@ void PercentileSpace::calculatePercentileOfSingleNode(void)
 
 void PercentileSpace::calculatePercentileOfMultiNode(void)
 {
+    MemoryContext oldcxt = CurrentMemoryContext;
     PG_TRY();
     {
         if (!g_instance.stat_cxt.calculate_on_other_cn) {
@@ -314,6 +318,7 @@ void PercentileSpace::calculatePercentileOfMultiNode(void)
     }
     PG_CATCH();
     {
+        (void)MemoryContextSwitchTo(oldcxt);
         /* free all handles */
         release_pgxc_handles(t_thrd.percentile_cxt.pgxc_all_handles);
         t_thrd.percentile_cxt.pgxc_all_handles = NULL;
@@ -336,9 +341,9 @@ void PercentileSpace::SubPercentileMain(void)
             pgstat_report_activity(STATE_RUNNING, NULL);
             t_thrd.percentile_cxt.need_reset_timer = false;
         }
-        if (u_sess->sig_cxt.got_PoolReload) {
+        if (IsGotPoolReload()) {
             processPoolerReload();
-            u_sess->sig_cxt.got_PoolReload = false;
+            ResetGotPoolReload(false);
         }
         if (t_thrd.percentile_cxt.got_SIGHUP) {
             t_thrd.percentile_cxt.got_SIGHUP = false;
@@ -491,12 +496,14 @@ void processCalculatePercentile()
     bool isTimeOut = false;
     /* get all data node index */
     cnlist = GetAllCoordNodes();
+    MemoryContext oldcxt = CurrentMemoryContext;
     PG_TRY();
     {
         t_thrd.percentile_cxt.pgxc_all_handles = get_handles(NULL, cnlist, true);
     }
     PG_CATCH();
     {
+        (void)MemoryContextSwitchTo(oldcxt);
         release_pgxc_handles(t_thrd.percentile_cxt.pgxc_all_handles);
         t_thrd.percentile_cxt.pgxc_all_handles = NULL;
         list_free(cnlist);

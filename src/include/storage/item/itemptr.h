@@ -1,7 +1,7 @@
 /* -------------------------------------------------------------------------
  *
  * itemptr.h
- *	  POSTGRES disk item pointer definitions.
+ *	  openGauss disk item pointer definitions.
  *
  *
  * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
@@ -47,6 +47,27 @@ ItemPointerData;
 #define SizeOfIptrData (offsetof(ItemPointerData, ip_posid) + sizeof(OffsetNumber))
 
 typedef ItemPointerData* ItemPointer;
+
+/* ------------------------------------------
+ * special values used in heap tuples (t_ctid)
+ * ------------------------------------------
+ */
+
+/*
+ * If a heap tuple holds a speculative insertion token rather than a real
+ * TID, ip_posid is set to SpecTokenOffsetNumber, and the token is stored in
+ * ip_blkid. SpecTokenOffsetNumber must be higher than MaxOffsetNumber, so
+ * that it can be distinguished from a valid offset number in a regular item
+ * pointer.
+ */
+#define SpecTokenOffsetNumber           0xfffe
+
+/*
+ * When a tuple is moved to a different partition by UPDATE, the t_ctid of
+ * the old tuple version is set to this magic value.
+ */
+#define MovedPartitionsOffsetNumber 0xfffd
+#define MovedPartitionsBlockNumber      InvalidBlockNumber
 
 /* ----------------
  *		support macros
@@ -136,12 +157,22 @@ typedef ItemPointerData* ItemPointer;
         BlockIdSet(&((pointer)->ip_blkid), InvalidBlockNumber), \
         (pointer)->ip_posid = InvalidOffsetNumber)
 
+/*
+ * ItemPointerSetMovedPartitions
+ *      Indicate that the item referenced by the itempointer has moved into a
+ *      different partition.
+ */
+#define ItemPointerSetMovedPartitions(pointer) \
+        ItemPointerSet((pointer), MovedPartitionsBlockNumber, MovedPartitionsOffsetNumber)
+
 /* ----------------
  *		externs
  * ----------------
  */
 
 extern bool ItemPointerEquals(ItemPointer pointer1, ItemPointer pointer2);
+/* for upgrade from existed session, syscache has builtin tuple, AssertMacro(ItemPointerIsValid(pointer)) will fail */
+extern bool ItemPointerEqualsNoCheck(ItemPointer pointer1, ItemPointer pointer2);
 extern int32 ItemPointerCompare(ItemPointer arg1, ItemPointer arg2);
 
 /* --------------------------------------------------------

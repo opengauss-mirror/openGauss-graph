@@ -1,3 +1,5 @@
+create database pl_test_llt DBCOMPATIBILITY 'pg';
+\c pl_test_llt
 --int1
 create table source(a int);
 insert into source values(1);
@@ -273,7 +275,7 @@ create view alter_llt1.v1 as select * from alter_llt1.t1;
 
 create function alter_llt1.plus1(int) returns int as 'select $1+1' language sql; 
 
-create domain alter_llt1.posint integer check (value > 0);
+--create domain alter_llt1.posint integer check (value > 0);
 
 create type alter_llt1.ctype as (f1 int, f2 text);
 
@@ -357,3 +359,5 @@ ALTER TEXT SEARCH DICTIONARY my_dict ( StopWords = newrussian );
 
 drop table t1 CASCADE;
 drop table test_raw cascade;
+\c regression;
+drop database IF EXISTS pl_test_llt;

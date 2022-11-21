@@ -7,6 +7,7 @@
  * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  * Portions Copyright (c) 2010-2012 Postgres-XC Development Group
+ * Portions Copyright (c) 2021, openGauss Contributors
  *
  * IDENTIFICATION
  *	  src/common/backend/catalog/dependency.cpp
@@ -20,8 +21,16 @@
 #include "access/sysattr.h"
 #include "access/xact.h"
 #include "catalog/dependency.h"
+#include "catalog/gs_db_privilege.h"
+#include "catalog/gs_encrypted_proc.h"
 #include "catalog/gs_matview.h"
 #include "catalog/gs_model.h"
+#ifdef GS_GRAPH
+#include "catalog/gs_graph.h"
+#include "catalog/gs_label.h"
+#include "catalog/gs_label_fn.h"
+#include "commands/graphcmds.h"
+#endif /* GS_GRAPH */
 #include "catalog/heap.h"
 #include "catalog/index.h"
 #include "catalog/namespace.h"
@@ -51,8 +60,12 @@
 #include "catalog/pg_operator.h"
 #include "catalog/pg_opfamily.h"
 #include "catalog/pg_proc.h"
+#include "catalog/pg_publication.h"
+#include "catalog/pg_publication_rel.h"
+#include "catalog/gs_package.h"
 #include "catalog/pg_rewrite.h"
 #include "catalog/pg_rlspolicy.h"
+#include "catalog/pg_subscription.h"
 #include "catalog/pg_synonym.h"
 #include "catalog/pg_tablespace.h"
 #include "catalog/pg_trigger.h"
@@ -83,6 +96,7 @@
 #include "commands/extension.h"
 #include "commands/matview.h"
 #include "commands/proclang.h"
+#include "commands/publicationcmds.h"
 #include "commands/schemacmds.h"
 #include "commands/seclabel.h"
 #include "commands/sec_rls_cmds.h"
@@ -95,6 +109,7 @@
 #include "parser/parsetree.h"
 #include "rewrite/rewriteRemove.h"
 #include "storage/lmgr.h"
+#include "storage/tcap.h"
 #include "tcop/utility.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
@@ -104,6 +119,7 @@
 #include "utils/syscache.h"
 #include "utils/snapmgr.h"
 #include "datasource/datasource.h"
+#include "postmaster/rbcleaner.h"
 
 /*
  * This constant table maps ObjectClasses to the corresponding catalog OIDs.
@@ -140,9 +156,19 @@ static const Oid object_classes[MAX_OCLASS] = {
     UserMappingRelationId,           /* OCLASS_USER_MAPPING */
     PgSynonymRelationId,             /* OCLASS_SYNONYM */
     DefaultAclRelationId,            /* OCLASS_DEFACL */
+    DbPrivilegeId,                   /* OCLASS_DB_PRIVILEGE */
     ExtensionRelationId,             /* OCLASS_EXTENSION */
     PgDirectoryRelationId,           /* OCLASS_DIRECTORY */
-    PgJobRelationId                  /* OCLASS_PG_JOB */
+    PgJobRelationId,                 /* OCLASS_PG_JOB */
+    PublicationRelationId,           /* OCLASS_PUBLICATION */
+    PublicationRelRelationId,        /* OCLASS_PUBLICATION_REL */
+    SubscriptionRelationId           /* OCLASS_SUBSCRIPTION */
+#ifdef GS_GRAPH
+    // TransformRelationId,		/* OCLASS_TRANSFORM */
+    ,
+    GraphRelationId,			/* OCLASS_GRAPH */
+	LabelRelationId				/* OCLASS_LABEL */
+#endif  /* GS_GRAPH */
 #ifdef PGXC
     ,
     PgxcClassRelationId /* OCLASS_PGXCCLASS */
@@ -150,10 +176,6 @@ static const Oid object_classes[MAX_OCLASS] = {
 
 };
 
-static void findDependentObjects(const ObjectAddress* object, int flags, ObjectAddressStack* stack,
-    ObjectAddresses* targetObjects, const ObjectAddresses* pendingObjects, Relation* depRel);
-static void reportDependentObjects(
-    const ObjectAddresses* targetObjects, DropBehavior behavior, int msglevel, const ObjectAddress* origObject);
 #ifdef ENABLE_MULTIPLE_NODES
 namespace Tsdb {
 static void findTsDependentObjects(ObjectAddresses* targetObjects, Relation depRel);
@@ -161,7 +183,6 @@ static void findTsDependentObjects(ObjectAddresses* targetObjects, Relation depR
 #endif   /* ENABLE_MULTIPLE_NODES */
 static void deleteOneObject(const ObjectAddress* object, Relation* depRel, int32 flags);
 static void doDeletion(const ObjectAddress* object, int flags);
-static void AcquireDeletionLock(const ObjectAddress* object, int flags);
 static void ReleaseDeletionLock(const ObjectAddress* object);
 static bool find_expr_references_walker(Node* node, find_expr_references_context* context);
 static void eliminate_duplicate_dependencies(ObjectAddresses* addrs);
@@ -169,6 +190,7 @@ static int object_address_comparator(const void* a, const void* b);
 static void add_object_address(ObjectClass oclass, Oid objectId, int32 subId, ObjectAddresses* addrs);
 static void add_exact_object_address_extra(
     const ObjectAddress* object, const ObjectAddressExtra* extra, ObjectAddresses* addrs);
+static void getLabelDescription(StringInfo buffer, Oid laboid);
 static bool object_address_present_add_flags(const ObjectAddress* object, int flags, ObjectAddresses* addrs);
 static bool stack_address_present_add_flags(const ObjectAddress* object, int flags, ObjectAddressStack* stack);
 static void getRelationDescription(StringInfo buffer, Oid relid);
@@ -323,7 +345,7 @@ static void PreDropForDfsTable(ObjectAddresses* targetObjects)
  * dropped, is the union of the implicit-object list for all objects.  This
  * makes each check be more relaxed.
  */
-void performMultipleDeletions(const ObjectAddresses* objects, DropBehavior behavior, uint32 flags)
+void performMultipleDeletions(const ObjectAddresses* objects, DropBehavior behavior, uint32 flags, bool isPkgDropTypes)
 {
     Relation depRel;
     ObjectAddresses* targetObjects = NULL;
@@ -351,6 +373,14 @@ void performMultipleDeletions(const ObjectAddresses* objects, DropBehavior behav
 
     for (i = 0; i < objects->numrefs; i++) {
         const ObjectAddress* thisobj = objects->refs + i;
+        if (getObjectClass(thisobj) == OCLASS_SCHEMA) {
+            AcquireDeletionLock(thisobj, flags);
+            RbCltPurgeSchema(thisobj->objectId);
+        }
+    }
+
+    for (i = 0; i < objects->numrefs; i++) {
+        const ObjectAddress* thisobj = objects->refs + i;
 
         /*
          * Acquire deletion lock on each target object.  (Ideally the caller
@@ -358,6 +388,13 @@ void performMultipleDeletions(const ObjectAddresses* objects, DropBehavior behav
          */
         AcquireDeletionLock(thisobj, flags);
 
+        /*
+         * Purge all the rb objects in the proper order.
+         */
+
+        /*
+         * Find dependent objects recursively.
+         */
         findDependentObjects(thisobj,
             DEPFLAG_ORIGINAL,
             NULL, /* empty stack */
@@ -374,7 +411,11 @@ void performMultipleDeletions(const ObjectAddresses* objects, DropBehavior behav
      * If there's exactly one object being deleted, report it the same way as
      * in performDeletion(), else we have to be vaguer.
      */
-    reportDependentObjects(targetObjects, behavior, NOTICE, (objects->numrefs == 1 ? objects->refs : NULL));
+    if (isPkgDropTypes) {
+        reportDependentObjects(targetObjects, behavior, INFO, ((objects->numrefs == 1) ? objects->refs : NULL));
+    } else {
+        reportDependentObjects(targetObjects, behavior, NOTICE, ((objects->numrefs == 1) ? objects->refs : NULL));
+    }
 
     /*
      * Don't allow "drop DFS table" to run inside a transaction block.
@@ -509,7 +550,7 @@ void deleteWhatDependsOn(const ObjectAddress* object, bool showNotices)
  *			not necessarily in targetObjects yet (can be NULL if none)
  *	*depRel: already opened pg_depend relation
  */
-static void findDependentObjects(const ObjectAddress* object, int flags, ObjectAddressStack* stack,
+void findDependentObjects(const ObjectAddress* object, int flags, ObjectAddressStack* stack,
     ObjectAddresses* targetObjects, const ObjectAddresses* pendingObjects, Relation* depRel)
 {
     ScanKeyData key[3];
@@ -820,7 +861,7 @@ static void findDependentObjects(const ObjectAddress* object, int flags, ObjectA
  *	origObject: base object of deletion, or NULL if not available
  *		(the latter case occurs in DROP OWNED)
  */
-static void reportDependentObjects(
+void reportDependentObjects(
     const ObjectAddresses* targetObjects, DropBehavior behavior, int msglevel, const ObjectAddress* origObject)
 {
     bool ok = true;
@@ -1163,7 +1204,7 @@ static void doDeletion(const ObjectAddress* object, int flags)
                  */
                 if (relKind == RELKIND_RELATION)
                     isTmpTable = IsTempTable(object->objectId);
-                else if (relKind == RELKIND_SEQUENCE) {
+                else if (RELKIND_IS_SEQUENCE(relKind)) {
                     isTmpSequence = IsTempSequence(object->objectId);
                     /*
                      * A relation is opened to get the schema and database name as
@@ -1213,6 +1254,7 @@ static void doDeletion(const ObjectAddress* object, int flags)
              */
             switch (relKind) {
                 case RELKIND_SEQUENCE:
+                case RELKIND_LARGE_SEQUENCE:
                     /*
                      * Drop the sequence on GTM.
                      * Sequence is dropped on GTM by a remote Coordinator only
@@ -1266,6 +1308,11 @@ static void doDeletion(const ObjectAddress* object, int flags)
 
         case OCLASS_PROC:
             RemoveFunctionById(object->objectId);
+            break;
+
+        case OCLASS_PACKAGE:
+            /* if objectId same as objectSubId, it's doing drop package body */
+            RemovePackageById(object->objectId, (int32)object->objectId == object->objectSubId);
             break;
 
         case OCLASS_TYPE:
@@ -1368,9 +1415,14 @@ static void doDeletion(const ObjectAddress* object, int flags)
         case OCLASS_DEFACL:
             RemoveDefaultACLById(object->objectId);
             break;
+
+        case OCLASS_DB_PRIVILEGE:
+            DropDbPrivByOid(object->objectId);
+            break;
+
 #ifdef PGXC
         case OCLASS_PGXC_CLASS:
-            RemovePgxcClass(object->objectId);
+            RemovePgxcClass(object->objectId, IS_PGXC_DATANODE);
             /* 
              * pgxc_slice is the extended information for pgxc_class,
              * so need to delete the related tuples in pgxc_slice.
@@ -1416,7 +1468,7 @@ static void doDeletion(const ObjectAddress* object, int flags)
             break;
 
         case OCLASS_PG_JOB:
-            remove_job_by_oid(NULL, RelOid, true, object->objectId);
+            remove_job_by_oid(object->objectId, RelOid, true);
             break;
 
         case OCLASS_SYNONYM:
@@ -1425,6 +1477,23 @@ static void doDeletion(const ObjectAddress* object, int flags)
         case OCLASS_DB4AI_MODEL:
             remove_model_by_oid(object->objectId);
             break;
+        case OCLASS_GS_CL_PROC:
+            remove_encrypted_proc_by_id(object->objectId);
+            break;
+        case OCLASS_PUBLICATION:
+            RemovePublicationById(object->objectId);
+            break;
+
+        case OCLASS_PUBLICATION_REL:
+            RemovePublicationRelById(object->objectId);
+            break;
+        case OCLASS_GRAPH:
+			RemoveGraphById(object->objectId);
+			break;
+
+		case OCLASS_LABEL:
+			label_drop_with_catalog(object->objectId);
+			break;
         default:
             ereport(ERROR,
                 (errcode(ERRCODE_UNRECOGNIZED_NODE_TYPE), errmsg("unrecognized object class: %u", object->classId)));
@@ -1438,7 +1507,7 @@ static void doDeletion(const ObjectAddress* object, int flags)
  * else.  Note that dependency.c is not concerned with deleting any kind of
  * shared-across-databases object, so we have no need for LockSharedObject.
  */
-static void AcquireDeletionLock(const ObjectAddress* object, int flags)
+void AcquireDeletionLock(const ObjectAddress* object, int flags)
 {
     if (object->classId == RelationRelationId) {
         /*
@@ -2083,6 +2152,53 @@ static void add_object_address(ObjectClass oclass, Oid objectId, int32 subId, Ob
     item->classId = object_classes[oclass];
     item->objectId = objectId;
     item->objectSubId = subId;
+    item->rbDropMode = RB_DROP_MODE_INVALID;
+    addrs->numrefs++;
+}
+
+/*
+ * Add an entry to an ObjectAddresses array.
+ *
+ * It is convenient to specify the class by ObjectClass rather than directly
+ * by catalog OID.
+ */
+void add_object_address_ext(Oid classId, Oid objectId, int32 subId, char deptype, ObjectAddresses* addrs)
+{
+    ObjectAddress* item = NULL;
+
+    /* enlarge array if needed */
+    if (addrs->numrefs >= addrs->maxrefs) {
+        addrs->maxrefs *= 2;
+        addrs->refs = (ObjectAddress*)repalloc(addrs->refs, addrs->maxrefs * sizeof(ObjectAddress));
+        Assert(!addrs->extras);
+    }
+    /* record this item */
+    item = addrs->refs + addrs->numrefs;
+    item->classId = classId;
+    item->objectId = objectId;
+    item->objectSubId = subId;
+    item->deptype = deptype;
+    item->rbDropMode = RB_DROP_MODE_INVALID;
+    addrs->numrefs++;
+}
+
+void add_object_address_ext1(const ObjectAddress *obj, ObjectAddresses* addrs)
+{
+    ObjectAddress* item = NULL;
+
+    /* enlarge array if needed */
+    if (addrs->numrefs >= addrs->maxrefs) {
+        addrs->maxrefs *= 2;
+        addrs->refs = (ObjectAddress*)repalloc(addrs->refs, addrs->maxrefs * sizeof(ObjectAddress));
+        Assert(!addrs->extras);
+    }
+    /* record this item */
+    item = addrs->refs + addrs->numrefs;
+    item->classId = obj->classId;
+    item->objectId = obj->objectId;
+    item->objectSubId = obj->objectSubId;
+    item->deptype = obj->deptype;
+    item->rbDropMode = obj->rbDropMode;
     addrs->numrefs++;
 }
 
@@ -2251,7 +2367,8 @@ void free_object_addresses(ObjectAddresses* addrs)
 ObjectClass getObjectClass(const ObjectAddress* object)
 {
     /* only pg_class entries can have nonzero objectSubId */
-    if (object->classId != RelationRelationId && object->objectSubId != 0)
+    if (object->classId != PackageRelationId && object->classId != RelationRelationId 
+                                             && object->objectSubId != 0)
         ereport(ERROR, (errmodule(MOD_OPT), errcode(ERRCODE_INVALID_PARAMETER_VALUE),
                 errmsg("invalid objectSubId 0 for object class %u", object->classId)));
 
@@ -2263,6 +2380,9 @@ ObjectClass getObjectClass(const ObjectAddress* object)
         case ProcedureRelationId:
             return OCLASS_PROC;
 
+         case PackageRelationId:
+            return OCLASS_PACKAGE;
+            
         case TypeRelationId:
             return OCLASS_TYPE;
 
@@ -2344,6 +2464,9 @@ ObjectClass getObjectClass(const ObjectAddress* object)
         case DefaultAclRelationId:
             return OCLASS_DEFACL;
 
+        case DbPrivilegeId:
+            return OCLASS_DB_PRIVILEGE;
+
         case ExtensionRelationId:
             return OCLASS_EXTENSION;
         case PgxcGroupRelationId:
@@ -2376,6 +2499,26 @@ ObjectClass getObjectClass(const ObjectAddress* object)
             return OCLASS_COLUMN_SETTING_ARGS;
         case ModelRelationId:
             return OCLASS_DB4AI_MODEL;
+        case ClientLogicProcId:
+            return OCLASS_GS_CL_PROC;
+        case PublicationRelationId:
+            return OCLASS_PUBLICATION;
+
+        case PublicationRelRelationId:
+            return OCLASS_PUBLICATION_REL;
+
+        case SubscriptionRelationId:
+            return OCLASS_SUBSCRIPTION;
+
+        // case TransformRelationId:
+		// 	return OCLASS_TRANSFORM;
+#ifdef GS_GRAPH
+        case GraphRelationId:
+			return OCLASS_GRAPH;
+            
+		case LabelRelationId:
+			return OCLASS_LABEL;
+#endif /* GS_GRAPH */
         default:
             break;
     }
@@ -2396,6 +2539,8 @@ char* getObjectDescription(const ObjectAddress* object)
 
     initStringInfo(&buffer);
 
+    char* signature = NULL;
+
     switch (getObjectClass(object)) {
         case OCLASS_CLASS:
             getRelationDescription(&buffer, object->objectId);
@@ -2405,7 +2550,15 @@ char* getObjectDescription(const ObjectAddress* object)
             break;
 
         case OCLASS_PROC:
-            appendStringInfo(&buffer, _("function %s"), format_procedure(object->objectId));
+            signature = format_procedure(object->objectId);
+            appendStringInfo(&buffer, _("function %s"), signature);
+            pfree_ext(signature);
+            break;
+
+        case OCLASS_PACKAGE:
+            signature = format_procedure(object->objectId);
+            appendStringInfo(&buffer, _("package %s"), signature);
+            pfree_ext(signature);
             break;
 
         case OCLASS_TYPE:
@@ -2659,7 +2812,7 @@ char* getObjectDescription(const ObjectAddress* object)
 
             initStringInfo(&opfam);
             getOpFamilyDescription(&opfam, amprocForm->amprocfamily);
-
+            signature = format_procedure(amprocForm->amproc);
             /* ------
                translator: %d is the function number, the first two %s's
                are data type names, the third %s is the description of the
@@ -2671,8 +2824,9 @@ char* getObjectDescription(const ObjectAddress* object)
                 format_type_be(amprocForm->amproclefttype),
                 format_type_be(amprocForm->amprocrighttype),
                 opfam.data,
-                format_procedure(amprocForm->amproc));
+                signature);
 
+            pfree_ext(signature);
             pfree_ext(opfam.data);
 
             systable_endscan(amscan);
@@ -2937,6 +3091,29 @@ char* getObjectDescription(const ObjectAddress* object)
             break;
         }
 
+        case OCLASS_DB_PRIVILEGE: {
+            Relation dbPrivRel = heap_open(DbPrivilegeId, AccessShareLock);
+            if (!RelationIsValid(dbPrivRel)) {
+                ereport(ERROR, (errmodule(MOD_SEC), errcode(ERRCODE_SYSTEM_ERROR),
+                    errmsg("Could not open the relation gs_db_privilege."),
+                        errcause("System error."), erraction("Contact engineer to support.")));
+            }
+
+            HeapTuple dbPrivTuple = SearchSysCache1(DBPRIVOID, ObjectIdGetDatum(object->objectId));
+            if (!HeapTupleIsValid(dbPrivTuple)) {
+                heap_close(dbPrivRel, AccessShareLock);
+                break;
+            }
+            
+            bool isNull = false;
+            Datum datum = heap_getattr(
+                dbPrivTuple, Anum_gs_db_privilege_privilege_type, RelationGetDescr(dbPrivRel), &isNull);
+            appendStringInfo(&buffer, _("\"%s\""), text_to_cstring(DatumGetTextP(datum)));
+
+            ReleaseSysCache(dbPrivTuple);
+            heap_close(dbPrivRel, AccessShareLock);
+            break;
+        }
         case OCLASS_EXTENSION: {
             char* extname = NULL;
 
@@ -3017,6 +3194,49 @@ char* getObjectDescription(const ObjectAddress* object)
             appendStringInfo(&buffer, _("synonym %s"), qualifiedSynname);
             break;
         }
+        case OCLASS_PUBLICATION: {
+            appendStringInfo(&buffer, _("publication %s"), get_publication_name(object->objectId, false));
+            break;
+        }
+
+        case OCLASS_PUBLICATION_REL: {
+            HeapTuple tup;
+            char *pubname;
+            Form_pg_publication_rel prform;
+            ScanKeyData scanKey[1];
+            ScanKeyInit(&scanKey[0], ObjectIdAttributeNumber, BTEqualStrategyNumber, F_OIDEQ,
+                ObjectIdGetDatum(object->objectId));
+            Relation rel = heap_open(PublicationRelRelationId, AccessShareLock);
+            SysScanDesc scanDesc = systable_beginscan(rel, PublicationRelObjectIndexId, true, NULL, 1, scanKey);
+
+            tup = systable_getnext(scanDesc);
+            if (!HeapTupleIsValid(tup)) {
+                ereport(ERROR, (errcode(ERRCODE_UNDEFINED_OBJECT),
+                        errmsg("could not find tuple for publication %u", object->objectId)));
+            }
+
+            prform = (Form_pg_publication_rel)GETSTRUCT(tup);
+            pubname = get_publication_name(prform->prpubid, false);
+
+            appendStringInfo(&buffer, _("publication table %s in publication %s"), get_rel_name(prform->prrelid),
+                pubname);
+            systable_endscan(scanDesc);
+            heap_close(rel, AccessShareLock);
+            break;
+        }
+
+        case OCLASS_SUBSCRIPTION: {
+            appendStringInfo(&buffer, _("subscription %s"), get_subscription_name(object->objectId, false));
+            break;
+        }
+
+        case OCLASS_GRAPH:
+			appendStringInfo(&buffer, _("graph %s"), get_graphid_graphname(object->objectId));
+			break;
+
+		case OCLASS_LABEL:
+			getLabelDescription(&buffer, object->objectId);
+			break;
 
         default:
             appendStringInfo(
@@ -3074,6 +3294,9 @@ static void getRelationDescription(StringInfo buffer, Oid relid)
             break;
         case RELKIND_SEQUENCE:
             appendStringInfo(buffer, _("sequence %s"), relname);
+            break;
+        case RELKIND_LARGE_SEQUENCE:
+            appendStringInfo(buffer, _("large sequence %s"), relname);
             break;
         case RELKIND_TOASTVALUE:
             appendStringInfo(buffer, _("toast table %s"), relname);
@@ -3203,6 +3426,28 @@ Datum pg_describe_object(PG_FUNCTION_ARGS)
 
     description = getObjectDescription(&address);
     PG_RETURN_TEXT_P(cstring_to_text(description));
+}
+
+static void
+getLabelDescription(StringInfo buffer, Oid laboid)
+{
+	HeapTuple   tuple;
+	Form_gs_label labtup;
+
+	tuple = SearchSysCache1(LABELOID, ObjectIdGetDatum(laboid));
+	if (!HeapTupleIsValid(tuple))
+		elog(ERROR, "cache lookup failed for label (OID=%u)", laboid);
+
+	labtup = (Form_gs_label) GETSTRUCT(tuple);
+
+	if (labtup->labkind == LABEL_KIND_VERTEX)
+		appendStringInfo(buffer, "vlabel %s", NameStr(labtup->labname));
+	else if (labtup->labkind == LABEL_KIND_EDGE)
+		appendStringInfo(buffer, "elabel %s", NameStr(labtup->labname));
+	else
+		elog(ERROR, "invalid label (OID=%u)", laboid);
+
+	ReleaseSysCache(tuple);
 }
 
 #ifdef ENABLE_MULTIPLE_NODES

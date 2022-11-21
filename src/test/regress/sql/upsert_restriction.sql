@@ -83,8 +83,6 @@ insert into up_neg_05 values(1,1,1,1,1) on duplicate key update c2 = 1;
 insert into up_neg_05 values(1,1,1,1,1) on duplicate key update c3 = 2;
 insert into up_neg_05 values(1,1,1,1,1) on duplicate key update c1 =1, c2 = 1, c3=2, c4=1,c5=1;
 
----- where clause
-insert into up_neg_05 values(1,1,1,1,1) on duplicate key update c4 = 1 where c1=1;
 ---- from clause
 insert into up_neg_05 values(1,1,1,1,1) on duplicate key update c4 = 1 from up_neg_04 where c1=1;
 

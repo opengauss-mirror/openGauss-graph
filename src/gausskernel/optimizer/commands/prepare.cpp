@@ -47,12 +47,24 @@
 #include "pgxc/execRemote.h"
 #include "catalog/pgxc_node.h"
 #endif
+#include "replication/walreceiver.h"
+
+#define CLUSTER_EXPANSION_BASE 2
 
 void InitQueryHashTable(void);
-static ParamListInfo EvaluateParams(PreparedStatement *pstmt, List* params, const char* queryString, EState* estate);
+static ParamListInfo EvaluateParams(CachedPlanSource* psrc, List* params, const char* queryString, EState* estate);
 static Datum build_regtype_array(const Oid* param_types, int num_params);
 
 extern void destroy_handles();
+
+static void CopyPlanForGPCIfNecessary(CachedPlanSource* psrc, Portal portal)
+{
+    MemoryContext tmpCxt = NULL;
+    bool needCopy = ENABLE_GPC && psrc->gplan;
+    if (needCopy) {
+        portal->stmts = CopyLocalStmt(portal->cplan->stmt_list, u_sess->temp_mem_cxt, &tmpCxt);
+    }
+}
 
 /*
  * Implements the 'PREPARE' utility statement.
@@ -118,11 +130,8 @@ void PrepareQuery(PrepareStmt* stmt, const char* queryString)
      * Because parse analysis scribbles on the raw querytree, we must make a
      * copy to ensure we don't modify the passed-in tree.
      */
-#ifdef ENABLE_MULTIPLE_NODES
+
     query = parse_analyze_varparams((Node*)copyObject(stmt->query), queryString, &argtypes, &nargs);
-#else
-    query = parse_analyze_varparams((Node*)copyObject(stmt->query), queryString, &argtypes, &nargs, NULL);
-#endif
 
     if (ENABLE_CN_GPC && plansource->gpc.status.IsSharePlan() && contains_temp_tables(query->rtable)) {
         /* temp table unsupport shared */
@@ -166,6 +175,7 @@ void PrepareQuery(PrepareStmt* stmt, const char* queryString)
         query_list,
         NULL,
         argtypes,
+        NULL,
         nargs,
         NULL,
         NULL,
@@ -198,7 +208,6 @@ void ExecuteQuery(ExecuteStmt* stmt, IntoClause* intoClause, const char* querySt
 {
     PreparedStatement *entry = NULL;
     CachedPlan* cplan = NULL;
-    MemoryContext tmpCxt = NULL;
     List* plan_list = NIL;
     ParamListInfo paramLI = NULL;
     EState* estate = NULL;
@@ -227,10 +236,15 @@ void ExecuteQuery(ExecuteStmt* stmt, IntoClause* intoClause, const char* querySt
          */
         estate = CreateExecutorState();
         estate->es_param_list_info = params;
-        paramLI = EvaluateParams(entry, stmt->params, queryString, estate);
+        paramLI = EvaluateParams(psrc, stmt->params, queryString, estate);
     }
 
     OpFusion::clearForCplan((OpFusion*)psrc->opFusionObj, psrc);
+
+    if (psrc->opFusionObj != NULL) {
+        Assert(psrc->cplan == NULL);
+        (void)RevalidateCachedQuery(psrc);
+    }
 
     if (psrc->opFusionObj != NULL) {
         OpFusion *opFusionObj = (OpFusion *)(psrc->opFusionObj);
@@ -276,11 +290,7 @@ void ExecuteQuery(ExecuteStmt* stmt, IntoClause* intoClause, const char* querySt
     PortalDefineQuery(portal, NULL, query_string, entry->plansource->commandTag, plan_list, cplan);
 
     /* incase change shared plan in execute stage */
-    bool needCopy = ENABLE_GPC && entry->plansource->gplan;
-    if (needCopy) {
-        plan_list = CopyLocalStmt(portal->cplan->stmt_list, u_sess->temp_mem_cxt, &tmpCxt);
-        portal->stmts = plan_list;
-    }
+    CopyPlanForGPCIfNecessary(entry->plansource, portal);
 
     /*
      * For CREATE TABLE ... AS EXECUTE, we must verify that the prepared
@@ -363,10 +373,10 @@ void ExecuteQuery(ExecuteStmt* stmt, IntoClause* intoClause, const char* querySt
  * CreateQueryDesc(), which allows the executor to make use of the parameters
  * during query execution.
  */
-static ParamListInfo EvaluateParams(PreparedStatement *pstmt, List* params, const char* queryString, EState* estate)
+static ParamListInfo EvaluateParams(CachedPlanSource* psrc, List* params, const char* queryString, EState* estate)
 {
-    Oid* param_types = pstmt->plansource->param_types;
-    int num_params = pstmt->plansource->num_params;
+    Oid* param_types = psrc->param_types;
+    int num_params = psrc->num_params;
     int nparams = list_length(params);
     ParseState* pstate = NULL;
     ParamListInfo paramLI;
@@ -377,7 +387,7 @@ static ParamListInfo EvaluateParams(PreparedStatement *pstmt, List* params, cons
     if (nparams != num_params)
         ereport(ERROR,
             (errcode(ERRCODE_SYNTAX_ERROR),
-                errmsg("wrong number of parameters for prepared statement \"%s\"", pstmt->stmt_name),
+                errmsg("wrong number of parameters for prepared statement \"%s\"", psrc->stmt_name),
                 errdetail("Expected %d parameters but got %d.", num_params, nparams)));
 
     /* Quick exit if no parameters */
@@ -453,6 +463,7 @@ static ParamListInfo EvaluateParams(PreparedStatement *pstmt, List* params, cons
         prm->ptype = param_types[i];
         prm->pflags = PARAM_FLAG_CONST;
         prm->value = ExecEvalExprSwitchContext(n, GetPerTupleExprContext(estate), &prm->isnull, NULL);
+        prm->tabInfo = NULL;
 
         i++;
     }
@@ -887,7 +898,7 @@ void DropPreparedStatement(const char* stmt_name, bool showError)
          * when the pooler tries to create new connections
          */
         t_thrd.utils_cxt.CurrentResourceOwner = ResourceOwnerCreate(NULL, "DropPreparedStatement",
-            MEMORY_CONTEXT_OPTIMIZER);
+            THREAD_GET_MEM_CXT_GROUP(MEMORY_CONTEXT_OPTIMIZER));
     }
 
 
@@ -961,7 +972,7 @@ void DropAllPreparedStatements(void)
          * when the pooler tries to create new connections
          */
         t_thrd.utils_cxt.CurrentResourceOwner = ResourceOwnerCreate(NULL, "DropAllPreparedStatements",
-            MEMORY_CONTEXT_OPTIMIZER);
+            THREAD_GET_MEM_CXT_GROUP(MEMORY_CONTEXT_OPTIMIZER));
     }
 
     bool failflag_dropcachedplan = false;
@@ -1129,6 +1140,33 @@ void HandlePreparedStatementsForRetry(void)
     ereport(DEBUG2, (errmodule(MOD_OPT), errmsg("Invalid all prepared statements for retry")));
 }
 
+CachedPlanSource* GetCachedPlanSourceFromExplainExecute(const char* stmt_name)
+{
+    PreparedStatement *entry = NULL;
+    CachedPlanSource* psrc = NULL;
+    if (ENABLE_DN_GPC && IsConnFromCoord()) {
+        psrc = u_sess->pcache_cxt.cur_stmt_psrc;
+        if (SECUREC_UNLIKELY(psrc == NULL)) {
+            ereport(ERROR, (errcode(ERRCODE_UNDEFINED_PSTATEMENT),
+                errmsg("dn gpc's prepared statement does not exist")));
+        }
+    } else {
+        /* Look it up in the hash table */
+        entry = FetchPreparedStatement(stmt_name, true, true);
+        psrc = entry->plansource;
+    }
+    Assert(psrc != NULL);
+
+    /* Shouldn't find a non-fixed-result cached plan */
+    if (!psrc->fixed_result) {
+        ereport(ERROR,
+            (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                errmsg("EXPLAIN EXECUTE does not support variable-result cached plans")));
+    }
+
+    return psrc;
+}
+
 /*
  * Implements the 'EXPLAIN EXECUTE' utility statement.
  *
@@ -1141,7 +1179,6 @@ void HandlePreparedStatementsForRetry(void)
 void ExplainExecuteQuery(
     ExecuteStmt* execstmt, IntoClause* into, ExplainState* es, const char* queryString, ParamListInfo params)
 {
-    PreparedStatement *entry = NULL;
     const char* query_string = NULL;
     CachedPlan* cplan = NULL;
     MemoryContext tmpCxt = NULL;
@@ -1150,19 +1187,12 @@ void ExplainExecuteQuery(
     ParamListInfo paramLI = NULL;
     EState* estate = NULL;
 
-    /* Look it up in the hash table */
-    entry = FetchPreparedStatement(execstmt->name, true, true);
+    CachedPlanSource* psrc = GetCachedPlanSourceFromExplainExecute(execstmt->name);
 
-    /* Shouldn't find a non-fixed-result cached plan */
-    if (!entry->plansource->fixed_result)
-        ereport(ERROR,
-            (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-                errmsg("EXPLAIN EXECUTE does not support variable-result cached plans")));
-
-    query_string = entry->plansource->query_string;
+    query_string = psrc->query_string;
 
     /* Evaluate parameters, if any */
-    if (entry->plansource->num_params) {
+    if (psrc->num_params) {
         /*
          * Need an EState to evaluate parameters; must not delete it till end
          * of query, in case parameters are pass-by-reference.	Note that the
@@ -1171,7 +1201,7 @@ void ExplainExecuteQuery(
          */
         estate = CreateExecutorState();
         estate->es_param_list_info = params;
-        paramLI = EvaluateParams(entry, execstmt->params, queryString, estate);
+        paramLI = EvaluateParams(psrc, execstmt->params, queryString, estate);
     }
 
     /* Replan if needed, and acquire a transient refcount */
@@ -1182,7 +1212,7 @@ void ExplainExecuteQuery(
 
     u_sess->attr.attr_sql.explain_allow_multinode = true;
 
-    cplan = GetCachedPlan(entry->plansource, paramLI, true);
+    cplan = GetCachedPlan(psrc, paramLI, true);
 
     /* use shared plan here, add refcount */
     if (cplan->isShared())
@@ -1190,14 +1220,14 @@ void ExplainExecuteQuery(
 
     u_sess->attr.attr_sql.explain_allow_multinode = false;
 
-    if (ENABLE_GPC && entry->plansource->gplan) {
+    if (ENABLE_GPC && psrc->gplan) {
         plan_list = CopyLocalStmt(cplan->stmt_list, u_sess->temp_mem_cxt, &tmpCxt);
     } else {
         plan_list = cplan->stmt_list;
     }
 
     es->is_explain_gplan = false;
-    if (entry->plansource->cplan == NULL)
+    if (psrc->cplan == NULL)
         es->is_explain_gplan = true;
 
     /* Explain each query */
@@ -1207,7 +1237,7 @@ void ExplainExecuteQuery(
 
         /* get g_RemoteQueryList by reseting sql_statement. */
         if (u_sess->attr.attr_common.max_datanode_for_plan > 0 && IS_PGXC_COORDINATOR && !IsConnFromCoord() &&
-            u_sess->exec_cxt.remotequery_list == NIL) {
+            es->is_explain_gplan && psrc->gplan_is_fqs) {
             GetRemoteQuery(pstmt, queryString);
             es->isexplain_execute = true;
         }
@@ -1294,7 +1324,11 @@ Datum pg_prepared_statement(PG_FUNCTION_ARGS)
             securec_check(rc, "\0", "\0");
 
             values[0] = CStringGetTextDatum(prep_stmt->stmt_name);
-            values[1] = CStringGetTextDatum(prep_stmt->plansource->query_string);
+            char* maskquery = maskPassword(prep_stmt->plansource->query_string);
+            const char* query = (maskquery == NULL) ? prep_stmt->plansource->query_string : maskquery;
+            values[1] = CStringGetTextDatum(query);
+            if (query != maskquery)
+                pfree_ext(maskquery);
             values[2] = TimestampTzGetDatum(prep_stmt->prepare_time);
             values[3] = build_regtype_array(prep_stmt->plansource->param_types, prep_stmt->plansource->num_params);
             values[4] = BoolGetDatum(prep_stmt->from_sql);
@@ -1369,8 +1403,9 @@ void DropDatanodeStatement(const char* stmt_name)
         List* nodelist = NIL;
 
         /* make a List of integers from node numbers */
-        for (i = 0; i < entry->current_nodes_number; i++)
+        for (i = 0; i < entry->current_nodes_number; i++) {
             nodelist = lappend_int(nodelist, entry->dns_node_indices[i]);
+        }
 
         CN_GPC_LOG("drop datanode statment", NULL, entry->stmt_name);
 
@@ -1406,7 +1441,7 @@ void DeActiveAllDataNodeStatements(void)
         tmp_num = entry->current_nodes_number;
         entry->current_nodes_number = 0;
         if (tmp_num > 0) {
-            Assert(tmp_num <= u_sess->pgxc_cxt.NumDataNodes);
+            Assert(tmp_num <= Max(u_sess->pgxc_cxt.NumTotalDataNodes, u_sess->pgxc_cxt.NumDataNodes));
             errorno = memset_s(entry->dns_node_indices, tmp_num * sizeof(int), 0, tmp_num * sizeof(int));
             securec_check_c(errorno, "\0", "\0");
         }
@@ -1445,7 +1480,7 @@ bool HaveActiveDatanodeStatements(void)
  * Returns false if statement has not been active on the node and should be
  * prepared on the node
  */
-bool ActivateDatanodeStatementOnNode(const char* stmt_name, int noid)
+bool ActivateDatanodeStatementOnNode(const char* stmt_name, int nodeIdx)
 {
     DatanodeStatement* entry = NULL;
     int i;
@@ -1455,23 +1490,24 @@ bool ActivateDatanodeStatementOnNode(const char* stmt_name, int noid)
 
     /* see if statement already active on the node */
     for (i = 0; i < entry->current_nodes_number; i++) {
-        if (entry->dns_node_indices[i] == noid)
+        if (entry->dns_node_indices[i] == nodeIdx) {
             return true;
+        }
     }
 
     /* After cluster expansion, must expand entry->dns_node_indices array too */
     if (entry->current_nodes_number == entry->max_nodes_number) {
         int* new_dns_node_indices = (int*)MemoryContextAllocZero(
-            u_sess->pcache_cxt.datanode_queries->hcxt, entry->max_nodes_number * 2 * sizeof(int));
+            u_sess->pcache_cxt.datanode_queries->hcxt, entry->max_nodes_number * CLUSTER_EXPANSION_BASE * sizeof(int));
         errno_t errorno = EOK;
         errorno = memcpy_s(new_dns_node_indices,
-            entry->max_nodes_number * 2 * sizeof(int),
+            entry->max_nodes_number * CLUSTER_EXPANSION_BASE * sizeof(int),
             entry->dns_node_indices,
             entry->max_nodes_number * sizeof(int));
         securec_check(errorno, "\0", "\0");
         pfree_ext(entry->dns_node_indices);
         entry->dns_node_indices = new_dns_node_indices;
-        entry->max_nodes_number = entry->max_nodes_number * 2;
+        entry->max_nodes_number = entry->max_nodes_number * CLUSTER_EXPANSION_BASE;
         elog(LOG,
             "expand node ids array for active datanode statements "
             "after cluster expansion, now array size is %d",
@@ -1479,8 +1515,7 @@ bool ActivateDatanodeStatementOnNode(const char* stmt_name, int noid)
     }
 
     /* statement is not active on the specified node append item to the list */
-    entry->dns_node_indices[entry->current_nodes_number++] = noid;
-
+    entry->dns_node_indices[entry->current_nodes_number++] = nodeIdx;
     return false;
 }
 

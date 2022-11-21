@@ -1,7 +1,7 @@
 /* -------------------------------------------------------------------------
  *
  * itemptr.cpp
- *	  POSTGRES disk item pointer code.
+ *	  openGauss disk item pointer code.
  *
  * Portions Copyright (c) 2020 Huawei Technologies Co.,Ltd.
  * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
@@ -30,6 +30,15 @@ bool ItemPointerEquals(ItemPointer pointer1, ItemPointer pointer2)
 {
     if (ItemPointerGetBlockNumber(pointer1) == ItemPointerGetBlockNumber(pointer2) &&
         ItemPointerGetOffsetNumber(pointer1) == ItemPointerGetOffsetNumber(pointer2))
+        return true;
+    else
+        return false;
+}
+
+bool ItemPointerEqualsNoCheck(ItemPointer pointer1, ItemPointer pointer2)
+{
+    if ((ItemPointerGetBlockNumberNoCheck(pointer1) == ItemPointerGetBlockNumberNoCheck(pointer2)) &&
+        (ItemPointerGetOffsetNumberNoCheck(pointer1) == ItemPointerGetOffsetNumberNoCheck(pointer2)))
         return true;
     else
         return false;

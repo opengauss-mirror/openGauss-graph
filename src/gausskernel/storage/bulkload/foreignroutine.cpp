@@ -46,7 +46,7 @@
 #include "pgxc/pgxc.h"
 #include "pgxc/pgxcnode.h"
 #include "parser/parsetree.h"
-#include "storage/fd.h"
+#include "storage/smgr/fd.h"
 #include "utils/builtins.h"
 #include "utils/date.h"
 #include "utils/formatting.h"
@@ -1569,7 +1569,9 @@ retry:
     CHECK_FOR_INTERRUPTS();
     (void)ExecClearTuple(slot);
     MemoryContextReset(node->scanMcxt);
+#ifndef ENABLE_LITE_MODE
     SetObsMemoryContext(((CopyState)importState)->copycontext);
+#endif
     ReportIllegalCharExceptionThreshold();
 
     PG_TRY();

@@ -21,7 +21,7 @@
  */
 #include "catalog/catversion.h" /* pgrminclude ignore */
 #include "catalog/pg_class.h"
-#include "storage/relfilenode.h"
+#include "storage/smgr/relfilenode.h"
 #include "utils/relcache.h"
 
 #define FORKNAMECHARS	4		/* max chars for a fork name */
@@ -41,8 +41,6 @@ extern int	forkname_chars(const char *str, ForkNumber *);
 
 extern char *relpathbackend(RelFileNode rnode, BackendId backend, ForkNumber forknum);
 extern char *GetDatabasePath(Oid dbNode, Oid spcNode);
-extern char* GetBucketDirPath(const RelFileNodeBackend& rel_file_node_backend);
-
 
 /* First argument is a RelFileNodeBackend */
 #define relpath(rnode, forknum) \
@@ -58,6 +56,7 @@ extern bool IsSystemRelation(Relation relation);
 extern bool IsToastRelation(Relation relation);
 extern bool IsCatalogRelation(Relation relation);
 
+extern bool IsSysSchema(Oid namespaceId);
 extern bool IsSystemClass(Form_pg_class reltuple);
 extern bool IsToastClass(Form_pg_class reltuple);
 extern bool IsCatalogClass(Oid relid, Form_pg_class reltuple);
@@ -65,7 +64,6 @@ extern bool IsCatalogClass(Oid relid, Form_pg_class reltuple);
 extern bool IsSystemNamespace(Oid namespaceId);
 extern bool IsToastNamespace(Oid namespaceId);
 extern bool IsCStoreNamespace(Oid namespaceId);
-
 extern bool IsPerformanceNamespace(Oid namespaceId);
 extern bool IsSnapshotNamespace(Oid namespaceId);
 extern bool IsMonitorSpace(Oid namespaceId);
@@ -77,5 +75,10 @@ extern bool IsSharedRelation(Oid relationId);
 extern Oid	GetNewOid(Relation relation);
 extern Oid GetNewOidWithIndex(Relation relation, Oid indexId, AttrNumber oidcolumn);
 extern Oid GetNewRelFileNode(Oid reltablespace, Relation pg_class, char relpersistence);
+
+extern bool IsPackageSchemaOid(Oid relnamespace);
+extern bool IsPackageSchemaName(const char* schemaName);
+
+
 
 #endif   /* CATALOG_H */

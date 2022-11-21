@@ -127,6 +127,8 @@ typedef struct {
 
 #define DEFAULT_WAIT 60
 #define MAX_BUF_SIZE 4096
+#define MAX_COMMAND_LEN 4096
+#define MAX_CHILD_PATH 1024
 
 static int sig = SIGHUP; /* default */
 CtlCommand ctl_command = NO_COMMAND;
@@ -226,6 +228,8 @@ typedef struct {
 } nodeInfo;
 /* storage the name which perform remote connection failed */
 nodeInfo* g_incorrect_nodeInfo = NULL;
+/* storage the name which need to ignore */
+nodeInfo* g_ignore_nodeInfo = NULL;
 
 typedef struct {
     char** nodename_array;
@@ -481,6 +485,39 @@ static pgpid_t get_pgpid(void)
     return (pgpid_t)pid;
 }
 
+static void check_path(const char *path_name)
+{
+    const char* danger_character_list[] = {"|",
+        ";",
+        "&",
+        "$",
+        "<",
+        ">",
+        "`",
+        "\\",
+        "'",
+        "\"",
+        "{",
+        "}",
+        "(",
+        ")",
+        "[",
+        "]",
+        "~",
+        "*",
+        "?",
+        "!",
+        "\n",
+        NULL};
+    int i = 0;
+    for (i = 0; danger_character_list[i] != NULL; i++) {
+        if (strstr(path_name, danger_character_list[i]) != NULL) {
+            fprintf(stderr, "invalid token \"%s\" in path name: (%s)\n", danger_character_list[i], path_name);
+            exit(1);
+        }
+    }
+}
+
 /*
 * @@GaussDB@@
 * Brief            : static ErrCode writefile(char *path, char **lines,
@@ -492,6 +529,7 @@ ErrCode writefile(char* path, char** lines, UpdateOrAddParameter isAddorUpdate)
 {
     FILE* out_file = NULL;
     char** line = NULL;
+    int fd = -1;
     if (UPDATE_PARAMETER == isAddorUpdate) {
         canonicalize_path(path);
         if ((out_file = fopen(path, "w")) == NULL) {
@@ -499,7 +537,13 @@ ErrCode writefile(char* path, char** lines, UpdateOrAddParameter isAddorUpdate)
                 _("%s: could not open file \"%s\" for writing: %s\n"), progname, path, gs_strerror(errno));
             return CODE_OPEN_CONFFILE_FAILED;
         }
+
+        fd = fileno(out_file);
+        if ((fd >= 0) && (-1 == fchmod(fd, S_IRUSR | S_IWUSR))) {
+            (void)write_stderr(_("could not set permissions of file  \"%s\"\n"), path);
+        }
         rewind(out_file);
+
         for (line = lines; *line != NULL; line++) {
             if (fputs(*line, out_file) < 0) {
                 (void)write_stderr(_("%s: could not write file \"%s\": %s\n"), progname, path, gs_strerror(errno));
@@ -792,6 +836,7 @@ ErrCode get_file_lock(const char* path, FileLock* filelock)
         return CODE_UNKOWN_ERROR;
     }
     ret = strcpy_s(newpath, sizeof(newpath), path);
+    securec_check_c(ret, "\0", "\0");
     canonicalize_path(newpath);
     if (checkPath(newpath) != 0) {
         write_stderr(_("realpath(%s) failed : %s!\n"), newpath, strerror(errno));
@@ -1034,6 +1079,65 @@ append_string_info(char **optLines, const char *newContext)
 }
 
 #ifndef ENABLE_MULTIPLE_NODES
+/*
+ * For a line in the configuration file, skip current spaces.
+ */
+static void SkipSpace(char* &line)
+{
+    while (line != NULL && isspace((unsigned char)*line)) {
+        ++line;
+    }
+}
+
+/*
+ * Handle commented lines in the configuration file.
+ * return:
+ * true - replconninfoX is commented
+ * false - replconninfoX is not in current line.
+ */
+static bool ProcessCommented(char* &line, char* replconninfoX)
+{
+    ++line;
+    SkipSpace(line);
+    /* replconninfoX must be invalid if it is commented*/
+    if (line != NULL && strncmp(line, replconninfoX, strlen(replconninfoX)) == 0) {
+        return true;
+    }
+    return false;
+}
+
+/*
+ * Handle lines which is not commented in the configuration file.
+ * notNullReplconninfoNums - the number of replconninfo which is not null
+ * matchReplconninfoX - whether replconninfoX is in current line.
+ * isReplconninfoXNull - whether replconninfoX is NULL.
+ */
+static void ProcessNotCommented(char* &line, char* replconninfoX,
+    int &notNullReplconninfoNums, bool &isReplconninfoXNull, bool &matchReplconninfoX)
+{
+    if (line != NULL && strncmp(line, "replconninfo", strlen("replconninfo")) == 0) {
+        if (strncmp(line, replconninfoX, strlen(replconninfoX)) == 0) {
+            matchReplconninfoX = true;
+        }
+        line += strlen(replconninfoX);
+        /* Skip all the blanks between the param and '=' */
+        SkipSpace(line);
+        /* Skip '=' */
+        if (line != NULL && *line == '=') {
+            line++;
+        }
+        /* Skip all the blanks between the '=' and value */
+        SkipSpace(line);
+        if (line != NULL && strncmp(line, "''", strlen("''")) != 0 &&
+            strncmp(line, "\"\"", strlen("\"\"")) != 0) {
+            ++notNullReplconninfoNums;
+            if (matchReplconninfoX) {
+                isReplconninfoXNull = false;
+            }
+        }
+    }
+}
+
 /*******************************************************************************
  Function    : IsLastNotNullReplconninfo
  Description : determine if replconninfoX which is being set is the last one valid replconninfo
@@ -1052,47 +1156,21 @@ static bool IsLastNotNullReplconninfo(char** optLines, char* replconninfoX)
     for (int i = 0; optLines != NULL && optLines[i] != NULL; i++) {
         p = optLines[i];
         /* Skip all the blanks at the begin of the optLine */
-        while (p != NULL && isspace((unsigned char)*p)) {
-            ++p;
-        }
+        SkipSpace(p);
         if (p == NULL) {
             continue;
         }
         if (*p == '#') {
-            ++p;
-            while (p != NULL && isspace((unsigned char)*p)) {
-                ++p;
-            }
-            /* replconninfoX must be invalid if it is commented*/
-            if (p != NULL && strncmp(p, replconninfoX, strlen(replconninfoX)) == 0) {
+            if(ProcessCommented(p, replconninfoX)) {
                 return false;
+            } else {
+                continue;
             }
-            continue;
         }
-        if (p != NULL && strncmp(p, "replconninfo", strlen("replconninfo")) == 0) {
-            if (strncmp(p, replconninfoX, strlen(replconninfoX)) == 0) {
-                matchReplconninfoX = true;
-            }
-            p += strlen(replconninfoX);
-            /* Skip all the blanks between the param and '=' */
-            while (p != NULL && isspace((unsigned char)*p)) {
-                p++;
-            }
-            /* Skip '=' */
-            if (p != NULL && *p == '=') {
-                p++;
-            }
-            /* Skip all the blanks between the '=' and value */
-            while (p != NULL && isspace((unsigned char)*p)) {
-                p++;
-            }
-            if (p != NULL && strncmp(p, "''", strlen("''")) != 0 &&
-                strncmp(p, "\"\"", strlen("\"\"")) != 0) {
-                ++notNullReplconninfoNums;
-                if (matchReplconninfoX) {
-                    isReplconninfoXNull = false;
-                }
-            }
+        ProcessNotCommented(p, replconninfoX, notNullReplconninfoNums,
+                            isReplconninfoXNull, matchReplconninfoX);
+        if (notNullReplconninfoNums > 1) {
+            return false;
         }
     }
     /* return true if replconninfoX which is being set is the last one valid replconninfo */
@@ -1113,7 +1191,83 @@ static void CheckLastValidReplconninfo(char** opt_lines, int idx)
             "the host role will be changed to Normal if the local_role is primary now.\n");
     }
 }
+
+static void CheckKeepSyncWindow(char** opt_lines, int idx)
+{
+    /* Give a warning if keep_sync_window is set */
+    if (strcmp(config_param[idx], "keep_sync_window") == 0) {
+        write_stderr("\nWARNING: If the primary server fails during keep_sync_window, the transactions which "
+            "were blocked during keep_sync_window will be lost and can't get recovered. This will affect RPO.\n");
+    }
+}
+
 #endif
+
+static void
+parse_next_sync_groups(char **pgroup, char *result)
+{
+    if (**pgroup == '\0') {
+        result[0] = '\0';
+        return;
+    }
+
+    char *this_group = *pgroup;
+    char *p = *pgroup;
+    while (*p != '\0' && *p != ')') p++;
+    while (*p != '\0' && *p != ',') p++;
+    if (*p == ',') {
+        *p = '\0';
+       p++;
+    }
+
+    *pgroup = p;
+    errno_t rc = snprintf_s(result, MAX_VALUE_LEN, MAX_VALUE_LEN - 1, "'%s'", this_group);
+    securec_check_ss_c(rc, "\0", "\0");
+    return;
+}
+
+static int
+transform_az_name(char *config_value, char *allAZString, int allAZStringBufLen, const char *data_dir)
+{
+    if (strcmp(config_value, "''") == 0) {
+        errno_t rc = strncpy_s(allAZString, allAZStringBufLen, config_value, strlen(config_value));
+        securec_check_c(rc, "\0", "\0");
+        return SUCCESS;
+    }
+
+    char    *azString = NULL;
+    char    *buf = allAZString;
+    int      buflen = allAZStringBufLen;
+
+    char    *allgroup = xstrdup(config_value);
+    char    *pgrp = allgroup + 1;                                  // trim first "'"
+    char    this_group[MAX_VALUE_LEN] = {0x00};
+
+    allgroup[strlen(allgroup) - 1] = '\0';                         // trim last  "'"
+    parse_next_sync_groups(&pgrp, this_group);
+    while (this_group[0] != '\0') {
+        azString = get_AZ_value(this_group, data_dir);
+        if (NULL == azString) {
+            GS_FREE(allgroup);
+            return FAILURE;
+        }
+
+        int azStringLen = strlen(azString);
+        azString[0] = ' ';
+        azString[azStringLen - 1] = ',';
+        errno_t rc = strncpy_s(buf, buflen, azString, azStringLen);
+        securec_check_c(rc, "\0", "\0");
+        buf += azStringLen;
+        buflen -= azStringLen;
+        GS_FREE(azString);
+
+        parse_next_sync_groups(&pgrp, this_group);
+    }
+    GS_FREE(allgroup);
+    allAZString[0] = allAZString[strlen(allAZString) - 1] = '\'';
+
+    return SUCCESS;
+}
 
 /*
  * @@GaussDB@@
@@ -1194,22 +1348,22 @@ do_gucset(const char *action_type, const char *data_dir)
 
             // get AZ string
             if (NULL != config_value[i]) {
-                char    *azString = NULL;
-                azString = get_AZ_value(config_value[i], data_dir);
-                if (NULL == azString) {
-                    result_status = FAILURE;
+                char allAZString[MAX_VALUE_LEN] = {0x00};
+
+                result_status = transform_az_name(config_value[i], allAZString, MAX_VALUE_LEN, data_dir);
+                if (result_status == FAILURE) {
                     continue;
                 }
                 tmpAZStr = xstrdup(config_value[i]);
 
                 GS_FREE(config_value[i]);
-                config_value[i] = xstrdup(azString);
-                GS_FREE(azString);
+                config_value[i] = xstrdup(allAZString);
             }
         }
 
 #ifndef ENABLE_MULTIPLE_NODES
         CheckLastValidReplconninfo(opt_lines, i);
+        CheckKeepSyncWindow(opt_lines, i);
 #endif
 
         /* find the line where guc parameter in */
@@ -1227,12 +1381,17 @@ do_gucset(const char *action_type, const char *data_dir)
                 to_generatenewline(optconf_line, newconf_line, config_param[i], config_value[i], optvalue_len);
             } else {
                 /*
-                 * if parameter value is NULL; not consider it as UNSET,
-                 * which means maintain the configuration parameter, and
-                 * there will be prompts telling the user to assign a value.
+                 * if parameter as value is NULL; consider it as UNSET (i.e to default value)
+                 *  which means comment the configuration parameter
                  */
-                write_stderr(_("ERROR: %s parameters value is expected\n"), config_param[i]);
-                return FAILURE;
+                //line is commented
+                if (isOptLineCommented(optconf_line)) {
+                    rc = strncpy_s(newconf_line, MAX_PARAM_LEN*2, optconf_line, (size_t)Min(line_len, MAX_PARAM_LEN*2 - 1));
+                    securec_check_c(rc, "\0", "\0");
+                } else {
+                    nRet = snprintf_s(newconf_line, MAX_PARAM_LEN*2, MAX_PARAM_LEN*2 - 1, "#%s", optconf_line);
+                    securec_check_ss_c(nRet, "\0", "\0");
+                }
             }
             updateoradd = UPDATE_PARAMETER;
         } else {
@@ -1448,6 +1607,14 @@ static void do_help_check_guc(void)
     (void)printf(_("\nOptions for check with -c parameter: \n"));
     (void)printf(_("  -Z NODE-TYPE   only can be \"coordinator\" or \"datanode\"\n"));
 #else
+#ifdef ENABLE_LITE_MODE
+    (void)printf(_("\nChecking GUC parameters:\n"));
+
+    (void)printf(_("    %s check [-Z NODE-TYPE] -D DATADIR {-c \"parameter\", -c "
+                   "\"parameter\", ...}\n"), progname);
+    (void)printf(_("    %s check [-Z NODE-TYPE] -D DATADIR {-c parameter, -c "
+                   "parameter, ...}\n"), progname);
+#else
     (void)printf(_("\nChecking GUC parameters:\n"));
 
     (void)printf(_("    %s check [-Z NODE-TYPE] [-N NODE-NAME] {-I INSTANCE-NAME | -D DATADIR} {-c \"parameter\", -c "
@@ -1457,6 +1624,7 @@ static void do_help_check_guc(void)
                    "parameter, ...}\n"),
         progname);
 
+#endif
 #endif
 }
 
@@ -1468,19 +1636,23 @@ static void do_help_config_guc(void)
 #ifdef ENABLE_MULTIPLE_NODES
     (void)printf(_("    NODE-TYPE is coordinator, datanode or gtm:\n"));
     (void)printf(_("        %s {set | reload} -Z NODE-TYPE [-N NODE-NAME] {-I INSTANCE-NAME | -D DATADIR} "
-                   "[--lcname=LCNAME] {-c \"parameter = value\" -c \"parameter = value\" ...}\n"),
+                   "[--lcname=LCNAME] [--ignore-node=NODES] "
+                   "{-c \"parameter = value\" -c \"parameter = value\" ...}\n"),
         progname);
     (void)printf(_("        %s {set | reload} -Z NODE-TYPE [-N NODE-NAME] {-I INSTANCE-NAME | -D DATADIR} "
-                   "[--lcname=LCNAME] {-c \" parameter = value \" -c \" parameter = value \" ...}\n"),
+                   "[--lcname=LCNAME] [--ignore-node=NODES] "
+                   "{-c \" parameter = value \" -c \" parameter = value \" ...}\n"),
         progname);
     (void)printf(_("        %s {set | reload} -Z NODE-TYPE [-N NODE-NAME] {-I INSTANCE-NAME | -D DATADIR} "
-                   "[--lcname=LCNAME] {-c \"parameter = \'value\'\" -c \"parameter = \'value\'\" ...}\n"),
+                   "[--lcname=LCNAME] [--ignore-node=NODES] "
+                   "{-c \"parameter = \'value\'\" -c \"parameter = \'value\'\" ...}\n"),
         progname);
     (void)printf(_("        %s {set | reload} -Z NODE-TYPE [-N NODE-NAME] {-I INSTANCE-NAME | -D DATADIR} "
-                   "[--lcname=LCNAME] {-c \" parameter = \'value\' \" -c \" parameter = \'value\' \" ...}\n"),
+                   "[--lcname=LCNAME] [--ignore-node=NODES] "
+                   "{-c \" parameter = \'value\' \" -c \" parameter = \'value\' \" ...}\n"),
         progname);
     (void)printf(_("        %s {set | reload} -Z NODE-TYPE [-N NODE-NAME] {-I INSTANCE-NAME | -D DATADIR} "
-                   "[--lcname=LCNAME] {-c \"parameter\" -c \"parameter\" ...}\n"),
+                   "[--lcname=LCNAME] [--ignore-node=NODES] {-c \"parameter\" -c \"parameter\" ...}\n"),
         progname);
     (void)printf(_("    NODE-TYPE is cmserver or cmagent:\n"));
     (void)printf(_("        %s {set | reload} -Z NODE-TYPE [-N all -I all] "
@@ -1510,21 +1682,47 @@ static void do_help_config_guc(void)
         _("    e.g. %s set -Z cmagent -N all -I all -c \"program = \'\\\"Hello\\\", World\\!\'\".\n"), progname);
     (void)printf(_("    e.g. %s set -Z cmagent -c \"program = \'\\\"Hello\\\", World\\!\'\".\n"), progname);
 #else
+#ifdef ENABLE_LITE_MODE
+    (void)printf(_("        %s {set | reload} [-Z NODE-TYPE] -D DATADIR "
+                "[--lcname=LCNAME] [--ignore-node=NODES] "
+                "{-c \"parameter = value\" -c \"parameter = value\" ...}\n"), progname);
+    (void)printf(_("        %s {set | reload} [-Z NODE-TYPE] -D DATADIR "
+                "[--lcname=LCNAME] [--ignore-node=NODES] "
+                "{-c \" parameter = value \" -c \" parameter = value \" ...}\n"), progname);
+    (void)printf(_("        %s {set | reload} [-Z NODE-TYPE] -D DATADIR "
+                "[--lcname=LCNAME] [--ignore-node=NODES] "
+                "{-c \"parameter = \'value\'\" -c \"parameter = \'value\'\" ...}\n"), progname);
+    (void)printf(_("        %s {set | reload} [-Z NODE-TYPE] -D DATADIR "
+                "[--lcname=LCNAME] [--ignore-node=NODES] "
+                "{-c \" parameter = \'value\' \" -c \" parameter = \'value\' \" ...}\n"), progname);
+    (void)printf(_("        %s {set | reload} [-Z NODE-TYPE] -D DATADIR "
+                "[--lcname=LCNAME] [--ignore-node=NODES] {-c \"parameter\" -c \"parameter\" ...}\n"), progname);
+    (void)printf(
+     _("    e.g. %s set -Z datanode -D /datanode/data -c \"program = \'\\\"Hello\\\", World\\!\'\".\n"), progname);
+    (void)printf(
+     _("    e.g. %s reload -Z datanode -D /datanode/data -c \"program = \'\\\"Hello\\\", World\\!\'\".\n"), progname);
+
+#else
     (void)printf(_("        %s {set | reload} [-Z NODE-TYPE] [-N NODE-NAME] {-I INSTANCE-NAME | -D DATADIR} "
-                        "[--lcname=LCNAME] {-c \"parameter = value\" -c \"parameter = value\" ...}\n"), progname);
+                "[--lcname=LCNAME] [--ignore-node=NODES] "
+                "{-c \"parameter = value\" -c \"parameter = value\" ...}\n"), progname);
     (void)printf(_("        %s {set | reload} [-Z NODE-TYPE] [-N NODE-NAME] {-I INSTANCE-NAME | -D DATADIR} "
-                        "[--lcname=LCNAME] {-c \" parameter = value \" -c \" parameter = value \" ...}\n"), progname);
+                "[--lcname=LCNAME] [--ignore-node=NODES] "
+                "{-c \" parameter = value \" -c \" parameter = value \" ...}\n"), progname);
     (void)printf(_("        %s {set | reload} [-Z NODE-TYPE] [-N NODE-NAME] {-I INSTANCE-NAME | -D DATADIR} "
-                "[--lcname=LCNAME] {-c \"parameter = \'value\'\" -c \"parameter = \'value\'\" ...}\n"), progname);
+                "[--lcname=LCNAME] [--ignore-node=NODES] "
+                "{-c \"parameter = \'value\'\" -c \"parameter = \'value\'\" ...}\n"), progname);
     (void)printf(_("        %s {set | reload} [-Z NODE-TYPE] [-N NODE-NAME] {-I INSTANCE-NAME | -D DATADIR} "
-                "[--lcname=LCNAME] {-c \" parameter = \'value\' \" -c \" parameter = \'value\' \" ...}\n"), progname);
+                "[--lcname=LCNAME] [--ignore-node=NODES] "
+                "{-c \" parameter = \'value\' \" -c \" parameter = \'value\' \" ...}\n"), progname);
     (void)printf(_("        %s {set | reload} [-Z NODE-TYPE] [-N NODE-NAME] {-I INSTANCE-NAME | -D DATADIR} "
-                "[--lcname=LCNAME] {-c \"parameter\" -c \"parameter\" ...}\n"), progname);
+                "[--lcname=LCNAME] [--ignore-node=NODES] {-c \"parameter\" -c \"parameter\" ...}\n"), progname);
     (void)printf(
      _("    e.g. %s set -Z datanode -N all -I all -c \"program = \'\\\"Hello\\\", World\\!\'\".\n"), progname);
     (void)printf(
      _("    e.g. %s reload -Z datanode -N all -I all -c \"program = \'\\\"Hello\\\", World\\!\'\".\n"), progname);
 
+#endif
 #endif
 
 
@@ -1543,49 +1741,82 @@ static void do_help_config_hba(void)
     (void)printf(_("\nConfiguring Authentication Policy:\n"));
     
 #ifdef ENABLE_MULTIPLE_NODES
-    (void)printf(_("    %s {set | reload} -Z NODE-TYPE [-N NODE-NAME] {-I INSTANCE-NAME | -D DATADIR} -h \"HOSTTYPE "
-                   "DATABASE USERNAME IPADDR IPMASK AUTHMEHOD authentication-options\" \n"),
+    (void)printf(_("    %s {set | reload} -Z NODE-TYPE [-N NODE-NAME] {-I INSTANCE-NAME | -D DATADIR} "
+                   "[--ignore-node=NODES] "
+                   "-h \"HOSTTYPE DATABASE USERNAME IPADDR IPMASK AUTHMEHOD authentication-options\" \n"),
         progname);
-    (void)printf(_("    %s {set | reload} -Z NODE-TYPE [-N NODE-NAME] {-I INSTANCE-NAME | -D DATADIR} -h \"HOSTTYPE "
-                   "DATABASE USERNAME IPADDR-WITH-IPMASK AUTHMEHOD authentication-options\" \n"),
+    (void)printf(_("    %s {set | reload} -Z NODE-TYPE [-N NODE-NAME] {-I INSTANCE-NAME | -D DATADIR} "
+                   "[--ignore-node=NODES] "
+                   "-h \"HOSTTYPE DATABASE USERNAME IPADDR-WITH-IPMASK AUTHMEHOD authentication-options\" \n"),
         progname);
-    (void)printf(_("    %s {set | reload} -Z NODE-TYPE [-N NODE-NAME] {-I INSTANCE-NAME | -D DATADIR} -h \"HOSTTYPE "
-                   "DATABASE USERNAME HOSTNAME AUTHMEHOD authentication-options\" \n"),
+    (void)printf(_("    %s {set | reload} -Z NODE-TYPE [-N NODE-NAME] {-I INSTANCE-NAME | -D DATADIR} "
+                   "[--ignore-node=NODES] "
+                   "-h \"HOSTTYPE DATABASE USERNAME HOSTNAME AUTHMEHOD authentication-options\" \n"),
         progname);
 
     (void)printf(_("  If authentication policy need to set/reload DEFAULT OR COMMENT then provide without "
                    "authentication menthod, use the form: \n"));
-    (void)printf(_("    %s {set | reload} -Z NODE-TYPE [-N NODE-NAME] {-I INSTANCE-NAME | -D DATADIR} -h \"HOSTTYPE "
-                   "DATABASE USERNAME IPADDR IPMASK\" \n"),
+    (void)printf(_("    %s {set | reload} -Z NODE-TYPE [-N NODE-NAME] {-I INSTANCE-NAME | -D DATADIR} "
+                   "[--ignore-node=NODES] -h \"HOSTTYPE DATABASE USERNAME IPADDR IPMASK\" \n"),
         progname);
-    (void)printf(_("    %s {set | reload} -Z NODE-TYPE [-N NODE-NAME] {-I INSTANCE-NAME | -D DATADIR} -h \"HOSTTYPE "
-                   "DATABASE USERNAME IPADDR-WITH-IPMASK \" \n"),
+    (void)printf(_("    %s {set | reload} -Z NODE-TYPE [-N NODE-NAME] {-I INSTANCE-NAME | -D DATADIR} "
+                   "[--ignore-node=NODES] -h \"HOSTTYPE DATABASE USERNAME IPADDR-WITH-IPMASK \" \n"),
         progname);
-    (void)printf(_("    %s {set | reload} -Z NODE-TYPE [-N NODE-NAME] {-I INSTANCE-NAME | -D DATADIR} -h \"HOSTTYPE "
-                   "DATABASE USERNAME HOSTNAME\" \n"),
+    (void)printf(_("    %s {set | reload} -Z NODE-TYPE [-N NODE-NAME] {-I INSTANCE-NAME | -D DATADIR} "
+                   "[--ignore-node=NODES] -h \"HOSTTYPE DATABASE USERNAME HOSTNAME\" \n"),
         progname);
 #else
-    (void)printf(_("    %s {set | reload} [-Z NODE-TYPE] [-N NODE-NAME] {-I INSTANCE-NAME | -D DATADIR} -h \"HOSTTYPE "
-                "DATABASE USERNAME IPADDR IPMASK AUTHMEHOD authentication-options\" \n"),
+#ifdef ENABLE_LITE_MODE
+    (void)printf(_("    %s {set | reload} [-Z NODE-TYPE] -D DATADIR "
+                "[--ignore-node=NODES] "
+                "-h \"HOSTTYPE DATABASE USERNAME IPADDR IPMASK AUTHMEHOD authentication-options\" \n"),
         progname);
-    (void)printf(_("    %s {set | reload} [-Z NODE-TYPE] [-N NODE-NAME] {-I INSTANCE-NAME | -D DATADIR} -h \"HOSTTYPE "
-                "DATABASE USERNAME IPADDR-WITH-IPMASK AUTHMEHOD authentication-options\" \n"),
+    (void)printf(_("    %s {set | reload} [-Z NODE-TYPE] -D DATADIR "
+                "[--ignore-node=NODES] "
+                "-h \"HOSTTYPE DATABASE USERNAME IPADDR-WITH-IPMASK AUTHMEHOD authentication-options\" \n"),
         progname);
-    (void)printf(_("    %s {set | reload} [-Z NODE-TYPE] [-N NODE-NAME] {-I INSTANCE-NAME | -D DATADIR} -h \"HOSTTYPE "
-                "DATABASE USERNAME HOSTNAME AUTHMEHOD authentication-options\" \n"),
+    (void)printf(_("    %s {set | reload} [-Z NODE-TYPE] -D DATADIR "
+                "[--ignore-node=NODES] "
+                "-h \"HOSTTYPE DATABASE USERNAME HOSTNAME AUTHMEHOD authentication-options\" \n"),
         progname);
 
     (void)printf(_("  If authentication policy need to set/reload DEFAULT OR COMMENT then provide without "
                 "authentication menthod, use the form: \n"));
-    (void)printf(_("    %s {set | reload} [-Z NODE-TYPE] [-N NODE-NAME] {-I INSTANCE-NAME | -D DATADIR} -h \"HOSTTYPE "
-                "DATABASE USERNAME IPADDR IPMASK\" \n"),
+    (void)printf(_("    %s {set | reload} [-Z NODE-TYPE] -D DATADIR "
+                "[--ignore-node=NODES] -h \"HOSTTYPE DATABASE USERNAME IPADDR IPMASK\" \n"),
         progname);
-    (void)printf(_("    %s {set | reload} [-Z NODE-TYPE] [-N NODE-NAME] {-I INSTANCE-NAME | -D DATADIR} -h \"HOSTTYPE "
-                "DATABASE USERNAME IPADDR-WITH-IPMASK \" \n"),
+    (void)printf(_("    %s {set | reload} [-Z NODE-TYPE] -D DATADIR "
+                "[--ignore-node=NODES] -h \"HOSTTYPE DATABASE USERNAME IPADDR-WITH-IPMASK \" \n"),
         progname);
-    (void)printf(_("    %s {set | reload} [-Z NODE-TYPE] [-N NODE-NAME] {-I INSTANCE-NAME | -D DATADIR} -h \"HOSTTYPE "
-                "DATABASE USERNAME HOSTNAME\" \n"),
+    (void)printf(_("    %s {set | reload} [-Z NODE-TYPE] -D DATADIR "
+                "[--ignore-node=NODES] -h \"HOSTTYPE DATABASE USERNAME HOSTNAME\" \n"),
         progname);
+#else
+    (void)printf(_("    %s {set | reload} [-Z NODE-TYPE] [-N NODE-NAME] {-I INSTANCE-NAME | -D DATADIR} "
+                "[--ignore-node=NODES] "
+                "-h \"HOSTTYPE DATABASE USERNAME IPADDR IPMASK AUTHMEHOD authentication-options\" \n"),
+        progname);
+    (void)printf(_("    %s {set | reload} [-Z NODE-TYPE] [-N NODE-NAME] {-I INSTANCE-NAME | -D DATADIR} "
+                "[--ignore-node=NODES] "
+                "-h \"HOSTTYPE DATABASE USERNAME IPADDR-WITH-IPMASK AUTHMEHOD authentication-options\" \n"),
+        progname);
+    (void)printf(_("    %s {set | reload} [-Z NODE-TYPE] [-N NODE-NAME] {-I INSTANCE-NAME | -D DATADIR} "
+                "[--ignore-node=NODES] "
+                "-h \"HOSTTYPE DATABASE USERNAME HOSTNAME AUTHMEHOD authentication-options\" \n"),
+        progname);
+
+    (void)printf(_("  If authentication policy need to set/reload DEFAULT OR COMMENT then provide without "
+                "authentication menthod, use the form: \n"));
+    (void)printf(_("    %s {set | reload} [-Z NODE-TYPE] [-N NODE-NAME] {-I INSTANCE-NAME | -D DATADIR} "
+                "[--ignore-node=NODES] -h \"HOSTTYPE DATABASE USERNAME IPADDR IPMASK\" \n"),
+        progname);
+    (void)printf(_("    %s {set | reload} [-Z NODE-TYPE] [-N NODE-NAME] {-I INSTANCE-NAME | -D DATADIR} "
+                "[--ignore-node=NODES] -h \"HOSTTYPE DATABASE USERNAME IPADDR-WITH-IPMASK \" \n"),
+        progname);
+    (void)printf(_("    %s {set | reload} [-Z NODE-TYPE] [-N NODE-NAME] {-I INSTANCE-NAME | -D DATADIR} "
+                "[--ignore-node=NODES] -h \"HOSTTYPE DATABASE USERNAME HOSTNAME\" \n"),
+        progname);
+#endif
 #endif
 
 }
@@ -1594,7 +1825,8 @@ static void do_help_encrypt(void)
 {
 
     (void)printf(_("\nEncrypt plain text to cipher text:\n"));
-    (void)printf(_("    %s encrypt [-M keymode] -K password [-U username] -D DATADIR\n"), progname);
+    (void)printf(_("    %s encrypt [-M keymode] -K password [-U username] "
+                   "{-D DATADIR | -R RANDFILEDIR -C CIPHERFILEDIR}\n"), progname);
 }
 
 static void do_help_generate(void)
@@ -1608,12 +1840,16 @@ static void do_help_common_options(void)
 {
 
     (void)printf(_("\nCommon options:\n"));
+#ifndef ENABLE_LITE_MODE
     (void)printf(_("  -N                      nodename in which this command need to be executed\n"));
     (void)printf(_("  -I                      instance name\n"));
+#endif
     (void)printf(_("  -D, --pgdata=DATADIR    location of the database storage area\n"));
     (void)printf(_("  -c    parameter=value   the parameter to set\n"));
     (void)printf(_("  -c    parameter         the parameter value to DEFAULT (i.e comments in configuration file)\n"));
     (void)printf(_("  --lcname=LCNAME         logical cluter name. It only can be used with datanode\n"));
+    (void)printf(_("  --ignore-node=NODES     Nodes which need to ignore. "
+                   "It only can be used with set/reload operation,and CN/DN nodetype\n"));
     (void)printf(_("  -h    host-auth-policy  to set authentication policy in HBA conf file\n"));
     (void)printf(_("  -?, --help              show this help, then exit\n"));
     (void)printf(_("  -V, --version           output version information, then exit\n"));
@@ -1660,6 +1896,8 @@ static void do_help_encrypt_options(void)
                    "value is server mode\n"));
     (void)printf(_("  -K PASSWORD            the plain password you want to encrypt, which length should between 8~16 and at least 3 different types of characters\n"));
     (void)printf(_("  -U, --keyuser=USER     if appointed, the cipher files will name with the user name\n"));
+    (void)printf(_("  -R RANDFILEDIR         set the dir that put the rand file\n"));
+    (void)printf(_("  -C CIPHERFILEDIR       set the dir that put the cipher file\n"));
     (void)printf(_("\n"));
 }
 
@@ -2209,6 +2447,124 @@ void clear_g_incorrect_nodeInfo()
     GS_FREE(g_incorrect_nodeInfo->nodename_array);
     GS_FREE(g_incorrect_nodeInfo);
 }
+
+static void clear_g_ignore_nodeInfo()
+{
+    uint32 idx = 0;
+    if (g_ignore_nodeInfo == NULL) {
+        return;
+    }
+    for (idx = 0; idx < g_ignore_nodeInfo->num; idx++) {
+        GS_FREE(g_ignore_nodeInfo->nodename_array[idx]);
+    }
+    GS_FREE(g_ignore_nodeInfo->nodename_array);
+    GS_FREE(g_ignore_nodeInfo);
+}
+
+static int countIgnoreNodeElems(const char *input)
+{
+    int cnt = 1;
+
+    for (; *input != '\0'; input++) {
+        if (*input == ',') {
+            cnt++;
+        }
+    }
+    return cnt;
+}
+
+static void saveIgnoreNodeElems(const char *input)
+{
+    errno_t rc = 0;
+    int cnt = 0;
+    int strLen = 0;
+    char* node = NULL;
+    char* tmpStr = NULL;
+    char* saveStr = NULL;
+    const char* split = ",";
+
+    if ((input == NULL) || (input[0] == '\0')) {
+        write_stderr(_("%s: invalid ignore nodes,please check it\n"), progname);
+        exit(1);
+    }
+
+    strLen = strlen(input);
+    tmpStr = (char*)pg_malloc_zero(strLen + 1);
+    rc = memcpy_s(tmpStr, strLen, input, strLen);
+    securec_check_c(rc, "\0", "\0");
+
+    cnt = countIgnoreNodeElems(tmpStr);
+    g_ignore_nodeInfo = (nodeInfo*)pg_malloc(sizeof(nodeInfo));
+    g_ignore_nodeInfo->nodename_array = (char**)pg_malloc_zero(cnt * sizeof(char*));
+    g_ignore_nodeInfo->num = 0;
+
+    node = strtok_r(tmpStr, split, &saveStr);
+    g_ignore_nodeInfo->nodename_array[g_ignore_nodeInfo->num++] = xstrdup(node);
+    while (node != NULL) {
+        node = strtok_r(NULL, split, &saveStr);
+        if (node == NULL) {
+            break;
+        }
+        g_ignore_nodeInfo->nodename_array[g_ignore_nodeInfo->num++] = xstrdup(node);
+    }
+    free(tmpStr);
+}
+
+static void process_encrypt_cmd(const char* pgdata_D, const char* pgdata_C, const char* pgdata_R)
+{
+    errno_t rc = 0;
+
+    if (pgdata_D && (pgdata_R || pgdata_C)) {
+        write_stderr(_("%s: encrypt cannot use -D, -R and -C same time!\n"), progname);
+        do_advice();
+        exit(1);
+    }
+
+    if (!pgdata_D && !(pgdata_R || pgdata_C)) {
+        write_stderr(_("%s: encrypt must use -D or <-R and -C> !\n"), progname);
+        do_advice();
+        exit(1);
+    }
+
+    if ((pgdata_R && !pgdata_C) || (!pgdata_R && pgdata_C)) {
+        write_stderr(_("%s: encrypt must use -R and -C same time!\n"), progname);
+        do_advice();
+        exit(1);
+    }
+
+    if (!pgdata_D) {
+        pgdata_D = (char *)pgdata_C;
+    }
+    checkDataDir(pgdata_D);
+    if (pgdata_R) {
+        checkDataDir(pgdata_R);
+    }
+    gen_cipher_rand_files(key_mode, g_plainkey, key_username, pgdata_D, NULL);
+    if (pgdata_R) {
+        FILE* cmd_fp = NULL;
+        char read_buf[MAX_CHILD_PATH] = {0};
+        char* mv_cmd = NULL;
+
+        mv_cmd = (char*)pg_malloc_zero(MAX_COMMAND_LEN + 1);
+        rc = snprintf_s(mv_cmd, MAX_COMMAND_LEN, MAX_COMMAND_LEN - 1, "mv %s/*.rand %s/",
+                        pgdata_C, pgdata_R);
+        securec_check_ss_c(rc, "\0", "\0");
+        cmd_fp = popen(mv_cmd, "r");
+        if (NULL == cmd_fp) {
+            (void)write_stderr("could not open mv command.\n");
+            GS_FREE(mv_cmd);
+            exit(1);
+        }
+        while (fgets(read_buf, sizeof(read_buf) - 1, cmd_fp) != 0) {
+            printf("%s\n", read_buf);
+            rc = memset_s(read_buf, sizeof(read_buf), 0, sizeof(read_buf));
+            securec_check_c(rc, "\0", "\0");
+        }
+        pclose(cmd_fp);
+        GS_FREE(mv_cmd);
+    }
+}
+
 /*
  * @@GaussDB@@
  * Brief            :
@@ -2225,6 +2581,7 @@ int main(int argc, char** argv)
         {"keyuser", required_argument, NULL, 'U'},
         {"keymode", required_argument, NULL, 'M'},
         {"lcname", required_argument, NULL, 1},
+        {"ignore-node", required_argument, NULL, 2},
         {NULL, 0, NULL, 0}};
 
     int option_index;
@@ -2237,6 +2594,8 @@ int main(int argc, char** argv)
     (void)setvbuf(stderr, NULL, _IONBF, 0);
 #endif
     char* pgdata_D = NULL;
+    char* pgdata_R = NULL;
+    char* pgdata_C = NULL;
     char* nodename = NULL;
     char* instance_name = NULL;
     int nRet = 0;
@@ -2244,16 +2603,14 @@ int main(int argc, char** argv)
     progname = PROG_NAME;
     set_pglocale_pgservice(argv[0], PG_TEXTDOMAIN("gs_guc"));
     arraysize = argc - 1;
+#ifndef ENABLE_LITE_MODE
     bool is_cluster_init = false;
+#endif
 
     if (0 != arraysize) {
         config_param = ((char**)pg_malloc_zero(arraysize * sizeof(char*)));
         hba_param = ((char**)pg_malloc_zero(arraysize * sizeof(char *)));
         config_value = ((char**)pg_malloc_zero(arraysize * sizeof(char*)));
-    }
-    if (false == allocate_memory_list()) {
-        write_stderr(_("ERROR: Failed to allocate memory to list.\n"));
-        exit(1);
     }
 
     key_mode = SERVER_MODE;
@@ -2279,12 +2636,26 @@ int main(int argc, char** argv)
     optind = 1;
     /* process command-line options */
     while (optind < argc) {
-        while ((c = getopt_long(argc, argv, "N:I:D:c:h:Z:U:M:K:S:o:", long_options, &option_index)) != -1) {
+        while ((c = getopt_long(argc, argv, "N:I:D:R:C:c:h:Z:U:M:K:S:o:", long_options, &option_index)) != -1) {
             switch (c) {
                 case 'D': {
                     GS_FREE(pgdata_D);
                     pgdata_D = xstrdup(optarg);
                     canonicalize_path(pgdata_D);
+                    break;
+                }
+                case 'R': {
+                    GS_FREE(pgdata_R);
+                    pgdata_R = xstrdup(optarg);
+                    canonicalize_path(pgdata_R);
+                    check_path(pgdata_R);
+                    break;
+                }
+                case 'C': {
+                    GS_FREE(pgdata_C);
+                    pgdata_C = xstrdup(optarg);
+                    canonicalize_path(pgdata_C);
+                    check_path(pgdata_C);
                     break;
                 }
                 case 'o': {
@@ -2328,10 +2699,12 @@ int main(int argc, char** argv)
                     is_hba_conf = true;
                     temp_config_parameter = xstrdup(optarg);
                     // init cluster static config
+#ifndef ENABLE_LITE_MODE
                     if (!is_cluster_init) {
                         init_gauss_cluster_config();
                         is_cluster_init = true;
                     }
+#endif
                     do_hba_analysis(temp_config_parameter);
                     GS_FREE(temp_config_parameter);
                     break;
@@ -2427,6 +2800,11 @@ int main(int argc, char** argv)
                     g_lcname = xstrdup(optarg);
                     break;
 
+                case 2: /* 2 is ignore-node */
+                    clear_g_ignore_nodeInfo();
+                    saveIgnoreNodeElems(optarg);
+                    break;
+
                 default:
                     do_advice();
                     exit(1);
@@ -2452,8 +2830,54 @@ int main(int argc, char** argv)
         do_advice();
         exit(1);
     }
+    char arguments[MAX_BUF_SIZE] = {0x00};
+    for (int i = 0; i < argc; i++) {
+        if ((strlen(arguments) + strlen(argv[i])) >= (MAX_BUF_SIZE - 2)) {
+            if (*arguments) {
+                (void)write_log("The gs_guc run with the following arguments: [%s].\n", arguments);
+            }
+            (void)write_log("The gs_guc run with the following arguments: [%s].\n", argv[i]);
+            rc = memset_s(arguments, MAX_BUF_SIZE, 0, MAX_BUF_SIZE - 1);
+            securec_check_c(rc, "\0", "\0");
+            continue;
+        }
+        errno_t rc = strcat_s(arguments, MAX_BUF_SIZE, argv[i]);
+        size_t len = strlen(arguments);
+        if (rc != EOK) {
+            break;
+        }
+        arguments[len] = ' ';
+        arguments[len + 1] = '\0';
+    }
+    if (*arguments) {
+        (void)write_log("The gs_guc run with the following arguments: [%s].\n", arguments);
+    }
 
     check_encrypt_options();
+    
+    if (ctl_command == ENCRYPT_KEY_COMMAND) {
+        process_encrypt_cmd(pgdata_D, pgdata_C, pgdata_R);
+        (void)write_log("gs_guc encrypt %s\n", loginfo);
+    } else if (ctl_command == GENERATE_KEY_COMMAND) {
+        doGenerateOperation(pgdata_D, loginfo);
+    }
+
+    if (ctl_command == ENCRYPT_KEY_COMMAND || ctl_command == GENERATE_KEY_COMMAND) {
+        GS_FREE(g_prefix);
+        GS_FREE(g_plainkey);
+        GS_FREE(g_cipherkey);
+        GS_FREE(key_username);
+        GS_FREE(pgdata_D);
+        GS_FREE(pgdata_R);
+        GS_FREE(pgdata_C);
+        return 0;
+    }
+
+    if (false == allocate_memory_list()) {
+        write_stderr(_("ERROR: Failed to allocate memory to list.\n"));
+        exit(1);
+    }
+
     if (ctl_command != ENCRYPT_KEY_COMMAND && ctl_command != GENERATE_KEY_COMMAND && (!bhave_param && !is_hba_conf)) {
         write_stderr(_("%s: the form of this command is incorrect\n"), progname);
         do_advice();
@@ -2463,6 +2887,29 @@ int main(int argc, char** argv)
     if (ctl_command != ENCRYPT_KEY_COMMAND && ctl_command != GENERATE_KEY_COMMAND && !bhave_nodetype) {
         write_stderr(_("%s: the type of node is not specified\n"), progname);
         do_advice();
+        exit(1);
+    }
+
+    if ((g_ignore_nodeInfo != NULL) &&
+        (ctl_command != SET_CONF_COMMAND) &&
+        (ctl_command != RELOAD_CONF_COMMAND)) {
+        write_stderr(_("%s: --ignore-node must be used with set/reload operation\n"), progname);
+        clear_g_ignore_nodeInfo();
+        exit(1);
+    }
+
+    if ((g_ignore_nodeInfo != NULL) &&
+        (nodetype != INSTANCE_DATANODE) &&
+        (nodetype != INSTANCE_COORDINATOR)) {
+        write_stderr(_("%s: --ignore-node must be used with DN/CN\n"), progname);
+        clear_g_ignore_nodeInfo();
+        exit(1);
+    }
+
+    if ((g_ignore_nodeInfo != NULL) &&
+        (pgdata_D != NULL)) {
+        write_stderr(_("%s:  -D and -ignore-node cannot be used together\n"), progname);
+        clear_g_ignore_nodeInfo();
         exit(1);
     }
 
@@ -2489,35 +2936,8 @@ int main(int argc, char** argv)
         instance_name = xstrdup("all");
     }
 
-    // We have checked CHECK_CONF_COMMAND in checkUDFsecboxParameter,
-    // so we do not check it here.
-
     // log output redirect
     init_log(PROG_NAME);
-
-    /* print the log about arguments of gs_guc */
-    char arguments[MAX_BUF_SIZE] = {0x00};
-    for (int i = 0; i < argc; i++) {
-        if ((strlen(arguments) + strlen(argv[i])) >= (MAX_BUF_SIZE - 2)) {
-            if (*arguments) {
-                (void)write_log("The gs_guc run with the following arguments: [%s].\n", arguments);
-            }
-            (void)write_log("The gs_guc run with the following arguments: [%s].\n", argv[i]);
-            rc = memset_s(arguments, MAX_BUF_SIZE, 0, MAX_BUF_SIZE - 1);
-            securec_check_c(rc, "\0", "\0");
-            continue;
-        }
-        errno_t rc = strcat_s(arguments, MAX_BUF_SIZE, argv[i]);
-        size_t len = strlen(arguments);
-        if (rc != EOK) {
-            break;
-        }
-        arguments[len] = ' ';
-        arguments[len + 1] = '\0';
-    }
-    if (*arguments) {
-        (void)write_log("The gs_guc run with the following arguments: [%s].\n", arguments);
-    }
 
     if ((true == is_hba_conf) &&
         ((nodetype != INSTANCE_COORDINATOR) && (nodetype != INSTANCE_DATANODE))) {
@@ -2526,56 +2946,42 @@ int main(int argc, char** argv)
         exit(1);
     }
 
-    if (ctl_command == ENCRYPT_KEY_COMMAND) {
-        checkDataDir(pgdata_D);
-        gen_cipher_rand_files(key_mode, g_plainkey, key_username, pgdata_D, NULL);
-        (void)write_log("gs_guc encrypt %s\n", loginfo);
-    } else if (ctl_command == GENERATE_KEY_COMMAND) {
-        doGenerateOperation(pgdata_D, loginfo);
-    } else {
-        // the number of -Z is equal to 2
-        if (node_type_number == LARGE_INSTANCE_NUM) {
-            if (node_type_value[0] == node_type_value[1]) {
-                (void)write_stderr("When the number of -Z is equal to 2, the value must be different.\n");
-                exit(1);
-            }
-
-            for (int index = 0; index < LARGE_INSTANCE_NUM; index++) {
-                if (node_type_value[index] != INSTANCE_COORDINATOR && node_type_value[index] != INSTANCE_DATANODE) {
-                    (void)write_stderr("ERROR: When the number of -Z is equal to 2, the parameter value of -Z must be "
-                                       "coordinator or datanode.\n");
-                    exit(1);
-                }
-                checkLcName(node_type_value[index]);
-            }
-            nodetype = INSTANCE_COORDINATOR;
-
-            if (0 != validate_cluster_guc_options(nodename, nodetype, instance_name, pgdata_D)) {
-                exit(1);
-            }
-            process_cluster_guc_option(nodename, nodetype, instance_name, pgdata_D);
-        } else {
-            checkLcName(nodetype);
-            if (0 != validate_cluster_guc_options(nodename, nodetype, instance_name, pgdata_D)) {
-                exit(1);
-            }
-            process_cluster_guc_option(nodename, nodetype, instance_name, pgdata_D);
+    // the number of -Z is equal to 2
+    if (node_type_number == LARGE_INSTANCE_NUM) {
+        if (node_type_value[0] == node_type_value[1]) {
+            (void)write_stderr("When the number of -Z is equal to 2, the value must be different.\n");
+            exit(1);
         }
+
+        for (int index = 0; index < LARGE_INSTANCE_NUM; index++) {
+            if (node_type_value[index] != INSTANCE_COORDINATOR && node_type_value[index] != INSTANCE_DATANODE) {
+                (void)write_stderr("ERROR: When the number of -Z is equal to 2, the parameter value of -Z must be "
+                                   "coordinator or datanode.\n");
+                exit(1);
+            }
+            checkLcName(node_type_value[index]);
+        }
+        nodetype = INSTANCE_COORDINATOR;
+
+        if (0 != validate_cluster_guc_options(nodename, nodetype, instance_name, pgdata_D)) {
+            exit(1);
+        }
+        process_cluster_guc_option(nodename, nodetype, instance_name, pgdata_D);
+    } else {
+        checkLcName(nodetype);
+        if (0 != validate_cluster_guc_options(nodename, nodetype, instance_name, pgdata_D)) {
+            exit(1);
+        }
+        process_cluster_guc_option(nodename, nodetype, instance_name, pgdata_D);
     }
 
-    GS_FREE(g_prefix);
-    GS_FREE(g_plainkey);
-    GS_FREE(g_cipherkey);
-    GS_FREE(key_username);
     GS_FREE(pgdata_D);
     GS_FREE(instance_name);
-
-    if (ctl_command == ENCRYPT_KEY_COMMAND || ctl_command == GENERATE_KEY_COMMAND)
-        return 0;
 
     nRet = print_guc_result((const char*)nodename);
     GS_FREE(nodename);
     clear_g_incorrect_nodeInfo();
+    clear_g_ignore_nodeInfo();
     if (is_hba_conf) {
         free_hba_params();
     }

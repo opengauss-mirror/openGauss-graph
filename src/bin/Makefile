@@ -27,9 +27,7 @@ SUBDIRS = \
 	gs_guc \
 	gs_plan_simulator \
 	pgxc_clean \
-	gds \
 	gs_log \
-	pg_redis \
 	gs_cgroup \
 	gsqlerr \
 	pg_upgrade \
@@ -48,6 +46,7 @@ SUBDIRS = \
 	pg_rewind \
 	pg_dump \
 	psql \
+	gs_loader \
 	pg_config \
 	pg_controldata \
 	pg_resetxlog \
@@ -55,8 +54,9 @@ SUBDIRS = \
 	gs_cgroup \
 	gsqlerr \
 	pg_basebackup \
-	pg_probackup
-	
+	pg_probackup \
+	gs_plan_simulator
+
 endif
 
 $(recurse)

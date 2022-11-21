@@ -52,8 +52,8 @@
 #include "miscadmin.h"
 #include "storage/buf/bufmgr.h"
 #include "storage/lmgr.h"
-#include "storage/smgr.h"
-#include "storage/fd.h"
+#include "storage/smgr/smgr.h"
+#include "storage/smgr/fd.h"
 #include "storage/cu.h"
 #include "utils/inval.h"
 #include "postmaster/alarmchecker.h"
@@ -144,6 +144,7 @@ void createBCMFile(Relation rel, int col)
     hd->node.relNode = rel->rd_node.relNode;
     hd->node.spcNode = rel->rd_node.spcNode;
     hd->node.bucketNode = rel->rd_node.bucketNode;
+    hd->node.opt = 0;
     hd->blockSize = col > 0 ? CUAlignUtils::GetCuAlignSizeColumnId(col) : BLCKSZ; /* defaut size for ROW_STORE */
 
     if (col > 0)

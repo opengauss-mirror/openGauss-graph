@@ -5,6 +5,7 @@
  *
  * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
+ * Portions Copyright (c) 2021, openGauss Contributors
  *
  *
  * IDENTIFICATION
@@ -21,6 +22,8 @@
 #include "catalog/catalog.h"
 #include "catalog/dependency.h"
 #include "catalog/indexing.h"
+#include "catalog/gs_db_privilege.h"
+#include "catalog/gs_package.h"
 #include "catalog/pg_authid.h"
 #include "catalog/pg_collation.h"
 #include "catalog/pg_conversion.h"
@@ -36,7 +39,9 @@
 #include "catalog/pg_opclass.h"
 #include "catalog/pg_opfamily.h"
 #include "catalog/pg_proc.h"
+#include "catalog/pg_publication.h"
 #include "catalog/pg_shdepend.h"
+#include "catalog/pg_subscription.h"
 #include "catalog/pg_tablespace.h"
 #include "catalog/pg_ts_dict.h"
 #include "catalog/pg_type.h"
@@ -46,7 +51,9 @@
 #include "commands/defrem.h"
 #include "commands/extension.h"
 #include "commands/proclang.h"
+#include "commands/publicationcmds.h"
 #include "commands/schemacmds.h"
+#include "commands/subscriptioncmds.h"
 #include "commands/sec_rls_cmds.h"
 #include "commands/tablecmds.h"
 #include "commands/typecmds.h"
@@ -151,6 +158,42 @@ void recordDependencyOnOwner(Oid classId, Oid objectId, Oid owner, const char* o
     referenced.objectSubId = 0;
 
     recordSharedDependencyOn(&myself, &referenced, SHARED_DEPENDENCY_OWNER, objfile);
+}
+
+/*
+ * recordDependencyOnPackage
+ *
+ * Register the dependencies to packages in batch.
+ */
+void recordDependencyOnPackage(Oid classId, Oid objectId, List* pkgOidList)
+{
+    ObjectAddress myself;
+    int nSkip = 0;
+    int referencedCnt = 0;
+    if ((referencedCnt = list_length(pkgOidList)) == 0) {
+        return;
+    }
+
+    myself.classId = classId;
+    myself.objectId = objectId;
+    myself.objectSubId = 0;
+
+    ObjectAddress* referenced = (ObjectAddress*)palloc(sizeof(ObjectAddress) * referencedCnt);
+    ObjectAddress* cursor = referenced;
+    ListCell* lc = NULL;
+    foreach(lc, pkgOidList) {
+        Oid pkgOid = lfirst_oid(lc);
+        if (pkgOid == objectId) {
+            nSkip++;
+            continue;
+        }
+        cursor->classId = PackageRelationId;
+        cursor->objectId = lfirst_oid(lc);
+        cursor->objectSubId = 0;
+        cursor++;
+    }
+    recordMultipleDependencies(&myself, referenced, referencedCnt - nSkip, DEPENDENCY_AUTO);
+    pfree_ext(referenced);
 }
 
 #ifdef ENABLE_MOT
@@ -1050,6 +1093,8 @@ static void storeObjectDescription(
                 appendStringInfo(descs, _("privileges for %s"), objdesc);
             else if (deptype == SHARED_DEPENDENCY_RLSPOLICY)
                 appendStringInfo(descs, _("target of %s"), objdesc);
+            else if (deptype == SHARED_DEPENDENCY_DBPRIV)
+                appendStringInfo(descs, _("privileges for %s"), objdesc);
             else
                 ereport(ERROR,
                     (errcode(ERRCODE_UNRECOGNIZED_NODE_TYPE),
@@ -1194,6 +1239,14 @@ void shdepDropOwned(List* roleids, DropBehavior behavior)
                     break;
                 case SHARED_DEPENDENCY_OWNER:
                     /* If a local object, save it for deletion below */
+                    if (sdepForm->dbid == u_sess->proc_cxt.MyDatabaseId) {
+                        obj.classId = sdepForm->classid;
+                        obj.objectId = sdepForm->objid;
+                        obj.objectSubId = sdepForm->objsubid;
+                        add_exact_object_address(&obj, deleteobjs);
+                    }
+                    break;
+                case SHARED_DEPENDENCY_DBPRIV:
                     if (sdepForm->dbid == u_sess->proc_cxt.MyDatabaseId) {
                         obj.classId = sdepForm->classid;
                         obj.objectId = sdepForm->objid;
@@ -1349,6 +1402,14 @@ void shdepReassignOwned(List* roleids, Oid newrole)
 
                 case TSDictionaryRelationId:
                     AlterTSDictionaryOwner_oid(sdepForm->objid, newrole);
+                    break;
+
+                case PublicationRelationId:
+                    AlterPublicationOwner_oid(sdepForm->objid, newrole);
+                    break;
+
+                case SubscriptionRelationId:
+                    AlterSubscriptionOwner_oid(sdepForm->objid, newrole);
                     break;
 
                 default:

@@ -40,6 +40,7 @@
 #include "utils/lsyscache.h"
 #include "utils/syscache.h"
 #include "utils/snapmgr.h"
+#include "catalog/pg_proc_fn.h"
 
 static void parseNameAndArgTypes(const char* string, bool allowNone, List** names, int* nargs, Oid* argtypes);
 
@@ -56,8 +57,11 @@ static Datum regprocin_booststrap(char* procname)
     ScanKeyInit(&skey[0], Anum_pg_proc_proname, BTEqualStrategyNumber, F_NAMEEQ, CStringGetDatum(procname));
 
     hdesc = heap_open(ProcedureRelationId, AccessShareLock);
+#ifndef ENABLE_MULTIPLE_NODES
+    sysscan = systable_beginscan(hdesc, ProcedureNameArgsNspNewIndexId, true, NULL, 1, skey);
+#else
     sysscan = systable_beginscan(hdesc, ProcedureNameArgsNspIndexId, true, NULL, 1, skey);
-
+#endif
     while (HeapTupleIsValid(tuple = systable_getnext(sysscan))) {
         result = (RegProcedure)HeapTupleGetOid(tuple);
         if (++matches > 1)
@@ -136,7 +140,11 @@ Datum regprocin(PG_FUNCTION_ARGS)
     names = stringToQualifiedNameList(pro_name_or_oid);
     clist = FuncnameGetCandidates(names, -1, NIL, false, false, false);
 
+    // Assert(0);
+
     if (clist == NULL) {
+        // Assert(strcmp(pro_name_or_oid, "graphid_in") == 0);
+        
         ereport(
             ERROR, (errcode(ERRCODE_UNDEFINED_FUNCTION), errmsg("function \"%s\" does not exist", pro_name_or_oid)));
     } else if (clist->next != NULL) {
@@ -301,6 +309,8 @@ char* format_procedure(Oid procedure_oid)
         char* nspname = NULL;
         StringInfoData buf;
 
+        oidvector* proargs = ProcedureGetArgTypes(proctup);
+
         /* XXX no support here for bootstrap mode */
 
         initStringInfo(&buf);
@@ -316,7 +326,7 @@ char* format_procedure(Oid procedure_oid)
 
         appendStringInfo(&buf, "%s(", quote_qualified_identifier(nspname, proname));
         for (i = 0; i < nargs; i++) {
-            Oid thisargtype = procform->proargtypes.values[i];
+            Oid thisargtype = proargs->values[i];
 
             if (i > 0)
                 appendStringInfoChar(&buf, ',');

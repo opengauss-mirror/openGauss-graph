@@ -4,6 +4,7 @@
  *	  definitions for executor state nodes
  *
  *
+ * Portions Copyright (c) 2021, openGauss Contributors
  * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
@@ -27,6 +28,9 @@
 #include "utils/sortsupport.h"
 #include "utils/tuplesort.h"
 #include "utils/tuplestore.h"
+#ifdef GS_GRAPH
+#include "utils/graph.h"
+#endif /* GS_GRAPH */
 #include "vecexecutor/vectorbatch.h"
 
 #include "db4ai/matrix.h"
@@ -97,6 +101,7 @@ typedef struct IndexInfo {
     bool ii_ReadyForInserts;
     bool ii_Concurrent;
     bool ii_BrokenHotChain;
+    int  ii_ParallelWorkers;
     short ii_PgClassAttrId;
     UtilityDesc ii_desc; /* meminfo for index create */
 } IndexInfo;
@@ -112,6 +117,7 @@ typedef void (*ExprContextCallbackFunction)(Datum arg);
 typedef struct ExprContext_CB {
     struct ExprContext_CB* next;
     ExprContextCallbackFunction function;
+    ResourceOwner resowner;
     Datum arg;
 } ExprContext_CB;
 
@@ -301,6 +307,7 @@ typedef struct ProjectionInfo {
     TupleTableSlot* pi_slot;
     ExprDoneCond* pi_itemIsDone;
     bool pi_directMap;
+    bool pi_topPlan;             /* Whether the outermost layer query */
     int pi_numSimpleVars;
     int* pi_varSlotOffsets;
     int* pi_varNumbers;
@@ -513,6 +520,23 @@ typedef struct BloomFilterControl {
 
 #define InvalidBktId  (-1)    /* invalid hash-bucket id */
 
+typedef struct GraphWriteStats
+{
+	uint32		insertVertex;
+	uint32		insertEdge;
+	uint32		deleteVertex;
+	uint32		deleteEdge;
+	uint32		updateProperty;
+} GraphWriteStats;
+
+typedef struct SparqlLoadStats
+{
+    uint32 newVLabel;
+    uint32 newELabel;
+    uint32 insertVertex;
+    uint32 insertEdge;
+} SparqlLoad;
+
 /* ----------------
  *	  EState information
  *
@@ -566,6 +590,8 @@ typedef struct EState {
 
     List* es_rowMarks; /* List of ExecRowMarks */
 
+    List *es_modifiedRowHash; /* List of prevHash of modified rows */
+
     uint64 es_processed; /* # of tuples processed */
 
     uint64 deleteLimitCount; /* delete Limit */
@@ -602,7 +628,8 @@ typedef struct EState {
      * remember if the tuple has been returned already.  Arrays are of size
      * list_length(es_range_table) and are indexed by scan node scanrelid - 1.
      */
-    HeapTuple* es_epqTuple; /* array of EPQ substitute tuples */
+    Tuple* es_epqTuple; /* array of EPQ substitute tuples */
+    TupleTableSlot** es_epqTupleSlot;
     bool* es_epqTupleSet;   /* true if EPQ tuple is provided */
     bool* es_epqScanDone;   /* true if EPQ tuple has been fetched */
 
@@ -631,6 +658,10 @@ typedef struct EState {
 #endif
 
     PruningResult* pruningResult;
+#ifdef GS_GRAPH
+    GraphWriteStats es_graphwrstats;	/* # of graph writes */
+    SparqlLoadStats* es_sparqlloadstats;
+#endif /* GS_GRAPH */
 } EState;
 
 /*
@@ -652,9 +683,20 @@ typedef struct ExecRowMark {
     Index rowmarkId;         /* unique identifier for resjunk columns */
     RowMarkType markType;    /* see enum in nodes/plannodes.h */
     bool noWait;             /* NOWAIT option */
+    int waitSec;      /* WAIT time Sec */
     ItemPointerData curCtid; /* ctid of currently locked tuple, if any */
     int numAttrs;            /* number of attributes in subplan */
 } ExecRowMark;
+
+#define PREV_HASH_LEN 36
+/*
+ * ExecModifiedRowHash -
+ *	   store previous hash of modified row.
+ *
+ */
+typedef struct ExecModifiedRowHash {
+    char hash[PREV_HASH_LEN]; /* value of previous hash */
+} ExecModifiedRowHash;
 
 /*
  * ExecAuxRowMark -
@@ -1142,6 +1184,7 @@ typedef struct HashFilterState {
     List* arg;       /* input expression */
     uint2* nodelist; /* Node indices where data is located */
     uint2* bucketMap;
+    int    bucketCnt;
 } HashFilterState;
 
 /* ----------------
@@ -1247,6 +1290,7 @@ typedef struct PlanState {
     List* plan_issues;
     bool recursive_reset; /* node already reset? */
     bool qual_is_inited;
+
     bool do_not_reset_rownum;
     int64 ps_rownum;    /* store current rownum */
 } PlanState;
@@ -1290,6 +1334,10 @@ typedef struct EPQState {
     Plan* plan;               /* plan tree to be executed */
     List* arowMarks;          /* ExecAuxRowMarks (non-locking only) */
     int epqParam;             /* ID of Param to force scan node re-eval */
+    /*
+     * We need its memory context to palloc es_epqTupleSlot if needed
+     */
+    EState                  *parentestate;
 } EPQState;
 
 /* ----------------
@@ -1324,11 +1372,12 @@ typedef struct MergeActionState {
  */
 typedef struct UpsertState
 {
-	NodeTag			type;
-	UpsertAction	us_action; 				/* Flags showing DUPLICATE UPDATE NOTHING or SOMETHING */
-	TupleTableSlot	*us_existing;			/* slot to store existing target tuple in */
-	List			*us_excludedtlist;		/* the excluded pseudo relation's tlist */
-	TupleTableSlot	*us_updateproj;			/* slot to update */
+    NodeTag         type;
+    UpsertAction    us_action;              /* Flags showing DUPLICATE UPDATE NOTHING or SOMETHING */
+    TupleTableSlot  *us_existing;           /* slot to store existing target tuple in */
+    List            *us_excludedtlist;      /* the excluded pseudo relation's tlist */
+    TupleTableSlot  *us_updateproj;         /* slot to update */
+    List            *us_updateWhere;        /* state for the upsert where clause */
 } UpsertState;
 
 /* ----------------
@@ -1393,6 +1442,10 @@ typedef struct AppendState {
     PlanState** appendplans; /* array of PlanStates for my inputs */
     int as_nplans;
     int as_whichplan;
+#ifdef GS_GRAPH
+    dlist_head  ctxs_head;		/* list of AppendContext */
+	dlist_node *prev_ctx_node;
+#endif
 } AppendState;
 
 /* ----------------
@@ -1432,6 +1485,7 @@ typedef struct MergeAppendState {
  *		intermediate_table	current recursive output (next generation of WT)
  * ----------------
  */
+struct StartWithOpState;
 struct RecursiveUnionController;
 typedef struct RecursiveUnionState {
     PlanState ps; /* its first field is NodeTag */
@@ -1446,6 +1500,7 @@ typedef struct RecursiveUnionState {
     MemoryContext tempContext;  /* short-term context for comparisons */
     TupleHashTable hashtable;   /* hash table for tuples already seen */
     MemoryContext tableContext; /* memory context containing hash table */
+    MemoryContext convertContext; /* memory context for start with convert tuple */
 
     /*
      * MPP with-recursive support
@@ -1463,7 +1518,73 @@ typedef struct RecursiveUnionState {
      * stage.
      */
     MemoryContext shareContext;
+
+    /* support start with*/
+    StartWithOpState *swstate;
+
+    /*
+     * tuple's index of relative order position in current iteration level
+     * only useful once start with...connect by..siblings all exist.
+     */
+    uint64 sw_tuple_idx;
 } RecursiveUnionState;
+
+/* ----------------
+ *	 StartWithOpState information
+ * ----------------
+ */
+#define PSEUDO_COLUMN_NUM 4
+typedef struct StartWithOpState
+{
+    PlanState ps;
+
+    /* other attributes */
+    int    swop_status;
+    /*
+     * An array of TargetEntry reference to store the entry for start-with pseudo
+     * return columns's TLE
+     * - entry[0]  LEVEL
+     * - entry[1]  CONNECT_BY_ISLEAF
+     * - entry[2]  CONNECT_BY_ISCYCLE
+     * - entry[3]  ROWNUM
+     */
+    TargetEntry *sw_pseudoCols[PSEUDO_COLUMN_NUM];
+
+    IterationStats iterStats;
+
+    /* variables to help calculate pseodu return columns */
+    TupleTableSlot      *sw_workingSlot;  /* A dedicate slot to hold tuple-2-tuple
+                                             conversion in side of StartWithOp node,
+                                             basically do not share use result tuple
+                                             to to avoid to tuple store,fetch,
+                                             conversion mess up */
+    Tuplestorestate     *sw_workingTable; /* Hold incoming tuple slto from RU and processed
+                                             one-by-on and store into resultTable */
+
+    Tuplestorestate     *sw_backupTable;  /* Hold a copy of sw_workingTable*/
+
+    Tuplestorestate     *sw_resultTable;  /* final calculated result stored int */
+
+    AttrNumber           sw_keyAttnum;
+    const char          *sw_curKeyArrayStr;
+
+    /* tuple slot value array for conversion (to avoid per-tupe process memory alloc/free) */
+    Datum               *sw_values;
+    bool                *sw_isnull;
+    int                 sw_connect_by_level;
+    uint64              sw_rownum;
+    int                 sw_level;
+    int                 sw_numtuples;       /* number of tuples in current level */
+
+    /*
+     * nocycle stop flag, normally is used to handle nocycle stop on order siblings
+     * case, as order-siblings add a sort operator on top of RU
+     */
+    bool                sw_nocycleStopOrderSiblings;
+
+    MemoryContext       sw_context;
+    List*               sw_cycle_rowmarks;
+} StartWithOpState;
 
 /* ----------------
  *	 BitmapAndState information
@@ -1512,6 +1633,28 @@ typedef struct SampleScanParams {
 } SampleScanParams;
 
 /* ----------------------------------------------------------------
+*				 Batch Scan Information
+* ----------------------------------------------------------------
+*/
+struct ScanBatchResult {
+    int rows;           /* rows number for current page. */
+    TupleTableSlot** scanTupleSlotInBatch; /* array size of BatchMaxSize, stores tuples scanned in a page */
+};
+
+struct ScanBatchState {
+    VectorBatch*    pCurrentBatch;  /* for output in batch */
+    VectorBatch*    pScanBatch;     /* batch formed from tuples */
+    int             scanTupleSlotMaxNum; /* max row number of tuples can be scanned once */
+    int             colNum;
+    int *colId;    /* for qual and project, only save the used cols. */
+    int maxcolId;
+    bool *nullflag;  /*indicate the batch has null value for performance */
+    bool *lateRead;  /* for project */
+    bool scanfinished; /* last time return with rows, but pages of this partition is read out */
+    ScanBatchResult scanBatch;
+};
+
+/* ----------------------------------------------------------------
  *				 Scan State Information
  * ----------------------------------------------------------------
  */
@@ -1538,6 +1681,7 @@ struct SeqScanAccessor;
  */
 typedef TupleTableSlot *(*ExecScanAccessMtd) (ScanState *node);
 typedef bool(*ExecScanRecheckMtd) (ScanState *node, TupleTableSlot *slot);
+typedef void (*SeqScanGetNextMtd)(TableScanDesc scan, TupleTableSlot* slot, ScanDirection direction);
 
 typedef struct ScanState {
     PlanState ps; /* its first field is NodeTag */
@@ -1550,21 +1694,27 @@ typedef struct ScanState {
     int currentSlot; /* current iteration position */
     ScanDirection partScanDirection;
     List* partitions; /* list of Partition */
+    List* subpartitions; /* list of SubPartition */
     LOCKMODE lockMode;
     List* runTimeParamPredicates;
     bool runTimePredicatesReady;
     bool is_scan_end; /* @hdfs Mark whether iterator is over or not, if the scan uses informational constraint. */
     SeqScanAccessor* ss_scanaccessor; /* prefetch related */
     int part_id;
+    List* subPartLengthList;
     int startPartitionId;            /* start partition id for parallel threads. */
     int endPartitionId;              /* end partition id for parallel threads. */
     RangeScanInRedis rangeScanInRedis;         /* if it is a range scan in redistribution time */
     bool isSampleScan;               /* identify is it table sample scan or not. */
     SampleScanParams sampleScanInfo; /* TABLESAMPLE params include type/seed/repeatable. */
+    SeqScanGetNextMtd  fillNextSlotFunc;
     ExecScanAccessMtd ScanNextMtd;
-
-    VectorBatch* m_pScanBatch;     // batch to work on
-    VectorBatch* m_pCurrentBatch;  // output batch
+    bool scanBatchMode;
+    ScanBatchState* scanBatchState;
+#ifdef GS_GRAPH
+    dlist_head  ctxs_head;		/* list of AppendContext */
+	dlist_node *prev_ctx_node;
+#endif
 } ScanState;
 
 /*
@@ -1625,7 +1775,10 @@ typedef struct IndexScanState {
     List* iss_IndexPartitionList;
     LOCKMODE lockMode;
     Relation iss_CurrentIndexPartition;
-    int part_id;
+#ifdef GS_GRAPH
+    dlist_head  ctxs_head;		/* list of AppendContext */
+	dlist_node *prev_ctx_node;
+#endif
 } IndexScanState;
 
 /* ----------------
@@ -1664,7 +1817,10 @@ typedef struct IndexOnlyScanState {
     List* ioss_IndexPartitionList;
     LOCKMODE lockMode;
     Relation ioss_CurrentIndexPartition;
-    int part_id;
+#ifdef GS_GRAPH
+    dlist_head  ctxs_head;		/* list of AppendContext */
+	dlist_node *prev_ctx_node;
+#endif
 } IndexOnlyScanState;
 
 /* ----------------
@@ -1699,7 +1855,10 @@ typedef struct BitmapIndexScanState {
     List* biss_IndexPartitionList;
     LOCKMODE lockMode;
     Relation biss_CurrentIndexPartition;
-    int part_id;
+#ifdef GS_GRAPH
+    dlist_head  ctxs_head;		/* list of AppendContext */
+	dlist_node *prev_ctx_node;
+#endif
 } BitmapIndexScanState;
 
 /* ----------------
@@ -1720,11 +1879,18 @@ typedef struct BitmapHeapScanState {
     TIDBitmap* tbm;
     TBMIterator* tbmiterator;
     TBMIterateResult* tbmres;
+    long exact_pages;
+    long lossy_pages;
     TBMIterator* prefetch_iterator;
     int prefetch_pages;
     int prefetch_target;
     GPIScanDesc gpi_scan;  /* global partition index scan use information */
-    int part_id;
+    CBIScanDesc cbi_scan;  /* for crossbucket index scan */
+
+#ifdef GS_GRAPH
+    dlist_head  ctxs_head;		/* list of AppendContext */
+	dlist_node *prev_ctx_node;
+#endif
 } BitmapHeapScanState;
 
 /* ----------------
@@ -1745,7 +1911,10 @@ typedef struct TidScanState {
     int tss_TidPtr;
     int tss_MarkTidPtr;
     ItemPointerData* tss_TidList;
-    HeapTupleData tss_htup;
+    union {
+        HeapTupleData tss_htup;
+        UHeapTupleData tss_uhtup;
+    };
     /* put decompressed tuple data into tss_ctbuf_hdr be careful  , when malloc memory  should give extra mem for
      *xs_ctbuf_hdr. t_bits which is varlength arr  */
     HeapTupleHeaderData tss_ctbuf_hdr;
@@ -1915,6 +2084,10 @@ typedef struct JoinState {
     JoinType jointype;
     List* joinqual; /* JOIN quals (in addition to ps.qual) */
     List* nulleqqual;
+#ifdef GS_GRAPH
+    bool single_match;	/* True if we should skip to next outer tuple
+								 * after finding one inner match */
+#endif
 } JoinState;
 
 /* ----------------
@@ -1931,6 +2104,11 @@ typedef struct NestLoopState {
     bool nl_MatchedOuter;
     bool nl_MaterialAll;
     TupleTableSlot* nl_NullInnerTupleSlot;
+#ifdef GS_GRAPH
+    dlist_head	ctxs_head;		/* list of NestLoopContext */
+	dlist_node *prev_ctx_node;
+    CommandId	nl_graphwrite_cid;
+#endif
 } NestLoopState;
 
 /* ----------------
@@ -1962,6 +2140,9 @@ typedef struct MergeJoinState {
     int mj_NumClauses;
     MergeJoinClause mj_Clauses; /* array of length mj_NumClauses */
     int mj_JoinState;
+#ifdef GS_GRAPH
+    bool mj_SkipMarkRestore;
+#endif
     bool mj_ExtraMarks;
     bool mj_ConstFalseJoin;
     bool mj_FillOuter;
@@ -2356,7 +2537,7 @@ typedef struct SetOpState {
 /* ----------------
  *	 LockRowsState information
  *
- *		LockRows nodes are used to enforce FOR UPDATE/FOR SHARE locking.
+ *		LockRows nodes are used to enforce FOR [KEY] UPDATE/FOR SHARE locking.
  * ----------------
  */
 typedef struct LockRowsState {
@@ -2406,6 +2587,7 @@ typedef struct LimitState {
 typedef struct PartIteratorState {
     PlanState ps;   /* its first field is NodeTag */
     int currentItr; /* the sequence number for processing partition */
+    int subPartCurrentItr; /* the sequence number for processing partition */
 } PartIteratorState;
 
 struct VecLimitState : public LimitState {
@@ -2419,6 +2601,62 @@ typedef struct RownumState {
     ExprState  xprstate;
     PlanState* ps;   /* the value of ROWNUM depends on its parent PlanState */
 } RownumState;
+
+#ifdef GS_GRAPH
+/*
+ * SparqlLoadState: used for nodeSparqlLoad.cpp
+ */ 
+typedef struct SparqlLoadState{
+    PlanState ps;
+    PlanState *subplan;
+} SparqlLoadState;
+
+/*
+ * CypherMapState node: used for computing the CypherMapExpr
+ */
+typedef struct CypherMapState {
+    ExprState xprstate;
+    List *key_valstate;    /* key, val_state, key, val_state, ... */
+} CypherMapState;
+
+typedef struct CypherTypeCastState {
+    ExprState xprstate;
+    ExprState* arg_state;
+    FunctionCallInfo fcinfo_data_in;
+} CypherTypeCastState;
+
+// states for CypherAccessPathElem
+typedef struct PathElem{
+    bool is_slice;
+    ExprState* lidx_state;
+    ExprState* uidx_state;
+} PathElem;
+
+typedef struct CypherAccessState {
+    ExprState xprstate;
+    ExprState *arg;
+    int pathlen;
+    PathElem *pathelems;
+} CypherAccessState;
+
+typedef struct NestLoopVLEState
+{
+	NestLoopState nls;
+	int			curhops;
+	ArrayBuildState *eids;		/* edge IDs for the current result row */
+	ArrayBuildState *edges;		/* edges for the current result row */
+	ArrayBuildState *vertices;	/* vertices for the current result row */
+	dlist_head	ctxs_head;		/* list of NestLoopVLEContext */
+	dlist_node *prev_ctx_node;
+} NestLoopVLEState;
+
+typedef struct IndexScanContext
+{
+	dlist_node	list;
+	Bitmapset  *chgParam;
+	struct IndexScanDescData *scanDesc;
+} IndexScanContext;
+#endif
 
 /* ----------------
  *		GroupingFuncExprState node
@@ -2484,135 +2722,165 @@ inline bool BitmapNodeNeedSwitchPartRel(BitmapHeapScanState* node)
     return tbm_is_global(node->tbm) && GPIScanCheckPartOid(node->gpi_scan, node->tbmres->partitionOid);
 }
 
-extern RangeScanInRedis reset_scan_qual(Relation currHeapRel, ScanState *node);
+// DB4AI state node
 
+struct AlgorithmAPI;
+struct TrainModelState;
+
+typedef struct ModelTuple {
+    Datum               *values;    // attributes value
+    bool                *isnull;    // whether an attribute is null
+    Oid                 *typid;     // type of an attribute
+    bool                *typbyval;  // attribute is passed by value or by reference
+    int16               *typlen;    // the length of an attribute
+    int                 ncolumns;   // number of attributes
+} ModelTuple;
+
+// returns the next data row, or nullptr when iteration has finished
+typedef bool (*callback_ml_fetch)(void *callback_data, ModelTuple *tuple);
+
+// restarts the iteration of the dataset without fetching any tuple at all
+typedef void (*callback_ml_rescan)(void *callback_data);
+
+typedef struct TrainModelState {
+    ScanState           ss;     /* its first field is NodeTag */
+    const TrainModel    *config;
+    AlgorithmAPI        *algorithm;
+    int                 finished;   // number of configurations still running
+    // row data
+    ModelTuple          tuple; // data as well as metadata
+    bool                row_allocated;
+    // utility functions
+    callback_ml_fetch   fetch;
+    callback_ml_rescan  rescan;
+    void                *callback_data; // for direct ML, used by the fetch callback
+} TrainModelState;
+
+#ifdef GS_GRAPH
 /*
- * DB4AI GD node: used for train models using Gradient Descent
+ * Graph nodes
  */
 
-struct GradientDescentAlgorithm;
-struct GradientDescentExpr;
-struct OptimizerGD;
-struct ShuffleGD;
+typedef struct ModifyGraphState
+{
+	PlanState	ps;
+	bool		done;
+	bool		child_done;
+	bool		eagerness;
+	PlanState  *subplan;
+	TupleTableSlot *elemTupleSlot;	/* to insert vertex/edge */
+	Oid			graphid;
+	int			numOldRtable;
+	ResultRelInfo *resultRelations;
+	int			numResultRelations;
+	CommandId	modify_cid;
+	List	   *pattern;		/* graph pattern (list of paths) for CREATE
+								   with `es_prop_map` */
+	List	   *exprs;			/* expression state list for DELETE */
+	List	   *sets;			/* list of GraphSetProp's for SET/REMOVE */
+	HTAB	   *elemTable;
+	Tuplestorestate *tuplestorestate;
+} ModifyGraphState;
 
-typedef struct GradientDescentState {
-    ScanState               ss;     /* its first field is NodeTag */
-    GradientDescentAlgorithm* algorithm;
-    OptimizerGD*            optimizer;
-    ShuffleGD*              shuffle;
-        
-    // tuple description
-    TupleDesc               tupdesc;
-    int                     n_features; // number of features
+typedef struct Hash2SideState
+{
+	PlanState	    ps;        /* its first field is NodeTag */
+	HashJoinTable   keytable;  /* hash table for the recursion */
+	HashJoinTable   hashtable; /* hash table for the hashjoin */
+	List	       *hashkeys;  /* list of ExprState nodes */
+	/* hashkeys is same as parent's hj_InnerHashKeys */
+	TupleTableSlot *slot;
+	ExprState      *key;
+	PlanState      *spstate;
+	double          totalPaths;
+	long            hops;
+	Size            spacePeak;
+	bool			isFieldSelect;	/* Track FieldSelect exprs */
+	Param		   *correctedParam;	/* Needed to correct FieldSelect exprs */
+	HeapTuple		vertexRow;		/* For reusing the vertexRow */
+	TupleDesc		tupleDesc;		/* Tuple descriptor for above vertexRow */
+} Hash2SideState;
 
-    // dependant var binary values
-    int                     num_classes;
-    Datum                   binary_classes[2];
+typedef struct ShortestpathState
+{
+	JoinState        js;               /* its first field is NodeTag */
+	ExprState       *hashclauses;      /* list of ExprState nodes */
+	List            *sp_OuterHashKeys; /* list of ExprState nodes */
+	List            *sp_InnerHashKeys; /* list of ExprState nodes */
+	List            *sp_HashOperators; /* list of operator OIDs */
+	HashJoinTable    sp_KeyTable;
+	HashJoinTable    sp_OuterTable;
+	HashJoinTable    sp_HashTable;
+	uint32           sp_CurHashValue;
+	int              sp_CurBucketNo;
+	int              sp_CurSkewBucketNo;
+	HashJoinTuple    sp_CurTuple;
+	int              sp_CurKeyBatch;
+	int              sp_CurKeyIdx;
+	void            *sp_CurOuterChunks; /* HashMemoryChunk */
+	int              sp_CurOuterIdx;
+	TupleTableSlot  *sp_OuterTupleSlot;
+	TupleTableSlot  *sp_HashTupleSlot;
+	long             sp_Hops;
+	int              sp_RowidSize;
+	MinimalTuple     sp_GraphidTuple;
+	MinimalTuple     sp_OuterTuple;
+	unsigned char   *sp_Vertexids;
+	unsigned char   *sp_Edgeids;
+	int              sp_JoinState;
+	ExprState       *source;
+	ExprState       *target;
+	long             minhops;
+	long             maxhops;
+	long             limit;
+	Graphid          startVid;
+	Graphid          endVid;
+	long             hops;
+	long             numResults;
+	Hash2SideState  *outerNode;
+	Hash2SideState  *innerNode;
+} ShortestpathState;
 
-    // training state
-    bool                    done;   // when finished
-    Matrix                  weights;
-    double                  learning_rate;
-    int                     n_iterations;
-    int                     usecs;          // execution time
-    int                     processed;  // tuples
-    int                     discarded;
-    float                   loss;
-    Scores                  scores;
-} GradientDescentState;
+#endif /* GS_GRAPH */
 
+// typedef struct ModifyGraphState
+// {
+// 	PlanState	ps;
+// 	bool		done;
+// 	bool		child_done;
+// 	bool		eagerness;
+// 	PlanState  *subplan;
+// 	TupleTableSlot *elemTupleSlot;	/* to insert vertex/edge */
+// 	Oid			graphid;
+// 	int			numOldRtable;
+// 	ResultRelInfo *resultRelations;
+// 	int			numResultRelations;
+// 	CommandId	modify_cid;
+// 	List	   *pattern;		/* graph pattern (list of paths) for CREATE
+// 								   with `es_prop_map` */
+// 	List	   *exprs;			/* expression state list for DELETE */
+// 	List	   *sets;			/* list of GraphSetProp's for SET/REMOVE */
+// 	HTAB	   *elemTable;
+// 	Tuplestorestate *tuplestorestate;
+// } ModifyGraphState;
 
-typedef struct GradientDescentExprState {
-    ExprState               xprstate;
-    PlanState*              ps;
-    GradientDescentExpr*    xpr;
-} GradientDescentExprState;
-
-/*
- * DB4AI k-means node
- */
-
-/*
- * to keep running statistics on each cluster being constructed
- */
-class IncrementalStatistics {
-    uint64_t population = 0;
-    double max_value = 0.;
-    double min_value = DBL_MAX;
-    double total = 0.;
-    double s = 0;
-
-public:
-    
-    IncrementalStatistics operator+(IncrementalStatistics const& rhs) const;
-    IncrementalStatistics operator-(IncrementalStatistics const& rhs) const;
-    IncrementalStatistics& operator+=(IncrementalStatistics const& rhs);
-    IncrementalStatistics& operator-=(IncrementalStatistics const& rhs);
-    
-    double getMin() const;
-    void setMin(double);
-    double getMax() const;
-    void setMax(double);
-    double getTotal() const;
-    void setTotal(double);
-    uint64_t getPopulation() const;
-    void setPopulation(uint64_t);
-    double getEmpiricalMean() const;
-    double getEmpiricalVariance() const;
-    double getEmpiricalStdDev() const;
-    bool reset();
-};
-
-/*
- * internal representation of a centroid
- */
-typedef struct Centroid {
-    IncrementalStatistics statistics;
-    ArrayType* coordinates = nullptr;
-    uint32_t id = 0U;
-} Centroid;
-
-/*
- * current state of the algorithm
- */
-typedef struct KMeansStateDescription {
-    Centroid* centroids[2] = {nullptr};
-    ArrayType* bbox_min = nullptr;
-    ArrayType* bbox_max = nullptr;
-    
-    double (* distance)(double const*, double const*, uint32_t const dimension) = nullptr;
-    
-    double execution_time = 0.;
-    double seeding_time = 0.;
-    IncrementalStatistics solution_statistics[2];
-    uint64_t num_good_points = 0UL;
-    uint64_t num_dead_points = 0UL;
-    uint32_t current_iteration = 0U;
-    uint32_t current_centroid = 0U;
-    uint32_t dimension = 0U;
-    uint32_t num_centroids = 0U;
-    uint32_t actual_num_iterations = 0U;
-} KMeansStateDescription;
-
-/*
- * current state of the k-means node
- */
-typedef struct KMeansState {
-    ScanState sst;
-    KMeansStateDescription description;
-    bool done = false;
-} KMeansState;
-
-/*
- * internal representation of a point (not a centroid)
- */
-typedef struct GSPoint {
-    ArrayType* pg_coordinates = nullptr;
-    uint32_t weight = 1U;
-    uint32_t id = 0ULL;
-    double distance_to_closest_centroid = DBL_MAX;
-    bool should_free = false;
-} GSPoint;
+// typedef struct DijkstraState
+// {
+// 	PlanState 		ps;
+// 	HTAB		   *visited_nodes;
+// 	pairingheap	   *pq;
+// 	MemoryContext 	pq_mcxt;
+// 	ExprState  	   *source;
+// 	ExprState  	   *target;
+// 	ExprState  	   *limit;
+// 	int				n;
+// 	int				max_n;
+// 	Graphid 		target_id;
+// 	bool			is_executed;
+// 	TupleTableSlot *selfTupleSlot;
+// 	HeapTuple		vertexRow;		/* pointer to hold reusable vertex row */
+// 	TupleDesc		tupleDesc;		/* pointer to vertex row's tuple descr */
+// } DijkstraState;
 
 #endif /* EXECNODES_H */
 

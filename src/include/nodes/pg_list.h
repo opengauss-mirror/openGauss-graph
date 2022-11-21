@@ -1,7 +1,7 @@
 /* -------------------------------------------------------------------------
  *
  * pg_list.h
- *	  interface for PostgreSQL generic linked list package
+ *	  interface for openGauss generic linked list package
  *
  * This package implements singly-linked homogeneous lists.
  *
@@ -176,6 +176,7 @@ extern ListCell *dlist_tail_cell(DList *l);
 #define list_make2(x1, x2) lcons(x1, list_make1(x2))
 #define list_make3(x1, x2, x3) lcons(x1, list_make2(x2, x3))
 #define list_make4(x1, x2, x3, x4) lcons(x1, list_make3(x2, x3, x4))
+#define list_make5(x1,x2,x3,x4,x5)	lcons(x1, list_make4(x2, x3, x4, x5))
 
 #define list_make1_int(x1) lcons_int(x1, NIL)
 #define list_make2_int(x1, x2) lcons_int(x1, list_make1_int(x2))
@@ -225,6 +226,12 @@ extern ListCell *dlist_tail_cell(DList *l);
     for ((cell1) = list_head(list1), (cell2) = list_head(list2), (cell3) = list_head(list3); \
          (cell1) != NULL && (cell2) != NULL && (cell3) != NULL;                              \
          (cell1) = lnext(cell1), (cell2) = lnext(cell2), (cell3) = lnext(cell3))
+
+#define forfour(cell1, list1, cell2, list2, cell3, list3,  cell4, list4)                                   \
+    for ((cell1) = list_head(list1), (cell2) = list_head(list2), (cell3) = list_head(list3), (cell4) = list_head(list4); \
+         (cell1) != NULL && (cell2) != NULL && (cell3) != NULL && (cell4) != NULL;                              \
+         (cell1) = lnext(cell1), (cell2) = lnext(cell2), (cell3) = lnext(cell3), (cell4) = lnext(cell4))
+
 
 extern DList* dlappend(DList* dlist, void* datum);
 
@@ -281,6 +288,7 @@ extern List* list_union_int(const List* list1, const List* list2);
 extern List* list_union_oid(const List* list1, const List* list2);
 extern List* list_intersection_int(const List* list1, const List* list2);
 extern bool list_is_subset(List* list1, List* list2);
+extern bool list_is_subset_int(List* list1, List* list2);
 
 #ifdef PGXC
 /* Well... this is used by Postgres-XC */

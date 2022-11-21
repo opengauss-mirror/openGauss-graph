@@ -1,0 +1,202 @@
+make[5]: warning: jobserver unavailable: using -j1.  Add `+' to parent make rule.
+make[7]: warning: jobserver unavailable: using -j1.  Add `+' to parent make rule.
+make[8]: warning: jobserver unavailable: using -j1.  Add `+' to parent make rule.
+Writing fmgroids.h
+Writing fmgrtab.cpp
+Writing pg_builtin_proc.h
+Writing fmgroids.h
+Writing fmgrtab.cpp
+Writing pg_builtin_proc.h
+Writing postgres.bki
+Writing schemapg.h
+Writing postgres.description
+Writing postgres.shdescription
+make[4]: warning: jobserver unavailable: using -j1.  Add `+' to parent make rule.
+-I../../../../src/include -I../../../../src/lib/gstrace -D_GNU_SOURCE  -I/home/opengauss/openGauss/binarylibs/dependency/centos7.6_x86_64/unixodbc/include -I/home/opengauss/openGauss/binarylibs/dependency/centos7.6_x86_64/libobs/comm/include -I/home/opengauss/openGauss/binarylibs/dependency/centos7.6_x86_64/libcgroup/comm/include -I/home/opengauss/openGauss/binarylibs/dependency/centos7.6_x86_64/openssl/comm/include -I/home/opengauss/openGauss/binarylibs/dependency/centos7.6_x86_64/liborc/comm/include -I/home/opengauss/openGauss/binarylibs/dependency/centos7.6_x86_64/libparquet/comm/include -I/home/opengauss/openGauss/binarylibs/dependency/centos7.6_x86_64/protobuf/comm/include -I/home/opengauss/openGauss/binarylibs/dependency/centos7.6_x86_64/boost/comm/include -I/home/opengauss/openGauss/binarylibs/dependency/centos7.6_x86_64/llvm/comm/include -I/home/opengauss/openGauss/binarylibs/dependency/centos7.6_x86_64/kerberos/comm/include -I/home/opengauss/openGauss/binarylibs/dependency/centos7.6_x86_64/cjson/comm/include -I/home/opengauss/openGauss/binarylibs/dependency/centos7.6_x86_64/numactl/comm/include -I/home/opengauss/openGauss/binarylibs/dependency/centos7.6_x86_64/zlib1.2.11/comm/include -I/home/opengauss/openGauss/binarylibs/dependency/centos7.6_x86_64/lz4/comm/include -I/home/opengauss/openGauss/binarylibs/dependency/centos7.6_x86_64/libcurl/comm/include -I/home/opengauss/openGauss/binarylibs/component/centos7.6_x86_64/dcf/include -I/home/opengauss/openGauss/binarylibs/dependency/centos7.6_x86_64/zstd/include
+heaptuple.cpp: In function ‘Datum slot_getattr(TupleTableSlot*, int, bool*)’:
+heaptuple.cpp:3593:13: warning: comparison between signed and unsigned integer expressions [-Wsign-compare]
+  if (attnum > HeapTupleHeaderGetNatts(tup, tupleDesc))
+      ~~~~~~~^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+make[5]: warning: jobserver unavailable: using -j1.  Add `+' to parent make rule.
+createplan.cpp: In function ‘ModifyGraph* make_modifygraph(PlannerInfo*, GraphWriteOp, bool, List*, Plan*, uint32, bool, bool, List*, List*, List*)’:
+createplan.cpp:1800:11: warning: unused variable ‘plan’ [-Wunused-variable]
+     Plan* plan = &node->plan;
+           ^~~~
+pquery.cpp: In function ‘void appendGraphWriteTag(char*, GraphWriteStats*)’:
+pquery.cpp:2373:5: warning: this ‘if’ clause does not guard... [-Wmisleading-indentation]
+     if(graphwrstats->insertVertex)
+     ^~
+pquery.cpp:2376:2: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the ‘if’
+  if(graphwrstats->insertEdge)
+  ^~
+In file included from utility.cpp:84:0:
+../../../../src/include/commands/event_trigger.h:40:1: warning: multi-line comment [-Wcomment]
+ // #define CALLED_AS_EVENT_TRIGGER(fcinfo) \
+ ^
+nodeFuncs.cpp:3535:0: warning: "FLATCOPY" redefined
+ #define FLATCOPY(newnode, node, nodetype)  \
+ 
+nodeFuncs.cpp:2285:0: note: this is the location of the previous definition
+ #define FLATCOPY(newnode, node, nodetype, isCopy)                                     \
+ 
+nodeFuncs.cpp:3539:0: warning: "CHECKFLATCOPY" redefined
+ #define CHECKFLATCOPY(newnode, node, nodetype) \
+ 
+nodeFuncs.cpp:2294:0: note: this is the location of the previous definition
+ #define CHECKFLATCOPY(newnode, node, nodetype)                                        \
+ 
+nodeFuncs.cpp:3544:0: warning: "MUTATE" redefined
+ #define MUTATE(newfield, oldfield, fieldtype)  \
+ 
+nodeFuncs.cpp:2302:0: note: this is the location of the previous definition
+ #define MUTATE(newfield, oldfield, fieldtype) ((newfield) = (fieldtype)mutator((Node*)(oldfield), context))
+ 
+equalfuncs.cpp:2275:1: warning: ‘bool _equalCreateGraphStmt(const CreateGraphStmt*, const CreateGraphStmt*)’ defined but not used [-Wunused-function]
+ _equalCreateGraphStmt(const CreateGraphStmt *a, const CreateGraphStmt *b)
+ ^~~~~~~~~~~~~~~~~~~~~
+parse_clause.cpp:3096:1: warning: ‘List* resolve_unique_index_expr(ParseState*, InferClause*, Relation)’ defined but not used [-Wunused-function]
+ resolve_unique_index_expr(ParseState *pstate, InferClause *infer,
+ ^~~~~~~~~~~~~~~~~~~~~~~~~
+In file included from /home/opengauss/openGauss/binarylibs/dependency/centos7.6_x86_64/boost/comm/include/boost/property_tree/json_parser/detail/parser.hpp:7:0,
+                 from /home/opengauss/openGauss/binarylibs/dependency/centos7.6_x86_64/boost/comm/include/boost/property_tree/json_parser/detail/read.hpp:13,
+                 from /home/opengauss/openGauss/binarylibs/dependency/centos7.6_x86_64/boost/comm/include/boost/property_tree/json_parser.hpp:16,
+                 from comm_common.cpp:34:
+/home/opengauss/openGauss/binarylibs/dependency/centos7.6_x86_64/boost/comm/include/boost/bind.hpp:41:1: note: #pragma message: The practice of declaring the Bind placeholders (_1, _2, ...) in the global namespace is deprecated. Please use <boost/bind/bind.hpp> + using namespace boost::placeholders, or define BOOST_BIND_GLOBAL_PLACEHOLDERS to retain the current behavior.
+ )
+ ^
+In file included from pg_builtin_proc.cpp:25:0:
+builtin_funcs.ini:4001:81: error: ‘jsonb_set’ was not declared in this scope
+         AddBuiltinFunc(_0(8346), _1("jsonb_set"), _2(), _3(true), _4(false), _5(jsonb_set), _6(3802), _7(PG_CATALOG_NAMESPACE), _8(BOOTSTRAP_SUPERUSERID), _9(INTERNALlanguageId), _10(1), _11(0), _12(0), _13(0), _14(false), _15(false), _16(false), _17(false), _18('i'), _19(1), _20(4, 3802, 1009, 3802, 16), _21(NULL), _22(NULL), _23(NULL), _24("({CONST :consttype 16 :consttypmod -1 :constcollid 0 :constlen 1 :constbyval true :constisnull false :ismaxvalue false :location 134 :constvalue 1 [ 1 0 0 0 0 0 0 0 ] :cursor_data  :row_count 0 :cur_dno -1 :is_open false :found false :not_found false :null_open false :null_fetch false})"), _25("jsonb_set"), _26(NULL), _27(NULL), _28(NULL), _29(1, 3), _30(false), _31(NULL), _32(false), _33("update data"), _34('f'), _35(NULL),  _36(0), _37(false), _38(NULL), _39(NULL), _40(0))
+                                                                                 ^
+../../../../src/include/utils/fmgrtab.h:209:13: note: in definition of macro ‘AddFuncGroup’
+             __VA_ARGS__                                                       \
+             ^~~~~~~~~~~
+builtin_funcs.ini:4001:9: note: in expansion of macro ‘AddBuiltinFunc’
+         AddBuiltinFunc(_0(8346), _1("jsonb_set"), _2(), _3(true), _4(false), _5(jsonb_set), _6(3802), _7(PG_CATALOG_NAMESPACE), _8(BOOTSTRAP_SUPERUSERID), _9(INTERNALlanguageId), _10(1), _11(0), _12(0), _13(0), _14(false), _15(false), _16(false), _17(false), _18('i'), _19(1), _20(4, 3802, 1009, 3802, 16), _21(NULL), _22(NULL), _23(NULL), _24("({CONST :consttype 16 :consttypmod -1 :constcollid 0 :constlen 1 :constbyval true :constisnull false :ismaxvalue false :location 134 :constvalue 1 [ 1 0 0 0 0 0 0 0 ] :cursor_data  :row_count 0 :cur_dno -1 :is_open false :found false :not_found false :null_open false :null_fetch false})"), _25("jsonb_set"), _26(NULL), _27(NULL), _28(NULL), _29(1, 3), _30(false), _31(NULL), _32(false), _33("update data"), _34('f'), _35(NULL),  _36(0), _37(false), _38(NULL), _39(NULL), _40(0))
+         ^~~~~~~~~~~~~~
+../../../../src/include/utils/fmgrtab.h:121:22: note: in expansion of macro ‘_SetField’
+ #define _5(func_ptr) _SetField(func, func_ptr)
+                      ^~~~~~~~~
+builtin_funcs.ini:4001:78: note: in expansion of macro ‘_5’
+         AddBuiltinFunc(_0(8346), _1("jsonb_set"), _2(), _3(true), _4(false), _5(jsonb_set), _6(3802), _7(PG_CATALOG_NAMESPACE), _8(BOOTSTRAP_SUPERUSERID), _9(INTERNALlanguageId), _10(1), _11(0), _12(0), _13(0), _14(false), _15(false), _16(false), _17(false), _18('i'), _19(1), _20(4, 3802, 1009, 3802, 16), _21(NULL), _22(NULL), _23(NULL), _24("({CONST :consttype 16 :consttypmod -1 :constcollid 0 :constlen 1 :constbyval true :constisnull false :ismaxvalue false :location 134 :constvalue 1 [ 1 0 0 0 0 0 0 0 ] :cursor_data  :row_count 0 :cur_dno -1 :is_open false :found false :not_found false :null_open false :null_fetch false})"), _25("jsonb_set"), _26(NULL), _27(NULL), _28(NULL), _29(1, 3), _30(false), _31(NULL), _32(false), _33("update data"), _34('f'), _35(NULL),  _36(0), _37(false), _38(NULL), _39(NULL), _40(0))
+                                                                              ^~
+builtin_funcs.ini:4001:81: note: suggested alternative: ‘jsonb_sub’
+         AddBuiltinFunc(_0(8346), _1("jsonb_set"), _2(), _3(true), _4(false), _5(jsonb_set), _6(3802), _7(PG_CATALOG_NAMESPACE), _8(BOOTSTRAP_SUPERUSERID), _9(INTERNALlanguageId), _10(1), _11(0), _12(0), _13(0), _14(false), _15(false), _16(false), _17(false), _18('i'), _19(1), _20(4, 3802, 1009, 3802, 16), _21(NULL), _22(NULL), _23(NULL), _24("({CONST :consttype 16 :consttypmod -1 :constcollid 0 :constlen 1 :constbyval true :constisnull false :ismaxvalue false :location 134 :constvalue 1 [ 1 0 0 0 0 0 0 0 ] :cursor_data  :row_count 0 :cur_dno -1 :is_open false :found false :not_found false :null_open false :null_fetch false})"), _25("jsonb_set"), _26(NULL), _27(NULL), _28(NULL), _29(1, 3), _30(false), _31(NULL), _32(false), _33("update data"), _34('f'), _35(NULL),  _36(0), _37(false), _38(NULL), _39(NULL), _40(0))
+                                                                                 ^
+../../../../src/include/utils/fmgrtab.h:209:13: note: in definition of macro ‘AddFuncGroup’
+             __VA_ARGS__                                                       \
+             ^~~~~~~~~~~
+builtin_funcs.ini:4001:9: note: in expansion of macro ‘AddBuiltinFunc’
+         AddBuiltinFunc(_0(8346), _1("jsonb_set"), _2(), _3(true), _4(false), _5(jsonb_set), _6(3802), _7(PG_CATALOG_NAMESPACE), _8(BOOTSTRAP_SUPERUSERID), _9(INTERNALlanguageId), _10(1), _11(0), _12(0), _13(0), _14(false), _15(false), _16(false), _17(false), _18('i'), _19(1), _20(4, 3802, 1009, 3802, 16), _21(NULL), _22(NULL), _23(NULL), _24("({CONST :consttype 16 :consttypmod -1 :constcollid 0 :constlen 1 :constbyval true :constisnull false :ismaxvalue false :location 134 :constvalue 1 [ 1 0 0 0 0 0 0 0 ] :cursor_data  :row_count 0 :cur_dno -1 :is_open false :found false :not_found false :null_open false :null_fetch false})"), _25("jsonb_set"), _26(NULL), _27(NULL), _28(NULL), _29(1, 3), _30(false), _31(NULL), _32(false), _33("update data"), _34('f'), _35(NULL),  _36(0), _37(false), _38(NULL), _39(NULL), _40(0))
+         ^~~~~~~~~~~~~~
+../../../../src/include/utils/fmgrtab.h:121:22: note: in expansion of macro ‘_SetField’
+ #define _5(func_ptr) _SetField(func, func_ptr)
+                      ^~~~~~~~~
+builtin_funcs.ini:4001:78: note: in expansion of macro ‘_5’
+         AddBuiltinFunc(_0(8346), _1("jsonb_set"), _2(), _3(true), _4(false), _5(jsonb_set), _6(3802), _7(PG_CATALOG_NAMESPACE), _8(BOOTSTRAP_SUPERUSERID), _9(INTERNALlanguageId), _10(1), _11(0), _12(0), _13(0), _14(false), _15(false), _16(false), _17(false), _18('i'), _19(1), _20(4, 3802, 1009, 3802, 16), _21(NULL), _22(NULL), _23(NULL), _24("({CONST :consttype 16 :consttypmod -1 :constcollid 0 :constlen 1 :constbyval true :constisnull false :ismaxvalue false :location 134 :constvalue 1 [ 1 0 0 0 0 0 0 0 ] :cursor_data  :row_count 0 :cur_dno -1 :is_open false :found false :not_found false :null_open false :null_fetch false})"), _25("jsonb_set"), _26(NULL), _27(NULL), _28(NULL), _29(1, 3), _30(false), _31(NULL), _32(false), _33("update data"), _34('f'), _35(NULL),  _36(0), _37(false), _38(NULL), _39(NULL), _40(0))
+                                                                              ^~
+../../../../src/include/utils/fmgrtab.h:207:70: error: expected primary-expression before ‘[’ token
+         .funcName = groupName, .fnums = nelem, .funcs = (Builtin_func[nelem]) \
+                                                                      ^
+builtin_funcs.ini:3999:5: note: in expansion of macro ‘AddFuncGroup’
+     AddFuncGroup(
+     ^~~~~~~~~~~~
+../../../../src/include/utils/fmgrtab.h:208:9: error: expected ‘}’ before ‘{’ token
+         {                                                                     \
+         ^
+builtin_funcs.ini:3999:5: note: in expansion of macro ‘AddFuncGroup’
+     AddFuncGroup(
+     ^~~~~~~~~~~~
+../../../../src/include/utils/fmgrtab.h:208:9: error: expected ‘}’ before ‘{’ token
+         {                                                                     \
+         ^
+builtin_funcs.ini:3999:5: note: in expansion of macro ‘AddFuncGroup’
+     AddFuncGroup(
+     ^~~~~~~~~~~~
+../../../../src/include/utils/fmgrtab.h:211:5: error: expected declaration before ‘}’ token
+     }
+     ^
+builtin_funcs.ini:3999:5: note: in expansion of macro ‘AddFuncGroup’
+     AddFuncGroup(
+     ^~~~~~~~~~~~
+make[4]: *** [pg_builtin_proc.o] Error 1
+make[3]: *** [catalog-recursive] Error 2
+make[3]: *** Waiting for unfinished jobs....
+parse_graph.cpp: In function ‘List* repairTargetListCollations(List*)’:
+parse_graph.cpp:626:14: warning: unused variable ‘fexpr’ [-Wunused-variable]
+    FuncExpr *fexpr = (FuncExpr *) expr;
+              ^~~~~
+parse_graph.cpp: In function ‘GraphSetProp* transformSetProp(ParseState*, RangeTblEntry*, CypherSetProp*, bool, CSetKind)’:
+parse_graph.cpp:4447:18: warning: passing NULL to non-pointer argument 5 of ‘Node* ParseFuncOrColumn(ParseState*, List*, List*, FuncCall*, int, bool)’ [-Wconversion-null]
+          NULL, -1);
+                  ^
+parse_graph.cpp: In function ‘bool find_target_label_walker(Node*, find_target_label_context*)’:
+parse_graph.cpp:5517:37: warning: comparison between signed and unsigned integer expressions [-Wsign-compare]
+   if (var->varno <= 0 || var->varno > list_length(qry->rtable))
+                          ~~~~~~~~~~~^~~~~~~~~~~~~~~~~~~~~~~~~~
+parse_graph.cpp: In function ‘Query* transformCypherProjectionSimple(ParseState*, CypherClause*)’:
+parse_graph.cpp:590:9: warning: ‘qry’ is used uninitialized in this function [-Wuninitialized]
+  return qry;
+         ^~~
+parse_cypher_expr.cpp: In function ‘Node* transformFields(ParseState*, Node*, List*, int)’:
+parse_cypher_expr.cpp:603:55: warning: passing NULL to non-pointer argument 5 of ‘Node* ParseFuncOrColumn(ParseState*, List*, List*, FuncCall*, int, bool)’ [-Wconversion-null]
+         (FuncCall *)pstate->p_last_srf, NULL, location);
+                                                       ^
+parse_cypher_expr.cpp: In function ‘Node* filterAccessArg(ParseState*, Node*, int, const char*)’:
+parse_cypher_expr.cpp:654:25: warning: passing NULL to non-pointer argument 5 of ‘Node* ParseFuncOrColumn(ParseState*, List*, List*, FuncCall*, int, bool)’ [-Wconversion-null]
+           NULL, location);
+                         ^
+parse_cypher_expr.cpp: In function ‘Node* transformFuncCall(ParseState*, FuncCall*)’:
+parse_cypher_expr.cpp:948:11: warning: unused variable ‘last_srf’ [-Wunused-variable]
+  Node    *last_srf = pstate->p_last_srf;
+           ^~~~~~~~
+parse_cypher_expr.cpp: In function ‘Node* transformIndirection(ParseState*, A_Indirection*)’:
+parse_cypher_expr.cpp:1668:45: warning: passing NULL to non-pointer argument 5 of ‘Node* ParseFuncOrColumn(ParseState*, List*, List*, FuncCall*, int, bool)’ [-Wconversion-null]
+          (FuncCall*)last_srf, NULL, location);
+                                             ^
+parse_cypher_expr.cpp: In function ‘Node* makeArrayIndex(ParseState*, Node*, bool)’:
+parse_cypher_expr.cpp:1786:11: warning: unused variable ‘last_srf’ [-Wunused-variable]
+  Node    *last_srf = pstate->p_last_srf;
+           ^~~~~~~~
+parse_cypher_expr.cpp: In function ‘Node* transformAExprOp(ParseState*, A_Expr*)’:
+parse_cypher_expr.cpp:1837:11: warning: unused variable ‘last_srf’ [-Wunused-variable]
+  Node    *last_srf = pstate->p_last_srf;
+           ^~~~~~~~
+parse_cypher_expr.cpp: In function ‘Node* coerce_expr(ParseState*, Node*, Oid, Oid, int32, CoercionContext, CoercionForm, int)’:
+parse_cypher_expr.cpp:2173:58: warning: passing NULL to non-pointer argument 5 of ‘Node* ParseFuncOrColumn(ParseState*, List*, List*, FuncCall*, int, bool)’ [-Wconversion-null]
+          list_make1(expr), (FuncCall*)last_srf, NULL, loc);
+                                                          ^
+parse_cypher_expr.cpp: In function ‘Node* coerce_all_to_jsonb(ParseState*, Node*)’:
+parse_cypher_expr.cpp:2344:28: warning: passing NULL to non-pointer argument 5 of ‘Node* ParseFuncOrColumn(ParseState*, List*, List*, FuncCall*, int, bool)’ [-Wconversion-null]
+          exprLocation(expr));
+                            ^
+make[2]: *** [../common/backend-recursive] Error 2
+make[2]: *** Waiting for unfinished jobs....
+In file included from ../../../../src/include/postgres.h:54:0,
+                 from nodeModifyGraph.cpp:11:
+nodeModifyGraph.cpp: In function ‘ItemPointerData* updateElemProp(ModifyGraphState*, Oid, Datum, Datum)’:
+nodeModifyGraph.cpp:1339:45: warning: too many arguments for format [-Wformat-extra-args]
+        GraphidGetLocid(DatumGetGraphid(gid)))));
+                                             ^
+../../../../src/include/utils/elog.h:124:83: note: in definition of macro ‘ereport_domain’
+     (errstart(elevel, __FILE__, __LINE__, PG_FUNCNAME_MACRO, domain) ? (errfinish rest) : (void)0)
+                                                                                   ^~~~
+nodeModifyGraph.cpp:1335:4: note: in expansion of macro ‘ereport’
+    ereport(ERROR,
+    ^~~~~~~
+nodeModifyGraph.cpp: In function ‘void enterSetPropTable(ModifyGraphState*, Datum, Datum)’:
+nodeModifyGraph.cpp:1719:35: warning: too many arguments for format [-Wformat-extra-args]
+        GraphidGetLocid(entry->key))));
+                                   ^
+../../../../src/include/utils/elog.h:124:83: note: in definition of macro ‘ereport_domain’
+     (errstart(elevel, __FILE__, __LINE__, PG_FUNCNAME_MACRO, domain) ? (errfinish rest) : (void)0)
+                                                                                   ^~~~
+nodeModifyGraph.cpp:1715:4: note: in expansion of macro ‘ereport’
+    ereport(ERROR,
+    ^~~~~~~
+In file included from graphcmds.cpp:31:0:
+../../../../src/include/commands/event_trigger.h:40:1: warning: multi-line comment [-Wcomment]
+ // #define CALLED_AS_EVENT_TRIGGER(fcinfo) \
+ ^
+make[1]: *** [install-gausskernel-recurse] Error 2
+make: *** [install-src-recurse] Error 2

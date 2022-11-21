@@ -108,6 +108,8 @@ typedef FormData_pg_aggregate *Form_pg_aggregate;
  * ---------------
  */
 
+
+DATA(insert ( 3251	jsonb_agg_transfn	-   jsonb_agg_finalfn   0	2281    _null_ _null_   n   0));
 /* avg */
 #ifdef PGXC
 DATA(insert ( 2100	int8_avg_accum	numeric_avg_collect	numeric_avg		0	1231	"{0,0}" "{0,0}" 	n	0));
@@ -166,6 +168,7 @@ DATA(insert ( 2127	timestamptz_larger	timestamptz_larger	-		1324	1184	_null_ _nu
 DATA(insert ( 2128	interval_larger interval_larger -				1334	1186	_null_ _null_ 	n	0));
 DATA(insert ( 2129	text_larger		text_larger		-				666		25		_null_ _null_ 	n	0));
 DATA(insert ( 2130	numeric_larger	numeric_larger	-				1756	1700	_null_ _null_ 	n	0));
+DATA(insert ( 6668	network_larger		network_larger		-		1205	869	   _null_ _null_ 	n	0));
 #define NUMERICLARGERFUNCOID 2130
 DATA(insert ( 2050	array_larger	array_larger	-				1073	2277	_null_ _null_ 	n	0));
 DATA(insert ( 2244	bpchar_larger	bpchar_larger	-				1060	1042	_null_ _null_ 	n	0));
@@ -196,6 +199,7 @@ DATA(insert ( 2143	timestamptz_smaller timestamptz_smaller -		1322	1184	_null_ _
 DATA(insert ( 2144	interval_smaller	interval_smaller	-		1332	1186	_null_ _null_ 	n	0));
 DATA(insert ( 2145	text_smaller	text_smaller	-				664		25		_null_ _null_ 	n	0));
 DATA(insert ( 2146	numeric_smaller numeric_smaller -				1754	1700	_null_ _null_ 	n	0));
+DATA(insert ( 6669	network_smaller		network_smaller		-		1203	869	    _null_ _null_ 	n	0));
 #define NUMERICSMALLERFUNCOID 2146
 DATA(insert ( 2051	array_smaller	array_smaller	-				1072	2277	_null_ _null_ 	n	0));
 DATA(insert ( 2245	bpchar_smaller	bpchar_smaller	-				1058	1042	_null_ _null_ 	n	0));
@@ -471,6 +475,13 @@ DATA(insert (4461 ordered_set_transition - mode_final 0 2281 _null_ _null_ o 0))
 
 DATA(insert (5555 median_transfn      -    median_float8_finalfn            0   2281    _null_   _null_ 	 n 0));
 DATA(insert (5556 median_transfn      -    median_interval_finalfn          0   2281    _null_   _null_ 	 n 0));
+
+/* percentile */
+DATA(insert ( 9990	tdigest_merge		tdigest_merge_to_one		calculate_quantile_of				0	4406	_null_ _null_ 	n	0));
+#define ADDTDIGESTMERGEOID 9990
+
+DATA(insert ( 9986	tdigest_mergep		tdigest_merge_to_one		calculate_value_at				0	4406	_null_ _null_ 	n	0));
+#define ADDTDIGESTMERGEPOID 9986
 
 /*
  * prototypes for functions in pg_aggregate.c

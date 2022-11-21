@@ -29,7 +29,7 @@
 #include "commands/trigger.h"
 #endif
 #include "executor/executor.h"
-#include "executor/nodeRecursiveunion.h"
+#include "executor/node/nodeRecursiveunion.h"
 #include "pgxc/execRemote.h"
 #include "nodes/nodes.h"
 #include "access/printtup.h"
@@ -49,7 +49,7 @@
 #include "libcomm/libcomm.h"
 #include "libpq/pqformat.h"
 #include <sys/poll.h>
-#include "executor/execStream.h"
+#include "executor/exec/execStream.h"
 #include "postmaster/postmaster.h"
 #include "access/transam.h"
 #include "gssignal/gs_signal.h"
@@ -275,6 +275,7 @@ void StreamSaveTxnContext(StreamTxnContext* stc)
     StreamTxnContextSaveComboCid(stc);
     StreamTxnContextSaveXact(stc);
     StreamTxnContextSaveSnapmgr(stc);
+    StreamTxnContextSaveInvalidMsg(stc);
 }
 
 void StreamRestoreTxnContext(StreamTxnContext* stc)
@@ -282,6 +283,7 @@ void StreamRestoreTxnContext(StreamTxnContext* stc)
     StreamTxnContextRestoreComboCid(stc);
     StreamTxnContextRestoreXact(stc);
     StreamTxnContextRestoreSnapmgr(stc);
+    StreamTxnContextRestoreInvalidMsg(stc);
 }
 
 /*
@@ -483,7 +485,7 @@ void InitStreamMergeSort(StreamState* node)
 static void CheckStreamMatchInfo(
     StreamFlowCheckInfo checkInfo, int plan_node_id, List* consumerExecNode, int consumerDop, bool isLocalStream)
 {
-#ifdef ENBALE_MULTIPLE_NODES
+#ifdef ENABLE_MULTIPLE_NODES
     /* 1.Check exec_nodes. */
     if (checkInfo.parentProducerExecNodeList == NIL) {
         ereport(ERROR,
@@ -720,6 +722,7 @@ static void InitStream(StreamFlowCtl* ctl, StreamTransType transType)
             producer->setSharedContext(sharedContext);
             producer->setUniqueSQLKey(u_sess->unique_sql_cxt.unique_sql_id,
                 u_sess->unique_sql_cxt.unique_sql_user_id, u_sess->unique_sql_cxt.unique_sql_cn_id);
+            producer->setGlobalSessionId(&u_sess->globalSessionId);
             producerSMPList = lappend(producerSMPList, producer);
 
             /* Add all producer to node group to avoid possible consumer-not-deinit */
@@ -738,6 +741,7 @@ static void InitStream(StreamFlowCtl* ctl, StreamTransType transType)
             StreamProducer(key, pstmt, streamNode, u_sess->stream_cxt.stream_runtime_mem_cxt, consumerNum, transType);
         producer->setUniqueSQLKey(u_sess->unique_sql_cxt.unique_sql_id,
             u_sess->unique_sql_cxt.unique_sql_user_id, u_sess->unique_sql_cxt.unique_sql_cn_id);
+        producer->setGlobalSessionId(&u_sess->globalSessionId);
         producerSMPList = lappend(producerSMPList, producer);
     }
 
@@ -950,7 +954,7 @@ void InitStreamContext()
     char context_name[NAMEDATALEN] = {0};
     errno_t rc = EOK;
 
-    /* Append tid to identify each postgres thread. */
+    /* Append tid to identify each openGauss thread. */
     rc = snprintf_s(context_name, NAMEDATALEN, NAMEDATALEN - 1, "StreamRuntimeContext__%lu", u_sess->debug_query_id);
     securec_check_ss(rc, "\0", "\0");
     u_sess->stream_cxt.stream_runtime_mem_cxt = AllocSetContextCreate(g_instance.instance_context,
@@ -961,7 +965,7 @@ void InitStreamContext()
         SHARED_CONTEXT);
 
     if (IS_PGXC_DATANODE) {
-        /* Append tid to identify each postgres thread. */
+        /* Append tid to identify each openGauss thread. */
         rc = snprintf_s(
             context_name, NAMEDATALEN, NAMEDATALEN - 1, "MemoryDataExchangeContext_%lu", u_sess->debug_query_id);
         securec_check_ss(rc, "\0", "\0");

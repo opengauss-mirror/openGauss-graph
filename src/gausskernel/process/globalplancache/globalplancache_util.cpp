@@ -237,6 +237,8 @@ void GPCResetAll()
 
 void GPCCleanDatanodeStatement(int dn_stmt_num, const char* stmt_name)
 {
+    if (stmt_name == NULL || stmt_name[0] == '\0' || !IS_PGXC_COORDINATOR)
+        return;
     int n = 0;
     char *tmp_name = NULL;
     for (n = 0; n < dn_stmt_num; n++) {
@@ -277,9 +279,6 @@ void CNGPCCleanUpSession()
         return;
     }
 
-    if (u_sess->plsql_cxt.plpgsql_HashTable) {
-        plpgsql_HashTableDeleteAll();
-    }
     DropAllPreparedStatements();
     /* if in shared memory, delete context. */
     CachedPlanSource* psrc = u_sess->pcache_cxt.ungpc_saved_plan;
@@ -292,6 +291,46 @@ void CNGPCCleanUpSession()
         psrc = next;
     }
     psrc = u_sess->pcache_cxt.first_saved_plan;
+    while (psrc != NULL) {
+        next = psrc->next_saved;
+        Assert (!psrc->gpc.status.InShareTable());
+        if (!psrc->gpc.status.IsPrivatePlan())
+            DropCachedPlan(psrc);
+        psrc = next;
+    }
+}
+
+void GPCCleanUpSessionSavedPlan()
+{
+    if (!ENABLE_GPC) {
+        return;
+    }
+    if (u_sess->pcache_cxt.first_saved_plan == NULL &&
+        u_sess->pcache_cxt.unnamed_stmt_psrc == NULL &&
+        u_sess->pcache_cxt.ungpc_saved_plan == NULL) {
+        return;
+    }
+    /* unnamed_stmt_psrc only save shared gpc plan or private plan,
+     * so we only need to sub refcount for shared plan. */
+    if (u_sess->pcache_cxt.unnamed_stmt_psrc && u_sess->pcache_cxt.unnamed_stmt_psrc->gpc.status.InShareTable()) {
+        u_sess->pcache_cxt.unnamed_stmt_psrc->gpc.status.SubRefCount();
+        u_sess->pcache_cxt.unnamed_stmt_psrc = NULL;
+    }
+    /* if in shared memory, delete context. */
+    /* For DN and CN */
+    CachedPlanSource* psrc = u_sess->pcache_cxt.first_saved_plan;
+    CachedPlanSource* next = NULL;
+    u_sess->pcache_cxt.first_saved_plan = NULL;
+    while (psrc != NULL) {
+        next = psrc->next_saved;
+        Assert (!psrc->gpc.status.InShareTable());
+        if (!psrc->gpc.status.IsPrivatePlan())
+            DropCachedPlan(psrc);
+        psrc = next;
+    }
+    /* For CN */
+    psrc = u_sess->pcache_cxt.ungpc_saved_plan;
+    next = NULL;
     while (psrc != NULL) {
         next = psrc->next_saved;
         Assert (!psrc->gpc.status.InShareTable());
@@ -684,6 +723,11 @@ void set_func_expr_unique_id(PLpgSQL_function* func)
             case PLPGSQL_DTYPE_ARRAYELEM:
                 set_id_expr(((PLpgSQL_arrayelem*)d)->subscript, &unique_id);
                 break;
+            case PLPGSQL_DTYPE_ROW:
+            case PLPGSQL_DTYPE_RECORD: {
+                PLpgSQL_row* row = (PLpgSQL_row*)d;
+                set_id_expr(row->default_val, &unique_id);
+            } break;
             default:
                 break;
         }

@@ -6,6 +6,7 @@
  * Portions Copyright (c) 2020 Huawei Technologies Co.,Ltd.
  * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
+ * Portions Copyright (c) 2021, openGauss Contributors
  *
  *
  * IDENTIFICATION
@@ -22,6 +23,7 @@
 #include "catalog/namespace.h"
 #include "catalog/pg_largeobject.h"
 #include "catalog/pg_namespace.h"
+#include "catalog/pg_subscription.h"
 #include "catalog/pg_synonym.h"
 #include "commands/alter.h"
 #include "commands/collationcmds.h"
@@ -31,7 +33,9 @@
 #include "commands/directory.h"
 #include "commands/extension.h"
 #include "commands/proclang.h"
+#include "commands/publicationcmds.h"
 #include "commands/schemacmds.h"
+#include "commands/subscriptioncmds.h"
 #include "commands/sec_rls_cmds.h"
 #include "commands/tablecmds.h"
 #include "commands/tablespace.h"
@@ -107,6 +111,14 @@ void ExecRenameStmt(RenameStmt* stmt)
         case OBJECT_PARTITION_INDEX:
             renamePartitionIndex(stmt);
             break;
+        
+        case OBJECT_PUBLICATION:
+            RenamePublication(stmt->object, stmt->newname);
+            break;
+
+        case OBJECT_SUBSCRIPTION:
+            RenameSubscription(stmt->object, stmt->newname);
+            break;
 
         case OBJECT_RLSPOLICY:
             RenameRlsPolicy(stmt);
@@ -136,6 +148,7 @@ void ExecRenameStmt(RenameStmt* stmt)
 
         case OBJECT_TABLE:
         case OBJECT_SEQUENCE:
+        case OBJECT_LARGE_SEQUENCE:
         case OBJECT_VIEW:
         case OBJECT_CONTQUERY:
         case OBJECT_MATVIEW:
@@ -229,6 +242,7 @@ void ExecAlterObjectSchemaStmt(AlterObjectSchemaStmt* stmt)
             break;
 
         case OBJECT_SEQUENCE:
+        case OBJECT_LARGE_SEQUENCE:
         case OBJECT_TABLE:
         case OBJECT_VIEW:
         case OBJECT_CONTQUERY:
@@ -519,6 +533,9 @@ void ExecAlterOwnerStmt(AlterOwnerStmt* stmt)
             AlterFunctionOwner(stmt->object, stmt->objarg, newowner);
             break;
 
+        case OBJECT_PACKAGE:
+            AlterPackageOwner(stmt->object, newowner);
+            break;
         case OBJECT_LANGUAGE:
             AlterLanguageOwner(strVal(linitial(stmt->object)), newowner);
             break;
@@ -579,6 +596,14 @@ void ExecAlterOwnerStmt(AlterOwnerStmt* stmt)
 
         case OBJECT_SYNONYM:
             AlterSynonymOwner(stmt->object, newowner);
+            break;
+
+        case OBJECT_PUBLICATION:
+            AlterPublicationOwner(strVal(linitial(stmt->object)), newowner);
+            break;
+
+        case OBJECT_SUBSCRIPTION:
+            AlterSubscriptionOwner(strVal(linitial(stmt->object)), newowner);
             break;
 
         default:

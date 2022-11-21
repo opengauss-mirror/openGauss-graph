@@ -24,7 +24,7 @@
 #include "codegen/gscodegen.h"
 #include "codegen/vecexprcodegen.h"
 #include "executor/executor.h"
-#include "executor/nodeGroup.h"
+#include "executor/node/nodeGroup.h"
 #include "vecexecutor/vecgroup.h"
 #include "vecexecutor/vecgrpuniq.h"
 

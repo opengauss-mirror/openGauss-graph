@@ -6,6 +6,7 @@
  * Portions Copyright (c) 2020 Huawei Technologies Co.,Ltd.
  * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
+ * Portions Copyright (c) 2021, openGauss Contributors
  *
  * IDENTIFICATION
  *	    src/gausskernel/runtime/executor/execAmi.cpp
@@ -15,43 +16,43 @@
 #include "postgres.h"
 #include "knl/knl_variable.h"
 
-#include "executor/execdebug.h"
-#include "executor/nodeAgg.h"
-#include "executor/nodeAppend.h"
-#include "executor/nodeBitmapAnd.h"
-#include "executor/nodeBitmapHeapscan.h"
-#include "executor/nodeBitmapIndexscan.h"
-#include "executor/nodeBitmapOr.h"
-#include "executor/nodeCtescan.h"
-#include "executor/nodeExtensible.h"
-#include "executor/nodeForeignscan.h"
-#include "executor/nodeFunctionscan.h"
-#include "executor/nodeGroup.h"
-#include "executor/nodeGroup.h"
-#include "executor/nodeHash.h"
-#include "executor/nodeHashjoin.h"
-#include "executor/nodeIndexonlyscan.h"
-#include "executor/nodeIndexscan.h"
-#include "executor/nodeLimit.h"
-#include "executor/nodeLockRows.h"
-#include "executor/nodeMaterial.h"
-#include "executor/nodeMergeAppend.h"
-#include "executor/nodeMergejoin.h"
-#include "executor/nodeModifyTable.h"
-#include "executor/nodeNestloop.h"
-#include "executor/nodePartIterator.h"
-#include "executor/nodeRecursiveunion.h"
-#include "executor/nodeResult.h"
-#include "executor/nodeSeqscan.h"
-#include "executor/nodeSetOp.h"
-#include "executor/nodeSort.h"
-#include "executor/nodeSubplan.h"
-#include "executor/nodeSubqueryscan.h"
-#include "executor/nodeTidscan.h"
-#include "executor/nodeUnique.h"
-#include "executor/nodeValuesscan.h"
-#include "executor/nodeWindowAgg.h"
-#include "executor/nodeWorktablescan.h"
+#include "executor/exec/execdebug.h"
+#include "executor/node/nodeAgg.h"
+#include "executor/node/nodeAppend.h"
+#include "executor/node/nodeBitmapAnd.h"
+#include "executor/node/nodeBitmapHeapscan.h"
+#include "executor/node/nodeBitmapIndexscan.h"
+#include "executor/node/nodeBitmapOr.h"
+#include "executor/node/nodeCtescan.h"
+#include "executor/node/nodeExtensible.h"
+#include "executor/node/nodeForeignscan.h"
+#include "executor/node/nodeFunctionscan.h"
+#include "executor/node/nodeGroup.h"
+#include "executor/node/nodeGroup.h"
+#include "executor/node/nodeHash.h"
+#include "executor/node/nodeHashjoin.h"
+#include "executor/node/nodeIndexonlyscan.h"
+#include "executor/node/nodeIndexscan.h"
+#include "executor/node/nodeLimit.h"
+#include "executor/node/nodeLockRows.h"
+#include "executor/node/nodeMaterial.h"
+#include "executor/node/nodeMergeAppend.h"
+#include "executor/node/nodeMergejoin.h"
+#include "executor/node/nodeModifyTable.h"
+#include "executor/node/nodeNestloop.h"
+#include "executor/node/nodePartIterator.h"
+#include "executor/node/nodeRecursiveunion.h"
+#include "executor/node/nodeResult.h"
+#include "executor/node/nodeSeqscan.h"
+#include "executor/node/nodeSetOp.h"
+#include "executor/node/nodeSort.h"
+#include "executor/node/nodeSubplan.h"
+#include "executor/node/nodeSubqueryscan.h"
+#include "executor/node/nodeTidscan.h"
+#include "executor/node/nodeUnique.h"
+#include "executor/node/nodeValuesscan.h"
+#include "executor/node/nodeWindowAgg.h"
+#include "executor/node/nodeWorktablescan.h"
 #include "nodes/nodeFuncs.h"
 #include "vecexecutor/vecnodes.h"
 #include "vecexecutor/vecnodevectorow.h"
@@ -61,7 +62,9 @@
 #ifdef PGXC
 #include "pgxc/execRemote.h"
 #endif
-
+#ifdef GS_GRAPH
+#include "executor/node/nodeNestloopVle.h"
+#endif
 static bool target_list_supports_backward_scan(List* targetlist);
 static bool index_supports_backward_scan(Oid indexid);
 
@@ -117,6 +120,10 @@ void ExecReScanByType(PlanState* node)
 
         case T_RecursiveUnionState:
             ExecReScanRecursiveUnion((RecursiveUnionState*)node);
+            break;
+
+        case T_StartWithOpState:
+            ExecReScanStartWithOp((StartWithOpState *)node);
             break;
 
         case T_BitmapAndState:
@@ -194,6 +201,12 @@ void ExecReScanByType(PlanState* node)
         case T_NestLoopState:
             ExecReScanNestLoop((NestLoopState*)node);
             break;
+
+#ifdef GS_GRAPH
+        case T_NestLoopVLEState:
+			ExecReScanNestLoopVLE((NestLoopVLEState *) node);
+			break;
+#endif
 
         case T_MergeJoinState:
             ExecReScanMergeJoin((MergeJoinState*)node);
@@ -638,3 +651,63 @@ bool ExecMaterializesOutput(NodeTag plantype)
 
     return false;
 }
+
+#ifdef GS_GRAPH
+void
+ExecNextContext(PlanState *node)
+{
+	switch (nodeTag(node))
+	{
+		case T_SeqScanState:
+			ExecNextSeqScanContext((SeqScanState *) node);
+			break;
+		case T_IndexScanState:
+			ExecNextIndexScanContext((IndexScanState *) node);
+			break;
+		case T_IndexOnlyScanState:
+			ExecNextIndexOnlyScanContext((IndexOnlyScanState *) node);
+			break;
+		case T_AppendState:
+			ExecNextAppendContext((AppendState *) node);
+			break;
+		case T_ResultState:
+			ExecNextResultContext((ResultState *) node);
+			break;
+		case T_NestLoopState:
+			ExecNextNestLoopContext((NestLoopState *) node);
+			break;
+		default:
+			elog(ERROR, "unrecognized node type: %d", (int) nodeTag(node));
+			break;
+	}
+}
+
+void
+ExecPrevContext(PlanState *node)
+{
+	switch (nodeTag(node))
+	{
+		case T_SeqScanState:
+			ExecPrevSeqScanContext((SeqScanState *) node);
+			break;
+		case T_IndexScanState:
+			ExecPrevIndexScanContext((IndexScanState *) node);
+			break;
+		case T_IndexOnlyScanState:
+			ExecPrevIndexOnlyScanContext((IndexOnlyScanState *) node);
+			break;
+		case T_AppendState:
+			ExecPrevAppendContext((AppendState *) node);
+			break;
+		case T_ResultState:
+			ExecPrevResultContext((ResultState *) node);
+			break;
+		case T_NestLoopState:
+			ExecPrevNestLoopContext((NestLoopState *) node);
+			break;
+		default:
+			elog(ERROR, "unrecognized node type: %d", (int) nodeTag(node));
+			break;
+	}
+}
+#endif

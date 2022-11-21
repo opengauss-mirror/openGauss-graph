@@ -8,6 +8,7 @@
  * Portions Copyright (c) 1994, Regents of the University of California
  * Portions Copyright (c) 2010-2012 Postgres-XC Development Group
  *
+ * Portions Copyright (c) 2021, openGauss Contributors
  * src/include/nodes/nodes.h
  *
  * -------------------------------------------------------------------------
@@ -50,6 +51,7 @@ typedef enum NodeTag {
     T_PartIterator,
     T_MergeAppend,
     T_RecursiveUnion,
+    T_StartWithOp,
     T_BitmapAnd,
     T_BitmapOr,
     T_Scan,
@@ -68,6 +70,9 @@ typedef enum NodeTag {
     T_ExtensiblePlan,
     T_Join,
     T_NestLoop,
+#ifdef GS_GRAPH
+    T_NestLoopVLE,
+#endif 
     T_MergeJoin,
     T_HashJoin,
     T_Material,
@@ -80,6 +85,12 @@ typedef enum NodeTag {
     T_SetOp,
     T_LockRows,
     T_Limit,
+    T_ModifyGraph,
+    T_ModifyGraphPath,
+    T_SparqlLoadPlan,
+	T_Shortestpath,
+	T_Hash2Side,
+	T_Dijkstra,
     T_Stream,
 #ifdef PGXC
     /*
@@ -102,6 +113,8 @@ typedef enum NodeTag {
     T_CreateResourcePoolStmt,
     T_AlterResourcePoolStmt,
     T_DropResourcePoolStmt,
+    T_AlterGlobalConfigStmt,
+    T_DropGlobalConfigStmt,
     T_CreateWorkloadGroupStmt,
     T_AlterWorkloadGroupStmt,
     T_DropWorkloadGroupStmt,
@@ -114,6 +127,7 @@ typedef enum NodeTag {
     T_PartIteratorParam,
     T_PlanRowMark,
     T_PlanInvalItem,
+    T_FuncInvalItem,
     /* TAGS FOR POLICY LABEL */
     T_PolicyFilterNode,
     T_CreatePolicyLabelStmt,
@@ -129,7 +143,7 @@ typedef enum NodeTag {
     T_CreateSecurityPolicyStmt,
 	T_AlterSecurityPolicyStmt,
 	T_DropSecurityPolicyStmt,
-    
+    T_AlterSchemaStmt,
     /*
      * TAGS FOR PLAN STATE NODES (execnodes.h)
      *
@@ -137,16 +151,22 @@ typedef enum NodeTag {
      */
     T_PlanState = 200,
     T_ResultState,
+    T_VecToRowState,
     T_MergeActionState,
     T_ModifyTableState,
+    T_ModifyGraphState,
+    T_SparqlLoadState,
     T_DistInsertSelectState,
     T_AppendState,
     T_PartIteratorState,
     T_MergeAppendState,
     T_RecursiveUnionState,
+    T_StartWithOpState,
     T_BitmapAndState,
     T_BitmapOrState,
     T_ScanState,
+    T_SeqScanState,
+    T_IndexScanState,
     T_IndexOnlyScanState,
     T_BitmapIndexScanState,
     T_BitmapHeapScanState,
@@ -160,6 +180,9 @@ typedef enum NodeTag {
     T_ExtensiblePlanState,
     T_JoinState,
     T_NestLoopState,
+#ifdef GS_GRAPH
+    T_NestLoopVLEState,
+#endif
     T_MergeJoinState,
     T_HashJoinState,
     T_MaterialState,
@@ -175,6 +198,7 @@ typedef enum NodeTag {
 #ifdef PGXC
     T_RemoteQueryState,
 #endif
+    T_TrainModelState,
     T_StreamState,
 
     /*
@@ -239,6 +263,7 @@ typedef enum NodeTag {
     T_HashFilter,
     T_EstSPNode,
     T_Rownum,
+    T_PseudoTargetEntry,
 
     /*
      * TAGS FOR EXPRESSION STATE NODES (execnodes.h)
@@ -281,6 +306,7 @@ typedef enum NodeTag {
     T_RangePartitionindexDefState,
     T_SplitPartitionState,
     T_AddPartitionState,
+    T_AddSubPartitionState,
     T_RangePartitionStartEndDefState,
     T_RownumState,
     T_ListPartitionDefState,
@@ -383,6 +409,7 @@ typedef enum NodeTag {
     T_SetOperationStmt,
     T_GrantStmt,
     T_GrantRoleStmt,
+    T_GrantDbStmt,
     T_AlterDefaultPrivilegesStmt,
     T_ClosePortalStmt,
     T_ClusterStmt,
@@ -394,6 +421,8 @@ typedef enum NodeTag {
     T_DropForeignStmt,
 #endif
     T_TruncateStmt,
+    T_PurgeStmt,
+    T_TimeCapsuleStmt,
     T_CommentStmt,
     T_FetchStmt,
     T_IndexStmt,
@@ -413,7 +442,10 @@ typedef enum NodeTag {
     T_DropdbStmt,
     T_VacuumStmt,
     T_ExplainStmt,
+    T_CreateLabelStmt,
+    T_AlterLabelStmt,
     T_CreateTableAsStmt,
+    T_CreateGraphStmt,
     T_CreateSeqStmt,
     T_AlterSeqStmt,
     T_VariableSetStmt,
@@ -452,6 +484,7 @@ typedef enum NodeTag {
     T_DropOwnedStmt,
     T_ReassignOwnedStmt,
     T_CompositeTypeStmt,
+    T_TableOfTypeStmt,
     T_CreateEnumStmt,
     T_CreateRangeStmt,
     T_AlterEnumStmt,
@@ -485,7 +518,20 @@ typedef enum NodeTag {
 #endif
     T_CreateWeakPasswordDictionaryStmt,
     T_DropWeakPasswordDictionaryStmt,
-
+    T_CreatePackageStmt,
+    T_CreatePackageBodyStmt,
+    T_AddTableIntoCBIState,
+	T_CreatePublicationStmt,
+	T_AlterPublicationStmt,
+	T_CreateSubscriptionStmt,
+	T_AlterSubscriptionStmt,
+	T_DropSubscriptionStmt,
+#ifdef GS_GRAPH
+    T_CypherStmt,
+    T_CypherProjection,
+    T_AlterEventTrigStmt,
+#endif
+    
     /*
      * TAGS FOR PARSE TREE NODES (parsenodes.h)
      */
@@ -506,6 +552,7 @@ typedef enum NodeTag {
     T_RangeSubselect,
     T_RangeFunction,
     T_RangeTableSample,
+    T_RangeTimeCapsule,
     T_TypeName,
     T_ColumnDef,
     T_IndexElem,
@@ -513,12 +560,14 @@ typedef enum NodeTag {
     T_DefElem,
     T_RangeTblEntry,
     T_TableSampleClause,
+    T_TimeCapsuleClause,
     T_SortGroupClause,
     T_GroupingSet,
     T_WindowClause,
     T_PrivGrantee,
     T_FuncWithArgs,
     T_AccessPriv,
+    T_DbPriv,
     T_CreateOpClassItem,
     T_TableLikeClause,
     T_FunctionParameter,
@@ -527,10 +576,25 @@ typedef enum NodeTag {
     T_XmlSerialize,
     T_WithClause,
     T_CommonTableExpr,
+    T_StartWithOptions,
     T_PruningResult,
+    T_SubPartitionPruningResult,
     T_Position,
+    T_LoadWhenExpr,
     T_MergeWhenClause,
 	T_UpsertClause,
+	T_CopyColExpr,
+    T_StartWithClause,
+    T_StartWithTargetRelInfo,
+    T_StartWithInfo,
+    T_SqlLoadColPosInfo,
+    T_SqlLoadScalarSpec,
+    T_SqlLoadSequInfo,
+    T_SqlLoadFillerInfo,
+    T_SqlLoadConsInfo,
+    T_SqlLoadColExpr,
+    T_RoleSpec,
+
     /*
      * TAGS FOR REPLICATION GRAMMAR PARSE NODES (replnodes.h)
      */
@@ -557,7 +621,7 @@ typedef enum NodeTag {
      * purposes (usually because they are involved in APIs where we want to
      * pass multiple object types through the same pointer).
      */
-    T_TriggerData = 960, /* in commands/trigger.h */
+    T_TriggerData = 970, /* in commands/trigger.h */
     T_ReturnSetInfo,     /* in nodes/execnodes.h */
     T_WindowObjectData,  /* private in nodeWindowAgg.c */
     T_TIDBitmap,         /* in nodes/tidbitmap.h */
@@ -625,10 +689,9 @@ typedef enum NodeTag {
     /*
      * Vectorized Execution Nodes
      */
-    T_VecToRowState = 2000,
 
     // this must put first for vector engine runtime state
-    T_VecStartState,
+    T_VecStartState = 2001,
 
     T_RowToVecState,
     T_VecAggState,
@@ -661,8 +724,6 @@ typedef enum NodeTag {
     T_VecMaterialState,
     T_VecMergeJoinState,
     T_VecWindowAggState,
-    T_SeqScanState,
-    T_IndexScanState,
 
     // this must put last for vector engine runtime state
     T_VecEndState,
@@ -682,7 +743,7 @@ typedef enum NodeTag {
     T_GroupingId,
     T_GroupingIdExprState,
     T_BloomFilterSet,
-    /* Hint type. */
+    /* Hint type. Please only append new tag after the last hint type and never change the order. */
     T_HintState,
     T_OuterInnerRels,
     T_JoinMethodHint,
@@ -693,7 +754,14 @@ typedef enum NodeTag {
     T_ScanMethodHint,
     T_MultiNodeHint,
     T_PredpushHint,
+    T_PredpushSameLevelHint,
+    T_SkewHint,
     T_RewriteHint,
+    T_GatherHint,
+    T_SetHint,
+    T_PlanCacheHint,
+    T_NoExpandHint,
+    T_NoGPCHint,
 
     /*
      * pgfdw
@@ -702,7 +770,6 @@ typedef enum NodeTag {
 
     /* Create table like. */
     T_TableLikeCtx,
-    T_SkewHint,
 
     /* Skew Hint Transform Info */
     T_SkewHintTransf,
@@ -729,13 +796,85 @@ typedef enum NodeTag {
     // DB4AI
     T_CreateModelStmt = 5000,
     T_PredictByFunction,
-    T_GradientDescent,
-    T_GradientDescentState,
-    T_GradientDescentExpr,
-    T_GradientDescentExprState,
-    T_KMeans,
-    T_KMeansState,
+    T_TrainModel,
+    T_ExplainModelStmt,
     // End DB4AI
+
+    /* Plpgsql */
+    T_PLDebug_variable,
+    T_PLDebug_breakPoint,
+    T_PLDebug_frame,
+
+    T_TdigestData,
+    T_CentroidPoint,
+    T_CypherSubPattern,
+    T_CypherClause,
+    T_CypherCreateClause,
+    T_CypherDeleteClause,
+    T_CypherSetClause,
+    T_CypherMergeClause,
+    T_CypherMatchClause,
+    T_CypherLoadClause,
+    T_CypherTypeCast,
+    T_CypherTypeCastState,
+    T_CypherMapExpr,
+    T_CypherMapState,
+    T_CypherListExpr,
+    T_CypherListCompExpr,
+    T_CypherListCompVar,
+    T_CypherAccessExpr,
+    T_CypherAccessState,
+    T_CypherIndices,
+    T_DropConstraintStmt,
+    T_CreateConstraintStmt,
+    T_CreatePropertyIndexStmt,
+    T_CypherListComp,
+    T_CypherGenericExpr,
+    T_CypherPath,
+    T_CypherNode,
+    T_CypherRel,
+    T_CypherName,
+    T_CypherSetProp,
+    T_GraphPath,
+    T_GraphVertex,
+    T_GraphEdge,
+    T_GraphSetProp,
+    T_GraphDelElem,
+    T_InferenceElem,
+    T_InferClause,
+    T_DisableIndexStmt,
+    T_DropPropertyIndexStmt,
+
+    /*
+	 * TAGS FOR SPARQL
+	 */
+    T_SparqlStmt,
+    T_SparqlLoadStmt,
+	T_SparqlSelectStmt,
+	T_SparqlWhere,
+	T_SparqlTriple,
+	T_SparqlProp,
+	T_SparqlPreObj,
+	//T_SparqlIri,
+	T_SparqlVar,
+	T_SparqlString,
+	T_SparqlBlank,
+	T_SparqlPathOr,
+	T_SparqlPathAnd,
+	T_SparqlPathEl,
+	T_SparqlPageRankStmt,
+	T_SparqlPageRankList,
+    T_SparqlPrefixClause, /* for spar_prefix_clause (keyword:PREFIX) */
+    T_SparqlIri, /*for spar_iriref & spar_qname (keyword:PREFIX) */
+	T_Triple,
+	T_SparqlTextSearch,
+    /* SPARQL INSERT*/
+    T_SparqlInsertStmt,
+    T_SparqlQuadPart,
+    T_SparqlQuadTriple,
+    T_SparqlQuadPreObj,
+    T_SparqlTriplesNode,
+    T_SparqlDeleteDataStmt
 } NodeTag;
 
 /* if you add to NodeTag also need to add nodeTagToString */
@@ -887,7 +1026,11 @@ typedef enum CmdType {
     CMD_DDL,
     CMD_DCL,
     CMD_DML,
-    CMD_TCL
+    CMD_TCL,
+#ifdef GS_GRAPH
+    CMD_GRAPHWRITE,	 /* graph write query */
+    CMD_SPARQLLOAD,  /* sparql load */
+#endif /* GS_GRAPH */
 } CmdType;
 
 /*
@@ -933,11 +1076,19 @@ typedef enum JoinType {
     JOIN_RIGHT_ANTI, /* Right Anti join */
 
     JOIN_LEFT_ANTI_FULL, /* unmatched LHS tuples */
-    JOIN_RIGHT_ANTI_FULL /* unmatched RHS tuples */
+    JOIN_RIGHT_ANTI_FULL, /* unmatched RHS tuples */
 
     /*
      * We might need additional join types someday.
      */
+#ifdef GS_GRAPH
+    /* This is similar to JOIN_LEFT but only for Cypher MERGE clause. */
+	JOIN_CYPHER_MERGE,
+	JOIN_VLE,
+
+	/* For Cypher DELETE */
+	JOIN_CYPHER_DELETE
+#endif    
 } JoinType;
 
 /*
@@ -967,5 +1118,50 @@ typedef enum UpsertAction
     UPSERT_NOTHING,         /* DUPLICATE KEY UPDATE NOTHING */
     UPSERT_UPDATE           /* DUPLICATE KEY UPDATE ... */
 }UpsertAction;
+
+struct CentroidPoint {
+    double mean;
+    int64 count;
+};
+
+struct TdigestData {
+    int32 vl_len_;
+    double compression; 
+    int cap;
+    int merged_nodes;
+    int unmerged_nodes;
+    double merged_count;
+    double unmerged_count;
+    double valuetoc;
+    CentroidPoint nodes[0];
+};
+
+
+/*
+ * OnConflictAction -
+ *	  "ON CONFLICT" clause type of query
+ *
+ * This is needed in both parsenodes.h and plannodes.h, so put it here...
+ */
+typedef enum OnConflictAction
+{
+	ONCONFLICT_NONE,			/* No "ON CONFLICT" clause */
+	ONCONFLICT_NOTHING,			/* ON CONFLICT ... DO NOTHING */
+	ONCONFLICT_UPDATE			/* ON CONFLICT ... DO UPDATE */
+} OnConflictAction;
+
+/*
+ * GraphWriteOp - enums for type of operation when CMD_GRAPHWRITE
+ *
+ * This is needed in both parsenodes.h and plannodes.h.
+ */
+typedef enum GraphWriteOp
+{
+	GWROP_NONE = 0,
+	GWROP_CREATE,
+	GWROP_DELETE,
+	GWROP_SET,
+	GWROP_MERGE
+} GraphWriteOp;
 
 #endif /* NODES_H */

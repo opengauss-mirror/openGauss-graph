@@ -32,11 +32,11 @@
 #include "pgstat.h"
 #include "postmaster/bgwriter.h"
 #include "storage/buf/bufmgr.h"
-#include "storage/fd.h"
+#include "storage/smgr/fd.h"
 #include "storage/ipc.h"
 #include "storage/lock/lwlock.h"
 #include "storage/proc.h"
-#include "storage/smgr.h"
+#include "storage/smgr/smgr.h"
 #include "utils/guc.h"
 #include "utils/hsearch.h"
 #include "utils/memutils.h"
@@ -62,7 +62,7 @@ void CBMWriterMain(void)
     ResourceOwner cbmwriter_resourceOwner;
 
     ereport(LOG, (errmsg("cbm writer started")));
-    u_sess->attr.attr_storage.CheckPointTimeout = g_instance.attr.attr_storage.enableIncrementalCheckpoint
+    u_sess->attr.attr_storage.CheckPointTimeout = ENABLE_INCRE_CKPT
                                                       ? u_sess->attr.attr_storage.incrCheckPointTimeout
                                                       : u_sess->attr.attr_storage.fullCheckPointTimeout;
 
@@ -100,7 +100,8 @@ void CBMWriterMain(void)
      * Create a resource owner to keep track of our resources (not clear that
      * we need this, but may as well have one).
      */
-    cbmwriter_resourceOwner = ResourceOwnerCreate(NULL, "CBM Writer", MEMORY_CONTEXT_STORAGE);
+    cbmwriter_resourceOwner = ResourceOwnerCreate(NULL, "CBM Writer",
+        THREAD_GET_MEM_CXT_GROUP(MEMORY_CONTEXT_STORAGE));
     t_thrd.utils_cxt.CurrentResourceOwner = cbmwriter_resourceOwner;
 
     /*
@@ -131,12 +132,16 @@ void CBMWriterMain(void)
         /* Since not using PG_TRY, must reset error stack by hand */
         t_thrd.log_cxt.error_context_stack = NULL;
 
+        t_thrd.log_cxt.call_stack = NULL;
+
         /* Prevent interrupts while cleaning up */
         HOLD_INTERRUPTS();
 
         /* Report the error to the server log */
         EmitErrorReport();
 
+        /* release resource held by lsc */
+        AtEOXact_SysDBCache(false);
         /*
          * These operations are really just a minimal subset of
          * AbortTransaction().	We don't have very many resources to worry
@@ -205,7 +210,7 @@ void CBMWriterMain(void)
         if (t_thrd.cbm_cxt.got_SIGHUP) {
             t_thrd.cbm_cxt.got_SIGHUP = false;
             ProcessConfigFile(PGC_SIGHUP);
-            u_sess->attr.attr_storage.CheckPointTimeout = g_instance.attr.attr_storage.enableIncrementalCheckpoint
+            u_sess->attr.attr_storage.CheckPointTimeout = ENABLE_INCRE_CKPT
                                                               ? u_sess->attr.attr_storage.incrCheckPointTimeout
                                                               : u_sess->attr.attr_storage.fullCheckPointTimeout;
         }

@@ -138,24 +138,24 @@ static void* InternalIpcMemoryCreate(IpcMemoryKey memKey, Size size)
                     (unsigned long)memKey,
                     (unsigned long)size,
                     IPC_CREAT | IPC_EXCL | IPCProtection),
-                (errno == EINVAL) ? errhint("This error usually means that PostgreSQL's request for a shared memory "
+                (errno == EINVAL) ? errhint("This error usually means that openGauss's request for a shared memory "
                                             "segment exceeded your kernel's SHMMAX parameter.  You can either "
                                             "reduce the request size or reconfigure the kernel with larger SHMMAX.  "
                                             "To reduce the request size (currently %lu bytes), reduce "
-                                            "PostgreSQL's shared memory usage, perhaps by reducing shared_buffers.\n"
+                                            "openGauss's shared memory usage, perhaps by reducing shared_buffers.\n"
                                             "If the request size is already small, it's possible that it is less than "
                                             "your kernel's SHMMIN parameter, in which case raising the request size or "
                                             "reconfiguring SHMMIN is called for.\n"
-                                            "The PostgreSQL documentation contains more information about shared "
+                                            "The openGauss documentation contains more information about shared "
                                             "memory configuration.", (unsigned long)size)
                     : 0,
-                (errno == ENOMEM) ? errhint("This error usually means that PostgreSQL's request for a shared "
+                (errno == ENOMEM) ? errhint("This error usually means that openGauss's request for a shared "
                                             "memory segment exceeded available memory or swap space, "
                                             "or exceeded your kernel's SHMALL parameter.  You can either "
                                             "reduce the request size or reconfigure the kernel with larger SHMALL.  "
                                             "To reduce the request size (currently %lu bytes), reduce "
-                                            "PostgreSQL's shared memory usage, perhaps by reducing shared_buffers.\n"
-                                            "The PostgreSQL documentation contains more information about shared "
+                                            "openGauss's shared memory usage, perhaps by reducing shared_buffers.\n"
+                                            "The openGauss documentation contains more information about shared "
                                             "memory configuration.", (unsigned long)size)
                     : 0,
                 (errno == ENOSPC) ? errhint("This error does *not* mean that you have run out of disk space.  "
@@ -163,9 +163,9 @@ static void* InternalIpcMemoryCreate(IpcMemoryKey memKey, Size size)
                                             "in which case you need to raise the SHMMNI parameter in your kernel, "
                                             "or because the system's overall limit for shared memory has been "
                                             "reached.  If you cannot increase the shared memory limit, "
-                                            "reduce PostgreSQL's shared memory request (currently %lu bytes), "
+                                            "reduce openGauss's shared memory request (currently %lu bytes), "
                                             "perhaps by reducing shared_buffers.\n"
-                                            "The PostgreSQL documentation contains more information about shared "
+                                            "The openGauss documentation contains more information about shared "
                                             "memory configuration.", (unsigned long)size)
                     : 0));
     }
@@ -252,7 +252,7 @@ bool PGSharedMemoryIsInUse(unsigned long id1, unsigned long id2)
 
         /*
          * EACCES implies that the segment belongs to some other userid, which
-         * means it is not a Postgres shmem segment (or at least, not one that
+         * means it is not a openGauss shmem segment (or at least, not one that
          * is relevant to our data directory).
          */
         if (errno == EACCES)
@@ -511,7 +511,7 @@ void PGSharedMemoryDetach(void)
 }
 
 /*
- * Attach to shared memory and make sure it has a Postgres header
+ * Attach to shared memory and make sure it has a openGauss header
  *
  * Returns attach address if OK, else NULL
  */

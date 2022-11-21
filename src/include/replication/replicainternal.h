@@ -20,14 +20,13 @@
 #endif
 
 #define IP_LEN 64
+#define SSL_MODE_LEN 16
 #define PG_PROTOCOL_VERSION "MPPDB"
 
 /* Notice: the value is same sa GUC_MAX_REPLNODE_NUM */
-#ifdef ENABLE_MULTIPLE_NODES
-#define MAX_REPLNODE_NUM 8
-#else
 #define MAX_REPLNODE_NUM 9
-#endif
+
+#define DOUBLE_MAX_REPLNODE_NUM (MAX_REPLNODE_NUM * 2)
 
 #define REPL_IDX_PRIMARY 1
 #define REPL_IDX_STANDBY 2
@@ -35,7 +34,8 @@
 typedef enum {
     NoDemote = 0,
     SmartDemote,
-    FastDemote
+    FastDemote,
+    ExtremelyFast
 } DemoteMode;
 
 typedef enum {
@@ -51,7 +51,9 @@ typedef enum {
     STANDBY_MODE,
     CASCADE_STANDBY_MODE,
     PENDING_MODE,
-    RECOVERY_MODE
+    RECOVERY_MODE,
+    STANDBY_CLUSTER_MODE,
+    MAIN_STANDBY_MODE
 } ServerMode;
 
 typedef enum {
@@ -74,10 +76,21 @@ typedef enum {
     TIMELINE_REBUILD,
     SYSTEMID_REBUILD,
     VERSION_REBUILD,
-    MODE_REBUILD
+    MODE_REBUILD,
+    DCF_LOG_LOSS_REBUILD
 } HaRebuildReason;
 
-typedef enum { NONE_BUILD = 0, AUTO_BUILD, FULL_BUILD, INC_BUILD } BuildMode;
+typedef enum {
+    NONE_BUILD = 0,
+    AUTO_BUILD,
+    FULL_BUILD,
+    INC_BUILD,
+    STANDBY_FULL_BUILD,
+    COPY_SECURE_FILES_BUILD,
+    CROSS_CLUSTER_FULL_BUILD,
+    CROSS_CLUSTER_INC_BUILD,
+    CROSS_CLUSTER_STANDBY_FULL_BUILD
+} BuildMode;
 
 typedef struct buildstate {
     BuildMode build_mode;
@@ -96,7 +109,22 @@ typedef struct gaussstate {
     uint64 term;
     BuildState build_info;
     HaRebuildReason ha_rebuild_reason;
+    int current_connect_idx;
 } GaussState;
+
+typedef struct newnodeinfo {
+    unsigned int stream_id;
+    unsigned int node_id;
+    char ip[IP_LEN];
+    unsigned int port;
+    unsigned int role;
+    unsigned int wait_timeout_ms;
+} NewNodeInfo;
+
+typedef struct runmodeparam {
+    uint32 voteNum;
+    uint32 xMode;
+} RunModeParam;
 
 #ifdef EXEC_BACKEND
 /*
@@ -105,13 +133,15 @@ typedef struct gaussstate {
 typedef struct replconninfo {
     char localhost[IP_LEN];
     int localport;
-    int localservice;
     int localheartbeatport;
     char remotehost[IP_LEN];
     int remoteport;
-    int remoteservice;
     int remoteheartbeatport;
     bool isCascade;
+    bool isCrossRegion;
+#ifdef ENABLE_LITE_MODE
+    char sslmode[SSL_MODE_LEN];
+#endif
 } ReplConnInfo;
 
 /*
@@ -120,9 +150,12 @@ typedef struct replconninfo {
 typedef struct hashmemdata {
     ServerMode current_mode;
     bool is_cascade_standby;
-    HaRebuildReason repl_reason[MAX_REPLNODE_NUM];
-    int disconnect_count[MAX_REPLNODE_NUM];
+    HaRebuildReason repl_reason[DOUBLE_MAX_REPLNODE_NUM];
+    int disconnect_count[DOUBLE_MAX_REPLNODE_NUM];
+    bool is_cross_region;
+    bool is_hadr_main_standby;
     int current_repl;
+    int prev_repl;
     int repl_list_num;
     int loop_find_times;
     slock_t mutex;
@@ -157,5 +190,10 @@ typedef enum {
 
 extern bool data_catchup;
 extern bool wal_catchup;
-
+extern BuildMode build_mode;
+extern bool is_cross_region_build; /* for stream disaster recovery cluster */
+#define IS_CROSS_CLUSTER_BUILD (build_mode == CROSS_CLUSTER_FULL_BUILD || \
+                                build_mode == CROSS_CLUSTER_INC_BUILD || \
+                                build_mode == CROSS_CLUSTER_STANDBY_FULL_BUILD || \
+                                is_cross_region_build)
 #endif /* _REPLICA_INTERNAL_H */

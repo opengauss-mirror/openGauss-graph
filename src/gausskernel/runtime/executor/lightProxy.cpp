@@ -43,6 +43,9 @@
 #include "instruments/instr_slow_query.h"
 #include "tcop/tcopprot.h"
 #include "optimizer/streamplan.h"
+#include "gs_ledger/blockchain.h"
+#include "parser/parse_hint.h"
+#include "replication/walreceiver.h"
 
 const int MAX_COMMAND = 51;
 typedef struct commandType {
@@ -106,7 +109,6 @@ extern void pgxc_node_init(PGXCNodeHandle* handle, int sock);
 extern void pgxc_handle_unsupported_stmts(Query* query);
 extern Oid exprType(const Node* expr);
 
-extern bool light_xactnodes_member(bool write, const void* datum);
 extern int light_node_send_begin(PGXCNodeHandle* handle, bool check_gtm_mode);
 extern int light_handle_response(PGXCNodeHandle* conn, lightProxyMsgCtl* msgctl, lightProxy* lp);
 extern void light_node_report_error(lightProxyErrData* combiner);
@@ -185,9 +187,11 @@ static void report_unsupport_light(LightUnSupportType type)
         "not support others cmd type except I/D/U/S",
         "not support table entry relkind is foreign",
         "not support query has a statement trigger",
-        "not support user-defined type "};
+        "not support user-defined type",
+        "not support query with node_name hint"};
 
-    ereport(DEBUG2, (errmsg("[LIGHT PROXY]  check failed with type: %s.", unsupport_msg[type])));
+    ereport(DEBUG2, (errmodule(MOD_LIGHTPROXY),
+                    errmsg("[LIGHT PROXY]  check failed with type: %s.", unsupport_msg[type])));
 
     return;
 }
@@ -228,6 +232,12 @@ static bool isSupportLightQuery(Query* query)
         query->commandType != CMD_DELETE && !(HAS_ROUTER && query->commandType == CMD_MERGE)) {
         report_unsupport_light(CMD_UNSUPPORT);
 
+        return false;
+    }
+
+    /* do not support node_name hint due to agg function's different behavior */
+    if (CheckNodeNameHint(query->hintState)) {
+        report_unsupport_light(NODE_NAME_UNSUPPORT);
         return false;
     }
 
@@ -287,6 +297,8 @@ lightProxy::lightProxy(Query *query)
     m_portalName = NULL;
     m_msgctl = (lightProxyMsgCtl*)palloc0(sizeof(lightProxyMsgCtl));
     m_msgctl->errData = (lightProxyErrData*)palloc0(sizeof(lightProxyErrData));
+    m_msgctl->relhash = 0;
+    m_msgctl->has_relhash = false;
     m_isRowTriggerShippable = query->isRowTriggerShippable;
     initStringInfo(&m_bindMessage);
     initStringInfo(&m_describeMessage);
@@ -319,6 +331,8 @@ lightProxy::lightProxy(MemoryContext context, CachedPlanSource *psrc, const char
 
     m_msgctl = (lightProxyMsgCtl *)palloc0(sizeof(lightProxyMsgCtl));
     m_msgctl->errData = (lightProxyErrData *)palloc0(sizeof(lightProxyErrData));
+    m_msgctl->relhash = 0;
+    m_msgctl->has_relhash = false;
 
     if (psrc != NULL && list_length(psrc->query_list) == 1 && linitial(psrc->query_list) != NULL) {
         m_isRowTriggerShippable = ((Query*)linitial(psrc->query_list))->isRowTriggerShippable;
@@ -417,9 +431,27 @@ void lightProxy::connect()
 {
     List* dn_allocate = NULL;
     errno_t ss_rc = 0;
+    int dnNum = u_sess->pgxc_cxt.NumDataNodes;
+    if (IS_CN_DISASTER_RECOVER_MODE) {
+        dnNum = u_sess->pgxc_cxt.NumTotalDataNodes;
+        if (!u_sess->pgxc_cxt.DisasterReadArrayInit) {
+            disaster_read_array_init();
+        }
+        Assert(m_nodeIdx < u_sess->pgxc_cxt.NumDataNodes);
+        if (u_sess->pgxc_cxt.disasterReadArray[m_nodeIdx] != -1) {
+            m_nodeIdx = u_sess->pgxc_cxt.disasterReadArray[m_nodeIdx];
+        }
+    }
 
     m_handle = &u_sess->pgxc_cxt.dn_handles[m_nodeIdx];
     if (!IS_VALID_CONNECTION(m_handle)) {
+        Assert(m_nodeIdx < dnNum);
+        if (m_nodeIdx >= dnNum) {
+            ereport(ERROR, (errcode(ERRCODE_CONNECTION_FAILURE),
+                errmsg("[LIGHT PROXY] m_nodeIdx error, m_nodeIdx:%d, numDataNodes:%d",
+                    m_nodeIdx, dnNum)));
+        }
+
         dn_allocate = lappend_int(dn_allocate, m_nodeIdx);
         PoolConnDef* pfds = PoolManagerGetConnections(dn_allocate, NULL);
         if (pfds == NULL)
@@ -436,6 +468,9 @@ void lightProxy::connect()
         ss_rc = memcpy_s(&m_handle->connInfo, sizeof(PoolConnInfo), conn_info, sizeof(PoolConnInfo));
 
         securec_check(ss_rc, "\0", "\0");
+#ifdef ENABLE_MULTIPLE_NODES
+        pgxc_node_send_global_session_id((PGXCNodeHandle*)m_handle);
+#endif
         u_sess->pgxc_cxt.dn_handles[m_nodeIdx] = *m_handle;
         u_sess->pgxc_cxt.datanode_count++;
 
@@ -478,7 +513,7 @@ void lightProxy::sendParseIfNecessary()
     /* see if statement already active on the node */
     for (int i = 0; i < m_entry->current_nodes_number; i++) {
         if (m_entry->dns_node_indices[i] == m_nodeIdx) {
-            if (ENABLE_CN_GPC) {
+            if (ENABLE_CN_GPC || IN_GPC_GRAYRELEASE_CHANGE) {
                 need_send_again = true;
             } else {
                 return;
@@ -542,31 +577,13 @@ void lightProxy::proxyNodeBegin(bool is_read_only)
 
     if (is_read_only) {
         gxid = GetCurrentTransactionIdIfAny();
-    } else if (GTM_MODE) {
-        gxid = GetCurrentTransactionId();
-        if (!GlobalTransactionIdIsValid(gxid)) {
-            ereport(ERROR,
-                (errcode(ERRCODE_CONNECTION_EXCEPTION), errmsg("[LIGHT PROXY] Failed to get new transaction id")));
-        }
-    }
-
-    /*
-     * Send GXID and check for errors
-     */
-    if (GTM_MODE && GlobalTransactionIdIsValid(gxid) &&
-        pgxc_node_send_gxid(m_handle, gxid, false)) {
-        ereport(ERROR,
-            (errcode(ERRCODE_CONNECTION_EXCEPTION),
-                errmsg("[LIGHT PROXY] Failed to send gxid %lu to %s[%u]",
-                    gxid,
-                    m_handle->remoteNodeName,
-                    m_handle->nodeoid)));
     }
 
     /*
      * If the node is already a participant in the transaction, skip it
      */
-    if (light_xactnodes_member(false, m_handle) || light_xactnodes_member(true, m_handle)) {
+    if (list_member(u_sess->pgxc_cxt.XactReadNodes, m_handle) ||
+        list_member(u_sess->pgxc_cxt.XactWriteNodes, m_handle)) {
         if (!is_read_only) {
             RegisterTransactionNodes(1, (void**)&m_handle, true);
         }
@@ -593,10 +610,10 @@ void lightProxy::proxyNodeBegin(bool is_read_only)
                             m_handle->remoteNodeName,
                             m_handle->nodeoid)));
             }
-            LPROXY_DEBUG(elog(DEBUG2,
-                "[LIGHT PROXY] Send internal begin to DataNode %u: query %s",
+            LPROXY_DEBUG(ereport(DEBUG2,(errmodule(MOD_LIGHTPROXY),
+                errmsg("[LIGHT PROXY] Send internal begin to DataNode %u: query %s",
                 m_handle->nodeoid,
-                m_msgctl->query_string));
+                m_msgctl->query_string))));
 
             /* recieve message */
             m_msgctl->cnMsg = true;
@@ -709,6 +726,7 @@ ExecNodes* lightProxy::checkLightQuery(Query* query)
     (void)ExecCheckRTPerms(query->rtable, true);
 
     exec_nodes = pgxc_is_query_shippable(query, 0, true);
+
     return exec_nodes;
 }
 
@@ -860,15 +878,14 @@ bool lightProxy::processMsg(int msgType, StringInfo msg)
     /*
     * Emit duration logging if appropriate.
     */
-    char msec_str[32];
+    char msec_str[PRINTF_DST_MAX];
     switch (check_log_duration(msec_str, false)) {
         case 1:
-            ereport(DEBUG1, (errmsg("duration: %s ms, queryid %ld, unique id %lu", msec_str, u_sess->debug_query_id, u_sess->slow_query_cxt.slow_query.unique_sql_id), errhidestmt(true)));
+            Assert(false);
             break;
         case 2: {
-            ereport(DEBUG1,
-                (errmsg("duration: %s ms queryid %ld unique id %ld", msec_str,  u_sess->debug_query_id, u_sess->slow_query_cxt.slow_query.unique_sql_id),
-                    errhidestmt(true)));
+            ereport(LOG, (errmsg("duration: %s ms queryid %ld unique id %ld", msec_str,
+                u_sess->debug_query_id, u_sess->slow_query_cxt.slow_query.unique_sql_id), errhidestmt(true)));
             break;
         }
         default:
@@ -1010,6 +1027,10 @@ void lightProxy::runSimpleQuery(StringInfo exec_message)
     if (!(g_instance.status > NoShutdown) && light_unified_audit_executor_hook) {
         light_unified_audit_executor_hook(m_query);
     }
+    /* global chain record */
+    if (IS_PGXC_COORDINATOR && m_msgctl->has_relhash) {
+        light_ledger_ExecutorEnd(m_query, m_msgctl->relhash);
+    }
     /* doing sql count accordiong to cmdType */
     if (u_sess->attr.attr_common.pgstat_track_activities && u_sess->attr.attr_common.pgstat_track_sql_count &&
         !u_sess->attr.attr_sql.enable_cluster_resize) {
@@ -1036,11 +1057,11 @@ int lightProxy::runBatchMsg(StringInfo batch_message, bool sendDMsg, int batch_c
 
     connect();
 
-    LPROXY_DEBUG(elog(DEBUG2,
-        "[LIGHT PROXY] Got Batch slim to DataNode %u: name %s, query %s",
+    LPROXY_DEBUG(ereport(DEBUG2,(errmodule(MOD_LIGHTPROXY),
+        errmsg("[LIGHT PROXY] Got Batch slim to DataNode %u: name %s, query %s",
         m_handle->nodeoid,
         m_stmtName,
-        m_cplan->query_string));
+        m_cplan->query_string))));
 
     /* Must set snapshot before starting executor. */
     PushActiveSnapshot(GetTransactionSnapshot(GTM_LITE_MODE));
@@ -1085,6 +1106,10 @@ int lightProxy::runBatchMsg(StringInfo batch_message, bool sendDMsg, int batch_c
     if (!(g_instance.status > NoShutdown) && light_unified_audit_executor_hook) {
         light_unified_audit_executor_hook((Query*)linitial(m_cplan->query_list));
     }
+    /* global chain record */
+    if (IS_PGXC_COORDINATOR && m_msgctl->has_relhash) {
+        light_ledger_ExecutorEnd((Query*)linitial(m_cplan->query_list), m_msgctl->relhash);
+    }
 
     /*
      * track_sql_count is on, counting WaitEventSQL for per user
@@ -1117,11 +1142,11 @@ void lightProxy::runMsg(StringInfo exec_message)
 
     connect();
 
-    LPROXY_DEBUG(elog(DEBUG2,
-        "[LIGHT PROXY] Got Execute slim to DataNode %u: name %s, query %s",
+    LPROXY_DEBUG(ereport(DEBUG2,(errmodule(MOD_LIGHTPROXY),
+        errmsg("[LIGHT PROXY] Got Execute slim to DataNode %u: name %s, query %s",
         m_handle->nodeoid,
         m_stmtName,
-        m_cplan->query_string));
+        m_cplan->query_string))));
 
     bool trigger_ship = false;
     if (u_sess->attr.attr_sql.enable_trigger_shipping && m_isRowTriggerShippable)
@@ -1207,6 +1232,10 @@ void lightProxy::runMsg(StringInfo exec_message)
     /* unified auditing policy */
     if (!(g_instance.status > NoShutdown) && light_unified_audit_executor_hook) {
         light_unified_audit_executor_hook((Query*)linitial(m_cplan->query_list));
+    }
+    /* global chain record */
+    if (IS_PGXC_COORDINATOR && m_msgctl->has_relhash) {
+        light_ledger_ExecutorEnd((Query*)linitial(m_cplan->query_list), m_msgctl->relhash);
     }
 
     /*
@@ -1315,7 +1344,8 @@ bool IsLightProxyOn(void)
 bool exec_query_through_light_proxy(List* querytree_list, Node* parsetree, bool snapshot_set, StringInfo msg, 
                                     MemoryContext OptimizerContext)
 {
-    if ((list_length(querytree_list) == 1) && !IsA(parsetree, CreateTableAsStmt)) {
+    if ((list_length(querytree_list) == 1) && !IsA(parsetree, CreateTableAsStmt) &&
+        !IsA(parsetree, RefreshMatViewStmt)) {
         ExecNodes* single_exec_node = NULL;
         lightProxy* proxy = NULL;
         Query* query = (Query*)linitial(querytree_list);
@@ -1330,7 +1360,6 @@ bool exec_query_through_light_proxy(List* querytree_list, Node* parsetree, bool 
             list_length(single_exec_node->primarynodelist) == 1) {
             /* GTMLite: need to mark that this is single shard statement */
             u_sess->exec_cxt.single_shard_stmt = true;
-
             if (CmdtypeSupportsHotkey(query->commandType))
                 SendHotkeyToPgstat();
 
@@ -1384,7 +1413,6 @@ void GPCDropLPIfNecessary(const char *stmt_name, bool need_drop_dnstmt, bool nee
 void GPCFillMsgForLp(CachedPlanSource* psrc)
 {
     Assert(psrc != NULL);
-    Assert(psrc->gpc.status.IsSharePlan());
     if (psrc->gpc.status.InSavePlanList(GPC_SHARED)) {
         pfree_ext(psrc->gpc.key);
         MemoryContext oldcxt = MemoryContextSwitchTo(psrc->context);
@@ -1395,6 +1423,7 @@ void GPCFillMsgForLp(CachedPlanSource* psrc)
         GlobalPlanCache::EnvFill(&psrc->gpc.key->env, psrc->dependsOnRole);
         psrc->gpc.key->env.search_path = psrc->search_path;
         psrc->gpc.key->env.num_params = psrc->num_params;
+        psrc->gpc.key->env.param_types = psrc->param_types;
         (void)MemoryContextSwitchTo(oldcxt);
     }
 }

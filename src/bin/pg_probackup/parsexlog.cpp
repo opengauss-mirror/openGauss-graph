@@ -32,10 +32,10 @@
  * a bit nicer.
  */
 #if PG_VERSION_NUM >= 100000
-#define PG_RMGR(symname,name,redo,desc,identify,startup,cleanup,mask) \
+#define PG_RMGR(symname, name, redo, desc, identify, startup, cleanup, mask, undo, undo_desc, type_name) \
   name,
 #else
-#define PG_RMGR(symname,name,redo,desc,identify,startup,cleanup) \
+#define PG_RMGR(symname, name, redo, desc, identify, startup, cleanup, undo, undo_desc, type_name) \
   name,
 #endif
 
@@ -55,7 +55,7 @@ static const char *RmgrNames[RM_MAX_ID + 1] = {
 #define XLOG_XACT_ABORT_PREPARED        0x40
 /* only keep same with the kernel #define XLOG_XACT_ASSIGNMENT		0x50  is not used in the pg_probackup*/
 /* free opcode 0x60 */
-/* free opcode 0x70 */
+#define XLOG_XACT_ABORT_WITH_XID        0x70
 
 /* mask for filtering opcodes out of xl_info */
 #define XLOG_XACT_OPMASK        0x70
@@ -153,7 +153,7 @@ typedef struct
 static int SimpleXLogPageRead_local(XLogReaderState *xlogreader,
                                                                     XLogRecPtr targetPagePtr,
                                                                     int reqLen, XLogRecPtr targetRecPtr, char *readBuf,
-                                                                    TimeLineID *pageTLI);
+                                                                    TimeLineID *pageTLI, char* xlog_path = NULL);
 static XLogReaderState *InitXLogPageRead(XLogReaderData *reader_data,
                                                                         const char *archivedir,
                                                                         TimeLineID tli, uint32 segment_size,
@@ -662,7 +662,7 @@ get_first_record_lsn(const char *archivedir, XLogSegNo	segno,
     if (segno <= 1)
         elog(ERROR, "Invalid WAL segment number " UINT64_FORMAT, segno);
 
-    GetXLogFileName(wal_segment, tli, segno, instance_config.xlog_seg_size);
+    GetXLogFileName(wal_segment, MAXFNAMELEN, tli, segno, instance_config.xlog_seg_size);
 
     xlogreader = InitXLogPageRead(&reader_data, archivedir, tli, wal_seg_size,
                                                         false, false, true);
@@ -716,7 +716,7 @@ get_next_record_lsn(const char *archivedir, XLogSegNo	segno,
     if (segno <= 1)
         elog(ERROR, "Invalid WAL segment number " UINT64_FORMAT, segno);
 
-    GetXLogFileName(wal_segment, tli, segno, instance_config.xlog_seg_size);
+    GetXLogFileName(wal_segment, MAXFNAMELEN, tli, segno, instance_config.xlog_seg_size);
 
     xlogreader = InitXLogPageRead(&reader_data, archivedir, tli, wal_seg_size,
                                                  false, false, true);
@@ -923,7 +923,7 @@ get_gz_error(gzFile gzf)
 static int
 SimpleXLogPageRead_local(XLogReaderState *xlogreader, XLogRecPtr targetPagePtr,
                                                         int reqLen, XLogRecPtr targetRecPtr, char *readBuf,
-                                                        TimeLineID *pageTLI)
+                                                        TimeLineID *pageTLI, char* xlog_path)
 {
     XLogReaderData *reader_data;
     uint32  targetPageOff;
@@ -1027,7 +1027,7 @@ static int switch_next_wal_segment(XLogReaderData *reader_data, bool *isreturn)
     char    xlogfname[MAXFNAMELEN];
     char    partial_file[MAXPGPATH];
 
-    GetXLogFileName(xlogfname, reader_data->tli, reader_data->xlogsegno, wal_seg_size);
+    GetXLogFileName(xlogfname, MAXFNAMELEN, reader_data->tli, reader_data->xlogsegno, wal_seg_size);
 
     nRet = snprintf_s(reader_data->xlogpath, MAXPGPATH, MAXPGPATH - 1, "%s/%s", wal_archivedir, xlogfname);
     securec_check_ss_c(nRet, "\0", "\0");
@@ -1228,7 +1228,6 @@ RunXLogThreads(const char *archivedir, time_t target_time,
 
     if (!XLogRecPtrIsInvalid(endpoint))
     {
-        //  if (XRecOffIsNull(endpoint) && !inclusive_endpoint)
         if (XRecOffIsNull(endpoint))
         {
             GetXLogSegNo(endpoint, endSegNo, segment_size);
@@ -1683,8 +1682,7 @@ XLogWaitForConsistency(XLogReaderState *xlogreader)
         {
             char    xlogfname[MAXFNAMELEN];
 
-            GetXLogFileName(xlogfname, reader_data->tli, reader_data->xlogsegno,
-                                            wal_seg_size);
+            GetXLogFileName(xlogfname, MAXFNAMELEN, reader_data->tli, reader_data->xlogsegno, wal_seg_size);
 
             elog(VERBOSE, "Thread [%d]: Possible WAL corruption in %s. Wait for other threads to decide is this a failure",
                     reader_data->thread_num, xlogfname);
@@ -1819,7 +1817,7 @@ extractPageInfo(XLogReaderState *record, XLogReaderData *reader_data,
         * source system.
         */
     }
-    else if (info & XLR_SPECIAL_REL_UPDATE)
+    else if (rmid != RM_HEAP_ID && rmid != RM_HEAP2_ID && (info & XLR_SPECIAL_REL_UPDATE))
     {
         /*
         * This record type modifies a relation file in some special way, but
@@ -1837,13 +1835,20 @@ extractPageInfo(XLogReaderState *record, XLogReaderData *reader_data,
         RelFileNode rnode;
         ForkNumber	forknum;
         BlockNumber blkno;
+        XLogPhyBlock pblk;
 
-        if (!XLogRecGetBlockTag(record, block_id, &rnode, &forknum, &blkno))
+        if (!XLogRecGetBlockTag(record, block_id, &rnode, &forknum, &blkno, &pblk))
             continue;
 
         /* We only care about the main fork; others are copied as is */
         if (forknum != MAIN_FORKNUM)
             continue;
+
+        if (OidIsValid(pblk.relNode)) {
+            Assert(PhyBlockIsValid(pblk));
+            rnode.relNode = pblk.relNode;
+            rnode.bucketNode = pblk.block;
+        }
 
         process_block_change(forknum, rnode, blkno);
     }
@@ -1897,7 +1902,7 @@ getRecordTimestamp(XLogReaderState *record, TimestampTz *recordXtime)
         return true;
     }
     else if (rmid == RM_XACT_ID && (xact_info == XLOG_XACT_ABORT ||
-                xact_info == XLOG_XACT_ABORT_PREPARED))
+                xact_info == XLOG_XACT_ABORT_PREPARED || xact_info == XLOG_XACT_ABORT_WITH_XID))
     {
         *recordXtime = ((xl_xact_abort_local *) XLogRecGetData(record))->xact_time;
         return true;
@@ -1932,17 +1937,21 @@ bool validate_wal_segment(TimeLineID tli, XLogSegNo segno, const char *prefetch_
 }
 
 /*
- *  * Returns information about the block that a block reference refers to.
- *   *
- *    * If the WAL record contains a block reference with the given ID, *rnode,
- *     * *forknum, and *blknum are filled in (if not NULL), and returns TRUE.
- *      * Otherwise returns FALSE.
- *       */
-bool XLogRecGetBlockTag(
-    XLogReaderState* record, uint8 block_id, RelFileNode* rnode, ForkNumber* forknum, BlockNumber* blknum)
+ *  Returns information about the block that a block reference refers to.
+ *  If the WAL record contains a block reference with the given ID, *rnode,
+ *  forknum, and *blknum are filled in (if not NULL), and returns TRUE.
+ *  Otherwise returns FALSE.
+ */
+bool XLogRecGetBlockTag(XLogReaderState* record, uint8 block_id, RelFileNode* rnode,
+    ForkNumber* forknum, BlockNumber* blknum, XLogPhyBlock *pblk)
 {
     DecodedBkpBlock* bkpb = NULL;
 
+    if (pblk != NULL) {
+        pblk->relNode = InvalidOid;
+        pblk->block = InvalidBlockNumber;
+        pblk->lsn = InvalidXLogRecPtr;
+    }
     if (!record->blocks[block_id].in_use)
         return false;
 
@@ -1953,6 +1962,11 @@ bool XLogRecGetBlockTag(
         *forknum = bkpb->forknum;
     if (blknum != NULL)
         *blknum = bkpb->blkno;
+    if (pblk != NULL) {
+        pblk->relNode = bkpb->seg_fileno;
+        pblk->block = bkpb->seg_blockno;
+        pblk->lsn = record->EndRecPtr;
+    }
     return true;
 }
 

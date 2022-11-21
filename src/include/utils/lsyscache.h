@@ -49,6 +49,7 @@ extern List* get_op_btree_interpretation(Oid opno);
 extern bool equality_ops_are_compatible(Oid opno1, Oid opno2);
 extern Oid get_opfamily_proc(Oid opfamily, Oid lefttype, Oid righttype, int16 procnum);
 extern char* get_attname(Oid relid, AttrNumber attnum);
+extern int get_kvtype(Oid relid, AttrNumber attnum);
 extern char* get_relid_attribute_name(Oid relid, AttrNumber attnum);
 extern AttrNumber get_attnum(Oid relid, const char* attname);
 extern char GetGenerated(Oid relid, AttrNumber attnum);
@@ -80,6 +81,7 @@ extern Oid get_func_variadictype(Oid funcid);
 extern bool get_func_retset(Oid funcid);
 extern bool func_strict(Oid funcid);
 extern char func_volatile(Oid funcid);
+extern char* get_func_langname(Oid funcid);
 extern bool get_func_proshippable(Oid funcid);
 extern bool get_func_leakproof(Oid funcid);
 extern float4 get_func_cost(Oid funcid);
@@ -167,6 +169,9 @@ extern bool is_pgxc_hostprimary(Oid nodeid);
 extern bool node_check_host(const char* host, Oid nodeid);
 extern Oid get_pgxc_groupoid(const char* groupname, bool missing_ok = true);
 extern char get_pgxc_groupkind(Oid group_oid);
+extern char* get_pgxc_groupparent(Oid group_oid);
+extern int get_pgxc_group_bucketcnt(Oid group_oid);
+extern bool is_pgxc_group_bucketcnt_exists(Oid parentOid, int bucketCnt, char **groupName, Oid *groupOid);
 extern int get_pgxc_groupmembers(Oid groupid, Oid** members);
 extern int get_pgxc_groupmembers_redist(Oid groupid, Oid** members);
 extern char get_pgxc_group_redistributionstatus(Oid groupid);
@@ -210,6 +215,23 @@ extern bool is_not_strict_agg(Oid funcOid);
 extern bool is_pgxc_class_table(Oid tableoid);
 extern Oid get_valid_relname_relid(const char* relnamespace, const char* relname);
 extern bool get_func_iswindow(Oid funcid);
+extern char get_func_prokind(Oid funcid);
+extern char get_typecategory(Oid typid);
+
+extern char *get_graphid_graphname(Oid graphid);
+extern Oid	get_graphname_oid(const char *graphname);
+extern char *get_labid_labname(Oid graphid, uint16 labid);
+extern Oid	get_labid_relid(Oid graphid, uint16 labid);
+extern bool labid_exists(Oid graphid, uint16 labid);
+extern Oid	get_labname_laboid(const char *labname, Oid graphid);
+extern uint16 get_labname_labid(const char *labname, Oid graphid);
+extern Oid	get_laboid_relid(Oid laboid);
+extern Oid	get_relid_laboid(Oid relid);
+extern Oid	get_labid_typeoid(Oid graphid, uint16 labid);
+
+extern Oid get_oid_by_prefix(char* prefix);
+extern char* get_prefix_by_oid(Oid oid);
+extern Oid insert_prefix(char* prefix);
 
 #define type_is_array(typid) (get_element_type(typid) != InvalidOid)
 /* type_is_array_domain accepts both plain arrays and domains over arrays */

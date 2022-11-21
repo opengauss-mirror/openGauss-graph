@@ -36,9 +36,11 @@
 #include "parser/parse_relation.h"
 #include "utils/numeric.h"
 #include "catalog/pg_proc.h"
+#include "utils/acl.h"
 #include "utils/syscache.h"
 #include "utils/lsyscache.h"
 #include "utils/builtins.h"
+#include "utils/fmgroids.h"
 #include "parser/parse_type.h"
 #include "nodes/makefuncs.h"
 #include "parser/parse_coerce.h"
@@ -52,11 +54,22 @@
 
 #define BUFFSIZE 256
 
+#ifdef ENABLE_UT
+#define static
+#endif
+
+using StrMap = gs_stl::gs_map<gs_stl::gs_string, masking_result>;
+static THR_LOCAL StrMap* masked_prepared_stmts = NULL;
+static THR_LOCAL StrMap* masked_cursor_stmts = NULL;
+
 void reset_node_location()
 {
     t_thrd.security_policy_cxt.node_location = 0;
 }
 
+const int DATA_TYPE_LENGTH = 2; /* data type length */
+static Node* create_udf_function(ParseState *pstate, Var* var, Oid funcid, masking_result *result, long long polid,
+    const char* full_column, const func_params *f_params);
 static void parse_func(Node *expr);
 static void get_var_value(const List *rtable, Var *var, PolicyLabelItem *full_column, PolicyLabelItem *view_name);
 
@@ -183,19 +196,29 @@ static void parse_func(Node* expr)
 static bool get_function_id(int vartype, const char* funcname, Oid *funcid, Oid *rettype,
                             Oid schemaid = SchemaNameGetSchemaOid("pg_catalog", true))
 {
-    CatCList   *catlist = SearchSysCacheList1(PROCNAMEARGSNSP, CStringGetDatum(funcname));
+    CatCList   *catlist = NULL;
+#ifndef ENABLE_MULTIPLE_NODES
+    if (t_thrd.proc->workingVersionNum < 92470) {
+        catlist = SearchSysCacheList1(PROCNAMEARGSNSP, CStringGetDatum(funcname));
+    } else {
+        catlist = SearchSysCacheList1(PROCALLARGS, CStringGetDatum(funcname));
+    }
+#else
+    catlist = SearchSysCacheList1(PROCNAMEARGSNSP, CStringGetDatum(funcname));
+#endif
     if (catlist != NULL) {
         for (int i = 0; i < catlist->n_members; ++i) {
-            HeapTuple    proctup = &catlist->members[i]->tuple;
+            HeapTuple    proctup = t_thrd.lsc_cxt.FetchTupleFromCatCList(catlist, i);
             Form_pg_proc procform = (Form_pg_proc) GETSTRUCT(proctup);
             if (procform && (int)procform->prorettype == vartype && procform->pronamespace == schemaid) {
                 (*funcid) = HeapTupleGetOid(proctup);
                 (*rettype) = procform->prorettype;
-                break;
+                ReleaseSysCacheList(catlist);
+                return true;
             }
         }
         ReleaseSysCacheList(catlist);
-        return true;
+        return false;
     }
     return false;
 }
@@ -256,7 +279,7 @@ static Node* create_relabel_type(Node* func, int resulttype, int location,
 
 static inline Node* create_string_node(ParseState *pstate, const char* letter, int location, int col_type = TEXTOID)
 {
-    Node * const_node = (Node *) make_const(pstate, makeString((char*)letter), location);
+    Node* const_node = (Node*)make_const(pstate, makeString((char*)letter), location);
     const_node = coerce_type(pstate, const_node, ((Const*)const_node)->consttype, col_type, -1,
                              COERCION_IMPLICIT, COERCE_IMPLICIT_CAST, -1);
     return const_node;
@@ -265,11 +288,19 @@ static inline Node* create_string_node(ParseState *pstate, const char* letter, i
 
 Node* create_integer_node(ParseState *pstate, int value, int location, int col_type, bool make_cast)
 {
-    Node * const_node = (Node *) make_const(pstate, makeInteger(value), location);
+    Node* const_node = (Node*)make_const(pstate, makeInteger(value), location);
     if (make_cast) {
         const_node = coerce_type(pstate, const_node, ((Const*)const_node)->consttype, col_type, -1,
                                  COERCION_IMPLICIT, COERCE_IMPLICIT_CAST, -1);
     }
+    return const_node;
+}
+
+static inline Node* create_float_node(ParseState *pstate, const char* value, int location, int col_type = FLOAT4OID)
+{
+    Node* const_node = (Node*)make_const(pstate, makeFloat((char*)value), location);
+    const_node = coerce_type(pstate, const_node, ((Const*)const_node)->consttype, col_type, -1,
+                             COERCION_IMPLICIT, COERCE_IMPLICIT_CAST, -1);
     return const_node;
 }
 
@@ -301,6 +332,39 @@ static Node *create_repeat_function(ParseState *pstate, const char *letter, Node
     return arg;
 }
 
+static Node *regexp_function(ParseState *pstate, Var *var, masking_result *result, long long polid,
+                              const char *full_column, const func_params *f_params)
+{
+    bool cast = false;
+    Node *regexp_func_node = NULL;
+    switch (var->vartype) {
+        case BPCHAROID:
+        case VARCHAROID:
+        case NVARCHAR2OID:
+            cast = true;
+        case TEXTOID:
+        {
+            Oid funcid = 0;
+            Oid rettype = TEXTOID;
+            get_function_id(TEXTOID, "regexpmasking", &funcid, &rettype);
+            if (funcid > 0) {
+                regexp_func_node = create_udf_function(pstate, var, funcid, result, polid, full_column, f_params);
+                if (cast) {
+                    Expr *cast_fun = (Expr*)create_relabel_type(regexp_func_node, var->vartype, var->location);
+                    if (cast_fun != NULL) { /* success */
+                        regexp_func_node = (Node*)cast_fun;
+                    }
+                }
+                (*result)[polid][M_REGEXP].insert(full_column);
+            }
+            break;
+        }
+        default:
+            break;
+    }
+    return regexp_func_node;
+}
+
 static Node *shuffle_function(ParseState *pstate, Var *var, masking_result *result, long long polid,
                               const char *full_column)
 {
@@ -326,8 +390,10 @@ static Node *shuffle_function(ParseState *pstate, Var *var, masking_result *resu
                 }
                 (*result)[polid][M_SHUFFLE].insert(full_column);
             }
+            break;
         }
-        break;
+        default:
+            break;
     }
     return shuffle_func_node;
 }
@@ -357,8 +423,10 @@ static Node *random_function(ParseState *pstate, Var *var, masking_result *resul
                 }
                 (*result)[polid][M_RANDOM].insert(full_column);
             }
+            break;
         }
-        break;
+        default:
+            break;
     }
     return random_func_node;
 }
@@ -382,7 +450,8 @@ static Node *all_digits_function(ParseState *pstate, Var *var,
             if (funcid > 0) {
                 digits_func_node = create_predefined_function("alldigitsmasking", funcid, TEXTOID, (Node*)var, 100);
                 if (func_params->size()) {
-                    Node *constnode = create_string_node(pstate, func_params->begin()->c_str(), var->location);
+                    Node *constnode = create_string_node(pstate, func_params->begin()->c_str() + DATA_TYPE_LENGTH,
+                        var->location);
                     FuncExpr *funcexpr = (FuncExpr*)digits_func_node;
                     funcexpr->args = lappend(funcexpr->args, constnode);
                 }
@@ -394,8 +463,10 @@ static Node *all_digits_function(ParseState *pstate, Var *var,
                 }
                 (*result)[polid][M_ALLDIGITS].insert(full_column);
             }
+            break;
         }
-        break;
+        default:
+            break;
     }
     return digits_func_node;
 }
@@ -420,7 +491,8 @@ static Node *email_function(ParseState *pstate, int masking_behavious,
             if (funcid > 0) {
                 email_func_node = create_predefined_function(funcname, funcid, TEXTOID, (Node*)var, 100);
                 if (func_params->size()) {
-                    Node *const_node = create_string_node(pstate, func_params->begin()->c_str(), var->location);
+                    Node *const_node = create_string_node(pstate, func_params->begin()->c_str() + DATA_TYPE_LENGTH,
+                        var->location);
                     FuncExpr *funcexpr = (FuncExpr*)email_func_node;
                     funcexpr->args = lappend(funcexpr->args, const_node);
                 }
@@ -432,8 +504,10 @@ static Node *email_function(ParseState *pstate, int masking_behavious,
                 }
                 (*result)[polid][masking_behavious].insert(full_column);
             }
+            break;
         }
-        break;
+        default:
+            break;
     }
     return email_func_node;
 }
@@ -442,6 +516,7 @@ static Node *maskall_function(ParseState *pstate,
     int masking_behavious, Var *var, masking_result *result, long long polid, const char *full_column,
     const gs_stl::gs_vector<gs_stl::gs_string> *func_params)
 {
+    bool make_cast = false;
     char time_str[BUFFSIZE] = {0};
     int printed_size = 0;
     Node *maskall_func_node = NULL;
@@ -479,16 +554,26 @@ static Node *maskall_function(ParseState *pstate,
             }
         }
         break;
-        case TEXTOID:
         case BPCHAROID:
         case VARCHAROID:
         case NVARCHAR2OID:
         case NAMEOID:
-            if (func_params->size() > 0)
-                maskall_func_node = create_repeat_function(pstate, func_params->begin()->c_str(), (Node*)var);
-            else
-                maskall_func_node = create_repeat_function(pstate, "x", (Node*)var);
-            break;
+            make_cast = true;
+        case TEXTOID:
+        {
+            const char *replace_str = "x";
+            if (func_params && func_params->size() > 0) {
+                replace_str = func_params->begin()->c_str();
+            }
+            maskall_func_node = create_repeat_function(pstate, replace_str, (Node*)var);
+            if (maskall_func_node != NULL && make_cast) {
+                Expr *cast_func = (Expr*)create_relabel_type(maskall_func_node, var->vartype, var->location);
+                if (cast_func != NULL) { /* success */
+                    maskall_func_node = (Node*)cast_func;
+                }
+            }
+        }
+        break;
         case INT8OID:
         case INT4OID:
         case INT2OID:
@@ -496,7 +581,6 @@ static Node *maskall_function(ParseState *pstate,
         case NUMERICOID:
         case FLOAT4OID: /* real */
         case FLOAT8OID:
-        case CASHOID:
         {
             Node *const_int_node = create_integer_node(pstate, 0, var->location,
                                                         var->vartype, (var->vartype != CASHOID));
@@ -514,6 +598,257 @@ static Node *maskall_function(ParseState *pstate,
     }
     (*result)[polid][M_MASKALL].insert(full_column);
     return maskall_func_node;
+}
+
+/* get funcname from pg_proc */
+static const char* get_udf_function_name(long long funcid, Oid& rettype, func_types* types)
+{
+    if (!funcid) {
+        return "";
+    }
+    HeapTuple tuple = SearchSysCache1(PROCOID, ObjectIdGetDatum(funcid));
+    if (!HeapTupleIsValid(tuple)) {
+        return "";
+    }
+    Form_pg_proc func_rel = (Form_pg_proc) GETSTRUCT(tuple);
+    const char* procname = func_rel->proname.data;
+    rettype = func_rel->prorettype;
+    get_function_parameters(tuple, types);
+    ReleaseSysCache(tuple);
+    return procname;
+}
+
+static Node* convert_text_to_numeric(Oid resulttype, Node* data)
+{
+    int funccollid = 100; /* OID of collation of result */
+    switch (resulttype) {
+        case INT1OID:
+            return create_predefined_function("text_int1", F_TEXT_INT1, resulttype, data, funccollid);
+        case INT2OID:
+            return create_predefined_function("text_int2", F_TEXT_INT2, resulttype, data, funccollid);
+        case INT4OID:
+            return create_predefined_function("text_int4", F_TEXT_INT4, resulttype, data, funccollid);
+        case INT8OID:
+            return create_predefined_function("text_int8", F_TEXT_INT8, resulttype, data, funccollid);
+        case NUMERICOID:
+            return create_predefined_function("text_numeric", F_TEXT_INT8, resulttype, data, funccollid);
+        case FLOAT4OID:
+            return create_predefined_function("text_float4", F_TEXT_FLOAT4, resulttype, data, funccollid);
+        case FLOAT8OID:
+            return create_predefined_function("text_float8", F_TEXT_FLOAT8, resulttype, data, funccollid);
+        case RELTIMEOID:
+            return create_predefined_function("text_date", F_TEXT_DATE, resulttype, data, funccollid);
+        case TIMEOID:
+        case TIMETZOID:
+        case INTERVALOID:
+        case TIMESTAMPOID:
+        case SMALLDATETIMEOID:
+        case ABSTIMEOID:
+            return create_predefined_function("text_timestamp", F_TEXT_TIMESTAMP, resulttype, data, funccollid);
+        default:
+        break;
+    }
+    return NULL;
+}
+
+static Node* convert_numeric_to_text(Oid resulttype, Node* data)
+{
+    int funccollid = 100; /* OID of collation of result */
+    switch (resulttype) {
+        case INT1OID:
+            return create_predefined_function("int1_text", F_INT1_TEXT, TEXTOID, data, funccollid);
+        case INT2OID:
+            return create_predefined_function("int2_text", F_INT2_TEXT, TEXTOID, data, funccollid);
+        case INT4OID:
+            return create_predefined_function("int4_text", F_INT4_TEXT, TEXTOID, data, funccollid);
+        case INT8OID:
+            return create_predefined_function("int8_text", F_INT8_TEXT, TEXTOID, data, funccollid);
+        case NUMERICOID:
+            return create_predefined_function("numeric_text", F_NUMERIC_TEXT, TEXTOID, data, funccollid);
+        case FLOAT4OID:
+            return create_predefined_function("float4_text", F_FLOAT4_TEXT, TEXTOID, data, funccollid);
+        case FLOAT8OID:
+            return create_predefined_function("float8_text", F_FLOAT8_TEXT, TEXTOID, data, funccollid);
+        case RELTIMEOID:
+            return create_predefined_function("date_text", F_DATE_TEXT, TEXTOID, data, funccollid);
+        case TIMEOID:
+        case TIMETZOID:
+        case INTERVALOID:
+        case TIMESTAMPOID:
+        case SMALLDATETIMEOID:
+        case ABSTIMEOID:
+            return create_predefined_function("timestamp_text", F_TIMESTAMP_TEXT, TEXTOID, data, funccollid);
+        case TIMESTAMPTZOID:
+            return create_predefined_function("timestampsone_text", F_TIMESTAMPZONE_TEXT, TEXTOID, data, funccollid);
+        default:
+        break;
+    }
+    return NULL;
+}
+
+static Node* check_and_fix_col_node(Oid prog_col_type, Var* var)
+{
+    switch (prog_col_type) { /* function input type */
+        case TEXTOID:
+        case BPCHAROID:
+        case VARCHAROID:
+        case NVARCHAR2OID:
+        {
+            switch (var->vartype) { /* col type */
+                case TEXTOID:
+                case BPCHAROID:
+                case VARCHAROID:
+                case NVARCHAR2OID:
+                    return (Node*)var;
+                break;
+                default:
+                break;
+            }
+        }
+        break;
+        case INT1OID:
+        case INT2OID:
+        case INT4OID:
+        case INT8OID:
+        case NUMERICOID:
+        case FLOAT4OID: // real
+        case FLOAT8OID:
+        {
+            if (var->vartype == prog_col_type) {
+                return (Node*)var;
+            }
+        }
+        break;
+        default:
+        break;
+    }
+    return NULL; /* function input type not support or mismatching, use maskall */
+}
+
+static Node* verify_function_return_type(Oid func_rettype, Var* var, FuncExpr* funcexpr)
+{
+    switch (func_rettype) { /* function return type */
+        case TEXTOID:
+        case BPCHAROID:
+        case VARCHAROID:
+        case NVARCHAR2OID:
+        {
+            switch (var->vartype) { /* col type */
+                case INT1OID:
+                case INT2OID:
+                case INT4OID:
+                case INT8OID:
+                case NUMERICOID:
+                case FLOAT4OID:
+                case FLOAT8OID:
+                case TIMEOID:
+                case TIMETZOID:
+                case INTERVALOID:
+                case TIMESTAMPOID:
+                case SMALLDATETIMEOID:
+                case ABSTIMEOID:
+                case RELTIMEOID:
+                    return convert_text_to_numeric(var->vartype, (Node*)funcexpr);
+                break;
+                case TEXTOID:
+                case BPCHAROID:
+                case VARCHAROID:
+                case NVARCHAR2OID:
+                {
+                    Expr *cast_fun = (Expr*)create_relabel_type((Node*)funcexpr, var->vartype, var->location);
+                    return (Node*)cast_fun;
+                }
+                break;
+                default:
+                break;
+            }
+        }
+        break;
+        case INT1OID:
+        case INT2OID:
+        case INT4OID:
+        case INT8OID:
+        case NUMERICOID:
+        case FLOAT4OID:
+        case FLOAT8OID:
+        case TIMEOID:
+        case TIMETZOID:
+        case INTERVALOID:
+        case TIMESTAMPOID:
+        case SMALLDATETIMEOID:
+        case ABSTIMEOID:
+        case RELTIMEOID:
+        {
+            switch (var->vartype) {
+                case TEXTOID:
+                case BPCHAROID:
+                case VARCHAROID:
+                case NVARCHAR2OID:
+                    return convert_numeric_to_text(var->vartype, (Node*)funcexpr);
+                break;
+                default:
+                break;
+            }
+        }
+        break;
+        default:
+            return NULL; /* function return type not support, use maskall */
+    }
+    return (Node*)funcexpr;
+}
+
+static Node* create_udf_function(ParseState *pstate, Var* var, Oid funcid, masking_result *result, long long polid,
+    const char* full_column, const func_params *f_params)
+{
+    Node* ret_node = NULL;
+    AclResult aclresult;
+    Oid rescollid = 100; /* OID of collation, or InvalidOid if none */
+    PG_TRY();
+    {
+        if (funcid <= 0) {
+            return NULL;
+        }
+        Oid rettype = var->vartype;
+        aclresult = pg_proc_aclcheck(funcid, GetUserId(), ACL_EXECUTE); 
+        func_types proctypes;
+        const char* funcname = get_udf_function_name(funcid, rettype, &proctypes);
+        if (aclresult == ACLCHECK_OK && strlen(funcname) != 0) {
+            /* verify function input parameters */
+            if (verify_proc_params(f_params, &proctypes)) {
+                Oid prog_col_type = proctypes[0];
+                /* check if mismatching between function input and col type */
+                Node* newc = check_and_fix_col_node(prog_col_type, var);
+                if (newc) {
+                    FuncExpr* funcexpr = (FuncExpr*)create_predefined_function(funcname, funcid, rettype,
+                                                                               newc, rescollid);
+                    func_params::const_iterator it = f_params->begin(), eit = f_params->end();
+                    for (; it != eit; ++it) {
+                        Node * const_node = NULL;
+                        if (!strncasecmp(it->c_str(), "s:", DATA_TYPE_LENGTH)) {
+                            const_node = create_string_node(pstate, it->c_str() + DATA_TYPE_LENGTH, var->location);
+                        } else if (!strncasecmp(it->c_str(), "i:", DATA_TYPE_LENGTH))
+                            const_node = create_integer_node(pstate, atoi(it->c_str() + DATA_TYPE_LENGTH),
+                                var->location);
+                        else if (!strncasecmp(it->c_str(), "f:", DATA_TYPE_LENGTH))
+                            const_node = create_float_node(pstate, it->c_str() + DATA_TYPE_LENGTH, var->location);
+                        if (!const_node)
+                            break;
+                        funcexpr->args = lappend(funcexpr->args, const_node);
+                    }
+                    (*result)[polid][M_MASKALL].insert(full_column);
+                    /* verify function output parameters */
+                    ret_node = verify_function_return_type(rettype, var, funcexpr);
+                }
+            }
+        }
+    }
+    PG_CATCH();
+    {
+        PG_RE_THROW();
+    }
+    PG_END_TRY();
+    (*result)[polid][M_MASKALL].insert(full_column);
+    return ret_node;
 }
 
 static Node *credit_card_function(ParseState *pstate,
@@ -535,7 +870,8 @@ static Node *credit_card_function(ParseState *pstate,
             if (funcid > 0) {
                 credit_func_node = create_predefined_function("creditcardmasking", funcid, TEXTOID, (Node*)var, 100);
                 if (func_params->size()) {
-                    Node *const_node = create_string_node(pstate, func_params->begin()->c_str(), var->location);
+                    Node *const_node = create_string_node(pstate, func_params->begin()->c_str() + DATA_TYPE_LENGTH,
+                        var->location);
                     FuncExpr *fexpr = (FuncExpr*)credit_func_node;
                     fexpr->args = lappend(fexpr->args, const_node);
                 }
@@ -547,8 +883,10 @@ static Node *credit_card_function(ParseState *pstate,
                 }
                 (*result)[polid][M_CREDIT_CARD].insert(full_column);
             }
+            break;
         }
-        break;
+        default:
+            break;
     }
     return credit_func_node;
 }
@@ -608,11 +946,32 @@ static Node *mask_node_by_behavious(bool *is_masking, int masking_behavious, Par
             }
         }
         break;
-        default:
+        case M_REGEXP:
+        {
+            (*is_masking) = true;
+            if ((masked_node = regexp_function(pstate, var, result, polid, full_column, func_params)) == NULL) {
+                masked_node = maskall_function(pstate, masking_behavious, var, result,
+                                               polid, full_column, NULL);
+            }
+        }
+        break;
+        case M_UNKNOWN:
+        case M_MASKALL:
+        {
             (*is_masking) = true;
             masked_node = maskall_function(pstate, masking_behavious, var, result,
                                            polid, full_column, func_params);
-            break;
+        }
+        break;
+        default:
+        {
+            (*is_masking) = true;
+            if ((masked_node = create_udf_function(pstate, var, masking_behavious, result,
+                polid, full_column, func_params)) == NULL) {
+                masked_node = maskall_function(pstate, M_UNKNOWN, var, result, polid, full_column, NULL);
+            }
+        }
+        break;
     }
     if (masked_node == NULL) {
         (*is_masking) = false;
@@ -672,85 +1031,21 @@ bool handle_masking_node(ParseState *pstate, Expr*& src_expr,
     return is_masking;
 }
 
-
-static inline void parse_var(Var* var, PolicyLabelItem *full_column, PolicyLabelItem *view_name, List* rtable)
+static bool mask_sublink(ParseState *pstate, Expr*& expr,
+    const policy_set *policy_ids, masking_result *result, List* rtable, bool can_mask)
 {
-    get_var_value(rtable, var, full_column, view_name); /* fqdn column name */
-    if (full_column->empty() && rtable != NIL) { /* sub query */
-        bool is_found = false;
-        audit_open_relation(rtable, var, full_column, &is_found);
+    if (expr == NULL) {
+        return false;
     }
-}
-
-static void parse_case_expr(Node* expr, List* rtable)
-{
-    PolicyLabelItem view_name, str_result;
-    switch (nodeTag(expr)) {
-        case T_Var:
-        {
-            parse_var((Var*)expr, &str_result, &view_name, rtable);
-        }
-        break;
-        case T_RelabelType:
-        {
-            RelabelType *relabel = (RelabelType *) expr;
-            if (relabel) {
-                switch (nodeTag(relabel->arg)) {
-                    case T_FuncExpr:
-                    {
-                        parse_func((Node*)relabel->arg);
-                    }
-                    break;
-                    case T_Var:
-                    {
-                        parse_var((Var*)relabel->arg, &str_result, &view_name, rtable);
-                    }
-                    break;
-                    default:
-                        break;
-                }
-            }
-        }
-        break;
-        case T_CaseWhen:
-        {
-            CaseWhen   *when = (CaseWhen *) expr;
-            switch (nodeTag(when->expr)) {
-                case T_OpExpr:
-                {
-                    OpExpr* op_expr = (OpExpr*)when->expr;
-                    List* args = op_expr->args;
-                    ListCell   *l = NULL;
-                    Node* n = NULL;
-                    foreach(l, args)
-                    {
-                        n = (Node*)lfirst(l);
-                        parse_case_expr(n, rtable);
-                    }
-                }
-                break;
-                case T_Var:
-                {
-                    parse_var((Var*)when->expr, &str_result, &view_name, rtable);
-                }
-                break;
-                default:
-                    break;
-            }
-            switch (nodeTag(when->result)) {
-                case T_Var:
-                {
-                    parse_var((Var*)when->result, &str_result, &view_name, rtable);
-                }
-                break;
-                default:
-                    break;
-            }
-        }
-        break;
-        default:
-            break;
+    SubLink *sublink = (SubLink *)expr;
+    Query *query = (Query *) sublink->subselect;
+    ListCell* temp = NULL;
+    bool is_masking = false;
+    foreach (temp, query->targetList) {
+        TargetEntry *old_tle = (TargetEntry *)lfirst(temp);
+        is_masking = parser_target_entry(pstate, old_tle, policy_ids, result, query->rtable, can_mask) || is_masking;
     }
+    return is_masking;
 }
 
 static bool mask_list_parameters(List **params, ParseState *pstate, bool *is_masking, const policy_set *policy_ids,
@@ -761,6 +1056,12 @@ static bool mask_list_parameters(List **params, ParseState *pstate, bool *is_mas
     foreach(lc, (*params)) {
         Node *item = (Node *) lfirst(lc);
         switch (nodeTag(item)) {
+            case T_SubLink:
+            {
+                bool expr_masked = mask_sublink(pstate, (Expr*&)item, policy_ids, result, rtable, can_mask);
+                *is_masking = expr_masked || *is_masking;
+            }
+            break;
             case T_Aggref:
             {
                 Aggref* agg = (Aggref *) item;
@@ -780,6 +1081,8 @@ static bool mask_list_parameters(List **params, ParseState *pstate, bool *is_mas
             case T_Var:
             case T_RelabelType:
             case T_FuncExpr:
+            case T_CaseExpr:
+            case T_CaseWhen:
             {
                 bool expr_masked = mask_expr_node(pstate, (Expr*&)item, policy_ids, result, rtable, can_mask);
                 *is_masking = expr_masked || *is_masking;
@@ -792,30 +1095,6 @@ static bool mask_list_parameters(List **params, ParseState *pstate, bool *is_mas
                 *is_masking = expr_masked || *is_masking;
             }
             break;
-            case T_CaseExpr:
-            {
-                CaseExpr   *expr = (CaseExpr *)item;
-                ListCell   *lc = NULL;
-
-                PolicyLabelItem defresult, view_name;
-                foreach(lc, expr->args) /* when expr */
-                {
-                    Node   *when = (Node *) lfirst(lc);
-                    parse_case_expr(when, rtable);
-                }
-                if (expr->defresult) {
-                    switch (nodeTag(expr->defresult)) {
-                        case T_Var:
-                        {
-                            parse_var((Var*)expr->defresult, &defresult, &view_name, rtable);
-                        }
-                        break;
-                        default:
-                            break;
-                    }
-                }
-            }
-            break;
             default:
                 break;
         }
@@ -826,72 +1105,71 @@ static bool mask_list_parameters(List **params, ParseState *pstate, bool *is_mas
     return *is_masking;
 }
 
-static bool mask_sublink(ParseState *pstate, Expr*& expr,
-    const policy_set *policy_ids, masking_result *result, List* rtable, bool can_mask)
-{
-    if (expr == NULL) {
-        return false;
-    }
-    SubLink *sublink = (SubLink *) expr;
-    Query *query = (Query *) sublink->subselect;
-    ListCell* temp = NULL;
-    bool is_masking = false;
-    foreach (temp, query->targetList) {
-        TargetEntry *old_tle = (TargetEntry *) lfirst(temp);
-        is_masking = parser_target_entry(pstate, old_tle, policy_ids, result, query->rtable, can_mask) || is_masking;
-    }
-    return is_masking;
-}
-
 static bool mask_expr_node(ParseState *pstate, Expr*& expr,
     const policy_set *policy_ids, masking_result *result, List* rtable, bool can_mask)
 {
+    bool is_masking = false;
     if (expr == NULL) {
         return false;
     }
     switch (nodeTag(expr)) {
         case T_SubLink:
-            return mask_sublink(pstate, expr, policy_ids, result, rtable, can_mask);
+            is_masking = mask_sublink(pstate, expr, policy_ids, result, rtable, can_mask);
+            break;
         case T_FuncExpr:
-            return mask_func(pstate, expr, policy_ids, result, rtable, can_mask);
+            is_masking = mask_func(pstate, expr, policy_ids, result, rtable, can_mask);
+            break;
         case T_Var:
-            return handle_masking_node(pstate, expr, policy_ids, result, rtable, can_mask);
+            is_masking = handle_masking_node(pstate, expr, policy_ids, result, rtable, can_mask);
+            break;
         case T_RelabelType: {
             RelabelType *relabel = (RelabelType *) expr;
-            if (relabel->arg != NULL) {
-                return mask_expr_node(pstate, (Expr *&)relabel->arg, policy_ids, result, rtable, can_mask);
-            }
+            is_masking = mask_expr_node(pstate, (Expr *&)relabel->arg, policy_ids, result, rtable, can_mask);
             break;
         }
         case T_CoerceViaIO: {
             CoerceViaIO *coerce = (CoerceViaIO *) expr;
-            if (coerce->arg != NULL) {
-                return mask_expr_node(pstate, (Expr *&)coerce->arg, policy_ids, result, rtable, false);
-            }
+            is_masking = mask_expr_node(pstate, (Expr *&)coerce->arg, policy_ids, result, rtable, false);
             break;
         }
         case T_Aggref: {
             Aggref *agg = (Aggref *) expr;
             if (agg->args != NIL && list_length(agg->args) > 0) {
-                bool is_masking = false;
                 mask_list_parameters(&(agg->args), pstate, &is_masking, policy_ids, result, rtable, can_mask);
-                return is_masking;
             }
             break;
         }
         case T_OpExpr: {
             OpExpr *opexpr = (OpExpr *) expr;
             if (opexpr->args != NIL && list_length(opexpr->args) > 0) {
-                bool is_masking = false;
                 mask_list_parameters(&(opexpr->args), pstate, &is_masking, policy_ids, result, rtable, can_mask);
-                return is_masking;
             }
             break;
         }
+        case T_CaseExpr:
+        {
+            CaseExpr *caseexpr = (CaseExpr *) expr;
+            if (caseexpr->args != NIL && list_length(caseexpr->args) > 0) {
+                mask_list_parameters(&(caseexpr->args), pstate, &is_masking, policy_ids, result, rtable, can_mask);
+            }
+            bool res = mask_expr_node(pstate, (Expr *&)caseexpr->defresult, policy_ids, result, rtable, can_mask);
+            is_masking = is_masking || res;
+        }
+        break;
+        case T_CaseWhen:
+        {
+            CaseWhen *whenexpr = (CaseWhen *) expr;
+            if (whenexpr->expr != NULL) {
+                is_masking = mask_expr_node(pstate, (Expr *&)whenexpr->expr, policy_ids, result, rtable, can_mask);
+            }
+            bool res = mask_expr_node(pstate, (Expr *&)whenexpr->result, policy_ids, result, rtable, can_mask);
+            is_masking = is_masking || res;
+        }
+        break;
         default:
             break;
     }
-    return false;
+    return is_masking;
 }
 
 bool parser_target_entry(ParseState *pstate, TargetEntry *&old_tle,
@@ -926,6 +1204,7 @@ bool parser_target_entry(ParseState *pstate, TargetEntry *&old_tle,
         case T_RelabelType:
         case T_FuncExpr:
         case T_CoerceViaIO:
+        case T_CaseExpr:
         {
             if (mask_expr_node(pstate, (Expr *&)old_tle->expr, policy_ids, result, rtable, can_mask)) {
                 old_tle->resorigtbl = 0;
@@ -938,4 +1217,202 @@ bool parser_target_entry(ParseState *pstate, TargetEntry *&old_tle,
             break;
     }
     return is_masking;
+}
+
+void free_masked_cursor_stmts()
+{
+    if (masked_cursor_stmts != NULL) {
+        delete masked_cursor_stmts;
+        masked_cursor_stmts = NULL;
+    }
+}
+
+void free_masked_prepared_stmts()
+{
+    if (masked_prepared_stmts) {
+        delete masked_prepared_stmts;
+        masked_prepared_stmts = NULL;
+    }
+}
+
+void close_cursor_stmt_as_masked(const char* name)
+{
+    if (masked_cursor_stmts == NULL) {
+        return;
+    }
+
+    masked_cursor_stmts->erase(name);
+    if (masked_cursor_stmts->empty() || (strcasecmp(name, "all") == 0)) {
+        delete masked_cursor_stmts;
+        masked_cursor_stmts = NULL;
+    }
+}
+
+void unprepare_stmt_as_masked(const char* name)
+{
+    unprepare_stmt(name);
+    if (!masked_prepared_stmts) {
+        return;
+    }
+    masked_prepared_stmts->erase(name);
+    if (masked_prepared_stmts->empty() || !strcasecmp(name, "all")) {
+        delete masked_prepared_stmts;
+        masked_prepared_stmts = NULL;
+    }
+}
+
+void set_prepare_stmt_as_masked(const char* name, const masking_result *result)
+{
+    if (!masked_prepared_stmts) {
+        masked_prepared_stmts = new StrMap;
+    }
+    (*masked_prepared_stmts)[name] = (*result);
+}
+
+void set_cursor_stmt_as_masked(const char* name, const masking_result *result)
+{
+    if (!masked_cursor_stmts) {
+        masked_cursor_stmts = new StrMap;
+    }
+    (*masked_cursor_stmts)[name] = (*result);
+}
+
+template< class T>
+static inline void flush_stmt_masking_result(const char* name, T* stmts)
+{
+    if (stmts) {
+        StrMap::const_iterator it = stmts->find(name);
+        if (it != stmts->end()) {
+            flush_masking_result(it->second);
+        }
+    }
+}
+
+void flush_cursor_stmt_masking_result(const char* name)
+{
+    flush_stmt_masking_result(name, masked_cursor_stmts);
+}
+
+void flush_prepare_stmt_masking_result(const char* name)
+{
+    flush_stmt_masking_result(name, masked_prepared_stmts);
+}
+
+bool process_union_masking(Node *union_node, ParseState *pstate, const Query *query, const policy_set *policy_ids,
+    bool audit_exist)
+{
+    if (union_node == NULL) {
+        return false;
+    }
+    switch (nodeTag(union_node)) {
+        /* For each union, we get its query recursively for masking until it doesn't have any union query */
+        case T_SetOperationStmt: {
+            SetOperationStmt *stmt = (SetOperationStmt *)union_node;
+            if (stmt->op != SETOP_UNION) {
+                return false;
+            }
+            process_union_masking((Node *)(stmt->larg), pstate, query, policy_ids, audit_exist);
+            process_union_masking((Node *)(stmt->rarg), pstate, query, policy_ids, audit_exist);
+        }
+            break;
+        case T_RangeTblRef: {
+            RangeTblRef *ref = (RangeTblRef *)union_node;
+            if (ref->rtindex <= 0 || ref->rtindex > list_length(query->rtable)) {
+                return false;
+            }
+            Query *mostQuery = rt_fetch(ref->rtindex, query->rtable)->subquery;
+            process_masking(pstate, mostQuery, policy_ids, audit_exist);
+        }
+            break;
+        default:
+            break;
+    }
+    return true;
+}
+
+/*
+ * Main entrance for masking
+ * Identify components in query tree that need to do masking.
+ * This function will find all parts which need masking of select query,
+ * mainly includes CTE / setOperation / normal select columns.
+ */
+void process_masking(ParseState *pstate, Query *query, const policy_set *policy_ids, bool audit_exist)
+{
+    if (query == NULL) {
+        return;
+    }
+
+    /* set-operation tree UNION query */
+    if (!process_union_masking(query->setOperations, pstate, query, policy_ids, audit_exist)) {
+        ListCell *lc = NULL;
+        /* For each Cte, we get its query recursively for masking, and then handle this query in normal way */
+        if (query->cteList != NIL) {
+            foreach(lc, query->cteList) {
+                CommonTableExpr *cte = (CommonTableExpr *) lfirst(lc);
+                Query *cte_query = (Query *)cte->ctequery;
+                process_masking(pstate, cte_query, policy_ids, audit_exist);
+            }
+        }
+        /* find subquery and process each subquery node */
+        if (query->rtable != NULL) {
+            foreach(lc, query->rtable) {
+                RangeTblEntry *rte = (RangeTblEntry *) lfirst(lc);
+                Query *subquery = (Query *)rte->subquery;
+                process_masking(pstate, subquery, policy_ids, audit_exist);
+            }
+        }
+        select_PostParseAnalyze(pstate, query, policy_ids, audit_exist);
+    }
+}
+
+void select_PostParseAnalyze(ParseState *pstate, Query *&query, const policy_set *policy_ids, bool audit_exist)
+{
+    Assert(query != NULL);
+    List *targetList = NIL;
+    targetList = (query->targetList != NIL) ? query->targetList : pstate->p_target_list;
+    handle_masking(targetList, pstate, policy_ids, query->rtable, query->utilityStmt);
+
+    /* deal with function type label */
+    load_function_label(query, audit_exist);
+}
+
+/*
+ * Do masking for given target list
+ * this function will parse each RTE of the list
+ * and then will check wether each node need to do mask.
+ */
+bool handle_masking(List *targetList, ParseState *pstate, const policy_set *policy_ids, List *rtable, Node *utilityNode)
+{
+    if (targetList == NIL || policy_ids->empty()) {
+        return false;
+    }
+    ListCell *temp = NULL;
+    masking_result masking_result;
+    foreach (temp, targetList) {
+        TargetEntry *old_tle = (TargetEntry *)lfirst(temp);
+        /* Shuffle masking columns can only select directly with out other operations */
+        parser_target_entry(pstate, old_tle, policy_ids, &masking_result, rtable, true);
+    }
+    if (masking_result.size() <= 0) {
+        return false;
+    }
+    if (strlen(t_thrd.security_policy_cxt.prepare_stmt_name) > 0) {
+        /* prepare statement was masked */
+        set_prepare_stmt_as_masked(t_thrd.security_policy_cxt.prepare_stmt_name,
+            &masking_result); /* save masking event for executing case */
+    } else if (utilityNode != NULL) {
+        switch (nodeTag(utilityNode)) {
+            case T_DeclareCursorStmt: {
+                DeclareCursorStmt *stmt = (DeclareCursorStmt *)utilityNode;
+                /* save masking event for fetching case */
+                set_cursor_stmt_as_masked(stmt->portalname, &masking_result);
+            }
+            break;
+            default:
+                flush_masking_result(&masking_result); /* invoke masking event */
+        }
+    } else {
+        flush_masking_result(&masking_result); /* invoke masking event */
+    }
+    return true;
 }

@@ -1,6 +1,6 @@
 /* -------------------------------------------------------------------------
  *
- * hypopg_index.h: Implementation of hypothetical indexes for PostgreSQL
+ * hypopg_index.h: Implementation of hypothetical indexes for openGauss
  *
  * This file contains all includes for the internal code related to
  * hypothetical indexes support.
@@ -68,6 +68,8 @@ typedef struct hypoIndex {
     bool amcanunique;    /* does AM support UNIQUE indexes? */
     bool amcanmulticol;  /* does AM support multi-column indexes? */
 
+    bool isGlobal;   /* true if index is global partition index */
+    bool ispartitionedindex;  /* it is an partitioned index */
     /* store some informations usually saved in catalogs */
     List *options;   /* WITH clause options: a list of DefElem */
     bool amcanorder; /* does AM support order by column value? */

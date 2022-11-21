@@ -1,17 +1,18 @@
 /* -------------------------------------------------------------------------
  *
  * miscadmin.h
- *	  This file contains general postgres administration and initialization
+ *	  This file contains general openGauss administration and initialization
  *	  stuff that used to be spread out between the following files:
  *		globals.h						global variables
  *		pdir.h							directory path crud
- *		pinit.h							postgres initialization
+ *		pinit.h							openGauss initialization
  *		pmod.h							processing modes
  *	  Over time, this has also become the preferred place for widely known
  *	  resource-limitation stuff, such as u_sess->attr.attr_memory.work_mem and check_stack_depth().
  *
  * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
+ * Portions Copyright (c) 2021, openGauss Contributors
  *
  * src/include/miscadmin.h
  *
@@ -39,7 +40,19 @@
 
 extern const uint32 GRAND_VERSION_NUM;
 
+extern const uint32 PREDPUSH_SAME_LEVEL_VERSION_NUM;
+extern const uint32 UPSERT_WHERE_VERSION_NUM;
+extern const uint32 FUNC_PARAM_COL_VERSION_NUM;
+extern const uint32 SUBPARTITION_VERSION_NUM;
+extern const uint32 PBESINGLEPARTITION_VERSION_NUM;
+extern const uint32 COMMENT_PROC_VERSION_NUM;
+extern const uint32 COMMENT_ROWTYPE_TABLEOF_VERSION_NUM;
+extern const uint32 COMMENT_PCT_TYPE_VERSION_NUM;
+extern const uint32 HINT_ENHANCEMENT_VERSION_NUM;
+extern const uint32 MATERIALIZED_CTE_NUM;
+extern const uint32 DEFAULT_MAT_CTE_NUM;
 extern const uint32 MATVIEW_VERSION_NUM;
+extern const uint32 SWCB_VERSION_NUM;
 extern const uint32 PARTIALPUSH_VERSION_NUM;
 extern const uint32 SUBLINKPULLUP_VERSION_NUM;
 extern const uint32 PREDPUSH_VERSION_NUM;
@@ -53,9 +66,37 @@ extern const uint32 PRIVS_VERSION_NUM;
 extern const uint32 ML_OPT_MODEL_VERSION_NUM;
 extern const uint32 RANGE_LIST_DISTRIBUTION_VERSION_NUM;
 extern const uint32 FIX_SQL_ADD_RELATION_REF_COUNT;
+extern const uint32 INPLACE_UPDATE_VERSION_NUM;
 extern const uint32 GENERATED_COL_VERSION_NUM;
+extern const uint32 SEGMENT_PAGE_VERSION_NUM;
+extern const uint32 DECODE_ABORT_VERSION_NUM;
+extern const uint32 COPY_TRANSFORM_VERSION_NUM;
+extern const uint32 TDE_VERSION_NUM;
+extern const uint32 PARALLEL_DECODE_VERSION_NUM;
+extern const uint32 V5R1C20_BACKEND_VERSION_NUM;
+extern const uint32 V5R2C00_START_VERSION_NUM;
+extern const uint32 V5R2C00_BACKEND_VERSION_NUM;
+extern const uint32 TWOPHASE_FILE_VERSION;
+extern const uint32 CLIENT_ENCRYPTION_PROC_VERSION_NUM;
+extern const uint32 PRIVS_DIRECTORY_VERSION_NUM;
+extern const uint32 COMMENT_RECORD_PARAM_VERSION_NUM;
+extern const uint32 INVALID_INVISIBLE_TUPLE_VERSION;
+extern const uint32 ENHANCED_TUPLE_LOCK_VERSION_NUM;
+extern const uint32 HASUID_VERSION_NUM;
+extern const uint32 CREATE_INDEX_CONCURRENTLY_DIST_VERSION_NUM;
+extern const uint32 WAIT_N_TUPLE_LOCK_VERSION_NUM;
+extern const uint32 DISASTER_READ_VERSION_NUM;
+extern const uint32 SUPPORT_DATA_REPAIR;
+extern const uint32 SCAN_BATCH_MODE_VERSION_NUM;
+extern const uint32 RELMAP_4K_VERSION_NUM;
+extern const uint32 PUBLICATION_VERSION_NUM;
 extern const uint32 ANALYZER_HOOK_VERSION_NUM;
+extern const uint32 SUPPORT_HASH_XLOG_VERSION_NUM;
+extern const uint32 PITR_INIT_VERSION_NUM;
 
+extern void register_backend_version(uint32 backend_version);
+extern bool contain_backend_version(uint32 version_number);
+extern PGDLLIMPORT int eager_mem;
 #define INPLACE_UPGRADE_PRECOMMIT_VERSION 1
 
 #define OPT_DISPLAY_LEADING_ZERO 1
@@ -69,7 +110,20 @@ extern const uint32 ANALYZER_HOOK_VERSION_NUM;
 #define OPT_CONCAT_VARIADIC 256
 #define OPT_MEGRE_UPDATE_MULTI 512
 #define OPT_CONVERT_TO_NUMERIC 1024
-#define OPT_MAX 11
+#define OPT_PLSTMT_IMPLICIT_SAVEPOINT 2048
+#define OPT_HIDE_TAILING_ZERO 4096
+#define OPT_SECURITY_DEFINER 8192
+#define OPT_SKIP_GS_SOURCE 16384
+#define OPT_PROC_OUTPARAM_OVERRIDE 32768
+#define OPT_ALLOW_PROCEDURE_COMPILE_CHECK 65536
+#define OPT_IMPLICIT_FOR_LOOP_VARIABLE 131072
+#define OPT_AFORMAT_NULL_TEST 262144
+#define OPT_AFORMAT_REGEX_MATCH 524288
+#define OPT_ROWNUM_TYPE_COMPAT 1048576
+#define OPT_COMPAT_CURSOR 2097152
+#define OPT_CHAR_COERCE_COMPAT 4194304
+#define OPT_MAX 23
+
 
 #define DISPLAY_LEADING_ZERO (u_sess->utils_cxt.behavior_compat_flags & OPT_DISPLAY_LEADING_ZERO)
 #define END_MONTH_CALCULATE (u_sess->utils_cxt.behavior_compat_flags & OPT_END_MONTH_CALCULATE)
@@ -85,6 +139,18 @@ extern const uint32 ANALYZER_HOOK_VERSION_NUM;
 #define CONCAT_VARIADIC (!(u_sess->utils_cxt.behavior_compat_flags & OPT_CONCAT_VARIADIC))
 #define MEGRE_UPDATE_MULTI (u_sess->utils_cxt.behavior_compat_flags & OPT_MEGRE_UPDATE_MULTI)
 #define CONVERT_STRING_DIGIT_TO_NUMERIC (u_sess->utils_cxt.behavior_compat_flags & OPT_CONVERT_TO_NUMERIC)
+#define PLSTMT_IMPLICIT_SAVEPOINT (u_sess->utils_cxt.behavior_compat_flags & OPT_PLSTMT_IMPLICIT_SAVEPOINT)
+#define HIDE_TAILING_ZERO (u_sess->utils_cxt.behavior_compat_flags & OPT_HIDE_TAILING_ZERO)
+#define PLSQL_SECURITY_DEFINER (u_sess->utils_cxt.behavior_compat_flags & OPT_SECURITY_DEFINER)
+#define SKIP_GS_SOURCE (u_sess->utils_cxt.behavior_compat_flags & OPT_SKIP_GS_SOURCE)
+#define PROC_OUTPARAM_OVERRIDE (u_sess->utils_cxt.behavior_compat_flags & OPT_PROC_OUTPARAM_OVERRIDE)
+#define ALLOW_PROCEDURE_COMPILE_CHECK (u_sess->utils_cxt.behavior_compat_flags & OPT_ALLOW_PROCEDURE_COMPILE_CHECK)
+#define IMPLICIT_FOR_LOOP_VARIABLE (u_sess->utils_cxt.behavior_compat_flags & OPT_IMPLICIT_FOR_LOOP_VARIABLE)
+#define AFORMAT_NULL_TEST (u_sess->utils_cxt.behavior_compat_flags & OPT_AFORMAT_NULL_TEST)
+#define AFORMAT_REGEX_MATCH (u_sess->utils_cxt.behavior_compat_flags & OPT_AFORMAT_REGEX_MATCH)
+#define ROWNUM_TYPE_COMPAT (u_sess->utils_cxt.behavior_compat_flags & OPT_ROWNUM_TYPE_COMPAT)
+#define COMPAT_CURSOR (u_sess->utils_cxt.behavior_compat_flags & OPT_COMPAT_CURSOR)
+#define CHAR_COERCE_COMPAT (u_sess->utils_cxt.behavior_compat_flags & OPT_CHAR_COERCE_COMPAT)
 
 /* define database compatibility Attribute */
 typedef struct {
@@ -138,6 +204,16 @@ extern void ProcessInterrupts(void);
         }                                                                                        \
     } while (0)
 
+#define PREVENT_POOL_VALIDATE_SIGUSR2()                                        \
+    do {                                                                       \
+        if (t_thrd.int_cxt.PoolValidateCancelPending && IS_PGXC_COORDINATOR) { \
+            g_pq_interrupt_happened = false;                                   \
+            t_thrd.int_cxt.ProcDiePending = false;                             \
+            t_thrd.int_cxt.QueryCancelPending = false;                         \
+            t_thrd.int_cxt.PoolValidateCancelPending = false;                  \
+        }                                                                      \
+    } while (0)                                                                \
+
 #define START_CRIT_SECTION() (t_thrd.int_cxt.CritSectionCount++)
 
 #define END_CRIT_SECTION()                           \
@@ -145,6 +221,14 @@ extern void ProcessInterrupts(void);
         Assert(t_thrd.int_cxt.CritSectionCount > 0); \
         t_thrd.int_cxt.CritSectionCount--;           \
     } while (0)
+
+#define HOLD_CANCEL_INTERRUPTS()  (t_thrd.int_cxt.QueryCancelHoldoffCount++)
+
+#define RESUME_CANCEL_INTERRUPTS() \
+do { \
+    Assert(t_thrd.int_cxt.QueryCancelHoldoffCount > 0); \
+    t_thrd.int_cxt.QueryCancelHoldoffCount--; \
+} while (0)
 
 /*****************************************************************************
  *	  globals.h --															 *
@@ -166,7 +250,7 @@ extern bool InplaceUpgradePrecommit;
 extern THR_LOCAL PGDLLIMPORT bool IsUnderPostmaster;
 extern THR_LOCAL PGDLLIMPORT char my_exec_path[];
 
-extern int8 ce_cache_refresh_type;
+extern uint8 ce_cache_refresh_type;
 
 #define MAX_QUERY_DOP (64)
 #define MIN_QUERY_DOP -(MAX_QUERY_DOP)
@@ -251,7 +335,7 @@ extern int trace_recovery(int trace_level);
 
 /*****************************************************************************
  *	  pdir.h --																 *
- *			POSTGRES directory path definitions.							 *
+ *			openGauss directory path definitions.							 *
  *****************************************************************************/
 
 /* flags to be OR'd to form sec_context */
@@ -273,7 +357,7 @@ extern bool InLocalUserIdChange(void);
 extern bool InSecurityRestrictedOperation(void);
 extern void GetUserIdAndContext(Oid* userid, bool* sec_def_context);
 extern void SetUserIdAndContext(Oid userid, bool sec_def_context);
-extern void InitializeSessionUserId(const char* rolename);
+extern void InitializeSessionUserId(const char* rolename, bool flagresue = false, Oid useroid = InvalidOid);
 extern void InitializeSessionUserIdStandalone(void);
 extern void SetSessionAuthorization(Oid userid, bool is_superuser);
 extern Oid GetCurrentRoleId(void);
@@ -319,20 +403,21 @@ extern bool CheckExecDirectPrivilege(const char* query); /* check user have priv
 
 /*****************************************************************************
  *	  pmod.h --																 *
- *			POSTGRES processing mode definitions.							 *
+ *			openGauss processing mode definitions.							 *
  *****************************************************************************/
 
 #define IsBootstrapProcessingMode() (u_sess->misc_cxt.Mode == BootstrapProcessing)
 #define IsInitProcessingMode() (u_sess->misc_cxt.Mode == InitProcessing)
 #define IsNormalProcessingMode() (u_sess->misc_cxt.Mode == NormalProcessing)
 #define IsPostUpgradeProcessingMode() (u_sess->misc_cxt.Mode == PostUpgradeProcessing)
+#define IsFencedProcessingMode() (u_sess->misc_cxt.Mode == FencedProcessing)
 
 #define GetProcessingMode() u_sess->misc_cxt.Mode
 
 #define SetProcessingMode(mode)                                                                              \
     do {                                                                                                     \
         AssertArg((mode) == BootstrapProcessing || (mode) == InitProcessing || (mode) == NormalProcessing || \
-                  (mode) == PostUpgradeProcessing);                                                          \
+                  (mode) == PostUpgradeProcessing ||  (mode) == FencedProcessing);                                                          \
         u_sess->misc_cxt.Mode = (mode);                                                                      \
     } while (0)
 
@@ -346,6 +431,8 @@ typedef enum {
     BootstrapProcess,
     StartupProcess,
     BgWriterProcess,
+    SpBgWriterProcess,
+    PageRepairProcess,
     CheckpointerProcess,
     WalWriterProcess,
     WalWriterAuxiliaryProcess,
@@ -366,8 +453,11 @@ typedef enum {
 #endif
     AsyncIOCompleterProcess,
     TpoolSchdulerProcess,
+    UndoRecyclerProcess,
     TsCompactionProcess,
     TsCompactionAuxiliaryProcess,
+    XlogCopyBackendProcess,
+    BarrierPreParseBackendProcess,
     NUM_SINGLE_AUX_PROC, /* Sentry for auxiliary type with single thread. */
 
     /*
@@ -376,11 +466,12 @@ typedef enum {
      * Meanwhile, you must update NUM_MULTI_AUX_PROC and GetAuxProcEntryIndex().
      */
     PageWriterProcess,
-    MultiBgWriterProcess,
     PageRedoProcess,
     TpoolListenerProcess,
     TsCompactionConsumerProcess,
     CsnMinSyncProcess,
+    ParallelDecodeProcess,
+    LogicalReadRecord,
 
     NUM_AUXPROCTYPES /* Must be last! */
 } AuxProcType;
@@ -389,7 +480,6 @@ typedef enum {
 #define AmStartupProcess() (t_thrd.bootstrap_cxt.MyAuxProcType == StartupProcess)
 #define AmPageRedoProcess() (t_thrd.bootstrap_cxt.MyAuxProcType == PageRedoProcess)
 #define AmBackgroundWriterProcess() (t_thrd.bootstrap_cxt.MyAuxProcType == BgWriterProcess)
-#define AmMulitBackgroundWriterProcess() (t_thrd.bootstrap_cxt.MyAuxProcType == MultiBgWriterProcess)
 #define AmCheckpointerProcess() (t_thrd.bootstrap_cxt.MyAuxProcType == CheckpointerProcess)
 #define AmWalWriterProcess() (t_thrd.bootstrap_cxt.MyAuxProcType == WalWriterProcess)
 #define AmWalWriterAuxiliaryProcess() (t_thrd.bootstrap_cxt.MyAuxProcType == WalWriterAuxiliaryProcess)
@@ -404,6 +494,8 @@ typedef enum {
 #define AmCBMWriterProcess() (t_thrd.bootstrap_cxt.MyAuxProcType == CBMWriterProcess)
 #define AmRemoteServiceProcess() (t_thrd.bootstrap_cxt.MyAuxProcType == RemoteServiceProcess)
 #define AmPageWriterProcess() (t_thrd.bootstrap_cxt.MyAuxProcType == PageWriterProcess)
+#define AmPageWriterMainProcess() (t_thrd.bootstrap_cxt.MyAuxProcType == PageWriterProcess && \
+    t_thrd.pagewriter_cxt.pagewriter_id == 0)
 #define AmHeartbeatProcess() (t_thrd.bootstrap_cxt.MyAuxProcType == HeartbeatProcess)
 #define AmTsCompactionProcess() (t_thrd.bootstrap_cxt.MyAuxProcType == TsCompactionProcess)
 #define AmTsCompactionConsumerProcess() (t_thrd.bootstrap_cxt.MyAuxProcType == TsCompactionConsumerProcess)
@@ -412,15 +504,14 @@ typedef enum {
 
 
 
-
 /*****************************************************************************
  *	  pinit.h --															 *
- *			POSTGRES initialization and cleanup definitions.				 *
+ *			openGauss initialization and cleanup definitions.				 *
  *****************************************************************************/
 
 /* in utils/init/postinit.c */
 extern void pg_split_opts(char** argv, int* argcp, char* optstr);
-extern void PostgresResetUsernamePgoption(const char* username);
+extern void PostgresResetUsernamePgoption(const char* username, bool ispoolerreuse = false);
 extern void BaseInit(void);
 
 /*
@@ -464,6 +555,8 @@ extern bool BackupInProgress(void);
 extern void CancelBackup(void);
 
 extern void EarlyBindingTLSVariables(void);
+
+// extern PGDLLIMPORT Oid MyDatabaseId;
 
 /*
  * converts the 64 bits unsigned integer between host byte order and network byte order.

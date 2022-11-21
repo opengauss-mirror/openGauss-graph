@@ -34,7 +34,7 @@
 #include "access/sysattr.h"
 #include "catalog/pg_inherits_fn.h"
 #include "catalog/pg_type.h"
-#include "executor/nodeRecursiveunion.h"
+#include "executor/node/nodeRecursiveunion.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
@@ -1603,6 +1603,7 @@ static void expand_inherited_rtentry(PlannerInfo* root, RangeTblEntry* rte, Inde
             newrc->rowmarkId = oldrc->rowmarkId;
             newrc->markType = oldrc->markType;
             newrc->noWait = oldrc->noWait;
+            newrc->waitSec = oldrc->waitSec;
             newrc->isParent = false;
 
             root->rowMarks = lappend(root->rowMarks, newrc);
@@ -2300,12 +2301,17 @@ void expand_internal_rtentry(PlannerInfo* root, RangeTblEntry* rte, Index rti)
         childrte->requiredPerms = 0;
         if (childOid != parentOid) {
             /*
-             * The delta table is row store format.
+             * Check if table is in UStore format.
+             */
+            childrte->is_ustore = RelationIsUstoreFormat(prarentRel);
+
+            /*
+             * Set delta table orientation.
              */
             childrte->orientation = REL_ROW_ORIENTED;
 
             /*
-             * fill main talbe name and schema name.
+             * fill main table name and schema name.
              */
             childrte->mainRelName = pstrdup(RelationGetRelationName(prarentRel));
             Oid nameSpaceOid = RelationGetNamespace(prarentRel);
@@ -2362,6 +2368,7 @@ void expand_internal_rtentry(PlannerInfo* root, RangeTblEntry* rte, Index rti)
             newrc->rowmarkId = oldrc->rowmarkId;
             newrc->markType = oldrc->markType;
             newrc->noWait = oldrc->noWait;
+            newrc->waitSec = oldrc->waitSec;
             newrc->isParent = false;
 
             root->rowMarks = lappend(root->rowMarks, newrc);

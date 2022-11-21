@@ -1,7 +1,7 @@
 /* -------------------------------------------------------------------------
  *
  * postgres_fdw.c
- * 		  Foreign-data wrapper for remote PostgreSQL servers
+ * 		  Foreign-data wrapper for remote openGauss servers
  *
  * Portions Copyright (c) 2020 Huawei Technologies Co.,Ltd.
  * Portions Copyright (c) 2012-2014, PostgreSQL Global Development Group
@@ -654,10 +654,18 @@ static ForeignScan *postgresGetForeignPlan(PlannerInfo *root, RelOptInfo *basere
              * complete information about, and (b) it wouldn't work anyway on
              * older remote servers.  Likewise, we don't worry about NOWAIT.
              */
-            if (rc->forUpdate) {
-                appendStringInfoString(&sql, " FOR UPDATE");
-            } else {
-                appendStringInfoString(&sql, " FOR SHARE");
+            switch (rc->strength) {
+                case LCS_FORKEYSHARE:
+                case LCS_FORSHARE:
+                    appendStringInfoString(&sql, " FOR SHARE");
+                    break;
+                case LCS_FORNOKEYUPDATE:
+                case LCS_FORUPDATE:
+                    appendStringInfoString(&sql, " FOR UPDATE");
+                    break;
+                default:
+                    ereport(ERROR, (errmsg("unknown lock type: %d", rc->strength)));
+                    break;
             }
         }
     }
@@ -681,7 +689,7 @@ static ForeignScan *postgresGetForeignPlan(PlannerInfo *root, RelOptInfo *basere
 
 /*
  * postgresBeginForeignScan
- * 		Initiate an executor scan of a foreign PostgreSQL table.
+ * 		Initiate an executor scan of a foreign openGauss table.
  */
 static void postgresBeginForeignScan(ForeignScanState *node, int eflags)
 {

@@ -28,6 +28,7 @@
 #include "knl/knl_variable.h"
 
 #include "access/sysattr.h"
+#include "access/ustore/knl_utuple.h"
 
 #include "catalog/pg_class.h"
 #include "catalog/pg_type.h"
@@ -53,21 +54,15 @@ PG_MODULE_MAGIC;
 extern "C" void _PG_init(void);
 extern "C" void _PG_output_plugin_init(OutputPluginCallbacks* cb);
 
-typedef struct {
-    MemoryContext context;
-    bool include_xids;
-    bool include_timestamp;
-    bool skip_empty_xacts;
-    bool xact_wrote_changes;
-    bool only_local;
-} TestDecodingData;
-
 static void pg_decode_startup(LogicalDecodingContext* ctx, OutputPluginOptions* opt, bool is_init);
 static void pg_decode_shutdown(LogicalDecodingContext* ctx);
 static void pg_decode_begin_txn(LogicalDecodingContext* ctx, ReorderBufferTXN* txn);
 static void pg_output_begin(
-    LogicalDecodingContext* ctx, TestDecodingData* data, ReorderBufferTXN* txn, bool last_write);
+    LogicalDecodingContext* ctx, PluginTestDecodingData* data, ReorderBufferTXN* txn, bool last_write);
 static void pg_decode_commit_txn(LogicalDecodingContext* ctx, ReorderBufferTXN* txn, XLogRecPtr commit_lsn);
+static void pg_decode_abort_txn(LogicalDecodingContext* ctx, ReorderBufferTXN* txn);
+static void pg_decode_prepare_txn(LogicalDecodingContext* ctx, ReorderBufferTXN* txn);
+
 static void pg_decode_change(
     LogicalDecodingContext* ctx, ReorderBufferTXN* txn, Relation rel, ReorderBufferChange* change);
 static bool pg_decode_filter(LogicalDecodingContext* ctx, RepOriginId origin_id);
@@ -86,6 +81,8 @@ void _PG_output_plugin_init(OutputPluginCallbacks* cb)
     cb->begin_cb = pg_decode_begin_txn;
     cb->change_cb = pg_decode_change;
     cb->commit_cb = pg_decode_commit_txn;
+    cb->abort_cb = pg_decode_abort_txn;
+    cb->prepare_cb = pg_decode_prepare_txn;
     cb->filter_by_origin_cb = pg_decode_filter;
     cb->shutdown_cb = pg_decode_shutdown;
 }
@@ -94,84 +91,33 @@ void _PG_output_plugin_init(OutputPluginCallbacks* cb)
 static void pg_decode_startup(LogicalDecodingContext* ctx, OutputPluginOptions* opt, bool is_init)
 {
     ListCell* option = NULL;
-    TestDecodingData* data = NULL;
+    PluginTestDecodingData* data = NULL;
 
-    data = (TestDecodingData*)palloc0(sizeof(TestDecodingData));
+    data = (PluginTestDecodingData*)palloc0(sizeof(PluginTestDecodingData));
     data->context = AllocSetContextCreate(ctx->context,
         "text conversion context",
         ALLOCSET_DEFAULT_MINSIZE,
         ALLOCSET_DEFAULT_INITSIZE,
         ALLOCSET_DEFAULT_MAXSIZE);
     data->include_xids = true;
-    data->include_timestamp = false;
+    data->include_timestamp = true;
     data->skip_empty_xacts = false;
     data->only_local = true;
+    data->tableWhiteList = NIL;
 
     ctx->output_plugin_private = data;
 
     opt->output_type = OUTPUT_PLUGIN_TEXTUAL_OUTPUT;
 
     foreach (option, ctx->output_plugin_options) {
-        DefElem* elem = (DefElem*)lfirst(option);
-
-        Assert(elem->arg == NULL || IsA(elem->arg, String));
-
-        if (strcmp(elem->defname, "include-xids") == 0) {
-            /* if option does not provide a value, it means its value is true */
-            if (elem->arg == NULL)
-                data->include_xids = true;
-            else if (!parse_bool(strVal(elem->arg), &data->include_xids))
-                ereport(ERROR,
-                    (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-                        errmsg("could not parse value \"%s\" for parameter \"%s\"", strVal(elem->arg), elem->defname)));
-        } else if (strcmp(elem->defname, "include-timestamp") == 0) {
-            if (elem->arg == NULL)
-                data->include_timestamp = true;
-            else if (!parse_bool(strVal(elem->arg), &data->include_timestamp))
-                ereport(ERROR,
-                    (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-                        errmsg("could not parse value \"%s\" for parameter \"%s\"", strVal(elem->arg), elem->defname)));
-        } else if (strcmp(elem->defname, "force-binary") == 0) {
-            bool force_binary = false;
-
-            if (elem->arg == NULL)
-                continue;
-            else if (!parse_bool(strVal(elem->arg), &force_binary))
-                ereport(ERROR,
-                    (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-                        errmsg("could not parse value \"%s\" for parameter \"%s\"", strVal(elem->arg), elem->defname)));
-
-            if (force_binary)
-                opt->output_type = OUTPUT_PLUGIN_BINARY_OUTPUT;
-        } else if (strcmp(elem->defname, "skip-empty-xacts") == 0) {
-
-            if (elem->arg == NULL)
-                data->skip_empty_xacts = true;
-            else if (!parse_bool(strVal(elem->arg), &data->skip_empty_xacts))
-                ereport(ERROR,
-                    (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-                        errmsg("could not parse value \"%s\" for parameter \"%s\"", strVal(elem->arg), elem->defname)));
-        } else if (strcmp(elem->defname, "only-local") == 0) {
-
-            if (elem->arg == NULL)
-                data->only_local = true;
-            else if (!parse_bool(strVal(elem->arg), &data->only_local))
-                ereport(ERROR,
-                    (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-                        errmsg("could not parse value \"%s\" for parameter \"%s\"", strVal(elem->arg), elem->defname)));
-        } else {
-            ereport(ERROR,
-                (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-                    errmsg(
-                        "option \"%s\" = \"%s\" is unknown", elem->defname, elem->arg ? strVal(elem->arg) : "(null)")));
-        }
+        ParseDecodingOptionPlugin(option, data, opt);
     }
 }
 
 /* cleanup this plugin's resources */
 static void pg_decode_shutdown(LogicalDecodingContext* ctx)
 {
-    TestDecodingData* data = (TestDecodingData*)ctx->output_plugin_private;
+    PluginTestDecodingData* data = (PluginTestDecodingData*)ctx->output_plugin_private;
 
     /* cleanup our own resources via memory context reset */
     MemoryContextDelete(data->context);
@@ -180,7 +126,7 @@ static void pg_decode_shutdown(LogicalDecodingContext* ctx)
 /* BEGIN callback */
 static void pg_decode_begin_txn(LogicalDecodingContext* ctx, ReorderBufferTXN* txn)
 {
-    TestDecodingData* data = (TestDecodingData*)ctx->output_plugin_private;
+    PluginTestDecodingData* data = (PluginTestDecodingData*)ctx->output_plugin_private;
 
     data->xact_wrote_changes = false;
     if (data->skip_empty_xacts)
@@ -189,7 +135,8 @@ static void pg_decode_begin_txn(LogicalDecodingContext* ctx, ReorderBufferTXN* t
     pg_output_begin(ctx, data, txn, true);
 }
 
-static void pg_output_begin(LogicalDecodingContext* ctx, TestDecodingData* data, ReorderBufferTXN* txn, bool last_write)
+static void pg_output_begin(LogicalDecodingContext* ctx, PluginTestDecodingData* data, ReorderBufferTXN* txn,
+    bool last_write)
 {
     OutputPluginPrepareWrite(ctx, last_write);
     if (data->include_xids)
@@ -202,7 +149,7 @@ static void pg_output_begin(LogicalDecodingContext* ctx, TestDecodingData* data,
 /* COMMIT callback */
 static void pg_decode_commit_txn(LogicalDecodingContext* ctx, ReorderBufferTXN* txn, XLogRecPtr commit_lsn)
 {
-    TestDecodingData* data = (TestDecodingData*)ctx->output_plugin_private;
+    PluginTestDecodingData* data = (PluginTestDecodingData*)ctx->output_plugin_private;
 
     if (data->skip_empty_xacts && !data->xact_wrote_changes)
         return;
@@ -220,86 +167,74 @@ static void pg_decode_commit_txn(LogicalDecodingContext* ctx, ReorderBufferTXN* 
     OutputPluginWrite(ctx, true);
 }
 
+/* ABORT callback */
+static void pg_decode_abort_txn(LogicalDecodingContext* ctx, ReorderBufferTXN* txn)
+{
+    PluginTestDecodingData* data = (PluginTestDecodingData*)ctx->output_plugin_private;
+
+    if (data->skip_empty_xacts && !data->xact_wrote_changes)
+        return;
+
+    OutputPluginPrepareWrite(ctx, true);
+    if (data->include_xids)
+        appendStringInfo(ctx->out, "ABORT %lu", txn->xid);
+    else
+        appendStringInfoString(ctx->out, "ABORT");
+
+    if (data->include_timestamp)
+        appendStringInfo(ctx->out, " (at %s)", timestamptz_to_str(txn->commit_time));
+
+    OutputPluginWrite(ctx, true);
+}
+
+/* PREPARE callback */
+static void pg_decode_prepare_txn(LogicalDecodingContext* ctx, ReorderBufferTXN* txn)
+{
+    PluginTestDecodingData* data = (PluginTestDecodingData*)ctx->output_plugin_private;
+
+    if (data->skip_empty_xacts && !data->xact_wrote_changes)
+        return;
+
+    OutputPluginPrepareWrite(ctx, true);
+    if (data->include_xids)
+        appendStringInfo(ctx->out, "PREPARE %lu", txn->xid);
+    else
+        appendStringInfoString(ctx->out, "PREPARE");
+
+    if (data->include_timestamp)
+        appendStringInfo(ctx->out, " (at %s)", timestamptz_to_str(txn->commit_time));
+
+    OutputPluginWrite(ctx, true);
+}
+
+
+
 static bool pg_decode_filter(LogicalDecodingContext* ctx, RepOriginId origin_id)
 {
-    TestDecodingData* data = (TestDecodingData*)ctx->output_plugin_private;
+    PluginTestDecodingData* data = (PluginTestDecodingData*)ctx->output_plugin_private;
 
     if (data->only_local && origin_id != InvalidRepOriginId)
         return true;
     return false;
 }
 
-/*
- * Print literal `outputstr' already represented as string of type `typid'
- * into stringbuf `s'.
- *
- * Some builtin types aren't quoted, the rest is quoted. Escaping is done as
- * if u_sess->parser_cxt.standard_conforming_strings were enabled.
- */
-static void print_literal(StringInfo s, Oid typid, char* outputstr)
-{
-    const char* valptr = NULL;
-
-    switch (typid) {
-        case INT1OID:
-        case INT2OID:
-        case INT4OID:
-        case INT8OID:
-        case OIDOID:
-        case FLOAT4OID:
-        case FLOAT8OID:
-        case NUMERICOID:
-            /* NB: We don't care about Inf, NaN et al. */
-            appendStringInfoString(s, outputstr);
-            break;
-
-        case BITOID:
-        case VARBITOID:
-            appendStringInfo(s, "B'%s'", outputstr);
-            break;
-
-        case BOOLOID:
-            if (strcmp(outputstr, "t") == 0)
-                appendStringInfoString(s, "true");
-            else
-                appendStringInfoString(s, "false");
-            break;
-
-        default:
-            appendStringInfoChar(s, '\'');
-            for (valptr = outputstr; *valptr; valptr++) {
-                char ch = *valptr;
-
-                if (SQL_STR_DOUBLE(ch, false))
-                    appendStringInfoChar(s, ch);
-                appendStringInfoChar(s, ch);
-            }
-            appendStringInfoChar(s, '\'');
-            break;
-    }
-}
-
 /* print the tuple 'tuple' into the StringInfo s */
-static void tuple_to_jsoninfo(
+static void TupleToJsoninfo(
     cJSON* cols_name, cJSON* cols_type, cJSON* cols_val, TupleDesc tupdesc, HeapTuple tuple, bool skip_nulls)
 {
-    if (HEAP_TUPLE_IS_COMPRESSED(tuple->t_data))
+    if ((tuple->tupTableType == HEAP_TUPLE) && (HEAP_TUPLE_IS_COMPRESSED(tuple->t_data) ||
+        (int)HeapTupleHeaderGetNatts(tuple->t_data, tupdesc) > tupdesc->natts)) {
         return;
-    if ((int)HeapTupleHeaderGetNatts(tuple->t_data, tupdesc) > tupdesc->natts)
-        return;
-
-    int natt;
+    }
 
     /* print all columns individually */
-    for (natt = 0; natt < tupdesc->natts; natt++) {
-        Form_pg_attribute attr; /* the attribute itself */
-        Oid typid;              /* type of current attribute */
+    for (int natt = 0; natt < tupdesc->natts; natt++) {
         Oid typoutput;          /* output function */
         bool typisvarlena = false;
-        Datum origval;       /* possibly toasted Datum */
+        Datum origval = 0;      /* possibly toasted Datum */
         bool isnull = false; /* column is null? */
 
-        attr = tupdesc->attrs[natt];
+        Form_pg_attribute attr = tupdesc->attrs[natt]; /* the attribute itself */
 
         /*
          * don't print dropped columns, we can't be sure everything is
@@ -315,11 +250,14 @@ static void tuple_to_jsoninfo(
         if (attr->attnum < 0)
             continue;
 
-        typid = attr->atttypid;
+        Oid typid = attr->atttypid; /* type of current attribute */
 
         /* get Datum from tuple */
-        origval = heap_getattr(tuple, natt + 1, tupdesc, &isnull);
-
+        if (tuple->tupTableType == HEAP_TUPLE) {
+            origval = heap_getattr(tuple, natt + 1, tupdesc, &isnull);
+        } else {
+            origval = uheap_getattr((UHeapTuple)tuple, natt + 1, tupdesc, &isnull);
+        }
         if (isnull && skip_nulls)
             continue;
 
@@ -347,32 +285,30 @@ static void tuple_to_jsoninfo(
         /* print data */
         if (isnull)
             appendStringInfoString(val_str, "null");
-        else if (typisvarlena && VARATT_IS_EXTERNAL_ONDISK_B(origval))
-            appendStringInfoString(val_str, "unchanged-toast-datum");
         else if (!typisvarlena)
-            print_literal(val_str, typid, OidOutputFunctionCall(typoutput, origval));
+            PrintLiteral(val_str, typid, OidOutputFunctionCall(typoutput, origval));
         else {
             Datum val; /* definitely detoasted Datum */
             val = PointerGetDatum(PG_DETOAST_DATUM(origval));
-            print_literal(val_str, typid, OidOutputFunctionCall(typoutput, val));
+            PrintLiteral(val_str, typid, OidOutputFunctionCall(typoutput, val));
         }
         cJSON* col_val = cJSON_CreateString(val_str->data);
         cJSON_AddItemToArray(cols_val, col_val);
     }
 }
+
 /*
  * callback for individual changed tuples
  */
 static void pg_decode_change(
     LogicalDecodingContext* ctx, ReorderBufferTXN* txn, Relation relation, ReorderBufferChange* change)
 {
-    TestDecodingData* data = NULL;
+    PluginTestDecodingData* data = NULL;
     Form_pg_class class_form;
     TupleDesc tupdesc;
     MemoryContext old;
     char* res = NULL;
-    data = (TestDecodingData*)ctx->output_plugin_private;
-    u_sess->attr.attr_common.extra_float_digits = 0;
+    data = (PluginTestDecodingData*)ctx->output_plugin_private;
 
     /* output BEGIN if we haven't yet */
     if (data->skip_empty_xacts && !data->xact_wrote_changes) {
@@ -386,11 +322,18 @@ static void pg_decode_change(
     /* Avoid leaking memory by using and resetting our own context */
     old = MemoryContextSwitchTo(data->context);
 
+    char *schema = get_namespace_name(class_form->relnamespace);
+    char *table = NameStr(class_form->relname);
+    if (data->tableWhiteList != NIL && !CheckWhiteList(data->tableWhiteList, schema, table)) {
+        (void)MemoryContextSwitchTo(old);
+        MemoryContextReset(data->context);
+        return;
+    }
+
     OutputPluginPrepareWrite(ctx, true);
 
     cJSON* root = cJSON_CreateObject();
-    cJSON* table_name = cJSON_CreateString(quote_qualified_identifier(
-        get_namespace_name(get_rel_namespace(RelationGetRelid(relation))), NameStr(class_form->relname)));
+    cJSON* table_name = cJSON_CreateString(quote_qualified_identifier(schema, table));
     cJSON_AddItemToObject(root, "table_name", table_name);
 
     cJSON* op_type = NULL;
@@ -405,29 +348,55 @@ static void pg_decode_change(
         case REORDER_BUFFER_CHANGE_INSERT:
             op_type = cJSON_CreateString("INSERT");
             if (change->data.tp.newtuple != NULL) {
-                tuple_to_jsoninfo(
+                TupleToJsoninfo(
                     columns_name, columns_type, columns_val, tupdesc, &change->data.tp.newtuple->tuple, false);
             }
             break;
         case REORDER_BUFFER_CHANGE_UPDATE:
             op_type = cJSON_CreateString("UPDATE");
             if (change->data.tp.oldtuple != NULL) {
-                tuple_to_jsoninfo(
+                TupleToJsoninfo(
                     old_keys_name, old_keys_type, old_keys_val, tupdesc, &change->data.tp.oldtuple->tuple, true);
             }
 
             if (change->data.tp.newtuple != NULL) {
-                tuple_to_jsoninfo(
+                TupleToJsoninfo(
                     columns_name, columns_type, columns_val, tupdesc, &change->data.tp.newtuple->tuple, false);
             }
             break;
         case REORDER_BUFFER_CHANGE_DELETE:
             op_type = cJSON_CreateString("DELETE");
             if (change->data.tp.oldtuple != NULL) {
-                tuple_to_jsoninfo(
+                TupleToJsoninfo(
                     old_keys_name, old_keys_type, old_keys_val, tupdesc, &change->data.tp.oldtuple->tuple, true);
             }
             /* if there was no PK, we only know that a delete happened */
+            break;
+        case REORDER_BUFFER_CHANGE_UINSERT:
+            op_type = cJSON_CreateString("INSERT");
+            if (change->data.utp.newtuple != NULL) {
+                TupleToJsoninfo(columns_name, columns_type, columns_val, tupdesc,
+                    (HeapTuple)(&change->data.utp.newtuple->tuple), false);
+            }
+            break;
+        case REORDER_BUFFER_CHANGE_UDELETE:
+            op_type = cJSON_CreateString("DELETE");
+            if (change->data.utp.oldtuple != NULL) {
+                TupleToJsoninfo(old_keys_name, old_keys_type, old_keys_val, tupdesc,
+                    (HeapTuple)(&change->data.utp.oldtuple->tuple), true);
+            }
+            break;
+        case REORDER_BUFFER_CHANGE_UUPDATE:
+            op_type = cJSON_CreateString("UPDATE");
+            if (change->data.utp.oldtuple != NULL) {
+                TupleToJsoninfo(old_keys_name, old_keys_type, old_keys_val, tupdesc,
+                    (HeapTuple)(&change->data.utp.oldtuple->tuple), true);
+            }
+
+            if (change->data.utp.newtuple != NULL) {
+                TupleToJsoninfo(columns_name, columns_type, columns_val, tupdesc,
+                    (HeapTuple)&change->data.utp.newtuple->tuple, false);
+            }
             break;
         default:
             Assert(false);

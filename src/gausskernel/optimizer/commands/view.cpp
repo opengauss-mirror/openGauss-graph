@@ -54,7 +54,7 @@ InSideView query_from_view_hook = NULL;
 static void setEncryptedColumnRef(ColumnDef *def, TargetEntry *tle)
 {
     def->clientLogicColumnRef = (ClientLogicColumnRef*)palloc(sizeof(ClientLogicColumnRef));
-    HeapTuple tup = search_sys_cache_ce_col_name(tle->resorigtbl, def->colname);
+    HeapTuple tup = SearchSysCache2(CERELIDCOUMNNAME, ObjectIdGetDatum(tle->resorigtbl), CStringGetDatum(def->colname));
     if (!HeapTupleIsValid(tup)) {
         ereport(ERROR,
                 (errcode(ERRCODE_UNDEFINED_COLUMN), errmsg("client encrypted column \"%s\" does not exist", def->colname)));
@@ -146,7 +146,7 @@ static Oid DefineVirtualRelation(RangeVar* relation, List* tlist, bool replace, 
      * namespace is temporary.
      */
     lockmode = replace ? AccessExclusiveLock : NoLock;
-    (void)RangeVarGetAndCheckCreationNamespace(relation, lockmode, &viewOid);
+    (void)RangeVarGetAndCheckCreationNamespace(relation, lockmode, &viewOid, RELKIND_VIEW);
     
     bool flag = OidIsValid(viewOid) && replace;
     if (flag) {
@@ -557,7 +557,7 @@ Oid DefineView(ViewStmt* stmt, const char* queryString, bool send_remote, bool i
 
      if (stmt->relkind == OBJECT_MATVIEW) {
         /* Relation Already Created */
-        (void)RangeVarGetAndCheckCreationNamespace(view, NoLock, &viewOid);
+        (void)RangeVarGetAndCheckCreationNamespace(view, NoLock, &viewOid, RELKIND_MATVIEW);
 
 #ifdef ENABLE_MULTIPLE_NODES
         /* try to send CREATE MATERIALIZED VIEW to DNs, Only consider PGXC now. */

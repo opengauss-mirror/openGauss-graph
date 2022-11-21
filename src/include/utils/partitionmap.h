@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2020 Huawei Technologies Co.,Ltd.
+ * Portions Copyright (c) 2021, openGauss Contributors
  *
  * openGauss is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
@@ -33,7 +34,6 @@
 #include "storage/lock/lock.h"
 #include "utils/hsearch.h"
 #include "utils/relcache.h"
-#include "utils/partcache.h"
 
 typedef enum PartitionType {
     PART_TYPE_NONE = 0,
@@ -56,6 +56,10 @@ typedef struct PartitionMap {
 #define PARTITION_PARTKEYMAXNUM 4
 #define VALUE_PARTKEYMAXNUM 4
 #define INTERVAL_PARTKEYMAXNUM 1
+
+#define LIST_PARTKEYMAXNUM 1
+
+#define HASH_PARTKEYMAXNUM 1
 
 #define PartitionLogicalExist(partitionIdentifier) ((partitionIdentifier)->partSeq >= 0)
 
@@ -93,29 +97,22 @@ void decre_partmap_refcount(PartitionMap* map);
 
 #define PruningResultIsSubset(pruningRes) (PointerIsValid(pruningRes) && (pruningRes)->state == PRUNING_RESULT_SUBSET)
 
-extern List* relationGetPartitionOidList(Relation rel);
-extern void RelationInitPartitionMap(Relation relation);
+extern void RelationInitPartitionMap(Relation relation, bool isSubPartition = false);
 
 extern int partOidGetPartSequence(Relation rel, Oid partOid);
-extern Oid getListPartitionOid(Relation relation, Const** partKeyValue, int* partIndex, bool topClosed);
-extern Oid getHashPartitionOid(Relation relation, Const** partKeyValue, int* partIndex, bool topClosed);
+extern Oid getListPartitionOid(PartitionMap* partitionmap, Const** partKeyValue, int* partIndex, bool topClosed);
+extern Oid getHashPartitionOid(PartitionMap* partitionmap, Const** partKeyValue, int* partIndex, bool topClosed);
 extern Oid getRangePartitionOid(PartitionMap* partitionmap, Const** partKeyValue, int* partIndex, bool topClosed);
 extern Oid GetPartitionOidByParam(Relation relation, Param *paramArg, ParamExternData *prm);
-extern List* getPartitionBoundaryList(Relation rel, int sequence);
+extern List* getRangePartitionBoundaryList(Relation rel, int sequence);
+extern List* getListPartitionBoundaryList(Relation rel, int sequence);
+extern List* getHashPartitionBoundaryList(Relation rel, int sequence);
 extern Oid partitionKeyValueListGetPartitionOid(Relation rel, List* partKeyValueList, bool topClosed);
 extern int getNumberOfRangePartitions(Relation rel);
 extern int getNumberOfListPartitions(Relation rel);
 extern int getNumberOfHashPartitions(Relation rel);
 extern int getNumberOfPartitions(Relation rel);
 extern Const* transformDatum2Const(TupleDesc tupledesc, int16 attnum, Datum datumValue, bool isnull, Const* cnst);
-
-extern List* relationGetPartitionList(Relation relation, LOCKMODE lockmode);
-extern List* indexGetPartitionOidList(Relation indexRelation);
-extern List* indexGetPartitionList(Relation indexRelation, LOCKMODE lockmode);
-extern void  releasePartitionList(Relation relation, List** partList, LOCKMODE lockmode);
-
-extern List* relationGetPartitionOidList(Relation rel);
-extern void releasePartitionOidList(List** partList);
 
 extern int2vector* getPartitionKeyAttrNo(
     Oid** typeOids, HeapTuple pg_part_tup, TupleDesc tupledsc, TupleDesc rel_tupledsc);
@@ -128,15 +125,17 @@ extern void unserializeHashPartitionAttribute(Const** outMax, int outMaxLen,
 
 extern int partitonKeyCompare(Const** value1, Const** value2, int len);
 extern int getPartitionNumber(PartitionMap* map);
+extern int GetSubPartitionNumber(Relation rel);
 
 extern bool targetListHasPartitionKey(List* targetList, Oid partitiondtableid);
 
 extern int constCompare_constType(Const* value1, Const* value2);
 
-extern bool tupleLocateThePartition(Relation partTableRel, int partSeq, TupleDesc tupleDesc, void* tuple);
-
 extern bool partitionHasToast(Oid partOid);
 
 extern void constCompare(Const* value1, Const* value2, int& compare);
+
+extern struct ListPartElement* CopyListElements(ListPartElement* src, int elementNum);
+extern struct HashPartElement* CopyHashElements(HashPartElement* src, int elementNum, int partkeyNum);
 
 #endif /* PARTITIONMAP_H_ */

@@ -1,7 +1,7 @@
 /* -------------------------------------------------------------------------
  *
  * parser.cpp
- *        Main entry point/driver for PostgreSQL grammar
+ *        Main entry point/driver for openGauss grammar
  *
  * Note that the grammar is not allowed to perform any table access
  * (since we need to be able to do basic parsing even while inside an
@@ -28,6 +28,16 @@
 
 extern void resetOperatorPlusFlag();
 
+static void resetIsTimeCapsuleFlag()
+{
+    u_sess->parser_cxt.isTimeCapsule = false;
+}
+
+static void resetCreateFuncFlag()
+{
+    u_sess->parser_cxt.isCreateFuncOrProc = false;
+}
+
 /*
  * raw_parser
  *        Given a query in string form, do lexical and grammatical analysis.
@@ -42,6 +52,12 @@ List* raw_parser(const char* str, List** query_string_locationlist)
 
     /* reset u_sess->parser_cxt.stmt_contains_operator_plus */
     resetOperatorPlusFlag();
+
+    /* reset u_sess->parser_cxt.isTimeCapsule */
+    resetIsTimeCapsuleFlag();
+
+    /* reset u_sess->parser_cxt.isCreateFuncOrProc */
+    resetCreateFuncFlag();
 
     /* initialize the flex scanner */
     yyscanner = scanner_init(str, &yyextra.core_yy_extra, ScanKeywords, NumScanKeywords);
@@ -264,6 +280,23 @@ int base_yylex(YYSTYPE* lvalp, YYLTYPE* llocp, core_yyscan_t yyscanner)
                     break;
             }
             break;
+        case SUBPARTITION:
+
+            GET_NEXT_TOKEN();
+
+            switch (next_token) {
+                case FOR:
+                    cur_token = SUBPARTITION_FOR;
+                    break;
+                default:
+                    /* save the lookahead token for next time */
+                    SET_LOOKAHEAD_TOKEN();
+                    /* and back up the output info to cur_token */
+                    lvalp->core_yystype = cur_yylval;
+                    *llocp = cur_yylloc;
+                    break;
+            }
+            break;
         case ADD_P:
             /*
              * ADD PARTITION must be reduced to one token
@@ -273,6 +306,9 @@ int base_yylex(YYSTYPE* lvalp, YYLTYPE* llocp, core_yyscan_t yyscanner)
             switch (next_token) {
                 case PARTITION:
                     cur_token = ADD_PARTITION;
+                    break;
+                case SUBPARTITION:
+                    cur_token = ADD_SUBPARTITION;
                     break;
                 default:
                     /* save the lookahead token for next time */
@@ -294,6 +330,9 @@ int base_yylex(YYSTYPE* lvalp, YYLTYPE* llocp, core_yyscan_t yyscanner)
             switch (next_token) {
                 case PARTITION:
                     cur_token = DROP_PARTITION;
+                    break;
+                case SUBPARTITION:
+                    cur_token = DROP_SUBPARTITION;
                     break;
                 default:
                     /* save the lookahead token for next time */
@@ -403,7 +442,44 @@ int base_yylex(YYSTYPE* lvalp, YYLTYPE* llocp, core_yyscan_t yyscanner)
                     break;
             }
             break;
+        case START:
+            /*
+             * START WITH must be reduced to one token, to allow START as table / column alias.
+             */
+            GET_NEXT_TOKEN();
 
+            switch (next_token) {
+                case WITH:
+                    cur_token = START_WITH;
+                    break;
+                default:
+                    /* save the lookahead token for next time */
+                    SET_LOOKAHEAD_TOKEN();
+                    /* and back up the output info to cur_token */
+                    lvalp->core_yystype = cur_yylval;
+                    *llocp = cur_yylloc;
+                    break;
+            }
+            break;
+        case CONNECT:
+            /*
+             * CONNECT BY must be reduced to one token, to allow CONNECT as table / column alias.
+             */
+            GET_NEXT_TOKEN();
+
+            switch (next_token) {
+                case BY:
+                    cur_token = CONNECT_BY;
+                    break;
+                default:
+                    /* save the lookahead token for next time */
+                    SET_LOOKAHEAD_TOKEN();
+                    /* and back up the output info to cur_token */
+                    lvalp->core_yystype = cur_yylval;
+                    *llocp = cur_yylloc;
+                    break;
+            }
+            break;
         default:
             break;
     }

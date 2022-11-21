@@ -72,8 +72,6 @@ typedef enum knl_thread_role {
     AUDITOR,
     PGSTAT,
     SYSLOGGER,
-    RPC_WORKER,
-    RPC_SERVICE,
     CATCHUP,
     ARCH,
     ALARMCHECK,
@@ -83,7 +81,12 @@ typedef enum knl_thread_role {
     STARTUP,
     FAULTMONITOR,
     BGWRITER,
+    SPBGWRITER,
     PERCENTILE_WORKER,
+    TXNSNAP_CAPTURER,
+    TXNSNAP_WORKER,
+    RBCLEANER,
+    RBWORKER,
     SNAPSHOT_WORKER,
     ASH_WORKER,
     TRACK_STMT_WORKER,
@@ -97,14 +100,28 @@ typedef enum knl_thread_role {
     DATARECWRITER,
     CBMWRITER,
     PAGEWRITER_THREAD,
+    PAGEREPAIR_THREAD,
     HEARTBEAT,
     COMM_SENDERFLOWER,
     COMM_RECEIVERFLOWER,
     COMM_RECEIVER,
     COMM_AUXILIARY,
     COMM_POOLER_CLEAN,
+    LOGICAL_READ_RECORD,
+    PARALLEL_DECODE,
+
+    UNDO_RECYCLER,
+    UNDO_LAUNCHER,
+    UNDO_WORKER,
     CSNMIN_SYNC,
+    GLOBALSTATS_THREAD,
     BARRIER_CREATOR,
+    BGWORKER,
+    BARRIER_ARCH,
+    SHARE_STORAGE_XLOG_COPYER,
+    APPLY_LAUNCHER,
+    APPLY_WORKER,
+    BARRIER_PREPARSE,
     TS_COMPACTION,
     TS_COMPACTION_CONSUMER,
     TS_COMPACTION_AUXILIAY,
@@ -114,15 +131,21 @@ typedef enum knl_thread_role {
     STREAMING_COLLECTOR_BACKEND,
     STREAMING_QUEUE_BACKEND,
     STREAMING_REAPER_BACKEND,
+
+    COMM_PROXYER,
     /* should be last valid thread. */
     THREAD_ENTRY_BOUND,
 
     NO_SUBROLE,
     REDISTRIBUTION_WORKER,
     WAL_NORMAL_SENDER,
+    WAL_HADR_SENDER, /* A cross cluster wal sender to hadr cluster main standby */
+    WAL_HADR_CN_SENDER, /* A cross cluster wal sender to hadr cluster coordinator standby */
+    WAL_SHARE_STORE_SENDER, /* A cross cluster wal sender to share storage cluster standby */
     WAL_STANDBY_SENDER, /* Am I cascading WAL to another standby ? */
     WAL_DB_SENDER,
     TOP_CONSUMER,
+    DCF_WORKER
 } knl_thread_role;
 
 /*

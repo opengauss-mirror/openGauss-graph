@@ -207,7 +207,7 @@ void BtreeXlogSplitOperatorLeftpage(RedoBufferInfo *lbuf, void *recorddata, Bloc
 
     /* assure that memory is properly allocated, prevent from core dump caused by buffer unpin */
     START_CRIT_SECTION();
-    newlpage = PageGetTempPageCopySpecial(lpage, true);
+    newlpage = PageGetTempPageCopySpecial(lpage);
     END_CRIT_SECTION();
 
     /* Set high key */
@@ -639,8 +639,8 @@ static XLogRecParseState *BtreeXlogVacuumParseBlock(XLogReaderState *record, uin
                 return NULL;
             }
 
-            XLogRecSetBlockCommonState(record, BLOCK_DATA_VACUUM_PIN_TYPE, MAIN_FORKNUM, thisblkno, &thisrnode,
-                                       blockstate);
+            RelFileNodeForkNum filenode = RelFileNodeForkNumFill(&thisrnode, InvalidBackendId, MAIN_FORKNUM, thisblkno);
+            XLogRecSetBlockCommonState(record, BLOCK_DATA_VACUUM_PIN_TYPE, filenode, blockstate);
             XLogRecSetPinVacuumState(&blockstate->blockparse.extra_rec.blockvacuumpin, xlrec->lastBlockVacuumed);
         }
     }
@@ -790,8 +790,10 @@ static XLogRecParseState *BtreeXlogReusePageParseBlock(XLogReaderState *record, 
 
         RelFileNode rnode;
         RelFileNodeCopy(rnode, xlrec->node, XLogRecGetBucketId(record));
-        XLogRecSetBlockCommonState(record, BLOCK_DATA_INVALIDMSG_TYPE, InvalidForkNumber, InvalidBlockNumber, &rnode,
-                                   recordstatehead);
+
+        RelFileNodeForkNum filenode =
+            RelFileNodeForkNumFill(&rnode, InvalidBackendId, InvalidForkNumber, InvalidBlockNumber);
+        XLogRecSetBlockCommonState(record, BLOCK_DATA_INVALIDMSG_TYPE, filenode, recordstatehead);
         XLogRecSetInvalidMsgState(&recordstatehead->blockparse.extra_rec.blockinvalidmsg, xlrec->latestRemovedXid);
     }
     return recordstatehead;

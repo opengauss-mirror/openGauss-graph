@@ -33,6 +33,7 @@
 #include "replication/datasender.h"
 #include "replication/datasender_private.h"
 #include "replication/walsender_private.h"
+#include "replication/shared_storage_walreceiver.h"
 #include "replication/syncrep.h"
 #include "storage/cu.h"
 #include "storage/pmsignal.h"
@@ -57,8 +58,9 @@ void WaitForDataSync(void)
      * sync replication standby names defined. Note that those standbys don't
      * need to be connected.
      */
-    if (!u_sess->attr.attr_storage.enable_stream_replication || !SyncRepRequested() || !SyncStandbysDefined() ||
-        (t_thrd.postmaster_cxt.HaShmData->current_mode == NORMAL_MODE)) {
+    bool isResetBcm = !u_sess->attr.attr_storage.enable_stream_replication || !SyncRepRequested() || !SyncStandbysDefined() ||
+        (t_thrd.postmaster_cxt.HaShmData->current_mode == NORMAL_MODE);
+    if (isResetBcm) {
         ResetBCMArray();
         return;
     }
@@ -183,8 +185,8 @@ void WaitForDataSync(void)
         /*
          * if we  modify the syncmode dynamically, we'll stop wait
          */
-        if (t_thrd.walsender_cxt.WalSndCtl->sync_master_standalone ||
-            synchronous_commit <= SYNCHRONOUS_COMMIT_LOCAL_FLUSH) {
+        if ((t_thrd.walsender_cxt.WalSndCtl->sync_master_standalone && !IS_SHARED_STORAGE_MODE) ||
+            u_sess->attr.attr_storage.guc_synchronous_commit <= SYNCHRONOUS_COMMIT_LOCAL_FLUSH) {
             ereport(WARNING,
                     (errmsg("canceling wait for synchronous replication due to syncmaster standalone."),
                      errdetail("The transaction has already committed locally, but might not have been replicated to "

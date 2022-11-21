@@ -214,12 +214,12 @@ VecHashJoinState* ExecInitVecHashJoin(VecHashJoin* node, EState* estate, int efl
     hash_state->eqfunctions = eqfunctions;
     hash_state->js.ps.ps_TupFromTlist = false;
 
-#ifdef ENABLE_LLVM_COMPILE
     /* Initialize runtime bloomfilter. */
     hash_state->bf_runtime.bf_var_list = hash_state->js.ps.plan->var_list;
     hash_state->bf_runtime.bf_filter_index = hash_state->js.ps.plan->filterIndexList;
     hash_state->bf_runtime.bf_array = estate->es_bloom_filter.bfarray;
 
+#ifdef ENABLE_LLVM_COMPILE
     /* consider codegeneration for hashjoin node with respect to innerjoin,
      * buildhashtable and probehashtable function.
      */

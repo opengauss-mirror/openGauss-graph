@@ -44,6 +44,12 @@ typedef enum {
     PMSIGNAL_ROLLBACK_STANDBY_PROMOTE, /* roll back standby promoting */
     PMSIGNAL_START_PAGE_WRITER,        /* start a new page writer thread */
     PMSIGNAL_START_THREADPOOL_WORKER,  /* start thread pool woker */
+	PMSIGNAL_START_UNDO_WORKER,        /* start a new undo worker */
+    PMSIGNAL_START_RB_WORKER,          /* start a rbworker */
+    PMSIGNAL_START_TXNSNAPWORKER,      /* start a snapcaputure worker */
+    PMSIGNAL_START_LOGICAL_READ_WORKER,/* start logical read worker */
+    PMSIGNAL_START_PARALLEL_DECODE_WORKER,/* start parallel decoding worker */
+    PMSIGNAL_START_APPLY_WORKER,       /* start a apply worker */
     NUM_PMSIGNALS                      /* Must be last value of enum! */
 } PMSignalReason;
 

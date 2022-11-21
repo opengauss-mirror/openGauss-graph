@@ -27,12 +27,9 @@ extern THR_LOCAL PGDLLIMPORT post_parse_analyze_hook_type post_parse_analyze_hoo
 
 extern Query* parse_analyze(Node* parseTree, const char* sourceText, Oid* paramTypes, int numParams,
     bool isFirstNode = true, bool isCreateView = false);
-#ifdef ENABLE_MULTIPLE_NODES	
+
 extern Query* parse_analyze_varparams(Node* parseTree, const char* sourceText, Oid** paramTypes, int* numParams);
-#else
-extern Query* parse_analyze_varparams(Node* parseTree, const char* sourceText, Oid** paramTypes, int* numParams,
-                                      char** paramTypeNames);
-#endif
+
 
 extern Query* parse_sub_analyze(Node* parseTree, ParseState* parentParseState, CommonTableExpr* parentCTE,
     bool locked_from_parent, bool resolve_unknowns);
@@ -45,7 +42,8 @@ extern Query* transformStmt(ParseState* pstate, Node* parseTree, bool isFirstNod
 extern bool analyze_requires_snapshot(Node* parseTree);
 
 extern void CheckSelectLocking(Query* qry);
-extern void applyLockingClause(Query* qry, Index rtindex, bool forUpdate, bool noWait, bool pushedDown);
+extern void applyLockingClause(Query* qry, Index rtindex, LockClauseStrength strength, bool noWait, bool pushedDown,
+                               int waitSec);
 #ifdef ENABLE_MOT
 extern void CheckTablesStorageEngine(Query* qry, StorageEngineType* type);
 extern bool CheckMotIndexedColumnUpdate(Query* qry);
@@ -90,6 +88,8 @@ typedef struct AnalyzerRoutine {
     transformSelectStmtHook transSelect;
 } AnalyzerRoutine;
 
+typedef Query* (*transformStmtFunc)(ParseState* pstate, Node* parseTree, bool isFirstNode, bool isCreateView);
+
 extern void transformOperatorPlus(ParseState* pstate, Node** whereClause);
 extern bool IsColumnRefPlusOuterJoin(const ColumnRef* cf);
 extern PlusJoinRTEItem* makePlusJoinRTEItem(RangeTblEntry* rte, bool hasplus);
@@ -101,5 +101,6 @@ extern void fixResTargetListWithTableNameRef(Relation rd, RangeVar* rel, List* c
 #endif /* !FRONTEND_PARSER */
 
 extern bool getOperatorPlusFlag();
+
 
 #endif /* ANALYZE_H */

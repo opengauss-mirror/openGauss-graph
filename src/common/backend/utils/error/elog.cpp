@@ -45,6 +45,7 @@
  *
  * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
+ * Portions Copyright (c) 2021, openGauss Contributors
  *
  *
  * IDENTIFICATION
@@ -86,7 +87,7 @@
 #include "pgxc/pgxc.h"
 #include "pgxc/execRemote.h"
 #endif
-#include "executor/execStream.h"
+#include "executor/exec/execStream.h"
 #include "executor/executor.h"
 #include "workload/workload.h"
 #include "../bin/gsqlerr/errmsg.h"
@@ -132,6 +133,8 @@ extern THR_LOCAL char* g_instance.attr.attr_common.event_source;
 static void write_eventlog(int level, const char* line, int len);
 #endif
 
+static const int CREATE_ALTER_SUBSCRIPTION = 16;
+
 /* Macro for checking t_thrd.log_cxt.errordata_stack_depth is reasonable */
 #define CHECK_STACK_DEPTH()                                               \
     do {                                                                  \
@@ -165,6 +168,27 @@ static void eraseSingleQuotes(char* query_string);
 static int output_backtrace_to_log(StringInfoData* pOutBuf);
 static void write_asp_chunks(char *data, int len, bool end);
 static void write_asplog(char *data, int len, bool end);
+
+#define MASK_OBS_PATH()                                                                                 \
+    do {                                                                                                \
+        char* childStmt = mask_funcs3_parameters(yylval.str);                                           \
+        if (childStmt != NULL) {                                                                        \
+            if (mask_string == NULL) {                                                                  \
+                mask_string = MemoryContextStrdup(                                                      \
+                    SESS_GET_MEM_CXT_GROUP(MEMORY_CONTEXT_SECURITY), query_string);                     \
+            }                                                                                           \
+            if (unlikely(yyextra.literallen != (int)strlen(childStmt))) {                               \
+                ereport(ERROR,                                                                          \
+                    (errcode(ERRCODE_SYNTAX_ERROR),                                                     \
+                    errmsg("parse error on statement %s.", childStmt)));                                \
+            }                                                                                           \
+            rc = memcpy_s(mask_string + yylloc + 1, yyextra.literallen, childStmt, yyextra.literallen); \
+            securec_check(rc, "\0", "\0");                                                              \
+            rc = memset_s(childStmt, yyextra.literallen, 0, yyextra.literallen);                        \
+            securec_check(rc, "", "");                                                                  \
+            pfree(childStmt);                                                                           \
+        }                                                                                               \
+    } while (0)
 
 /*
  * in_error_recursion_trouble --- are we at risk of infinite error recursion?
@@ -246,8 +270,12 @@ bool errstart(int elevel, const char* filename, int lineno, const char* funcname
          * infinite recursion!)
          */
         if (elevel == ERROR) {
-            if (t_thrd.log_cxt.PG_exception_stack == NULL || t_thrd.proc_cxt.proc_exit_inprogress)
+            if (t_thrd.log_cxt.PG_exception_stack == NULL ||
+                t_thrd.proc_cxt.proc_exit_inprogress ||
+                t_thrd.xact_cxt.applying_subxact_undo)
+            {
                 elevel = FATAL;
+            }
 
             if (u_sess->attr.attr_common.ExitOnAnyError && !AmPostmasterProcess()) {
                 /*
@@ -280,6 +308,9 @@ bool errstart(int elevel, const char* filename, int lineno, const char* funcname
          */
         for (i = 0; i <= t_thrd.log_cxt.errordata_stack_depth; i++)
             elevel = Max(elevel, t_thrd.log_cxt.errordata[i].elevel);
+        if (elevel == FATAL && t_thrd.role == JOB_WORKER) {
+            elevel = ERROR;
+        }
     }
 
     /*
@@ -532,6 +563,17 @@ void errfinish(int dummy, ...)
     }
 #endif
 
+    /* 
+     * Make sure reset create schema flag if error happen,
+     * even in pg_try_catch case and procedure exception case.
+     * Top transaction memcxt will release the memory, just set NULL.
+     */
+    if (elevel >= ERROR) {
+        u_sess->catalog_cxt.setCurCreateSchema = false;
+        u_sess->catalog_cxt.curCreateSchema = NULL;
+        u_sess->exec_cxt.isLockRows = false;
+    }
+
     /*
      * If ERROR (not more nor less) we pass it off to the current handler.
      * Printing it and popping the stack is the responsibility of the handler.
@@ -553,6 +595,7 @@ void errfinish(int dummy, ...)
          * should make life easier for most.)
          */
         t_thrd.int_cxt.InterruptHoldoffCount = 0;
+        t_thrd.int_cxt.QueryCancelHoldoffCount = 0;
 
         t_thrd.int_cxt.InterruptCountResetFlag = true;
 
@@ -630,7 +673,10 @@ void errfinish(int dummy, ...)
         pfree(edata->internalquery);
     if (edata->backtrace_log)
         pfree(edata->backtrace_log);
-
+    if (edata->cause)
+        pfree(edata->cause);
+    if (edata->action)
+        pfree(edata->action);
     t_thrd.log_cxt.errordata_stack_depth--;
 
     /* Exit error-handling context */
@@ -1116,6 +1162,37 @@ int errdetail_plural(const char* fmt_singular, const char* fmt_plural, unsigned 
     return 0; /* return value does not matter */
 }
 
+int errcause(const char* fmt, ...)
+{
+    ErrorData* edata = &t_thrd.log_cxt.errordata[t_thrd.log_cxt.errordata_stack_depth];
+    MemoryContext oldcontext;
+
+    t_thrd.log_cxt.recursion_depth++;
+    CHECK_STACK_DEPTH();
+    oldcontext = MemoryContextSwitchTo(ErrorContext);
+
+    EVALUATE_MESSAGE(cause, false, true);
+
+    MemoryContextSwitchTo(oldcontext);
+    t_thrd.log_cxt.recursion_depth--;
+    return 0; /* return value does not matter */
+}
+
+int erraction(const char* fmt, ...)
+{
+    ErrorData* edata = &t_thrd.log_cxt.errordata[t_thrd.log_cxt.errordata_stack_depth];
+    MemoryContext oldcontext;
+
+    t_thrd.log_cxt.recursion_depth++;
+    CHECK_STACK_DEPTH();
+    oldcontext = MemoryContextSwitchTo(ErrorContext);
+
+    EVALUATE_MESSAGE(action, false, true);
+
+    MemoryContextSwitchTo(oldcontext);
+    t_thrd.log_cxt.recursion_depth--;
+    return 0; /* return value does not matter */
+}
 /*
  * errhint --- add a hint error message text to the current error
  */
@@ -1266,6 +1343,23 @@ int internalerrquery(const char* query)
     return 0; /* return value does not matter */
 }
 
+
+/*
+ * ErrOutToClient --- sets whether to send error output to client or not.
+ */
+int
+ErrOutToClient(bool outToClient)
+{
+    ErrorData  *edata = &t_thrd.log_cxt.errordata[t_thrd.log_cxt.errordata_stack_depth];
+
+    /* we don't bother incrementing recursion_depth */
+    CHECK_STACK_DEPTH();
+
+    edata->output_to_client = outToClient;
+
+    return 0;                   /* return value does not matter */
+}
+
 /*
  * geterrcode --- return the currently set SQLSTATE error code
  *
@@ -1280,6 +1374,22 @@ int geterrcode(void)
     CHECK_STACK_DEPTH();
 
     return edata->sqlerrcode;
+}
+
+/*
+ * Geterrmsg --- return the currently set error message
+ *
+ * This is only intended for use in error callback subroutines, since there
+ * is no other place outside elog.c where the concept is meaningful.
+ */
+char *Geterrmsg(void)
+{
+    ErrorData* edata = &t_thrd.log_cxt.errordata[t_thrd.log_cxt.errordata_stack_depth];
+
+    /* we don't bother incrementing t_thrd.log_cxt.recursion_depth */
+    CHECK_STACK_DEPTH();
+
+    return edata->message;
 }
 
 /*
@@ -1571,7 +1681,10 @@ ErrorData* CopyErrorData(void)
         newedata->funcname = pstrdup(newedata->funcname);
     if (newedata->backtrace_log)
         newedata->backtrace_log = pstrdup(newedata->backtrace_log);
-
+    if (newedata->cause)
+        newedata->cause = pstrdup(newedata->cause);
+    if (newedata->action)
+        newedata->action = pstrdup(newedata->action);
     return newedata;
 }
 
@@ -1587,7 +1700,8 @@ void UpdateErrorData(ErrorData* edata, ErrorData* newData)
     FREE_POINTER(edata->context);
     FREE_POINTER(edata->internalquery);
     FREE_POINTER(edata->backtrace_log);
-
+    FREE_POINTER(edata->cause);
+    FREE_POINTER(edata->action);
     MemoryContext oldcontext = MemoryContextSwitchTo(ErrorContext);
 
     edata->elevel = newData->elevel;
@@ -1606,7 +1720,8 @@ void UpdateErrorData(ErrorData* edata, ErrorData* newData)
     edata->saved_errno = newData->saved_errno;
     edata->backtrace_log = pstrdup(newData->backtrace_log);
     edata->internalerrcode = newData->internalerrcode;
-
+    edata->cause = newData->cause;
+    edata->action = newData->action;
     MemoryContextSwitchTo(oldcontext);
 }
 
@@ -1638,7 +1753,14 @@ void FreeErrorData(ErrorData* edata)
         pfree(edata->backtrace_log);
         edata->backtrace_log = NULL;
     }
-
+    if (edata->cause) {
+        pfree(edata->cause);
+        edata->cause = NULL;
+    }
+    if (edata->action) {
+        pfree(edata->action);
+        edata->action = NULL;
+    }
     pfree(edata);
 }
 
@@ -1720,7 +1842,10 @@ void ReThrowError(ErrorData* edata)
         newedata->funcname = pstrdup(newedata->funcname);
     if (newedata->backtrace_log)
         newedata->backtrace_log = pstrdup(newedata->backtrace_log);
-
+    if (newedata->cause)
+        newedata->cause = pstrdup(newedata->cause);
+    if (newedata->action)
+        newedata->action = pstrdup(newedata->action);
     t_thrd.log_cxt.recursion_depth--;
     PG_RE_THROW();
 }
@@ -1773,7 +1898,23 @@ void pg_re_throw(void)
 
     /* Doesn't return ... */
     ExceptionalCondition("pg_re_throw tried to return", "FailedAssertion", __FILE__, __LINE__);
+    abort(); // keep compiler quiet
 }
+
+
+/*
+ * PgRethrowAsFatal - Promote the error level to fatal.
+ */
+void
+PgRethrowAsFatal(void)
+{
+    ErrorData  *edata = &t_thrd.log_cxt.errordata[t_thrd.log_cxt.errordata_stack_depth];
+
+    Assert(t_thrd.log_cxt.errordata_stack_depth >= 0);
+    edata->elevel = FATAL;
+    PG_RE_THROW();
+}
+
 
 /*
  * Initialization of error output file
@@ -2282,14 +2423,21 @@ static void log_line_prefix(StringInfo buf, ErrorData* edata)
                 appendStringInfo(buf, XID_FMT, GetTopTransactionIdIfAny());
                 break;
             case 'e':
-                appendStringInfoString(buf, unpack_sql_state(edata->sqlerrcode));
+                appendStringInfoString(buf, plpgsql_get_sqlstate(edata->sqlerrcode));
                 break;
             case 'n':
                 appendStringInfoString(buf, g_instance.attr.attr_common.PGXCNodeName);
                 t_thrd.log_cxt.error_with_nodename = true;
                 break;
             case 'S':
-                appendStringInfo(buf, "%lu", u_sess->session_id);
+                appendStringInfo(buf, "%lu[%d:%lu#%lu]", u_sess->session_id,
+                    (int)u_sess->globalSessionId.nodeId,
+                    u_sess->globalSessionId.sessionId, u_sess->globalSessionId.seq);
+                break;
+            case 'T':
+                if (u_sess->trace_cxt.trace_id[0]) {
+                    appendStringInfo(buf, "%s", u_sess->trace_cxt.trace_id);
+                }
                 break;
             case '%':
                 appendStringInfoChar(buf, '%');
@@ -2310,7 +2458,7 @@ static void log_line_prefix(StringInfo buf, ErrorData* edata)
 
 /*
  * append a CSV'd version of a string to a StringInfo
- * We use the PostgreSQL defaults for CSV, i.e. quote = escape = '"'
+ * We use the openGauss defaults for CSV, i.e. quote = escape = '"'
  * If it's NULL, append nothing.
  */
 static inline void appendCSVLiteral(StringInfo buf, const char* data)
@@ -2478,7 +2626,7 @@ static void write_csvlog(ErrorData* edata)
 
     /* SQL state code */
     /* @CSV_SCHMA@ sql_state text, @ */
-    appendStringInfoString(&buf, unpack_sql_state(edata->sqlerrcode));
+    appendStringInfoString(&buf, plpgsql_get_sqlstate(edata->sqlerrcode));
     appendStringInfoChar(&buf, ',');
 
     /* errmessage */
@@ -2599,7 +2747,7 @@ static void write_csvlog(ErrorData* edata)
  * Unpack MAKE_SQLSTATE code. Note that this returns a pointer to a
  * static THR_LOCAL buffer.
  */
-char* unpack_sql_state(int sql_state)
+const char* unpack_sql_state(int sql_state)
 {
     char* buf = t_thrd.buf_cxt.unpack_sql_state_buf;
     int i;
@@ -2611,6 +2759,16 @@ char* unpack_sql_state(int sql_state)
 
     buf[i] = '\0';
     return buf;
+}
+
+/* if sqlcode is init by the database, it must be positive; if is init by the user, then it must be negative */
+const char *plpgsql_get_sqlstate(int sqlcode)
+{
+    if (sqlcode >= 0) {
+        return unpack_sql_state(sqlcode);
+    } else {
+        return plpgsql_code_int2cstring(sqlcode);
+    }
 }
 
 const char* mask_encrypted_key(const char *query_string, int str_len)
@@ -2679,7 +2837,7 @@ const char* mask_encrypted_key(const char *query_string, int str_len)
     return mask_string;
 }
 
-static int output_backtrace_to_log(StringInfoData* pOutBuf)
+int output_backtrace_to_log(StringInfoData* pOutBuf)
 {
     const int max_buffer_size = 128;
     void* buffer[max_buffer_size];
@@ -2695,7 +2853,7 @@ static int output_backtrace_to_log(StringInfoData* pOutBuf)
         t_thrd.log_cxt.thd_bt_symbol = NULL;
     }
 
-    int len_symbols = backtrace(buffer, max_buffer_size);
+   int len_symbols = backtrace(buffer, max_buffer_size);
     t_thrd.log_cxt.thd_bt_symbol = backtrace_symbols(buffer, len_symbols);
 
     int ret = snprintf_s(title, sizeof(title), sizeof(title) - 1, "tid[%d]'s backtrace:\n", gettid());
@@ -2743,7 +2901,7 @@ static void send_message_to_server_log(ErrorData* edata)
     }
 
     if (u_sess->attr.attr_common.Log_error_verbosity >= PGERROR_VERBOSE && !edata->hide_prefix)
-        appendStringInfo(&buf, "%s: ", unpack_sql_state(edata->sqlerrcode));
+        appendStringInfo(&buf, "%s: ", plpgsql_get_sqlstate(edata->sqlerrcode));
 
     if (edata->message) {
         append_with_tabs(&buf, edata->message);
@@ -2775,6 +2933,18 @@ static void send_message_to_server_log(ErrorData* edata)
             log_line_prefix(&buf, edata);
             appendStringInfoString(&buf, _("HINT:  "));
             append_with_tabs(&buf, edata->hint);
+            appendStringInfoChar(&buf, '\n');
+        }
+        if (edata->cause) {
+            log_line_prefix(&buf, edata);
+            appendStringInfoString(&buf, _("CAUSE:  "));
+            append_with_tabs(&buf, edata->cause);
+            appendStringInfoChar(&buf, '\n');
+        }
+        if (edata->action) {
+            log_line_prefix(&buf, edata);
+            appendStringInfoString(&buf, _("ACTION:  "));
+            append_with_tabs(&buf, edata->action);
             appendStringInfoChar(&buf, '\n');
         }
         if (edata->internalquery) {
@@ -3281,7 +3451,7 @@ static void send_message_to_frontend(ErrorData* edata)
 
     /*
      * Since cancel is always driven by Coordinator, internal-cancel message
-     * of datanode postgres thread can be ignored to avoid libcomm waitting quota in here.
+     * of datanode openGauss thread can be ignored to avoid libcomm waitting quota in here.
      * If a single node, always send message to front.
      */
 
@@ -3292,7 +3462,9 @@ static void send_message_to_frontend(ErrorData* edata)
      * If u_sess->utils_cxt.qunit_case_number != 0, it(CN/DN) serves as a QUNIT backend thread, and it(CN/DN)
      * needs to send all ERROR messages to the client(gsql).
      */
-    if ((IsConnFromCoord() || StreamThreadAmI()) && edata->elevel < ERROR && !edata->handle_in_client
+    if ((IsConnFromCoord() || StreamThreadAmI() || 
+        (t_thrd.proc_cxt.MyProgName != NULL && strcmp(t_thrd.proc_cxt.MyProgName, "BackgroundWorker") == 0)) && 
+        edata->elevel < ERROR && !edata->handle_in_client
 
 #ifdef ENABLE_QUNIT
         && u_sess->utils_cxt.qunit_case_number == 0
@@ -3509,7 +3681,15 @@ static void send_message_to_frontend(ErrorData* edata)
             !t_thrd.log_cxt.flush_message_immediately)
             return;
 
-        pq_flush();
+        /*
+         * If it is WalSender's timeout message, choose pq_flush_if_writable()
+         * to avoid blokcing in send() if the send buffer of the socket is full.
+         */
+        if (AM_WAL_NORMAL_SENDER && t_thrd.walsender_cxt.isWalSndSendTimeoutMessage) {
+            pq_flush_if_writable();
+        } else {
+            pq_flush();
+        }
 
         if (edata->elevel == FATAL)
             t_thrd.log_cxt.flush_message_immediately = true;
@@ -3765,6 +3945,10 @@ void getElevelAndSqlstate(int* eLevel, int* sqlState)
     *sqlState = t_thrd.log_cxt.errordata[t_thrd.log_cxt.errordata_stack_depth].sqlerrcode;
 }
 
+/*
+ * When the SQL statement is truncated, this function cannot perform normal password masking.
+ * maskPassword will return null if the statement does not need to be masked or any error occurs.
+ */
 char* maskPassword(const char* query_string)
 {
     char* mask_string = NULL;
@@ -3987,36 +4171,84 @@ static void tolower_func(char *convert_query)
     }
 }
 
+static void apply_funcs3_mask(char *string, char** end, char replace)
+{
+    errno_t rc = EOK;
+    if (*end == NULL || **end == '\0') {
+        return;
+    }
+    char *start = *end;
+
+    /* find '=' in param: field  ^=   123abc */
+    while (**end != '=' && **end != '\0') {
+        (*end)++;
+    }
+    if (**end != '=') {
+        return;
+    }
+    (*end)++;
+
+    /* find start of value in param: field  =   ^123abc */
+    while (**end == ' ') {
+        (*end)++;
+    }
+    if (**end == '\0') {
+        return;
+    }
+    start = *end;
+    (*end)++;
+
+    /* find end of value in param: field  =   123abc^ */
+    while (**end != ' ' && **end != '\0') {
+        (*end)++;
+    }
+    size_t param_len = *end - start;
+    Assert(param_len < strlen(string));
+    /*
+     * replace value with '*': field  =   ****** ...
+     *                                   ^      ^
+     *                                 start   end
+     */
+    rc = memset_s(start, param_len, replace, param_len);
+    securec_check_c(rc, "\0", "\0");
+}
+
 char* mask_funcs3_parameters(const char* query_string)
 {
-    char* start = NULL;
-    int len_start = 0;
-    int j = 0;
-    errno_t rc = EOK;
-    const char* funcs3Mask[] = {"accesskey=", "secretkey="};
+    const char* funcs3Mask[] = {"accesskey", "secretkey"};
     int funcs3MaskNum =  sizeof(funcs3Mask) / sizeof(funcs3Mask[0]);
-    char* mask_string = MemoryContextStrdup(
-        SESS_GET_MEM_CXT_GROUP(MEMORY_CONTEXT_STORAGE), query_string);
+    char* mask_string = MemoryContextStrdup(SESS_GET_MEM_CXT_GROUP(MEMORY_CONTEXT_STORAGE), query_string);
     for (int i = 0; i < funcs3MaskNum; i++) {
-        start = mask_string;
+        char *start = mask_string;
         while ((start = strstr(start, funcs3Mask[i])) != NULL) {
-            start = start + strlen(funcs3Mask[i]);
-            len_start = strlen(start);
-            for (j = 0; j < len_start; j++) {
-                if (start[j] == '\0' || start[j] == ' ')
-                    break;
-            }
-            if (j > 0) {
-                rc = memset_s(start, len_start, '*', j);
-                securec_check(rc, "\0", "\0");
-            } else {
-                /* nothing to replace */
-                break;
-            }
+            /* take the original string and replace the key value with '*' */
+            apply_funcs3_mask(mask_string, &start, '*');
         }
     }
     return mask_string;
 }
+
+static void inline ClearYylval(const core_YYSTYPE *yylval)
+{
+    int rc = memset_s(yylval->str, strlen(yylval->str), 0, strlen(yylval->str));
+    securec_check(rc, "\0", "\0");
+    rc = memset_s((char*)yylval->keyword, strlen(yylval->keyword), 0, strlen(yylval->keyword));
+    securec_check(rc, "\0", "\0");
+}
+
+static int get_reallen_of_credential(char *param)
+{
+    int len = 0;
+    for (int i = 0; param[i] != '\0'; i++) {
+        if (param[i] == '\'') {
+            len += 2;
+        } else {
+            len++;
+        }
+    }
+    return len;
+}
+
 /*
  * Mask the password in statment CREATE ROLE, CREATE USER, ALTER ROLE, ALTER USER, CREATE GROUP
  * SET ROLE, CREATE DATABASE LINK, and some function
@@ -4032,7 +4264,10 @@ static char* mask_Password_internal(const char* query_string)
     int currToken = 59; /* initialize prevToken as ';' */
     bool isPassword = false;
     char* mask_string = NULL;
-    const char* funcs[] = {"dblink_connect"}; /* the function list need mask */
+    /* the function list need mask */
+    const char* funcs[] = {"dblink_connect", "create_credential"};
+    bool is_create_credential = false;
+    bool is_create_credential_passwd = false;
     int funcNum = sizeof(funcs) / sizeof(funcs[0]);
     int position[16] = {0};
     int length[16] = {0};
@@ -4041,11 +4276,14 @@ static char* mask_Password_internal(const char* query_string)
     bool isChildStmt = false;
     errno_t rc = EOK;
     int truncateLen = 0; /* accumulate total length for each truncate */
+    YYLTYPE conninfoStartPos = 0; /* connection start postion for CreateSubscriptionStmt */
 
     /* the functions need to mask all contents */
-    const char* funCrypt[] = {"gs_encrypt_aes128", "gs_decrypt_aes128","gs_encrypt", "gs_decrypt"};
+    const char* funCrypt[] = {"gs_encrypt_aes128", "gs_decrypt_aes128", "gs_encrypt", "gs_decrypt",
+        "pg_create_physical_replication_slot_extern"};
     int funCryptNum = sizeof(funCrypt) / sizeof(funCrypt[0]);
     bool isCryptFunc = false;
+
     int length_crypt = 0;
     int count_crypt = 0;
     int position_crypt = 0;
@@ -4075,6 +4313,7 @@ static char* mask_Password_internal(const char* query_string)
      * 13 - for funcs3
      * 14 - create/alter text search dictionary
      * 15 - for funCrypt
+     * 16 - create/alter subscription(CREATE_ALTER_SUBSCRIPTION)
      */
     int curStmtType = 0;
     int prevToken[5] = {0};
@@ -4135,13 +4374,34 @@ static char* mask_Password_internal(const char* query_string)
                             mask_string = MemoryContextStrdup(
                                 SESS_GET_MEM_CXT_GROUP(MEMORY_CONTEXT_SECURITY), query_string);
                         }
-                        if (unlikely(yyextra.literallen != (int)strlen(childStmt))) {
-                            ereport(ERROR,
-                                (errcode(ERRCODE_SYNTAX_ERROR), errmsg("parse error on statement %s.", childStmt)));
+
+                        /*
+                         * After mask child statement, child statement length maybe be large than origin query
+                         * statement length. So we should enlarge buffer size.
+                         */
+                        int childStmtLen = strlen(childStmt);
+                        int subQueryLen = strlen(yylval.str);
+                        int maskStringLen = strlen(mask_string);
+                        if (subQueryLen < childStmtLen) {
+                            /* Need more space, enlarge length is (childStmtLen - subQueryLen) */
+                            maskStringLen += (childStmtLen - subQueryLen) + 1;
+                            char* maskStrNew = (char*)MemoryContextAllocZero(
+                                SESS_GET_MEM_CXT_GROUP(MEMORY_CONTEXT_SECURITY), maskStringLen);
+                            rc = memcpy_s(maskStrNew, maskStringLen, mask_string, strlen(mask_string));
+                            securec_check(rc, "\0", "\0");
+                            pfree_ext(mask_string);
+                            mask_string = maskStrNew;
                         }
-                        rc = memcpy_s(mask_string + yylloc + 1, yyextra.literallen, childStmt, yyextra.literallen);
+
+                        /*
+                         * After enlarge buffer size, value of new buffer position is '0', and using strlen() will
+                         * get wrong result of buffer length, which is smaller than real length.
+                         * So use 'maskStringLen' here to indicate real buffer length.
+                         */
+                        rc = memcpy_s(mask_string + yylloc + 1, maskStringLen - yylloc,
+                            childStmt, strlen(childStmt) + 1);
                         securec_check(rc, "\0", "\0");
-                        rc = memset_s(childStmt, yyextra.literallen, 0, yyextra.literallen);
+                        rc = memset_s(childStmt, strlen(childStmt), 0, strlen(childStmt));
                         securec_check(rc, "", "");
                         pfree(childStmt);
                     }
@@ -4157,15 +4417,39 @@ static char* mask_Password_internal(const char* query_string)
             if (curStmtType > 0 && curStmtType != 12 && curStmtType != 13 && curStmtType != 14 && curStmtType != 15 &&
                 (currToken == SCONST || currToken == IDENT)) {
                 if (unlikely(yylloc >= (int)strlen(query_string))) {
-                    ereport(ERROR, (errcode(ERRCODE_SYNTAX_ERROR), errmsg("parse error on query %s.", query_string)));
+                    ereport(ERROR, (errcode(ERRCODE_SYNTAX_ERROR),
+                        errmsg("current index (%d) out of length of query string (%lu).",
+                        yylloc, strlen(query_string))));
                 }
                 char ch = query_string[yylloc];
                 position[idx] = yylloc;
 
                 if (ch == '\'' || ch == '\"')
                     ++position[idx];
-                length[idx] = strlen(yylval.str);
+
+                /* Calcute the difference between origin password length and mask password length */
+                position[idx] -= truncateLen;
+
+                if (!is_create_credential) {
+                    length[idx] = strlen(yylval.str);
+                } else if (isPassword) {
+                    is_create_credential_passwd = true;
+                    length[idx] = strlen(yylval.str);
+                } else {
+                    if (idx == 2 && !is_create_credential_passwd) {
+                        length[idx] = get_reallen_of_credential(yylval.str);
+                    } else {
+                        length[idx] = 0;
+                    }
+                }
                 ++idx;
+
+                /* record the conninfo start pos, we will use it to calculate the actual length of conninfo */
+                if (curStmtType == CREATE_ALTER_SUBSCRIPTION) {
+                    conninfoStartPos = yylloc;
+                    /* the yylval store the conninfo, so we clear it here */
+                    ClearYylval(&yylval);
+                }
                 /*
                  *  use a fixed length of masked password.
                  *  For a matched token, position[idx] is query_string's position, but mask_string is truncated,
@@ -4183,45 +4467,59 @@ static char* mask_Password_internal(const char* query_string)
                          *  the len of password may be shorter than actual, 
                          *  we need to find the start position of password word by looking forward.
                          */ 
-                        char wordHead = position[i] > 0 ? query_string[position[i] - 1] : '\0';
+                        char wordHead = position[i] > 0 ? mask_string[position[i] - 1] : '\0';
                         if (isPassword && wordHead != '\0' && wordHead != '\'' && wordHead != '\"') {
                             while (position[i] > 0 && !isspace(wordHead) && wordHead != '\'' && wordHead != '\"') {
                                 position[i]--;
-                                wordHead = query_string[position[i] - 1];
+                                wordHead = mask_string[position[i] - 1];
                             }
-                            length[i] = strlen(query_string + position[i]);
+                            length[i] = strlen(mask_string + position[i]);
                             /* if the last char is ';', we should keep it */
-                            if (query_string[position[i] + length[i] - 1] == ';') {
+                            if (mask_string[position[i] + length[i] - 1] == ';') {
                                 length[i]--;
                             }
                         }
+
+                        /*
+                         * After core_yylex, double quotation marks will be parsed to single quotation mark.
+                         * Calcute length of '\'' and double this length.
+                         */
+                        int lengthOfQuote = 0;
+                        for (int len = 0; len < length[i]; len++) {
+                            if ((yylval.str != NULL) && (yylval.str[len] == '\'')) {
+                                lengthOfQuote++;
+                            }
+                        }
+                        length[i] += lengthOfQuote;
+
                         if (length[i] < maskLen) {
                             /* need more space. */
                             int plen = strlen(mask_string) + maskLen - length[i] + 1;
-                            char* maskStrNew = (char*)selfpalloc0(plen);
+                            char* maskStrNew = (char*)MemoryContextAllocZero(
+                                SESS_GET_MEM_CXT_GROUP(MEMORY_CONTEXT_SECURITY), plen);
                             rc = memcpy_s(maskStrNew, plen, mask_string, strlen(mask_string));
                             securec_check(rc, "\0", "\0");
-                            selfpfree(mask_string);
+                            pfree_ext(mask_string);
                             mask_string = maskStrNew;
                         }
 
-                        char* maskBegin = mask_string + position[i] - truncateLen;
-                        int copySize = strlen(mask_string) - (position[i] - truncateLen) - length[i] + 1;
+                        char* maskBegin = mask_string + position[i];
+                        int copySize = strlen(mask_string) - position[i] - length[i] + 1;
                         rc = memmove_s(maskBegin + maskLen, copySize, maskBegin + length[i], copySize);
                         securec_check(rc, "", "");
-                        if (length[i] > maskLen) {
-                            truncateLen += (length[i] - maskLen);
-                        }
+                        /*
+                         * After masking password, the origin password had been transformed to '*', which length equals
+                         * to u_sess->attr.attr_security.Password_min_length.
+                         * So we should record the difference between origin password length and mask password length.
+                         */
+                        truncateLen = strlen(query_string) - strlen(mask_string);
                         rc = memset_s(maskBegin, maskLen, '*', maskLen);
                         securec_check(rc, "", "");
 
                         need_clear_yylval = true;
                     }
                     if (need_clear_yylval) {
-                        rc = memset_s(yylval.str, strlen(yylval.str), 0, strlen(yylval.str));
-                        securec_check(rc, "\0", "\0");
-                        rc = memset_s((char*)yylval.keyword, strlen(yylval.keyword), 0, strlen(yylval.keyword));
-                        securec_check(rc, "\0", "\0");
+                        ClearYylval(&yylval);
                         need_clear_yylval = false;
                     }
                     idx = 0;
@@ -4332,6 +4630,10 @@ static char* mask_Password_internal(const char* query_string)
                         /* first, check funcs[] */
                         for (i = 0; i < funcNum; ++i) {
                             if (pg_strcasecmp(yylval.str, funcs[i]) == 0) {
+                                is_create_credential = false;
+                                if (pg_strcasecmp(yylval.str, "create_credential") == 0) {
+                                    is_create_credential = true;
+                                }
                                 curStmtType = 8;
                                 break;
                             }
@@ -4384,6 +4686,7 @@ static char* mask_Password_internal(const char* query_string)
                                 break;
                             }
                         }
+
                     }
                     break;
                 case 41: /* character ')' */
@@ -4520,6 +4823,13 @@ static char* mask_Password_internal(const char* query_string)
                     }
                     break;
                 case IDENT:
+                    if (curStmtType == 14) {
+                        if (pg_strncasecmp(yylval.str, "obs", strlen("obs")) == 0) {
+                            MASK_OBS_PATH();
+                        }
+                        curStmtType = 0;
+                    }
+
                     if ((prevToken[1] == SERVER && prevToken[2] == OPTIONS) ||
                         (prevToken[1] == FOREIGN && prevToken[2] == TABLE && prevToken[3] == OPTIONS)) {
                         if (pg_strcasecmp(yylval.str, "secret_access_key") == 0) {
@@ -4546,6 +4856,15 @@ static char* mask_Password_internal(const char* query_string)
                         } else {
                             curStmtType = 0;
                         }
+                    } else if (prevToken[1] == ALTER && prevToken[2] == SUBSCRIPTION) {
+                        /*
+                         * For SUBSCRIPTION, there are 3 cases need to mask conninfo(which has username and password):
+                         * 1. CREATE SUBSCRIPTION name CONNECTION Sconst. Which could be coverd by case CONNECTION.
+                         * 2. ALTER SUBSCRIPTION name CONNECTION Sconst. Which could be coverd by case CONNECTION.
+                         * 3. ALTER SUBSCRIPTION name SET (conninfo='xx'). Here we deal with this case.
+                         */
+                        curStmtType = pg_strcasecmp(yylval.str, "conninfo") == 0 ? CREATE_ALTER_SUBSCRIPTION : 0;
+                        idx = 0;
                     }
                     break;
                 case SCONST:
@@ -4564,24 +4883,67 @@ static char* mask_Password_internal(const char* query_string)
                         }
                     } else if (curStmtType == 14) {
                         if (pg_strncasecmp(yylval.str, "obs", strlen("obs")) == 0) {
-                            char* childStmt = mask_funcs3_parameters(yylval.str);
-                            if (childStmt != NULL) {
-                                if (mask_string == NULL) {
-                                    mask_string = MemoryContextStrdup(
-                                        SESS_GET_MEM_CXT_GROUP(MEMORY_CONTEXT_SECURITY), query_string);
-                                }
-                                if (unlikely(yyextra.literallen != (int)strlen(childStmt))) {
-                                    ereport(ERROR,
-                                        (errcode(ERRCODE_SYNTAX_ERROR),
-                                        errmsg("parse error on statement %s.", childStmt)));
-                                }
-                                rc = memcpy_s(mask_string + yylloc + 1, yyextra.literallen, childStmt, yyextra.literallen);
-                                securec_check(rc, "\0", "\0");
-                                rc = memset_s(childStmt, yyextra.literallen, 0, yyextra.literallen);
-                                securec_check(rc, "", "");
-                                pfree(childStmt);
-                            }
+                            MASK_OBS_PATH();
                         }
+                        curStmtType = 0;
+                    } else if (curStmtType == CREATE_ALTER_SUBSCRIPTION &&
+                        (prevToken[0] == '=' || prevToken[1] == ALTER)) {
+                        /*
+                         * ALTER SUBSCRIPTION name SET (conninfo='xx')
+                         * ALTER SUBSCRIPTION name CONNECTION Sconst
+                         * mask connection info
+                         */
+                        if (mask_string == NULL) {
+                            mask_string = MemoryContextStrdup(
+                                SESS_GET_MEM_CXT_GROUP(MEMORY_CONTEXT_SECURITY), query_string);
+                        }
+                        /*
+                         * mask to the end of string, cause the length[0] may be shorter than actual.
+                         * For example:
+                         * ALTER SUBSCRIPTION name SET (conninfo='host=''1.1.1.1'' password=''password_123''');
+                         * ALTER SUBSCRIPTION name CONNECTION 'host=''1.1.1.1'' password=''password_123''';
+                         */
+                        int maskLen = strlen(query_string + position[0]);
+                        /* if the last char is ';', we should keep it */
+                        if (query_string[position[0] + maskLen - 1] == ';') {
+                            maskLen--;
+                        }
+                        rc = memset_s(mask_string + position[0], maskLen, '*', maskLen);
+                        securec_check(rc, "", "");
+                        /* the yylval store the conninfo, so we clear it here */
+                        ClearYylval(&yylval);
+                        idx = 0;
+                        curStmtType = 0;
+                    }
+                    break;
+                case SUBSCRIPTION:
+                    if (prevToken[0] == CREATE || prevToken[0] == ALTER) {
+                        prevToken[1] = prevToken[0];
+                        prevToken[2] = SUBSCRIPTION;
+                    }
+                    break;
+                case CONNECTION:
+                    if (prevToken[2] == SUBSCRIPTION) {
+                        curStmtType = CREATE_ALTER_SUBSCRIPTION;
+                        prevToken[3] = CONNECTION;
+                    }
+                    break;
+                case PUBLICATION:
+                    if (curStmtType == CREATE_ALTER_SUBSCRIPTION && prevToken[2] == SUBSCRIPTION &&
+                        prevToken[3] == CONNECTION) {
+                        /*
+                         * CREATE SUBSCRIPTION name CONNECTION Sconst PUBLICATION xxx, try to mask Sconst.
+                         * it should not happen that conninfoStartPos < 0, if it does, we will mask the
+                         * string from the beginning to current pos to ensure all sensetive info is masked.
+                         */
+                        if (mask_string == NULL) {
+                            mask_string = MemoryContextStrdup(
+                                SESS_GET_MEM_CXT_GROUP(MEMORY_CONTEXT_SECURITY), query_string);
+                        }
+                        int maskLen = yylloc - conninfoStartPos;
+                        rc = memset_s(mask_string + conninfoStartPos, maskLen, '*', maskLen);
+                        securec_check(rc, "", "");
+                        idx = 0;
                         curStmtType = 0;
                     }
                     break;
@@ -4637,6 +4999,7 @@ static char* mask_Password_internal(const char* query_string)
     }
 
     return mask_string;
+
 }
 
 static void eraseSingleQuotes(char* query_string)

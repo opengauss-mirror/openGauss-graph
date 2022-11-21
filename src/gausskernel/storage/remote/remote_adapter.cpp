@@ -25,24 +25,28 @@
 #include "postgres.h"
 #include "knl/knl_variable.h"
 
+#include "catalog/pg_authid.h"
+#include "catalog/pg_type.h"
 #include "access/xlog.h"
 #include "miscadmin.h"
 #include "pgstat.h"
+#include "funcapi.h"
 #include "postmaster/postmaster.h"
+#include "storage/smgr/segment_internal.h"
+#include "storage/smgr/segment.h"
 #include "storage/custorage.h"
 #include "storage/ipc.h"
 #include "storage/remote_adapter.h"
+#include "libpq/pqformat.h"
 #include "utils/guc.h"
 #include "utils/memutils.h"
+#include "utils/builtins.h"
+#include "utils/aiomem.h"
 
-extern GaussdbThreadEntry GetThreadEntry(knl_thread_role role);
-#define MAX_WAIT_TIMES 5
+const int DEFAULT_WAIT_TIMES = 60;
+int ReadFileForRemote(RemoteReadFileKey *key, XLogRecPtr lsn, bytea** fileData, int timeout);
 
-typedef struct RemoteReadContext {
-    CUStorage* custorage;
-    CU* cu;
-    char* pagedata;
-} RemoteReadContext;
+int ReadCOrCsnFileForRemote(RelFileNode rnode, bytea** fileData);
 
 /*
  * @Description: wait lsn to replay
@@ -50,7 +54,7 @@ typedef struct RemoteReadContext {
  * @Return: remote read error code
  * @See also:
  */
-int XLogWaitForReplay(uint64 primary_insert_lsn)
+int XLogWaitForReplay(uint64 primary_insert_lsn, int timeout = DEFAULT_WAIT_TIMES)
 {
     int wait_times = 0;
 
@@ -60,7 +64,7 @@ int XLogWaitForReplay(uint64 primary_insert_lsn)
     /* if primary_insert_lsn  >  standby_replay_lsn then need wait */
     while (!XLByteLE(primary_insert_lsn, standby_replay_lsn)) {
         /* if sleep to much times */
-        if (wait_times >= MAX_WAIT_TIMES) {
+        if (wait_times >= timeout) {
             ereport(LOG,
                     (errmodule(MOD_REMOTE),
                      errmsg("replay slow. requre lsn %X/%X, replayed lsn %X/%X",
@@ -83,6 +87,104 @@ int XLogWaitForReplay(uint64 primary_insert_lsn)
 }
 
 /*
+ * Read block from buffer from primary, returning it as bytea
+ */
+Datum gs_read_block_from_remote(PG_FUNCTION_ARGS)
+{
+    uint32 spcNode;
+    uint32 dbNode;
+    uint32 relNode;
+    int16 bucketNode;
+    int32 forkNum;
+    uint64 blockNum;
+    uint32 blockSize;
+    uint64 lsn;
+    bool isForCU = false;
+    bytea* result = NULL;
+    int timeout = 0;
+
+    if (GetUserId() != BOOTSTRAP_SUPERUSERID) {
+        ereport(ERROR, (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE), (errmsg("must be initial account to read files"))));
+    }
+    /* handle optional arguments */
+    spcNode = PG_GETARG_UINT32(0);
+    dbNode = PG_GETARG_UINT32(1);
+    relNode = PG_GETARG_UINT32(2);
+    bucketNode = PG_GETARG_INT16(3);
+    forkNum = PG_GETARG_INT32(4);
+    blockNum = (uint64)PG_GETARG_TRANSACTIONID(5);
+    blockSize = PG_GETARG_UINT32(6);
+    lsn = (uint64)PG_GETARG_TRANSACTIONID(7);
+    isForCU = PG_GETARG_BOOL(8);
+    timeout = PG_GETARG_INT32(9);
+
+    RepairBlockKey key;
+    key.relfilenode.spcNode = spcNode;
+    key.relfilenode.dbNode = dbNode;
+    key.relfilenode.relNode = relNode;
+    key.relfilenode.bucketNode = bucketNode;
+    key.relfilenode.opt = 0;
+    key.forknum = forkNum;
+    key.blocknum = blockNum;
+
+    /* get block from local buffer */
+    if (isForCU) {
+        /* if request to read CU block, we use forkNum column to replace colid. */
+        (void)StandbyReadCUforPrimary(key, blockNum, blockSize, lsn, timeout, &result);
+    } else {
+        (void)StandbyReadPageforPrimary(key, blockSize, lsn, &result, timeout, NULL);
+    }
+
+    if (NULL != result) {
+        PG_RETURN_BYTEA_P(result);
+    } else {
+        PG_RETURN_NULL();
+    }
+}
+
+/*
+ * Read block from buffer from primary, returning it as bytea
+ */
+Datum gs_read_block_from_remote_compress(PG_FUNCTION_ARGS)
+{
+    RepairBlockKey key;
+    uint32 blockSize;
+    uint64 lsn;
+    int timeout = 0;
+    bool isForCU = false;
+    bytea* result = NULL;
+
+    if (GetUserId() != BOOTSTRAP_SUPERUSERID) {
+        ereport(ERROR, (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE), (errmsg("must be initial account to read files"))));
+    }
+    /* handle optional arguments */
+    key.relfilenode.spcNode = PG_GETARG_UINT32(0);
+    key.relfilenode.dbNode = PG_GETARG_UINT32(1);
+    key.relfilenode.relNode = PG_GETARG_UINT32(2);
+    key.relfilenode.bucketNode = PG_GETARG_INT16(3);
+    key.relfilenode.opt = PG_GETARG_UINT16(4);
+    key.forknum = PG_GETARG_INT32(5);
+    key.blocknum = (uint64)PG_GETARG_TRANSACTIONID(6);
+    blockSize = PG_GETARG_UINT32(7);
+    lsn = (uint64)PG_GETARG_TRANSACTIONID(8);
+    isForCU = PG_GETARG_BOOL(9);
+    timeout = PG_GETARG_INT32(10);
+    /* get block from local buffer */
+    if (isForCU) {
+        /* if request to read CU block, we use forkNum column to replace colid. */
+        (void)StandbyReadCUforPrimary(key, key.blocknum, blockSize, lsn, timeout, &result);
+    } else {
+        (void)StandbyReadPageforPrimary(key, blockSize, lsn, &result, timeout, NULL);
+    }
+    
+    if (NULL != result) {
+        PG_RETURN_BYTEA_P(result);
+    } else {
+        PG_RETURN_NULL();
+    }
+}
+
+/*
  * @Description: read cu for primary
  * @IN spcnode: tablespace id
  * @IN dbnode: database id
@@ -96,54 +198,53 @@ int XLogWaitForReplay(uint64 primary_insert_lsn)
  * @Return: remote read error code
  * @See also:
  */
-int StandbyReadCUforPrimary(uint32 spcnode, uint32 dbnode, uint32 relnode, int32 colid, uint64 offset, int32 size,
-                            uint64 lsn, RemoteReadContext* context, char** cudata)
+int StandbyReadCUforPrimary(RepairBlockKey key, uint64 offset, int32 size, uint64 lsn, int32 timeout,
+    bytea** cudata)
 {
     Assert(cudata);
-
-    (void)MemoryContextSwitchTo(t_thrd.storage_cxt.remote_function_context);
 
     int ret_code = REMOTE_READ_OK;
 
     /* wait request lsn for replay */
-    ret_code = XLogWaitForReplay(lsn);
-    if (ret_code != REMOTE_READ_OK) {
-        return ret_code;
+    if (RecoveryInProgress()) {
+        ret_code = XLogWaitForReplay(lsn, timeout);
+        if (ret_code != REMOTE_READ_OK) {
+            ereport(ERROR, (errmodule(MOD_REMOTE), errmsg("could not redo request lsn.")));
+            return ret_code;
+        }
     }
 
-    RelFileNode relfilenode {spcnode, dbnode, relnode, InvalidBktId};
+    RelFileNode relfilenode {key.relfilenode.spcNode, key.relfilenode.dbNode, key.relfilenode.relNode, InvalidBktId};
 
-    PG_TRY();
     {
         /* read from disk */
-        CFileNode cfilenode(relfilenode, colid, MAIN_FORKNUM);
+        CFileNode cfilenode(relfilenode, key.forknum, MAIN_FORKNUM);
 
-        context->custorage = New(CurrentMemoryContext) CUStorage(cfilenode);
-        context->cu = New(CurrentMemoryContext) CU();
-        context->cu->m_inCUCache = false;
+        CUStorage* custorage = New(CurrentMemoryContext) CUStorage(cfilenode);
+        CU* cu = New(CurrentMemoryContext) CU();
+        cu->m_inCUCache = false;
 
-        context->custorage->LoadCU(context->cu, offset, size, false, false);
+        custorage->LoadCU(cu, offset, size, false, false);
 
         /* check crc */
         if (ret_code == REMOTE_READ_OK) {
-            if (!context->cu->CheckCrc())
+            if (!cu->CheckCrc()) {
+                ereport(ERROR, (errmodule(MOD_REMOTE), errmsg("check CU crc error.")));
                 ret_code = REMOTE_READ_CRC_ERROR;
-            else
-                *cudata = context->cu->m_compressedLoadBuf;
+            } else {
+                bytea* buf = (bytea*)palloc0(VARHDRSZ + size);
+                SET_VARSIZE(buf, size + VARHDRSZ);
+                errno_t rc = memcpy_s(VARDATA(buf), size, cu->m_compressedLoadBuf, size);
+                if (rc != EOK) {
+                    ereport(ERROR, (errmodule(MOD_REMOTE), errmsg("memcpy_s error, retcode=%d", rc)));
+                    ret_code = REMOTE_READ_MEMCPY_ERROR;
+                }
+                *cudata = buf;
+                DELETE_EX(custorage);
+                DELETE_EX(cu);
+            }
         }
     }
-    PG_CATCH();
-    {
-        ret_code = REMOTE_READ_IO_ERROR;
-
-        /* Using LOG level output the error message */
-        (void)MemoryContextSwitchTo(t_thrd.storage_cxt.remote_function_context);
-        ErrorData* edata = CopyErrorData();
-        ereport(LOG, (errmodule(MOD_REMOTE), errmsg("Fail to load CU for remote, cause: %s", edata->message)));
-        FlushErrorState();
-        FreeErrorData(edata);
-    }
-    PG_END_TRY();
 
     return ret_code;
 }
@@ -162,34 +263,73 @@ int StandbyReadCUforPrimary(uint32 spcnode, uint32 dbnode, uint32 relnode, int32
  * @Return: remote read error code
  * @See also:
  */
-int StandbyReadPageforPrimary(uint32 spcnode, uint32 dbnode, uint32 relnode, int16 bucketnode, int32 forknum,
-                              uint32 blocknum, uint32 blocksize, uint64 lsn, RemoteReadContext* context, char** pagedata)
+int StandbyReadPageforPrimary(RepairBlockKey key, uint32 blocksize, uint64 lsn, bytea** pagedata,
+    int timeout, const XLogPhyBlock *pblk)
 {
     Assert(pagedata);
 
     if (unlikely(blocksize != BLCKSZ))
         return REMOTE_READ_BLCKSZ_NOT_SAME;
 
-    (void)MemoryContextSwitchTo(t_thrd.storage_cxt.remote_function_context);
-
     int ret_code = REMOTE_READ_OK;
 
     /* wait request lsn for replay */
-    ret_code = XLogWaitForReplay(lsn);
-    if (ret_code != REMOTE_READ_OK) {
-        return ret_code;
+    if (RecoveryInProgress()) {
+        ret_code = XLogWaitForReplay(lsn, timeout);
+        if (ret_code != REMOTE_READ_OK) {
+            ereport(ERROR, (errmodule(MOD_REMOTE), errmsg("could not redo request lsn.")));
+            return ret_code;
+        }
     }
 
-    RelFileNode relfilenode {spcnode, dbnode, relnode, bucketnode};
+    RelFileNode relfilenode{key.relfilenode.spcNode, key.relfilenode.dbNode, key.relfilenode.relNode,
+                            key.relfilenode.bucketNode, key.relfilenode.opt};
 
-    PG_TRY();
-    {
-        context->pagedata = (char*)palloc0(BLCKSZ);
+    if (NULL != pblk) {
+        SegPageLocation loc = seg_get_physical_location(relfilenode, key.forknum, key.blocknum);
+        uint8 standby_relNode = (uint8) EXTENT_SIZE_TO_TYPE(loc.extent_size);
+        BlockNumber standby_block = loc.blocknum;
+        if (standby_relNode != pblk->relNode || standby_block != pblk->block) {
+            ereport(ERROR, (errmodule(MOD_REMOTE),
+                    errmsg("Standby page file is invalid! Standby relnode is %u, "
+                           "master is %u; Standby block is %u, master is %u.",
+                           standby_relNode, pblk->relNode, standby_block, pblk->block)));
+            return REMOTE_READ_BLCKSZ_NOT_SAME;
+        }
+    }
 
+    bytea* pageData = (bytea*)palloc(BLCKSZ + VARHDRSZ);
+    SET_VARSIZE(pageData, BLCKSZ + VARHDRSZ);
+    if (IsSegmentPhysicalRelNode(relfilenode)) {
+        Buffer buffer = InvalidBuffer;
+        SegSpace *spc = spc_open(relfilenode.spcNode, relfilenode.dbNode, false, false);
+        BlockNumber spc_nblocks = spc_size(spc, relfilenode.relNode, key.forknum);
+
+        if (key.blocknum < spc_nblocks) {
+            buffer = ReadBufferFast(spc, relfilenode, key.forknum, key.blocknum, RBM_FOR_REMOTE);
+        }
+
+        if (BufferIsValid(buffer)) {
+            LockBuffer(buffer, BUFFER_LOCK_SHARE);
+            Block block = BufferGetBlock(buffer);
+
+            errno_t rc = memcpy_s(VARDATA(pageData), BLCKSZ, block, BLCKSZ);
+            if (rc != EOK) {
+                pfree(pageData);
+                ereport(ERROR, (errmodule(MOD_REMOTE), errmsg("memcpy_s error, retcode=%d", rc)));
+                ret_code = REMOTE_READ_MEMCPY_ERROR;
+            }
+
+            LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+            ReleaseBuffer(buffer);
+        } else {
+            ret_code = REMOTE_READ_SIZE_ERROR;
+        }
+    } else {
         bool hit = false;
 
         /* read page, if PageIsVerified failed will long jump to PG_CATCH() */
-        Buffer buf = ReadBufferForRemote(relfilenode, forknum, blocknum, RBM_FOR_REMOTE, NULL, &hit);
+        Buffer buf = ReadBufferForRemote(relfilenode, key.forknum, key.blocknum, RBM_FOR_REMOTE, NULL, &hit, pblk);
 
         if (BufferIsInvalid(buf)) {
             ereport(ERROR, (errmodule(MOD_REMOTE), errmsg("standby page buffer is invalid!")));
@@ -198,321 +338,443 @@ int StandbyReadPageforPrimary(uint32 spcnode, uint32 dbnode, uint32 relnode, int
         LockBuffer(buf, BUFFER_LOCK_SHARE);
         Block block = BufferGetBlock(buf);
 
-        errno_t rc = memcpy_s(context->pagedata, BLCKSZ, block, BLCKSZ);
+        errno_t rc = memcpy_s(VARDATA(pageData), BLCKSZ, block, BLCKSZ);
         if (rc != EOK) {
-            ereport(LOG, (errmodule(MOD_REMOTE), errmsg("memcpy_s error, retcode=%d", rc)));
+            pfree(pageData);
+            ereport(ERROR, (errmodule(MOD_REMOTE), errmsg("memcpy_s error, retcode=%d", rc)));
             ret_code = REMOTE_READ_MEMCPY_ERROR;
         }
 
         LockBuffer(buf, BUFFER_LOCK_UNLOCK);
         ReleaseBuffer(buf);
-
-        if (ret_code == REMOTE_READ_OK) {
-            *pagedata = context->pagedata;
-            PageSetChecksumInplace((Page) * pagedata, blocknum);
-        }
-
-        if (t_thrd.utils_cxt.CurrentResourceOwner != NULL)
-            ResourceOwnerRelease(t_thrd.utils_cxt.CurrentResourceOwner, RESOURCE_RELEASE_BEFORE_LOCKS, false, true);
-
-        smgrcloseall();
     }
-    PG_CATCH();
-    {
-        ret_code = REMOTE_READ_IO_ERROR;
 
-        /* Prevent interrupts while cleaning up */
-        HOLD_INTERRUPTS();
-
-        /* clear buffer and lock */
-        LWLockReleaseAll();
-        pgstat_report_waitevent(WAIT_EVENT_END);
-        AbortBufferIO();
-        UnlockBuffers();
-        if (t_thrd.utils_cxt.CurrentResourceOwner != NULL)
-            ResourceOwnerRelease(t_thrd.utils_cxt.CurrentResourceOwner, RESOURCE_RELEASE_BEFORE_LOCKS, false, true);
-
-        /* Using LOG level output the error message */
-        (void)MemoryContextSwitchTo(t_thrd.storage_cxt.remote_function_context);
-        ErrorData* edata = CopyErrorData();
-        ereport(LOG, (errmodule(MOD_REMOTE), errmsg("Fail to load Page for remote, cause: %s", edata->message)));
-
-        /* checksum error */
-        if (edata->sqlerrcode == ERRCODE_DATA_CORRUPTED)
-            ret_code = REMOTE_READ_CRC_ERROR;
-
-        FlushErrorState();
-        FreeErrorData(edata);
-
-        /* Now we can allow interrupts again */
-        RESUME_INTERRUPTS();
-
-        smgrcloseall();
+    if (ret_code == REMOTE_READ_OK) {
+        *pagedata = pageData;
+        PageSetChecksumInplace((Page) VARDATA(*pagedata), key.blocknum);
     }
-    PG_END_TRY();
 
     return ret_code;
 }
 
-/*
- * @Description: init thread state for rpc thread
- * @See also:
- */
-void InitWorkEnv()
+const int RES_COL_NUM = 2;
+Datum gs_read_file_from_remote(PG_FUNCTION_ARGS)
 {
-    if (!t_thrd.storage_cxt.work_env_init) {
-        knl_thread_arg arg;
-        arg.role = RPC_WORKER;
-        arg.t_thrd = &t_thrd;
-        /* binding static TLS variables for current thread */
-        EarlyBindingTLSVariables();
-        if ((GetThreadEntry(RPC_WORKER))(&arg) == 0) {
-            t_thrd.utils_cxt.CurrentResourceOwner = ResourceOwnerCreate(NULL, "rpc worker thread",
-                MEMORY_CONTEXT_STORAGE);
-            t_thrd.storage_cxt.work_env_init = true;
+    RelFileNode rnode;
+    RemoteReadFileKey key;
+    int32 forknum;
+    uint32 blockstart;
+    uint64 lsn;
+    bytea* result = NULL;
+    Datum values[RES_COL_NUM];
+    bool nulls[RES_COL_NUM] = {false};
+    HeapTuple tuple = NULL;
+    TupleDesc tupdesc;
+    int ret_code = 0;
+    int32 timeout;
+    int parano = 0;
+    XLogRecPtr current_lsn = InvalidXLogRecPtr;
+
+    if (GetUserId() != BOOTSTRAP_SUPERUSERID) {
+        ereport(ERROR, (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE), (errmsg("must be initial account to read files"))));
+    }
+    /* handle optional arguments */
+    rnode.spcNode = PG_GETARG_UINT32(parano++);
+    rnode.dbNode = PG_GETARG_UINT32(parano++);
+    rnode.relNode = PG_GETARG_UINT32(parano++);
+    rnode.bucketNode = PG_GETARG_INT32(parano++);
+    rnode.opt = 0;
+    forknum = PG_GETARG_INT32(parano++);
+    blockstart = PG_GETARG_INT32(parano++);
+    lsn = (uint64)PG_GETARG_TRANSACTIONID(parano++);
+    timeout = PG_GETARG_INT32(parano++);
+
+    if (rnode.spcNode != 1 && rnode.spcNode != 2) {
+         /* get tale data file */
+        key.relfilenode = rnode;
+        key.forknum = forknum;
+        key.blockstart = blockstart;
+        if (forknum != MAIN_FORKNUM) {
+            ereport(WARNING, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                (errmsg("Forknum should be 0. Now is %d. \n", forknum))));
+            PG_RETURN_NULL();
         }
+        ret_code = ReadFileForRemote(&key, lsn, &result, timeout);
+    } else {
+        ret_code = ReadCOrCsnFileForRemote(rnode, &result);
+    }
+
+    if (ret_code != REMOTE_READ_OK) {
+        PG_RETURN_NULL();
+    }
+
+    if (!RecoveryInProgress()) {
+        current_lsn = GetXLogInsertRecPtr();
+    }
+
+    tupdesc = CreateTemplateTupleDesc(RES_COL_NUM, false, TAM_HEAP);
+    parano = 1;
+    TupleDescInitEntry(tupdesc, (AttrNumber)parano++, "file", BYTEAOID, -1, 0);
+    TupleDescInitEntry(tupdesc, (AttrNumber)parano++, "lsn", XIDOID, -1, 0);
+    values[0] = PointerGetDatum(result);
+    nulls[0] = false;
+    values[1] = UInt64GetDatum(current_lsn);
+    nulls[1] = false;
+
+    tupdesc = BlessTupleDesc(tupdesc);
+    tuple = heap_form_tuple(tupdesc, values, nulls);
+    PG_RETURN_DATUM(HeapTupleGetDatum(tuple));
+}
+
+Datum gs_read_file_size_from_remote(PG_FUNCTION_ARGS)
+{
+    RelFileNode rnode;
+    int32 forknum;
+    uint64 lsn;
+    int64 size = 0;
+    int32 timeout;
+    int parano = 0;
+    int ret_code = REMOTE_READ_OK;
+
+    if (GetUserId() != BOOTSTRAP_SUPERUSERID) {
+        ereport(ERROR, (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE), (errmsg("must be initial account to read files"))));
+    }
+    /* handle optional arguments */
+    rnode.spcNode = PG_GETARG_UINT32(parano++);
+    rnode.dbNode = PG_GETARG_UINT32(parano++);
+    rnode.relNode = PG_GETARG_UINT32(parano++);
+    rnode.bucketNode = PG_GETARG_INT32(parano++);
+    rnode.opt = 0;
+    forknum = PG_GETARG_INT32(parano++);
+    lsn = (uint64)PG_GETARG_TRANSACTIONID(parano++);
+    timeout = PG_GETARG_INT32(parano++);
+
+    /* get file size */
+    ret_code = ReadFileSizeForRemote(rnode, forknum, lsn, &size, timeout);
+    if (ret_code == REMOTE_READ_OK) {
+        PG_RETURN_INT64(size);
+    } else {
+        PG_RETURN_NULL();
     }
 }
 
-/*
- * @Description: clear thread state for rpc thread
- * @See also:
- */
-void CleanWorkEnv()
+int ReadFileSizeForRemote(RelFileNode rnode, int32 forknum, XLogRecPtr lsn, int64* res, int timeout)
 {
-    if (t_thrd.storage_cxt.work_env_init) {
-        proc_exit(0);
-    }
-}
+    SMgrRelation smgr = NULL;
+    int64 nblock = 0;
+    int ret_code = REMOTE_READ_OK;
 
-/*
- * @Description: init remote read context
- * @Return: remote read context
- * @See also:
- */
-RemoteReadContext* InitRemoteReadContext()
-{
-    InitWorkEnv();
-
-    if (t_thrd.storage_cxt.remote_function_context == NULL) {
-        t_thrd.storage_cxt.remote_function_context = AllocSetContextCreate((MemoryContext)NULL,
-                                                                           "remote function",
-                                                                           ALLOCSET_DEFAULT_MINSIZE,
-                                                                           ALLOCSET_DEFAULT_INITSIZE,
-                                                                           ALLOCSET_DEFAULT_MAXSIZE);
-    }
-    (void)MemoryContextSwitchTo(t_thrd.storage_cxt.remote_function_context);
-
-    RemoteReadContext* context = (RemoteReadContext*)palloc0(sizeof(RemoteReadContext));
-    return context;
-}
-
-/*
- * @Description: clear remote read context
- * @IN context:remote read context
- * @See also:
- */
-void ReleaseRemoteReadContext(RemoteReadContext* context)
-{
-    if (context != NULL) {
-        if (context->custorage != NULL)
-            DELETE_EX(context->custorage);
-
-        if (context->cu != NULL)
-            DELETE_EX(context->cu);
-
-        if (context->pagedata != NULL)
-            pfree_ext(context->pagedata);
-
-        pfree_ext(context);
-    }
-
-    MemoryContextReset(t_thrd.storage_cxt.remote_function_context);
-}
-
-/*
- * @Description:get the grpc certificate path environment
- * @IN envVar:get which env
- * @OUT outputEnvStr:env value
- * @See alse:
- */
-bool GetCertEnv(const char* envName, char* outputEnvStr, size_t envValueLen)
-{
-    const char* tmpenv = NULL;
-    char* envValue = NULL;
-    const char* dangerCharacterList[] = {"|",
-                                         ";",
-                                         "&",
-                                         "$",
-                                         "<",
-                                         ">",
-                                         "`",
-                                         "\\",
-                                         "'",
-                                         "\"",
-                                         "{",
-                                         "}",
-                                         "(",
-                                         ")",
-                                         "[",
-                                         "]",
-                                         "~",
-                                         "*",
-                                         "?",
-                                         "!",
-                                         "\n",
-                                         NULL
-                                        };
-    int index = 0;
-    errno_t rc = EOK;
-
-    if (envName == NULL) {
-        ::OutputMsgforRPC(WARNING, "Invalid env Name: \"%s\".", envName);
-        return false;
-    }
-
-    tmpenv = getenv(envName);
-    if (tmpenv == NULL) {
-        ::OutputMsgforRPC(WARNING,
-                          "Failed to get environment variable: \"%s\". Please check and make sure it is configured!",
-                          envName);
-        return false;
-    }
-
-    size_t len = strlen(tmpenv);
-    if (len >= envValueLen) {
-        ::OutputMsgforRPC(WARNING, "len(%lu) > envValueLen(%lu), "
-                          "Failed to get environment variable: \"%s\". Please check and make sure it is configured!",
-                          len, envValueLen, envName);
-        return false;
-    }
-
-    envValue = (char *)malloc(len + 1);
-    if (envValue == NULL) {
-        ::OutputMsgforRPC(WARNING,
-                          "Failed to malloc when get environment variable: \"%s\"!", envName);
-        return false;
-    }
-    rc = strcpy_s(envValue, len + 1, tmpenv);
-    securec_check_c(rc, "", "");
-
-    if (envValue[0] == '\0') {
-        ::OutputMsgforRPC(WARNING,
-                          "Failed to get environment variable: \"%s\". Please check and make sure it is configured!",
-                          envName);
-        free(envValue);
-        return false;
-    }
-
-    for (; dangerCharacterList[index] != NULL; index++) {
-        if (strstr(envValue, dangerCharacterList[index]) != NULL) {
-            ::OutputMsgforRPC(
-                WARNING, "Failed to check environment value: invalid token \"%s\".", dangerCharacterList[index]);
-            free(envValue);
-            return false;
+    /* wait request lsn for replay */
+    if (RecoveryInProgress()) {
+        ret_code = XLogWaitForReplay(lsn, timeout);
+        if (ret_code != REMOTE_READ_OK) {
+            ereport(ERROR, (errmodule(MOD_REMOTE), errmsg("could not redo request lsn.")));
+            return ret_code;
         }
     }
 
-    rc = strcpy_s(outputEnvStr, len + 1, envValue);
-    securec_check_c(rc, "", "");
+    RequestCheckpoint(CHECKPOINT_IMMEDIATE | CHECKPOINT_FORCE | CHECKPOINT_WAIT);
 
-    free(envValue);
-    return true;
-}
-
-/*
- * @Description:get the grpc certificate context
- * @IN path:Certification path
- * @OUT len: Certification len
- * @return buf: Certification context
- * @See alse:
- */
-char* GetCertStr(char* path, int* len)
-{
-    char* retVal = NULL;
-    int fd = -1;
-    char* buf = NULL;
-    char lRealPath[PATH_MAX] = {0};
+    /* check whether the file exists. not exist, return size -1 */
     struct stat statBuf;
+    char* path = relpathperm(rnode, forknum);
+    if (stat(path, &statBuf) < 0 && errno == ENOENT) {
+        *res = -1;
+        pfree(path);
+        return ret_code;
+    }
+    pfree(path);
 
-    if (path == NULL) {
-        ::OutputMsgforRPC(LOG, "Invalid path: \"%s\". Please check it", path);
-        return NULL;
-    }
-    retVal = realpath(path, lRealPath);
-    if (retVal == NULL) {
-        ::OutputMsgforRPC(LOG, "Could not get realpath: \"%s\".", path);
-        return NULL;
-    }
-    if ((fd = open(lRealPath, O_RDONLY | PG_BINARY, 0)) < 0) {
-        ::OutputMsgforRPC(LOG, "Could not open relpath: \"%s\".", path);
-        return NULL;
-    }
-    if (fstat(fd, &statBuf) < 0) {
-        ::OutputMsgforRPC(LOG, "Could not open file: \"%s\".", path);
-        (void)close(fd);
-        return NULL;
-    }
+    if (!IsSegmentFileNode(rnode)) {
+        smgr = smgropen(rnode, InvalidBackendId);
+        nblock = smgrnblocks(smgr, forknum);
+        smgrcloseall();
+    } else {
+        SegSpace *spc = spc_open(rnode.spcNode, rnode.dbNode, true, true);
+        spc_datafile_create(spc, rnode.relNode, forknum);
 
-    buf = (char*)malloc(statBuf.st_size + 1);
-    if (buf == NULL) {
-        ::OutputMsgforRPC(ERROR, "Out of memory when getting grpc certificates.");
-        (void)close(fd);
-        return NULL;
+        nblock = spc_size(spc, rnode.relNode, forknum);
     }
-    *len = (int)read(fd, buf, statBuf.st_size);
-    if (*len != statBuf.st_size) {
-        free(buf);
-        *len = 0;
-        (void)close(fd);
-        return NULL;
-    }
-    buf[statBuf.st_size] = '\0';
+    *res = nblock * BLCKSZ;
 
-    (void)close(fd);
-    return buf;
+    return ret_code;
 }
 
-/*
- * @Description: get remote mode for rpc thread
- * @Return: remote read mode
- * @See also:
- */
-int GetRemoteReadMode()
+int ReadFileByReadBufferComom(RemoteReadFileKey *key, bytea* pageData, uint32 nblock)
 {
-    return g_instance.attr.attr_storage.remote_read_mode;
-}
+    int ret_code = REMOTE_READ_OK;
+    uint32 i = 0;
+    uint32 j = 0;
+    uint32 blk_start;
+    uint32 blk_end;
+    bool hit = false;
+    char* bufBlock = NULL;
+    errno_t rc;
 
-/*
- * @Description: output log fro rpc thread
- * @IN fmt: log format
- * @See also:
- */
-void OutputMsgforRPC(int elevel, const char* fmt, ...)
-{
-    /* must call after InitWorkEnv() in RPC worker thread */
-    if (fmt != NULL) {
-        StringInfoData emsg;
-        initStringInfo(&emsg);
+    /* get the segno file block start and block end */
+    blk_start = key->blockstart;
+    blk_end = (nblock >= blk_start + MAX_BATCH_READ_BLOCKNUM ? blk_start + MAX_BATCH_READ_BLOCKNUM : nblock);
 
-        for (;;) {
-            va_list args;
-            bool success = false;
+    for (i = blk_start, j = 0; i < blk_end; i++, j++) {
+        /* read page, if PageIsVerified failed will long jump */
+        BufferAccessStrategy bstrategy = GetAccessStrategy(BAS_REPAIR);
+        Buffer buf = ReadBufferForRemote(key->relfilenode, key->forknum, i, RBM_FOR_REMOTE, bstrategy, &hit, NULL);
 
-            va_start(args, fmt);
-            success = appendStringInfoVA(&emsg, fmt, args);
-            va_end(args);
-
-            if (success) {
-                break;
-            }
-
-            enlargeStringInfo(&emsg, emsg.maxlen);
+        if (BufferIsInvalid(buf)) {
+            ereport(WARNING, (errmodule(MOD_REMOTE), errmsg("repair file failed!")));
+            return REMOTE_READ_BLCKSZ_NOT_SAME;
         }
 
-        ereport(elevel, (errmodule(MOD_REMOTE), errmsg("%s", emsg.data)));
+        LockBuffer(buf, BUFFER_LOCK_SHARE);
+        bufBlock = (char*)BufferGetBlock(buf);
 
-        pfree(emsg.data);
-        emsg.data = NULL;
+        rc = memcpy_s(VARDATA(pageData) + j * BLCKSZ, BLCKSZ, bufBlock, BLCKSZ);
+        if (rc != EOK) {
+            ereport(WARNING, (errmodule(MOD_REMOTE), errmsg("repair file failed, memcpy_s error, retcode=%d", rc)));
+            ret_code = REMOTE_READ_MEMCPY_ERROR;
+            LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+            ReleaseBuffer(buf);
+            return ret_code;
+        }
+
+        LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+        ReleaseBuffer(buf);
+        PageSetChecksumInplace((Page) (VARDATA(pageData) + j * BLCKSZ), i);
     }
+
+    return ret_code;
+}
+
+const int MAX_RETRY_TIMES = 60;
+int ReadFileByReadDisk(SegSpace* spc, RemoteReadFileKey *key, char* bufBlock, BlockNumber blocknum)
+{
+    int ret_code = REMOTE_READ_OK;
+    int pageStatus;
+    int retryTimes = 0;
+
+    if (IsSegmentFileNode(key->relfilenode)) {
+        RelFileNode fakenode = {
+            .spcNode = key->relfilenode.spcNode,
+            .dbNode = key->relfilenode.dbNode,
+            .relNode = key->relfilenode.relNode,
+            .bucketNode = SegmentBktId,
+            .opt = 0
+        };
+SEG_RETRY:
+        seg_physical_read(spc, fakenode, key->forknum, blocknum, (char *)bufBlock);
+        retryTimes++;
+        if (PageIsVerified((Page)bufBlock, blocknum)) {
+            pageStatus = SMGR_RD_OK;
+        } else {
+            pageStatus = SMGR_RD_CRC_ERROR;
+            if (retryTimes < MAX_RETRY_TIMES) {
+                /* sleep 10ms */
+                pg_usleep(10000L);
+                goto SEG_RETRY;
+            } else {
+                pfree(bufBlock);
+                ereport(WARNING, (errmodule(MOD_REMOTE),
+                    errmsg("repair file failed, read page crc check error, page: %u/%u/%u/%d, "
+                    "forknum is %d, block num is %u", key->relfilenode.spcNode, key->relfilenode.dbNode,
+                    key->relfilenode.relNode, key->relfilenode.bucketNode, key->forknum, blocknum)));
+                ret_code = REMOTE_READ_CRC_ERROR;
+                return ret_code;
+            }
+        }
+    } else {
+        SMgrRelation smgr = smgropen(key->relfilenode, InvalidBackendId);
+        /* standby read page, replay finish, there will be no synchronous changes. */
+        pageStatus = smgrread(smgr, key->forknum, blocknum, (char *)bufBlock);
+        retryTimes++;
+        if (pageStatus != SMGR_RD_OK) {
+            pfree(bufBlock);
+            ereport(WARNING, (errmodule(MOD_REMOTE),
+                errmsg("repair file failed, read page crc check error, page: %u/%u/%u/%d, "
+                "forknum is %d, block num is %u", key->relfilenode.spcNode, key->relfilenode.dbNode,
+                key->relfilenode.relNode, key->relfilenode.bucketNode, key->forknum, blocknum)));
+            ret_code = REMOTE_READ_CRC_ERROR;
+            smgrclose(smgr);
+            return ret_code;
+        }
+        smgrclose(smgr);
+    }
+    return ret_code;
+}
+
+int ReadFileForRemote(RemoteReadFileKey *key, XLogRecPtr lsn, bytea** fileData, int timeout)
+{
+    int ret_code = REMOTE_READ_OK;
+    SMgrRelation smgr = NULL;
+    SegSpace* spc = NULL;
+    bytea* pageData = NULL;
+    char* bufBlock = NULL;
+    uint32 nblock = 0;
+    uint32 blk_start = 0;
+    uint32 blk_end = 0;
+    uint32 i = 0;
+    uint32 j = 0;
+    errno_t rc;
+
+    /* wait request lsn for replay */
+    if (RecoveryInProgress()) {
+        ret_code = XLogWaitForReplay(lsn, timeout);
+        if (ret_code != REMOTE_READ_OK) {
+            ereport(ERROR, (errmodule(MOD_REMOTE), errmsg("could not redo request lsn.")));
+            return ret_code;
+        }
+    }
+    if (RecoveryInProgress() || IsSegmentFileNode(key->relfilenode)) {
+        RequestCheckpoint(CHECKPOINT_WAIT | CHECKPOINT_FORCE | CHECKPOINT_IMMEDIATE);
+    }
+
+    /* get block num */
+    if (!IsSegmentFileNode(key->relfilenode)) {
+        smgr = smgropen(key->relfilenode, InvalidBackendId);
+        nblock = smgrnblocks(smgr, key->forknum);
+        smgrclose(smgr);
+    } else {
+        spc = spc_open(key->relfilenode.spcNode, key->relfilenode.dbNode, false, false);
+        if (!spc) {
+            ereport(WARNING, (errmodule(MOD_REMOTE),
+                    errmsg("Spc open failed. spcNode is: %u, dbNode is %u",
+                    key->relfilenode.spcNode, key->relfilenode.dbNode)));
+            return REMOTE_READ_IO_ERROR;
+        }
+        nblock = spc_size(spc, key->relfilenode.relNode, key->forknum);
+    }
+
+    if (nblock <= key->blockstart) {
+        ret_code = REMOTE_READ_SIZE_ERROR;
+        return ret_code;
+    }
+
+    /* get the segno file block start and block end */
+    blk_start = key->blockstart;
+    blk_end = (nblock >= blk_start + MAX_BATCH_READ_BLOCKNUM ? blk_start + MAX_BATCH_READ_BLOCKNUM : nblock);
+
+    pageData = (bytea*)palloc((blk_end - blk_start) * BLCKSZ + VARHDRSZ);
+    SET_VARSIZE(pageData, ((blk_end - blk_start) * BLCKSZ + VARHDRSZ));
+
+    /* primary read page, need read page by ReadBuffer_common */
+    if (!IsSegmentFileNode(key->relfilenode) && !RecoveryInProgress()) {
+        ret_code = ReadFileByReadBufferComom(key, pageData, nblock);
+        if (ret_code != REMOTE_READ_OK) {
+            pfree(pageData);
+            ereport(ERROR, (errmodule(MOD_REMOTE), errmsg("read file failed!")));
+            return ret_code;
+        }
+    } else {
+        ADIO_RUN()
+        {
+            bufBlock = (Page)adio_align_alloc(BLCKSZ);
+        }
+        ADIO_ELSE()
+        {
+            bufBlock = (Page)palloc(BLCKSZ);
+        }
+        ADIO_END();
+        for (i = blk_start, j = 0; i < blk_end; i++, j++) {
+            ret_code = ReadFileByReadDisk(spc, key, bufBlock, i);
+            if (ret_code != REMOTE_READ_OK) {
+                pfree(bufBlock);
+                pfree(pageData);
+                ereport(ERROR, (errmodule(MOD_REMOTE), errmsg("repair file failed, read block %u error, retcode=%d",
+                    i, rc)));
+                return ret_code;
+            }
+            rc = memcpy_s(VARDATA(pageData) + j * BLCKSZ, BLCKSZ, bufBlock, BLCKSZ);
+            if (rc != EOK) {
+                pfree(bufBlock);
+                pfree(pageData);
+                ret_code = REMOTE_READ_MEMCPY_ERROR;
+                ereport(ERROR, (errmodule(MOD_REMOTE), errmsg("repair file failed, memcpy_s error, retcode=%d", rc)));
+                return ret_code;
+            }
+        }
+        pfree(bufBlock);
+        if (ret_code != REMOTE_READ_OK) {
+            pfree(pageData);
+            ereport(ERROR, (errmodule(MOD_REMOTE), errmsg("read file failed!")));
+            return ret_code;
+        }
+    }
+
+    *fileData = pageData;
+
+    return ret_code;
+}
+
+const int REGR_MCR_SIZE_1MB = 1048576;
+const int CLOG_NODE = 1;
+const int CSN_NODE = 2;
+int ReadCOrCsnFileForRemote(RelFileNode rnode, bytea** fileData)
+{
+    uint32 flags = O_RDWR | PG_BINARY;
+    int fd = -1;
+    char* logType = NULL;
+    char* path = (char*)palloc0(MAX_PATH);
+    errno_t rc;
+    uint32 logSize = 16 * REGR_MCR_SIZE_1MB;
+    char *buffer = (char*)palloc(logSize);
+    int result = -1;
+
+    if (rnode.spcNode == CLOG_NODE) {
+        logType = "pg_clog";
+    } else if (rnode.spcNode == CSN_NODE) {
+        logType = "pg_csnlog";
+    } else {
+        ereport(LOG, (errmodule(MOD_SEGMENT_PAGE), errmsg("File type\"%u\" does not exist, stop read here.",
+                                                          rnode.spcNode)));
+    }
+
+    rc = snprintf_s(path, MAX_PATH, MAX_PATH - 1, "%s/%012u", logType, rnode.relNode);
+    securec_check_ss(rc, "\0", "\0");
+
+    fd = BasicOpenFile(path, flags, S_IWUSR | S_IRUSR);
+    if (fd < 0) {
+        pfree(buffer);
+        if (errno != ENOENT) {
+            ereport(ERROR, (errcode_for_file_access(), errmsg("could not open file \"%s\": %m", path)));
+        }
+        // The file does not exist, break.
+        ereport(LOG,
+                (errmodule(MOD_SEGMENT_PAGE), errmsg("File \"%s\" does not exist, stop read here.", path)));
+        pfree(path);
+        return -1;
+    }
+    pgstat_report_waitevent(WAIT_EVENT_DATA_FILE_READ);
+    uint32 nbytes = pread(fd, buffer, logSize, 0);
+    pgstat_report_waitevent(WAIT_EVENT_END);
+    if (close(fd)) {
+        pfree(path);
+        pfree(buffer);
+        ereport(ERROR, (errcode_for_file_access(), errmsg("could not close file \"%s\": %m", path)));
+    }
+
+    if (nbytes > logSize) {
+        pfree(buffer);
+        ereport(ERROR,
+                (errcode(MOD_SEGMENT_PAGE),
+                        errcode_for_file_access(),
+                        errmsg("could not read file %s. nbytes:%u, logSize:%u", path, nbytes, logSize)));
+        pfree(path);
+        return -1;
+    } else {
+        bytea* pageData = (bytea*)palloc(nbytes + VARHDRSZ);
+        SET_VARSIZE(pageData, (nbytes + VARHDRSZ));
+        rc = memcpy_s(VARDATA(pageData), nbytes, buffer, nbytes);
+        if (rc != EOK) {
+            pfree(path);
+            pfree(pageData);
+            pfree(buffer);
+            ereport(ERROR, (errmodule(MOD_REMOTE), errmsg("repair file failed, memcpy_s error, retcode=%d", rc)));
+            return -1;
+        } else {
+            *fileData = pageData;
+            result = 0;
+        }
+    }
+    pfree(path);
+    pfree(buffer);
+    return result;
 }

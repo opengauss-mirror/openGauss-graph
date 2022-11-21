@@ -139,7 +139,7 @@ select 2 from vector_result_engine.vector_result_table_01 where col_int > 500 li
 
 select count(*) from vector_result_engine.vector_result_table_01 t1 where exists (select t2.col_int from vector_result_engine.vector_result_table_01 t2 where col_int < 500);
 \o vec_result_json.o
-explain (analyze on, detail on, format json)select count(*) from vector_result_engine.vector_result_table_01 t1 where exists (select t2.col_int from vector_result_engine.vector_result_table_01 t2 where col_int < 500);
+explain (analyze on, format json)select count(*) from vector_result_engine.vector_result_table_01 t1 where exists (select t2.col_int from vector_result_engine.vector_result_table_01 t2 where col_int < 500);
 \o
 \! rm vec_result_json.o
 set enable_vector_engine=false;
@@ -270,6 +270,14 @@ create table location_type
     location_type_desc varchar(250) not null 
 )with (orientation=column);
 
+
+explain (costs off, verbose on) WITH WITH_345 AS MATERIALIZED (SELECT Table_037.location_type_desc Column_024 
+FROM (SELECT 1 Column_017
+FROM region Table_010 RIGHT OUTER JOIN job_classification Table_030 ON FALSE) Table_036,
+location_type Table_037 ) 
+SELECT WITH_345.Column_024 Column_026
+FROM WITH_345
+GROUP BY ROLLUP(Column_026);
 
 explain (costs off, verbose on) WITH WITH_345 AS (SELECT Table_037.location_type_desc Column_024 
 FROM (SELECT 1 Column_017

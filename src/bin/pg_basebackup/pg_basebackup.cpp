@@ -1511,7 +1511,7 @@ static void backup_dw_file(const char *target_dir)
     char *unaligned_buf = NULL;
 
     /* Delete the dw file, if it exists. */
-    remove_dw_file(DW_FILE_NAME, target_dir, real_file_path);
+    remove_dw_file(OLD_DW_FILE_NAME, target_dir, real_file_path);
 
     rc = memset_s(real_file_path, (PATH_MAX + 1), 0, (PATH_MAX + 1));
     securec_check_c(rc, "\0", "\0");
@@ -2061,7 +2061,7 @@ static int GsBaseBackup(int argc, char** argv)
                    "or import environment variables PGPORT.\n"), progname);
             exit(1); 
         }
-     }
+    }
 
     /*
      * Any non-option arguments?

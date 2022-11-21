@@ -30,7 +30,7 @@ typedef struct EventInfo {
     char* type;
     char* event;
 } EventInfo;
-#define WAIT_EVENT_SIZE 249
+#define WAIT_EVENT_SIZE 256
 struct EventInfo waitEventInfo[WAIT_EVENT_SIZE] = {
     {"none", "STATUS", "none"},
     {"LWLock", "STATUS", "acquire lwlock"},
@@ -52,6 +52,11 @@ struct EventInfo waitEventInfo[WAIT_EVENT_SIZE] = {
     {"Transaction", "STATUS", "wait data sync"},
     {"Transaction", "STATUS", "wait data sync queue"},
     {"COMM", "STATUS", "flush data"},
+    {"Transaction", "STATUS", "wait reserve td"},
+    {"Transaction", "STATUS", "wait td rollback"},
+    {"Transaction", "STATUS", "wait transaction rollback"},
+    {"Data file", "STATUS", "prune table"},
+    {"Data file", "STATUS", "prune index"},
     {"COMM", "STATUS", "stream get conn"},
     {"COMM", "STATUS", "wait producer ready"},
     {"Stream", "STATUS", "synchronize quit"},
@@ -283,7 +288,9 @@ struct EventInfo waitEventInfo[WAIT_EVENT_SIZE] = {
     {"Dbmind", "LWLOCK_EVENT", "HypoIndexLock"},
     {"Plugin", "LWLOCK_EVENT", "GeneralExtendedLock"},
     {"plugin", "LWLOCK_EVENT", "extension"},
-    {"plugin", "LWLOCK_EVENT", "extension"}
+    {"plugin", "LWLOCK_EVENT", "extension"},
+    {"Transaction", "LWLOCK_EVENT", "TwoPhaseStatePartLock"},
+    {"Relation", "LWLOCK_EVENT", "NgroupDestoryLock"}
 };
 
 Datum get_wait_event_info(PG_FUNCTION_ARGS)

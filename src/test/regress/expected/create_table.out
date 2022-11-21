@@ -245,7 +245,6 @@ NOTICE:  CREATE TABLE / PRIMARY KEY will create implicit index "unlogged1_pkey" 
 INSERT INTO unlogged1 VALUES (42);
 CREATE UNLOGGED TABLE public.unlogged2 (a int primary key);		-- also OK
 NOTICE:  CREATE TABLE / PRIMARY KEY will create implicit index "unlogged2_pkey" for table "unlogged2"
-SET enforce_two_phase_commit TO off;
 CREATE UNLOGGED TABLE pg_temp.unlogged3 (a int primary key);	-- not OK
 ERROR:  only temporary relations may be created in temporary schemas
 CREATE TABLE pg_temp.implicitly_temp (a int primary key);		-- OK
@@ -272,7 +271,8 @@ DROP TABLE hw_create_as_test3;
 DROP TABLE hw_create_as_test1;
 CREATE TABLE hw_create_as_test1(C_INT int);
 CREATE TABLE hw_create_as_test2(C_INT) as SELECT C_INT FROM hw_create_as_test1;
-ERROR:  relation "hw_create_as_test2" already exists
+ERROR:  relation "hw_create_as_test2" already exists in schema "public"
+DETAIL:  creating new table with existing name in the same schema
 CREATE TABLE hw_create_as_test3 (C_INT int);
 ALTER TABLE hw_create_as_test3 INHERIT hw_create_as_test2;
 ERROR:  child table is missing column "c_char"

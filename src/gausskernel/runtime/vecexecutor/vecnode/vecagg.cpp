@@ -23,7 +23,7 @@
 #include "catalog/pg_proc.h"
 #include "catalog/pg_type.h"
 #include "executor/executor.h"
-#include "executor/nodeAgg.h"
+#include "executor/node/nodeAgg.h"
 #include "miscadmin.h"
 #include "nodes/nodeFuncs.h"
 #include "optimizer/clauses.h"
@@ -1486,7 +1486,7 @@ void BaseAggRunner::BatchSortAggregation(int curr_set, int work_mem, int max_mem
                 FmgrInfo* equalfns = &peragg_stat->equalfns[0];
 
                 /* This vector's values all is NULL. */
-                if (!FilterRepeatValue(equalfns, curr_set, aggno, first)) {
+                if (equalfns && !FilterRepeatValue(equalfns, curr_set, aggno, first)) {
                     break;
                 }
 

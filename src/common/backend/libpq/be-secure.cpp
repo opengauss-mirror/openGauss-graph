@@ -82,6 +82,7 @@
 #include "cipher.h"
 #include "pgstat.h"
 #include "workload/workload.h"
+#include "communication/commproxy_interface.h"
 
 #ifdef USE_SSL
 typedef enum DHKeyLength {
@@ -95,7 +96,6 @@ typedef enum DHKeyLength {
     DHKey8192
 } DHKeyLength;
 
-static int verify_cb(int ok, X509_STORE_CTX* ctx);
 static void info_cb(const SSL* ssl, int type, int args);
 static const char* SSLerrmessage(void);
 static void set_user_config_ssl_ciphers(const char* sslciphers);
@@ -121,12 +121,19 @@ extern THR_LOCAL unsigned char disable_pqlocking;
 
 /* security ciphers suites in SSL connection */
 static const char* ssl_ciphers_map[] = {
-    TLS1_TXT_DHE_RSA_WITH_AES_128_GCM_SHA256,   /* TLS_DHE_RSA_WITH_AES_128_GCM_SHA256 */
-    TLS1_TXT_DHE_RSA_WITH_AES_256_GCM_SHA384,   /* TLS_DHE_RSA_WITH_AES_256_GCM_SHA384 */
-    TLS1_TXT_DHE_RSA_WITH_AES_128_CCM,          /* TLS_DHE_RSA_WITH_AES_128_CCM */
-    TLS1_TXT_DHE_RSA_WITH_AES_256_CCM,          /* TLS_DHE_RSA_WITH_AES_256_CCM */
+    TLS1_TXT_ECDHE_RSA_WITH_AES_128_GCM_SHA256,     /* TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256 */
+    TLS1_TXT_ECDHE_RSA_WITH_AES_256_GCM_SHA384,     /* TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384 */
+    TLS1_TXT_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,   /* TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256 */
+    TLS1_TXT_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,   /* TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384 */
+    /* The following are compatible with earlier versions of the client. */
+    TLS1_TXT_DHE_RSA_WITH_AES_128_GCM_SHA256,       /* TLS_DHE_RSA_WITH_AES_128_GCM_SHA256, */
+    TLS1_TXT_DHE_RSA_WITH_AES_256_GCM_SHA384,       /* TLS_DHE_RSA_WITH_AES_256_GCM_SHA384 */
     NULL};
 
+#ifndef ENABLE_UT
+static
+#endif
+bool g_server_crl_err = false;
 #endif
 
 const char* ssl_cipher_file = "server.key.cipher";
@@ -304,7 +311,9 @@ ssize_t secure_read(Port* port, void* ptr, size_t len)
             prepare_for_client_read();
             PGSTAT_INIT_TIME_RECORD();
             PGSTAT_START_TIME_RECORD();
-            n = recv(port->sock, ptr, len, 0);
+
+            /* CommProxy Interface Support */
+            n = comm_recv(port->sock, ptr, len, 0);
             END_NET_RECV_INFO(n);
             client_read_ended();
         }
@@ -337,6 +346,11 @@ ssize_t secure_write(Port* port, void* ptr, size_t len)
                 break;
             case SSL_ERROR_WANT_READ:
             case SSL_ERROR_WANT_WRITE:
+                if (port->noblock) {
+                    errno = EWOULDBLOCK;
+                    n = -1;
+                    break;
+                }
 #ifdef WIN32
                 pgwin32_waitforsinglesocket(SSL_get_fd(port->ssl),
                     (err == SSL_ERROR_WANT_READ) ? (FD_READ | FD_CLOSE) : (FD_WRITE | FD_CLOSE),
@@ -399,7 +413,9 @@ ssize_t secure_write(Port* port, void* ptr, size_t len)
     } else {
         PGSTAT_INIT_TIME_RECORD();
         PGSTAT_START_TIME_RECORD();
-        n = send(port->sock, ptr, len, 0);
+
+        /* CommProxy Interface Support */
+        n = comm_send(port->sock, ptr, len, 0);
         PGSTAT_END_TIME_RECORD(NET_SEND_TIME);
         END_NET_SEND_INFO(n);
         
@@ -428,14 +444,64 @@ ssize_t secure_write(Port* port, void* ptr, size_t len)
  *  criteria (e.g., accepting self-signed or expired certs), but
  *  for now we accept the default checks.
  */
-static int verify_cb(int ok, X509_STORE_CTX* ctx)
+int be_verify_cb(int ok, X509_STORE_CTX* ctx)
 {
+    if (ok) {
+        return ok;
+    }
+
+    /* 
+    * When the CRL is abnormal, it won't be used to check whether the certificate is revoked,
+    * and the services shouldn't be affected due to the CRL exception.
+    */
+    const int crl_err_scenarios[] = {
+        X509_V_ERR_CRL_HAS_EXPIRED,
+        X509_V_ERR_UNABLE_TO_GET_CRL,
+        X509_V_ERR_UNABLE_TO_DECRYPT_CRL_SIGNATURE,
+        X509_V_ERR_CRL_SIGNATURE_FAILURE,
+        X509_V_ERR_CRL_NOT_YET_VALID,
+        X509_V_ERR_ERROR_IN_CRL_LAST_UPDATE_FIELD,
+        X509_V_ERR_ERROR_IN_CRL_NEXT_UPDATE_FIELD,
+        X509_V_ERR_UNABLE_TO_GET_CRL_ISSUER,
+        X509_V_ERR_KEYUSAGE_NO_CRL_SIGN,
+        X509_V_ERR_UNHANDLED_CRITICAL_CRL_EXTENSION,
+        X509_V_ERR_DIFFERENT_CRL_SCOPE,
+        X509_V_ERR_CRL_PATH_VALIDATION_ERROR
+    };
+    bool ignore_crl_err = false;
+
+    int err_code = X509_STORE_CTX_get_error(ctx);
+    const char *err_msg = X509_verify_cert_error_string(err_code);
+    if (!g_server_crl_err) {
+        for (size_t i = 0; i < sizeof(crl_err_scenarios) / sizeof(crl_err_scenarios[0]); i++) {
+            if (err_code == crl_err_scenarios[i]) {
+                ereport(LOG,
+                    (errmsg("During SSL authentication, there are some errors in the CRL, so we just ignore the CRL. "
+                        "{ssl err code: %d, ssl err message: %s}\n", err_code, err_msg)));
+                
+                g_server_crl_err = true;
+                ignore_crl_err = true;
+                break;
+            }
+        }
+    } else {
+        if (err_code == X509_V_ERR_CERT_REVOKED) {
+            g_server_crl_err = false; /* reset */
+            ignore_crl_err = true;
+        }
+    }
+
+    if (ignore_crl_err) {
+        X509_STORE_CTX_set_error(ctx, X509_V_OK);
+        ok = 1;
+    }
+
     return ok;
 }
 
 /*
  *  This callback is used to copy SSL information messages
- *  into the PostgreSQL log.
+ *  into the openGauss log.
  */
 static void info_cb(const SSL* ssl, int type, int args)
 {
@@ -777,7 +843,7 @@ static void initialize_SSL(void)
             if (1 == X509_STORE_load_locations(cvstore, g_instance.attr.attr_security.ssl_crl_file, NULL)) {
                 (void)X509_STORE_set_flags(cvstore, X509_V_FLAG_CRL_CHECK);
             } else {
-                ereport(FATAL,
+                ereport(WARNING,
                     (errmsg("could not load SSL certificate revocation list file \"%s\": %s",
                         g_instance.attr.attr_security.ssl_crl_file,
                         SSLerrmessage())));
@@ -791,7 +857,8 @@ static void initialize_SSL(void)
          * presented.  We might fail such connections later, depending on
          * what we find in pg_hba.conf.
          */
-        SSL_CTX_set_verify(u_sess->libpq_cxt.SSL_server_context, (SSL_VERIFY_PEER | SSL_VERIFY_CLIENT_ONCE), verify_cb);
+        SSL_CTX_set_verify(u_sess->libpq_cxt.SSL_server_context, (SSL_VERIFY_PEER | SSL_VERIFY_CLIENT_ONCE),
+            be_verify_cb);
 
         /* Increase the depth to support multi-level certificate. */
         SSL_CTX_set_verify_depth(u_sess->libpq_cxt.SSL_server_context, (MAX_CERTIFICATE_DEPTH_SUPPORTED - 2));
@@ -824,6 +891,8 @@ static int open_server_SSL(Port* port)
 
     Assert(port->ssl == NULL);
     Assert(port->peer == NULL);
+
+    g_server_crl_err = false;
 
     port->ssl = SSL_new(u_sess->libpq_cxt.SSL_server_context);
     if (port->ssl == NULL) {
@@ -1022,7 +1091,9 @@ ssize_t secure_raw_read(Port* port, void* ptr, size_t len)
 #endif
     PGSTAT_INIT_TIME_RECORD();
     PGSTAT_START_TIME_RECORD();
-    n = recv(port->sock, ptr, len, 0);
+
+    /* CommProxy Interface Support */
+    n = comm_recv(port->sock, ptr, len, 0);
     END_NET_RECV_INFO(n);
 #ifdef WIN32
     pgwin32_noblock = false;
@@ -1040,7 +1111,9 @@ ssize_t secure_raw_write(Port* port, const void* ptr, size_t len)
 #endif
     PGSTAT_INIT_TIME_RECORD();
     PGSTAT_START_TIME_RECORD();
-    n = send(port->sock, ptr, len, 0);
+
+    /* CommProxy Interface Support */
+    n = comm_send(port->sock, ptr, len, 0);
     END_NET_SEND_INFO(n);
 #ifdef WIN32
     pgwin32_noblock = false;

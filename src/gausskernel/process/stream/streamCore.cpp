@@ -45,8 +45,8 @@
 #include "libpq/libpq.h"
 #include "libcomm/libcomm.h"
 #include <sys/poll.h>
-#include "executor/execStream.h"
-#include "executor/nodeRecursiveunion.h"
+#include "executor/exec/execStream.h"
+#include "executor/node/nodeRecursiveunion.h"
 #include "postmaster/postmaster.h"
 #include "access/transam.h"
 #include "gssignal/gs_signal.h"
@@ -748,12 +748,15 @@ void StreamNodeGroup::initStreamThread(StreamProducer* producer, uint8 smpIdenti
 #ifdef __aarch64__
         pg_memory_barrier();
 #endif
+        AutoMutexLock streamLock(&m_mutex);
+        streamLock.lock();
         producer->setThreadId(producerThreadId);
         /* Set create thread num for sync quit. */
         m_createThreadNum++;
         /* Assume all stream threads build successfully for sync quit process. */
         StreamPair* tmpPair = producer->getPair();
         tmpPair->createThreadNum = tmpPair->expectThreadNum;
+        streamLock.unLock();
 
         Assert(m_createThreadNum <= m_size);
         STREAM_LOG(DEBUG2,
@@ -969,12 +972,13 @@ void StreamNodeGroup::syncQuit(StreamObjStatus status)
 
     if (u_sess->stream_cxt.global_obj != NULL) {
 #ifdef ENABLE_MULTIPLE_NODES
-        if (status == STREAM_ERROR)
+        if (status == STREAM_ERROR) {
 #else
         if (status == STREAM_ERROR ||
-            unlikely(u_sess->stream_cxt.global_obj->GetStreamQuitStatus() == STREAM_ERROR))
+            unlikely(u_sess->stream_cxt.global_obj->GetStreamQuitStatus() == STREAM_ERROR)) {
 #endif
             u_sess->stream_cxt.global_obj->MarkSyncControllerStopFlagAll();
+        }
 
         if (StreamTopConsumerAmI()) {
             /*

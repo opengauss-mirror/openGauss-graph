@@ -29,15 +29,17 @@
 
 #include "c.h"
 #include "access/xlogdefs.h"
-#include "storage/relfilenode.h"
+#include "storage/smgr/relfilenode.h"
 #include "access/rmgr.h"
 #include "port/pg_crc32c.h"
 #include "utils/pg_crc.h"
+#include "tde_key_management/data_common.h"
 /*
  * These macros encapsulate knowledge about the exact layout of XLog file
  * names, timeline history file names, and archive-status file names.
  */
 #define MAXFNAMELEN 64
+
 
 /* size of the buffer allocated for error message. */
 #define MAX_ERRORMSG_LEN 1000
@@ -46,7 +48,6 @@
  * Each page of XLOG file has a header like this:
  */
 #define XLOG_PAGE_MAGIC 0xD074     /* can be used as WAL version indicator */
-#define XLOG_PAGE_MAGIC_OLD 0xD073 /* can be used as WAL old version indicator */
 
 /*
  * The XLOG is split into WAL segments (physical files) of the size indicated
@@ -127,11 +128,18 @@
 #define BKPBLOCK_WILL_INIT 0x40 /* redo will re-init the page */
 #define BKPBLOCK_SAME_REL 0x80  /* RelFileNode omitted, same as previous */
 
+/*
+ * The first bit in seg_fileno field denates whether the xlog record contains VM 
+ * physical block location
+ */
+#define BKPBLOCK_HAS_VM_LOC 0x80
+#define BKPBLOCK_GET_SEGFILENO(fileno) ((fileno) & 0x3F)
+
 typedef struct XLogReaderState XLogReaderState;
 
 /* Function type definition for the read_page callback */
 typedef int (*XLogPageReadCB)(XLogReaderState* xlogreader, XLogRecPtr targetPagePtr, int reqLen,
-    XLogRecPtr targetRecPtr, char* readBuf, TimeLineID* pageTLI);
+    XLogRecPtr targetRecPtr, char* readBuf, TimeLineID* pageTLI, char* xlog_path);
 
 typedef struct {
     /* Is this block ref in use? */
@@ -141,6 +149,13 @@ typedef struct {
     RelFileNode rnode;
     ForkNumber forknum;
     BlockNumber blkno;
+
+    /* Segment block number */
+    uint8 seg_fileno;
+    BlockNumber seg_blockno;
+    bool has_vm_loc;
+    uint8 vm_seg_fileno;
+    BlockNumber vm_seg_blockno;
 
     /* copy of the fork_flags field from the XLogRecordBlockHeader */
     uint8 flags;
@@ -161,6 +176,7 @@ typedef struct {
 #ifdef USE_ASSERT_CHECKING
     uint8 replayed;
 #endif
+    TdeInfo* tdeinfo;
 } DecodedBkpBlock;
 
 /*
@@ -191,21 +207,11 @@ typedef struct XLogRecord {
     XLogRecPtr xl_prev;   /* ptr to previous record in log */
     uint8 xl_info;        /* flag bits, see below */
     RmgrId xl_rmid;       /* resource manager for this record */
-    int2  xl_bucket_id;
+    uint2  xl_bucket_id;    /* stores bucket id */
     pg_crc32c xl_crc; /* CRC for this record */
 
     /* XLogRecordBlockHeaders and XLogRecordDataHeader follow, no padding */
 } XLogRecord;
-
-typedef struct XLogRecordOld {
-    uint32 xl_tot_len;         /* total len of entire record */
-    ShortTransactionId xl_xid; /* xact id */
-    XLogRecPtrOld xl_prev;     /* ptr to previous record in log */
-    uint8 xl_info;             /* flag bits, see below */
-    RmgrId xl_rmid;            /* resource manager for this record */
-    /* 2 bytes of padding here, initialize to zero */
-    pg_crc32 xl_crc; /* CRC for this record */
-} XLogRecordOld;
 
 struct XLogReaderState {
     /*
@@ -247,7 +253,8 @@ struct XLogReaderState {
      * Opaque data for callbacks to use.  Not used by XLogReader.
      */
     void* private_data;
-
+        /* Buffer to hold error message */
+    char* errormsg_buf;
     /*
      * Start and end point of last record read.  EndRecPtr is also used as the
      * position to read next, if XLogReadRecord receives an invalid recptr.
@@ -270,7 +277,9 @@ struct XLogReaderState {
     uint32 main_data_len;   /* main data portion's length */
     uint32 main_data_bufsz; /* allocated size of the buffer */
 
-    /* information about blocks referenced by the record. */
+    /* 
+     * Information about blocks referenced by the record.
+     */
     DecodedBkpBlock blocks[XLR_MAX_BLOCK_ID + 1];
 
     int max_block_id; /* highest block_id in use (-1 if none) */
@@ -286,7 +295,7 @@ struct XLogReaderState {
      */
     char* readBuf;
     uint32 readLen;
-
+    char* readBufOrigin;
     /* last read segment, segment offset, TLI for data currently in readBuf */
     XLogSegNo readSegNo;
     uint32 readOff;
@@ -310,19 +319,17 @@ struct XLogReaderState {
     char* readRecordBuf;
     uint32 readRecordBufSize;
 
-    /* Buffer to hold error message */
-    char* errormsg_buf;
-    
-    /* add for batch redo */
-    uint32 refcount;
     // For parallel recovery
     bool isPRProcess;
     bool isDecode;
-    bool isFullSyncCheckpoint;
+    bool isFullSync;
+    /* add for batch redo */
+    uint32 refcount;
+    bool isTde;
+    uint32 readblocks;
 };
 
 #define SizeOfXLogRecord (offsetof(XLogRecord, xl_crc) + sizeof(pg_crc32c))
-#define SizeOfXLogRecordOld (offsetof(XLogRecordOld, xl_crc) + sizeof(pg_crc32))
 
 typedef struct XLogPageHeaderData {
     uint16 xlp_magic;        /* magic value for correctness checks */
@@ -340,6 +347,7 @@ typedef struct XLogPageHeaderData {
      * continuation data isn't necessarily aligned.
      */
     uint32 xlp_rem_len; /* total len of remaining data for record */
+    uint32 xlp_total_len;
 } XLogPageHeaderData;
 
 #define SizeOfXLogShortPHD MAXALIGN(sizeof(XLogPageHeaderData))
@@ -391,7 +399,58 @@ typedef XLogLongPageHeaderData* XLogLongPageHeader;
 /* transform old version LSN into new version. */
 #define XLogRecPtrSwap(x) (((uint64)((x).xlogid)) << 32 | (x).xrecoff)
 
+typedef struct XLogPhyBlock {
+    Oid         relNode;
+    BlockNumber block;
+    XLogRecPtr  lsn;
+} XLogPhyBlock;
 
+const uint16 PAD_SIZE = 500;
+typedef struct ShareStorageXLogCtl_ {
+    uint16 magic;
+    uint16 length;
+    uint32 version;
+    uint64 systemIdentifier;
+    XLogRecPtr insertHead;
+    XLogRecPtr insertTail;
+    uint64 checkNumber;   // new member add after checkNumber
+    uint64 xlogFileSize;
+    // reserved fields
+    uint32 term;
+    uint32 pad1;
+    uint64 pad2;
+    uint64 pad3;
+    uint32 pad4;
+    pg_crc32c crc;
+    uint8 pad[PAD_SIZE];  // just make sizeof(ShareStorageXLogCtl) >= 512
+} ShareStorageXLogCtl;
+#define SizeOfShareStorageXLogCtl (offsetof(ShareStorageXLogCtl, pad))
+typedef struct ShareStorageXLogCtlAlloc_ {
+    ShareStorageXLogCtl ctlInfo;
+    void *originPointer;
+}ShareStorageXLogCtlAllocBlock;
+static const int ShareStorageBufSize = (1 << 20);  // 1MB
+static const int ShareStorageAlnSize = (1 << 26);  // 64MB
+const uint16 SHARE_STORAGE_CTL_MAGIC = 0x6C69;
+const uint32 CURRENT_SHARE_STORAGE_CTL_VERSION = 0;
+const uint64 SHARE_STORAGE_CTL_CHCK_NUMBER = 0x444F5241444F0630;
+typedef struct ShareStorageOpereate_ {
+    void (*ReadCtlInfo)(ShareStorageXLogCtl*);
+    void (*WriteCtlInfo)(const ShareStorageXLogCtl*);
+    int (*readXlog)(XLogRecPtr startLsn, char* buf, int readLen);
+    int (*WriteXlog)(XLogRecPtr startLsn, char* buf, int writeLen);
+    void (*fsync)();
+} ShareStorageOperateIf;
+typedef struct ShareStorageOperateCtl_ {
+    bool isInit;
+    int fd;
+    const char* xlogFilePath;
+    uint64 xlogFileSize;
+    uint32 blkSize;
+    const ShareStorageOperateIf *opereateIf;
+} ShareStorageOperateCtl;
+
+extern List *readTimeLineHistory(TimeLineID targetTLI);
 
 #endif /* XLOG_BASIC_H */
 

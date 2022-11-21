@@ -178,28 +178,18 @@ class redis_tester():
             if (status != 0):
                 exitWithError("cp config[%s] failed. Error: %s" % (dbNode.name, output))
 			
-            cmd = "sed -i \"/^comm_sctp_port =/c\\comm_sctp_port = %d\"   %s" % (dbNode.sctp_port, new_config)    
-            (status, output) = commands.getstatusoutput(cmd)
-            if (status != 0):
-                exitWithError("cp config[%s] failed. Error: %s" % (dbNode.name, output))
-				
             cmd = "sed -i \"/^pooler_port =/c\\pooler_port = %d\"   %s" % ((dbNode.port + 1), new_config)    
             (status, output) = commands.getstatusoutput(cmd)
             if (status != 0):
                 exitWithError("cp config[%s] failed. Error: %s" % (dbNode.name, output))
                 
-            cmd = "sed -i \"/^comm_control_port =/c\\comm_control_port = %d\"   %s" % ((dbNode.port + 2), new_config)    
-            (status, output) = commands.getstatusoutput(cmd)
-            if (status != 0):
-                exitWithError("cp config[%s] failed. Error: %s" % (dbNode.name, output))
-
             self.setConfig(dbNode.name, "", new_config)
             self.setConfig(dbNode.name, "port = %d" % dbNode.port, new_config)
             self.setConfig(dbNode.name, "pgxc_node_name = \"%s\"" % dbNode.name, new_config)
             #self.setConfig(dbNode.name, "pooler_port = %d" % (dbNode.port + 1), new_config)
             
     def dumpall(self):
-        cmd = "source %s && gs_dumpall -p %d -s -f %s --include-alter-table" % (self.envir_file, self.old_datanodes[0].port, self.schema_file)
+        cmd = "source %s && gs_dumpall -p %d -s -f %s --include-alter-table" % (self.envir_file, self.old_coordinators[0].port, self.schema_file)
         (status, output) = commands.getstatusoutput(cmd)
         if (status != 0):
             exitWithError("dumpall failed. Error: %s" % output)
@@ -266,7 +256,17 @@ class redis_tester():
                     break  
             if (retry == 0):
                 exitWithError("create node group[%s] failed." % (dbNode.name))
-            
+        bucketcnts = [1024,2048,4096,8192]
+        for i in bucketcnts:
+            create_child_group_sql = "create node group %s_%s bucketcnt %s groupparent %s;" % (self.new_group_name, i, i, self.new_group_name)
+            self.debug("create_child_group_sql: %s" % (create_child_group_sql))
+            for dbNode in self.old_coordinators:
+                cmd = "source %s && gsql -d postgres -p %d -c \"%s\"" % (self.envir_file, dbNode.port, create_child_group_sql)
+                (status, output) = commands.getstatusoutput(cmd)
+                self.debug(output)
+                if (status != 0 or output.find("ERROR") >= 0):
+                    exitWithError("create child group[%s] failed. Error: %s" %(i, output))
+
     def do_clean(self):
         fp = open(self.new_node_list_file, "r")
         lines = fp.read()

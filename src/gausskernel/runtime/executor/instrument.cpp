@@ -5,6 +5,7 @@
  *
  * Portions Copyright (c) 2020 Huawei Technologies Co.,Ltd.
  * Copyright (c) 2001-2012, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2021, openGauss Contributors
  *
  * IDENTIFICATION
  *	  src/gausskernel/runtime/executor/instrument.cpp
@@ -52,7 +53,7 @@
 #include "optimizer/streamplan.h"
 #include "parser/parsetree.h"
 #include "utils/lsyscache.h"
-#include "executor/execdesc.h"
+#include "executor/exec/execdesc.h"
 #include "libpq/pqformat.h"
 
 extern const char* GetStreamType(Stream* node);
@@ -524,13 +525,10 @@ void AddControlMemoryContext(Instrumentation* instr, MemoryContext context)
 }
 
 /* Exit from a plan node */
-void InstrStopNode(Instrumentation* instr, double n_tuples)
+void InstrStopNode(Instrumentation* instr, double n_tuples, bool containMemory)
 {
     instr_time end_time;
-
     CPUUsage cpu_usage;
-    int64 memory_size = 0;
-    int64 control_memory_size = 0;
 
     CPUUsageGetCurrent(&cpu_usage);
 
@@ -551,8 +549,9 @@ void InstrStopNode(Instrumentation* instr, double n_tuples)
     }
 
     /* Add delta of buffer usage since entry to node's totals */
-    if (instr->need_bufusage)
+    if (instr->need_bufusage) {
         BufferUsageAccumDiff(&instr->bufusage, u_sess->instr_cxt.pg_buffer_usage, &instr->bufusage_start);
+    }
 
     CPUUsageAccumDiff(&instr->cpuusage, &cpu_usage, &instr->cpuusage_start);
 
@@ -562,22 +561,26 @@ void InstrStopNode(Instrumentation* instr, double n_tuples)
         instr->firsttuple = INSTR_TIME_GET_DOUBLE(instr->counter);
     }
 
-    /* calculate the memory context size of this Node */
-    CalculateContextSize(instr->memoryinfo.nodeContext, &memory_size);
-    if (instr->memoryinfo.peakOpMemory < memory_size)
-        instr->memoryinfo.peakOpMemory = memory_size;
+    if (containMemory) {
+        int64 memory_size = 0;
+        int64 control_memory_size = 0;
+        /* calculate the memory context size of this Node */
+        CalculateContextSize(instr->memoryinfo.nodeContext, &memory_size);
+        if (instr->memoryinfo.peakOpMemory < memory_size)
+            instr->memoryinfo.peakOpMemory = memory_size;
 
-    List* control_list = instr->memoryinfo.controlContextList;
-    ListCell* context_cell = NULL;
+        List* control_list = instr->memoryinfo.controlContextList;
+        ListCell* context_cell = NULL;
 
-    /* calculate all control memory */
-    foreach (context_cell, control_list) {
-        MemoryContext context = (MemoryContext)lfirst(context_cell);
-        CalculateContextSize(context, &control_memory_size);
+        /* calculate all control memory */
+        foreach (context_cell, control_list) {
+            MemoryContext context = (MemoryContext)lfirst(context_cell);
+            CalculateContextSize(context, &control_memory_size);
+        }
+
+        if (instr->memoryinfo.peakControlMemory < control_memory_size)
+            instr->memoryinfo.peakControlMemory = control_memory_size;
     }
-
-    if (instr->memoryinfo.peakControlMemory < control_memory_size)
-        instr->memoryinfo.peakControlMemory = control_memory_size;
 }
 
 /* Finish a run cycle for a plan node */
@@ -899,6 +902,10 @@ Instrumentation* ThreadInstrumentation::allocInstrSlot(int plan_node_id, int par
             pname = "Recursive Union";
             plan_type = UTILITY_OP;
             break;
+        case T_StartWithOp:
+            pname = "StartWithOp";
+            plan_type = UTILITY_OP;
+            break;
         case T_BitmapAnd:
             pname = "BitmapAnd";
             plan_type = UTILITY_OP;
@@ -911,6 +918,12 @@ Instrumentation* ThreadInstrumentation::allocInstrSlot(int plan_node_id, int par
             pname = "Nested Loop";
             plan_type = JOIN_OP;
             break;
+#ifdef GS_GRAPH
+        case T_NestLoopVLE:
+            pname = "Nested Loop VLE";
+            plan_type = JOIN_OP;
+            break;
+#endif
         case T_VecNestLoop:
             pname = "Vector Nest Loop";
             plan_type = JOIN_OP;
@@ -2534,6 +2547,11 @@ bool StreamInstrumentation::IsSend(int idx, int planId, int smpId)
     }
 
     int* m_instr_array_map = thread_instr->m_instrArrayMap;
+
+    /* m_instr_array_map[planId - 1] = -1 means plannode is initialized but not execute */
+    if (m_instr_array_map[planId - 1] == -1) {
+        return false;
+    }
 
     InstrStreamPlanData* instr = &thread_instr->m_instrArray[m_instr_array_map[planId - 1]].instr;
 

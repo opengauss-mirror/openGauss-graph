@@ -23,11 +23,12 @@
 #include "replication/dataqueue.h"
 #include "replication/datareceiver.h"
 #include "replication/walsender.h"
+#include "replication/dcf_replication.h"
 #include "storage/buf/bufmgr.h"
 #include "storage/ipc.h"
 #include "storage/lmgr.h"
 #include "storage/proc.h"
-#include "storage/smgr.h"
+#include "storage/smgr/smgr.h"
 #include "utils/guc.h"
 #include "access/xlog.h"
 #include "access/multi_redo_api.h"
@@ -37,6 +38,10 @@
 #include "utils/resowner.h"
 #include "gssignal/gs_signal.h"
 #include "gs_bbox.h"
+
+#ifdef ENABLE_MULTIPLE_NODES
+#include "postmaster/barrier_preparse.h"
+#endif
 
 /*
  * These variables are used similarly to openLogFile/SegNo/Off,
@@ -140,6 +145,8 @@ static void XLogWalRcvWrite(WalRcvCtlBlock *walrcb, char *buf, Size nbytes, XLog
              * would otherwise have to reopen this file to fsync it later
              */
             if (recvFile >= 0) {
+                char xlogfname[MAXFNAMELEN];
+
                 /*
                  * XLOG segment files will be re-read by recovery in startup
                  * process soon, so we don't advise the OS to release cache
@@ -150,15 +157,12 @@ static void XLogWalRcvWrite(WalRcvCtlBlock *walrcb, char *buf, Size nbytes, XLog
                                     errmsg("could not close log file %s: %m",
                                            XLogFileNameP(t_thrd.xlog_cxt.ThisTimeLineID, recvSegNo))));
 
-#ifdef ENABLE_MULTIPLE_NODES
                 /*
                  * Create .done file forcibly to prevent the restored segment from
                  * being archived again later.
                  */
-                char xlogfname[MAXFNAMELEN];
-                XLogFileName(xlogfname, recvFileTLI, recvSegNo);
+                XLogFileName(xlogfname, MAXFNAMELEN, recvFileTLI, recvSegNo);
                 XLogArchiveForceDone(xlogfname);
-#endif
             }
             recvFile = -1;
 
@@ -231,6 +235,10 @@ static void XLogWalRcvWrite(WalRcvCtlBlock *walrcb, char *buf, Size nbytes, XLog
         }
         SpinLockRelease(&walrcv->mutex);
 
+#ifdef ENABLE_MULTIPLE_NODES
+        WakeUpBarrierPreParseBackend();
+
+#endif
         /* Signal the startup process and walsender that new WAL has arrived */
         WakeupRecovery();
         if (AllowCascadeReplication())
@@ -250,6 +258,11 @@ static void XLogWalRcvWrite(WalRcvCtlBlock *walrcb, char *buf, Size nbytes, XLog
         ereport(DEBUG2, (errmsg("write xlog done: start %X/%X %lu bytes", (uint32)(recptr >> 32), (uint32)recptr,
                                 write_bytes)));
     }
+#ifndef ENABLE_MULTIPLE_NODES
+    if (g_instance.attr.attr_storage.dcf_attr.enable_dcf) {
+        UpdateRecordIdxState();
+    }
+#endif
 }
 
 void WalRcvXLogClose(void)
@@ -562,19 +575,11 @@ int walRcvWrite(WalRcvCtlBlock *walrcb)
     SpinLockAcquire(&walrcb->mutex);
 
     if (walrcb->walFreeOffset == walrcb->walWriteOffset) {
-        if (IsExtremeRtoReadWorkerRunning()) {
-            if (walrcb->walFreeOffset != walrcb->walReadOffset && 
-                pg_atomic_read_u32(&(g_instance.comm_cxt.localinfo_cxt.is_finish_redo)) == ATOMIC_FALSE) {
-                nbytes = 1;
-            }
-        }
-
         SpinLockRelease(&walrcb->mutex);
         LWLockRelease(WALWriteLock);
 
         END_CRIT_SECTION();
-
-        return nbytes;
+        return 0;
     }
     walfreeoffset = walrcb->walFreeOffset;
     walwriteoffset = walrcb->walWriteOffset;
@@ -592,19 +597,11 @@ int walRcvWrite(WalRcvCtlBlock *walrcb)
     SpinLockAcquire(&walrcb->mutex);
     walrcb->walWriteOffset += nbytes;
     walrcb->walStart = startptr;
-    if (IsExtremeRedo()) {
-        if (walrcb->walWriteOffset == recBufferSize && (walrcb->walReadOffset > 0)) {
-            walrcb->walWriteOffset = 0;
-            if (walrcb->walFreeOffset == recBufferSize) {
-                walrcb->walFreeOffset = 0;
-            }
-        }
-    } else {
-        if (walrcb->walWriteOffset == recBufferSize) {
-            walrcb->walWriteOffset = 0;
-            if (walrcb->walFreeOffset == recBufferSize) {
-                walrcb->walFreeOffset = 0;
-            }
+
+    if (walrcb->walWriteOffset == recBufferSize) {
+        walrcb->walWriteOffset = 0;
+        if (walrcb->walFreeOffset == recBufferSize) {
+            walrcb->walFreeOffset = 0;
         }
     }
     walfreeoffset = walrcb->walFreeOffset;
@@ -701,7 +698,8 @@ void walrcvWriterMain(void)
      * Create a resource owner to keep track of our resources (currently only
      * buffer pins).
      */
-    t_thrd.utils_cxt.CurrentResourceOwner = ResourceOwnerCreate(NULL, "WalReceive Writer", MEMORY_CONTEXT_STORAGE);
+    t_thrd.utils_cxt.CurrentResourceOwner = ResourceOwnerCreate(NULL, "WalReceive Writer",
+        THREAD_GET_MEM_CXT_GROUP(MEMORY_CONTEXT_STORAGE));
 
     /*
      * Create a memory context that we will do all our work in.  We do this so
@@ -745,6 +743,9 @@ void walrcvWriterMain(void)
 
         /* abort async io, must before LWlock release */
         AbortAsyncListIO();
+
+        /* release resource held by lsc */
+        AtEOXact_SysDBCache(false);
 
         /*
          * These operations are really just a minimal subset of

@@ -36,6 +36,7 @@
 #include "optimizer/paths.h"
 #include "optimizer/plancat.h"
 #include "optimizer/planner.h"
+#include "optimizer/planmain.h"
 #include "optimizer/prep.h"
 #include "optimizer/pruning.h"
 #include "optimizer/restrictinfo.h"
@@ -58,6 +59,9 @@ THR_LOCAL set_rel_pathlist_hook_type set_rel_pathlist_hook = NULL;
 
 /* Hook for plugins to get control in add_paths_to_joinrel() */
 THR_LOCAL set_join_pathlist_hook_type set_join_pathlist_hook = NULL;
+
+const int min_parallel_table_scan_size = 1073741824 / BLCKSZ;    /* 1GB */
+const int max_parallel_maintenance_workers = 32;
 
 static bool check_func_walker(Node* node, bool* found);
 static bool check_func(Node* node);
@@ -85,6 +89,7 @@ static void set_subquery_path(PlannerInfo *root, RelOptInfo *rel,
 static void set_function_pathlist(PlannerInfo* root, RelOptInfo* rel, RangeTblEntry* rte);
 static void set_values_pathlist(PlannerInfo* root, RelOptInfo* rel, RangeTblEntry* rte);
 static void set_cte_pathlist(PlannerInfo* root, RelOptInfo* rel, RangeTblEntry* rte);
+static void set_result_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte);
 static void set_worktable_pathlist(PlannerInfo* root, RelOptInfo* rel, RangeTblEntry* rte);
 static RelOptInfo* make_rel_from_joinlist(PlannerInfo* root, List* joinlist);
 static bool subquery_is_pushdown_safe(Query* subquery, Query* topquery, bool* unsafeColumns);
@@ -383,6 +388,63 @@ static void set_correlated_rel_pathlist(PlannerInfo* root, RelOptInfo* rel)
     return;
 }
 
+#ifdef ENABLE_MULTIPLE_NODES
+/*
+ * Check we could reduce broadcast above scan of predpush subquery or not.
+ */
+static bool reduce_predpush_broadcast(PlannerInfo* root, Path *path)
+{
+    bool reduce = false;
+    ItstDisKey dis_keys = root->dis_keys;
+
+    if (list_length(path->distribute_keys) != 1) {
+        return false;
+    }
+
+    if (!IsA((Node*)linitial(path->distribute_keys), Var)) {
+        return false;
+    }
+
+    Var *dist_key = (Var *)linitial(path->distribute_keys);
+
+    if (dis_keys.superset_keys != NULL && list_length(dis_keys.superset_keys) == 1) {
+        List *matching = (List *)linitial(dis_keys.superset_keys);
+
+        if (list_length(matching) == 1) {
+            Var *var = (Var *)linitial(matching);
+            if (equal(var, dist_key)) {
+                reduce = true;
+            }
+        }
+    }
+
+    return reduce;
+}
+
+static Path *make_predpush_subpath(PlannerInfo* root, RelOptInfo* rel, Path *path)
+{
+    List* quals = NULL;
+    Path *subpath = NULL;
+    ListCell* lc = NULL;
+    Bitmapset* upper_params = NULL;
+
+    foreach (lc, rel->subplanrestrictinfo) {
+        RestrictInfo *res_info = (RestrictInfo*)lfirst(lc);
+        quals = lappend(quals, res_info->clause);
+    }
+
+    /* get the upper param IDs */
+    if (SUBQUERY_PREDPUSH(root)) {
+        upper_params = collect_param_clause((Node*)quals);
+    }
+
+    subpath = (Path*)create_result_path(root, rel, quals, path, upper_params);
+
+    return subpath;
+}
+
+#endif
+
 /*
  * set_base_rel_pathlists
  *	  Finds all paths available for scanning each base-relation entry.
@@ -454,6 +516,26 @@ static void set_base_rel_pathlists(PlannerInfo* root)
                 foreach (lc2, rel->cheapest_total_path) {
                     if (path == lfirst(lc2))
                         break;
+                }
+
+                /* Here we want to reduce broadcast in predpush */
+                if (SUBQUERY_PREDPUSH(root) &&
+                    rel->subplanrestrictinfo != NIL &&
+                    reduce_predpush_broadcast(root, path)) {
+                    subpath = make_predpush_subpath(root, rel, path);
+
+                    /* Do not free old path, maybe it's used in other places. */
+                    lfirst(lc) = subpath;
+                    if (lc2 != NULL) {
+                        lfirst(lc2) = subpath;
+                    }
+
+                    /* Set cheapest startup path as result + predpush-index path */
+                    if (is_cheapest_startup) {
+                        rel->cheapest_startup_path = subpath;
+                    }
+
+                    continue;
                 }
 
                 Distribution* distribution = ng_get_dest_distribution(path);
@@ -638,6 +720,10 @@ void set_rel_size(PlannerInfo* root, RelOptInfo* rel, Index rti, RangeTblEntry* 
                 else
                     set_cte_pathlist(root, rel, rte);
                 break;
+            case RTE_RESULT:
+                /* Might as well just build the path immediately */
+                set_result_pathlist(root, rel, rte);
+                break;
             default:
                 ereport(ERROR,
                     (errmodule(MOD_OPT),
@@ -679,6 +765,30 @@ void set_rel_size(PlannerInfo* root, RelOptInfo* rel, Index rti, RangeTblEntry* 
 }
 
 /*
+ * Create baserel path for RTE_RELATION kind
+ */
+static void SetRelationPath(PlannerInfo* root, RelOptInfo* rel, RangeTblEntry* rte)
+{
+    /*
+     * If the rel can apply inlist2join and the guc qrw_inlist2join_optmode=rule_base
+     * So we can just convert inlist to join, there is no need to genenate other paths
+     */
+    if (rel->alternatives && u_sess->opt_cxt.qrw_inlist2join_optmode > QRW_INLIST2JOIN_CBO) {
+        set_cheapest(rel);
+        return;
+    }
+    if (rte->relkind == RELKIND_FOREIGN_TABLE || rte->relkind == RELKIND_STREAM) {
+        /* Foreign table */
+        set_foreign_pathlist(root, rel, rte);
+    } else {
+        /* Plain relation */
+        set_plain_rel_pathlist(root, rel, rte);
+    }
+
+    return;
+}
+
+/*
  * set_rel_pathlist
  *	  Build access paths for a base relation
  */
@@ -692,21 +802,7 @@ static void set_rel_pathlist(PlannerInfo* root, RelOptInfo* rel, Index rti, Rang
     } else {
         switch (rel->rtekind) {
             case RTE_RELATION:
-                /*
-                 * If the rel can apply inlist2join and the guc qrw_inlist2join_optmode=rule_base
-                 * So we can just convert inlist to join, there is no need to genenate other paths
-                 */
-                if (rel->alternatives && u_sess->opt_cxt.qrw_inlist2join_optmode > QRW_INLIST2JOIN_CBO) {
-                    set_cheapest(rel);
-                    break;
-                }
-                if (rte->relkind == RELKIND_FOREIGN_TABLE || rte->relkind == RELKIND_STREAM) {
-                    /* Foreign table */
-                    set_foreign_pathlist(root, rel, rte);
-                } else {
-                    /* Plain relation */
-                    set_plain_rel_pathlist(root, rel, rte);
-                }
+                SetRelationPath(root, rel, rte);
                 break;
             case RTE_SUBQUERY:
                 /* Subquery --- fully handled during set_rel_size */
@@ -731,6 +827,9 @@ static void set_rel_pathlist(PlannerInfo* root, RelOptInfo* rel, Index rti, Rang
             case RTE_CTE:
                 /* CTE reference --- fully handled during set_rel_size */
                 break;
+            case RTE_RESULT:
+                /* simple Result --- fully handled during set_rel_size */
+                break;
             default:
                 ereport(ERROR,
                     (errmodule(MOD_OPT),
@@ -746,6 +845,11 @@ static void set_rel_pathlist(PlannerInfo* root, RelOptInfo* rel, Index rti, Rang
      */
     if (set_rel_pathlist_hook) {
         (*set_rel_pathlist_hook) (root, rel, rti, rte);
+    }
+
+    /* add baserel cn gather path when gather hint switch on */
+    if (IS_STREAM_PLAN && permit_gather(root, HINT_GATHER_REL)) {
+        CreateGatherPaths(root, rel, false);
     }
 
     debug1_print_rel(root, rel);
@@ -770,6 +874,31 @@ static void SetPlainReSizeWithPruningRatio(RelOptInfo *rel, double pruningRatio)
 }
 
 /*
+ * This function applies only to single partition key of range partitioned tables in PBE mode.
+ */
+static bool IsPbeSinglePartition(Relation rel, RelOptInfo* relInfo)
+{
+    if (relInfo->pruning_result->paramArg == NULL) {
+        return false;
+    }
+    if (RelationIsSubPartitioned(rel)) {
+        return false;
+    }
+    if (rel->partMap->type != PART_TYPE_RANGE) {
+        return false;
+    }
+    RangePartitionMap* partMap = (RangePartitionMap*)rel->partMap;
+    int partKeyNum = partMap->partitionKey->dim1;
+    if (partKeyNum > 1) {
+        return false;
+    }
+    if (relInfo->pruning_result->isPbeSinlePartition) {
+        return true;
+    }
+    return false;
+}
+
+/*
  * set_plain_rel_size
  *	  Set size estimates for a plain relation (no subquery, no inheritance)
  */
@@ -783,14 +912,16 @@ static void set_plain_rel_size(PlannerInfo* root, RelOptInfo* rel, RangeTblEntry
         /* get pruning result */
         if (rte->isContainPartition) {
             rel->pruning_result = singlePartitionPruningForRestrictInfo(rte->partitionOid, relation);
+        } else if (rte->isContainSubPartition) {
+            rel->pruning_result =
+                SingleSubPartitionPruningForRestrictInfo(rte->subpartitionOid, relation, rte->partitionOid);
         } else {
             rel->pruning_result = partitionPruningForRestrictInfo(root, rte, relation, rel->baserestrictinfo);
         }
 
         Assert(rel->pruning_result);
 
-     
-        if (rel->pruning_result->expr != NULL) {
+        if (IsPbeSinglePartition(relation, rel)) {
             rel->partItrs = 1;
         } else {
             /* set flag for dealing with partintioned table */
@@ -960,7 +1091,7 @@ static void set_plain_rel_pathlist(PlannerInfo* root, RelOptInfo* rel, RangeTblE
      * support normal row table unless it is partitioned.
      * The partition table can be parallelized when partItrs > u_sess->opt_cxt.query_dop.
      */
-    bool can_parallel = IS_STREAM_PLAN && (u_sess->opt_cxt.query_dop > 1) &&
+    bool can_parallel = IS_STREAM_PLAN && (u_sess->opt_cxt.query_dop > 1) && (!rel->is_ustore) &&
                         (rel->locator_type != LOCATOR_TYPE_REPLICATED) && (rte->tablesample == NULL);
     if (!isrp) {
 #endif
@@ -1036,7 +1167,12 @@ static void set_plain_rel_pathlist(PlannerInfo* root, RelOptInfo* rel, RangeTblE
              * Since former TidScan is not fit for column store table, just create
              * TidScan path for row store table
              */
+#ifdef GS_GRAPH
+            if (rel->orientation == REL_ROW_ORIENTED && !root->hasVLEJoinRTE)
+#else
             if (rel->orientation == REL_ROW_ORIENTED)
+#endif
+            
                 create_tidscan_paths(root, rel);
         }
 #ifdef PGXC
@@ -2373,6 +2509,10 @@ static bool predpush_subquery(PlannerInfo* root, RelOptInfo* rel, Index rti,
             joininfo = lappend(joininfo, ri);
             continue;
         }
+        if (!isEqualExpr((Node *)(ri->clause))) {
+            joininfo = lappend(joininfo, ri);
+            continue;
+        }
 
         if (bms_equal(ri->left_relids, rel->relids)) {
             if (bms_num_members(ri->right_relids) != 1)
@@ -2568,7 +2708,11 @@ static void set_subquery_pathlist(PlannerInfo* root, RelOptInfo* rel, Index rti,
      */
     List* upperrestrictlist = NIL;
     ListCell* l = NULL;
+#ifdef GS_GRAPH
+    if (safe_pushdown && rel->baserestrictinfo != NIL && !rte->isVLE)
+#else
     if (safe_pushdown && rel->baserestrictinfo != NIL)
+#endif
     {
         foreach (l, rel->baserestrictinfo) {
             RestrictInfo* rinfo = (RestrictInfo*)lfirst(l);
@@ -2587,7 +2731,11 @@ static void set_subquery_pathlist(PlannerInfo* root, RelOptInfo* rel, Index rti,
 
     if (ENABLE_PRED_PUSH_FORCE(root) &&
         !SUBQUERY_IS_SUBLINK(root) &&
+#ifdef GS_GRAPH
+        safe_pushdown && rel->subplanrestrictinfo != NIL && !rte->isVLE)
+#else
         safe_pushdown && rel->subplanrestrictinfo != NIL)
+#endif
     {
         /* OK to consider pushing down individual quals */
         upperrestrictlist = NIL;
@@ -2627,6 +2775,7 @@ static void set_subquery_pathlist(PlannerInfo* root, RelOptInfo* rel, Index rti,
         Assert(param_subquery != NULL);
         Assert(new_rel != NULL);
         MemoryContext oldcxt = CurrentMemoryContext;
+        bool old_stream_support = u_sess->opt_cxt.is_stream_support;
         PG_TRY();
         {
             rel->alternatives = lappend(rel->alternatives, new_rel);
@@ -2639,6 +2788,7 @@ static void set_subquery_pathlist(PlannerInfo* root, RelOptInfo* rel, Index rti,
             MemoryContextSwitchTo(oldcxt);
             FlushErrorState();
             root->plan_params = NULL;
+            u_sess->opt_cxt.is_stream_support = old_stream_support;
         }
         PG_END_TRY();
     }
@@ -2789,17 +2939,6 @@ static void set_cte_pathlist(PlannerInfo* root, RelOptInfo* rel, RangeTblEntry* 
     foreach (lc, cteroot->parse->cteList) {
         CommonTableExpr* cte = (CommonTableExpr*)lfirst(lc);
 
-        /*
-         * MPP with recursive support.
-         *
-         * Recursive CTE is initialized in subplan list, so we should only count
-         * the recursive CTE, the none-recursive CTE is fold in early stage of
-         * query rewrite.
-         */
-        if (STREAM_RECURSIVECTE_SUPPORTED && !cte->cterecursive) {
-            continue;
-        }
-
         if (strcmp(cte->ctename, rte->ctename) == 0)
             break;
         ndx++;
@@ -2862,6 +3001,35 @@ static void set_cte_pathlist(PlannerInfo* root, RelOptInfo* rel, RangeTblEntry* 
 
     /* Generate appropriate path */
     add_path(root, rel, create_ctescan_path(root, rel));
+
+    /* Select cheapest path (pretty easy in this case...) */
+    set_cheapest(rel);
+}
+
+/*
+ * set_result_pathlist
+ *             Build the (single) access path for an RTE_RESULT RTE
+ *
+ * There's no need for a separate set_result_size phase, since we
+ * don't support join-qual-parameterized paths for these RTEs.
+ */
+static void set_result_pathlist(PlannerInfo *root, RelOptInfo *rel,
+    RangeTblEntry *rte)
+{
+    Relids          required_outer;
+
+    /* Mark rel with estimated output rows, width, etc */
+    set_result_size_estimates(root, rel);
+
+    /*
+     * We don't support pushing join clauses into the quals of a Result scan,
+     * but it could still have required parameterization due to LATERAL refs
+     * in its tlist.
+     */
+    required_outer = rel->lateral_relids;
+
+    /* Generate appropriate path */
+    add_path(root, rel, create_resultscan_path(root, rel, required_outer));
 
     /* Select cheapest path (pretty easy in this case...) */
     set_cheapest(rel);
@@ -3046,7 +3214,7 @@ RelOptInfo* standard_join_search(PlannerInfo* root, int levels_needed, List* ini
      */
     root->join_rel_level = (List**)palloc0((levels_needed + 1) * sizeof(List*));
 
-    root->join_rel_level[1] = initial_rels;
+    root->join_rel_level[1] = initial_rels;   // initial_rels ³¤¶ÈÎª 4
 
     for (lev = 2; lev <= levels_needed; lev++) {
         ListCell* lc = NULL;
@@ -3063,6 +3231,11 @@ RelOptInfo* standard_join_search(PlannerInfo* root, int levels_needed, List* ini
          */
         foreach (lc, root->join_rel_level[lev]) {
             rel = (RelOptInfo*)lfirst(lc);
+
+            /* add joinrel cn gather path when gather hint switch on */
+            if (IS_STREAM_PLAN && permit_gather(root, HINT_GATHER_JOIN)) {
+                CreateGatherPaths(root, rel, true);
+            }
 
             /* Find and save the cheapest paths for this rel */
             set_cheapest(rel, root);
@@ -3594,9 +3767,14 @@ static void make_partiterator_pathkey(
     int2vector* partitionKey = NULL;
     ListCell* pk_cell = NULL;
     ListCell* rt_ec_cell = NULL;
+    IndexesUsableType usable_type;
     Oid indexOid = ((IndexPath*)itrpath->subPath)->indexinfo->indexoid;
-    IndexesUsableType usable_type = eliminate_partition_index_unusable(indexOid, rel->pruning_result, NULL, NULL);
-
+    if (u_sess->attr.attr_sql.enable_hypo_index && ((IndexPath *)itrpath->subPath)->indexinfo->hypothetical) {
+        /* hypothetical index does not support partition index unusable */
+        usable_type = INDEXES_FULL_USABLE;
+    } else {
+        usable_type = eliminate_partition_index_unusable(indexOid, rel->pruning_result, NULL, NULL);
+    }
     if (INDEXES_FULL_USABLE != usable_type) {
         /* some index partition is unusable */
         OPT_LOG(DEBUG2, "fail to inherit pathkeys since some index partition is unusable");
@@ -3828,7 +4006,7 @@ static void make_partiterator_pathkey(
 /*
  * Check scan path for partition table whether use global partition index
  */
-static bool CheckPathUseGlobalPartIndex(Path* path)
+bool CheckPathUseGlobalPartIndex(Path* path)
 {
     if (path->pathtype == T_IndexScan || path->pathtype == T_IndexOnlyScan) {
         IndexPath* indexPath = (IndexPath*)path;

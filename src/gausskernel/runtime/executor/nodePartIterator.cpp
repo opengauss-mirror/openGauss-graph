@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2020 Huawei Technologies Co.,Ltd.
+ * Portions Copyright (c) 2021, openGauss Contributors
  *
  * openGauss is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
@@ -24,8 +25,8 @@
 #include "postgres.h"
 #include "knl/knl_variable.h"
 
-#include "executor/execdebug.h"
-#include "executor/nodePartIterator.h"
+#include "executor/exec/execdebug.h"
+#include "executor/node/nodePartIterator.h"
 #include "executor/tuptable.h"
 #include "utils/memutils.h"
 #include "nodes/execnodes.h"
@@ -55,24 +56,81 @@ PartIteratorState* ExecInitPartIterator(PartIterator* node, EState* estate, int 
     state->ps.ps_TupFromTlist = false;
     state->ps.ps_ProjInfo = NULL;
     state->currentItr = -1;
+    state->subPartCurrentItr = -1;
 
     return state;
 }
 
-static void init_scan_partition(PartIteratorState* node)
+static int GetScanPartitionNum(PartIteratorState* node)
+{
+    PartIterator* pi_node = (PartIterator*)node->ps.plan;
+    PlanState* noden = (PlanState*)node->ps.lefttree;
+    int partitionScan;
+    switch (nodeTag(noden)) {
+        case T_SeqScanState:
+        case T_IndexScanState:
+        case T_IndexOnlyScanState:
+        case T_BitmapHeapScanState:
+            partitionScan =  ((ScanState*)noden)->part_id;
+            break;
+        case T_VecToRowState:
+            partitionScan = ((VecToRowState*)noden)->part_id;
+            break;
+        default:
+            partitionScan = pi_node->itrs;
+            break;
+    }
+    return partitionScan;
+}
+
+void SetPartitionIteratorParamter(PartIteratorState* node, List* subPartLengthList)
+{
+    if (subPartLengthList != NIL) {
+        if (node->currentItr == -1) {
+            node->currentItr++;
+        }
+
+        int subPartLength = (int)list_nth_int(subPartLengthList, node->currentItr);
+        if (node->subPartCurrentItr + 1 >= subPartLength) {
+            node->currentItr++;
+            node->subPartCurrentItr = -1;
+        }
+        node->subPartCurrentItr++;
+        unsigned int subitr_idx = node->subPartCurrentItr;
+        PartIterator* pi_node = (PartIterator*)node->ps.plan;
+        int subPartParamno = pi_node->param->subPartParamno;
+        ParamExecData* subPartParam = &(node->ps.state->es_param_exec_vals[subPartParamno]);
+        subPartParam->isnull = false;
+        subPartParam->value = (Datum)subitr_idx;
+        node->ps.lefttree->chgParam = bms_add_member(node->ps.lefttree->chgParam, subPartParamno);
+    } else {
+        node->currentItr++;
+    }
+}
+
+static void InitScanPartition(PartIteratorState* node, int partitionScan)
 {
     int paramno = 0;
     unsigned int itr_idx = 0;
     PartIterator* pi_node = (PartIterator*)node->ps.plan;
     ParamExecData* param = NULL;
+    PlanState* noden = (PlanState*)node->ps.lefttree;
+    List *subPartLengthList = NIL;
+    if (IsA(noden, VecToRowState)) {
+        subPartLengthList = ((VecToRowState *)noden)->subPartLengthList;
+    } else if (IsA(noden, ScanState) || IsA(noden, SeqScanState) || IsA(noden, IndexOnlyScanState) ||
+               IsA(noden, IndexScanState) || IsA(noden, BitmapHeapScanState) || IsA(noden, TidScanState)) {
+        subPartLengthList = ((ScanState *)noden)->subPartLengthList;
+    }
 
     Assert(ForwardScanDirection == pi_node->direction || BackwardScanDirection == pi_node->direction);
 
     /* set iterator parameter */
-    node->currentItr++;
+    SetPartitionIteratorParamter(node, subPartLengthList);
+
     itr_idx = node->currentItr;
     if (BackwardScanDirection == pi_node->direction)
-        itr_idx = pi_node->itrs - itr_idx - 1;
+        itr_idx = partitionScan - itr_idx - 1;
 
     paramno = pi_node->param->paramno;
     param = &(node->ps.state->es_param_exec_vals[paramno]);
@@ -96,34 +154,11 @@ static void init_scan_partition(PartIteratorState* node)
 TupleTableSlot* ExecPartIterator(PartIteratorState* node)
 {
     TupleTableSlot* slot = NULL;
-    PartIterator* pi_node = (PartIterator*)node->ps.plan;
     EState* state = node->ps.lefttree->state;
     node->ps.lefttree->do_not_reset_rownum = true;
     bool orig_early_free = state->es_skip_early_free;
 
-    PlanState* noden = (PlanState*)node->ps.lefttree;
-    int partitionScan;
-    switch (nodeTag(noden)) {
-        case T_SeqScanState:
-            partitionScan =  ((SeqScanState*)noden)->part_id;
-            break;
-        case T_IndexScanState:
-            partitionScan =  ((IndexScanState*)noden)->part_id;
-            break;
-        case T_IndexOnlyScanState:
-            partitionScan =  ((IndexOnlyScanState*)noden)->part_id;
-            break;
-        case T_BitmapHeapScanState:
-            partitionScan =  ((BitmapHeapScanState*)noden)->part_id;
-            break;
-        case T_VecToRowState:
-            partitionScan = ((VecToRowState*)noden)->part_id;
-            break;
-        default:
-            partitionScan = pi_node->itrs;
-            break;
-    }
-
+    int partitionScan = GetScanPartitionNum(node);
     if (partitionScan == 0) {
         /* return NULL if no partition is selected */
         return NULL;
@@ -131,7 +166,7 @@ TupleTableSlot* ExecPartIterator(PartIteratorState* node)
 
     /* init first scanned partition */
     if (node->currentItr == -1)
-        init_scan_partition(node);
+        InitScanPartition(node, partitionScan);
 
     /* For partition wise join, can not early free left tree's caching memory */
     state->es_skip_early_free = true;
@@ -146,11 +181,28 @@ TupleTableSlot* ExecPartIterator(PartIteratorState* node)
         /* minus wrong rownum */
         node->ps.lefttree->ps_rownum--;
 
-        if (node->currentItr + 1 >= partitionScan) /* have scanned all partitions */
-            return NULL;
+        if (node->currentItr + 1 >= partitionScan) { /* have scanned all partitions */
+            PlanState* noden = (PlanState*)node->ps.lefttree;
+            List *subPartLengthList = NIL;
+            if (IsA(noden, VecToRowState)) {
+                subPartLengthList = ((VecToRowState *)noden)->subPartLengthList;
+            } else if (IsA(noden, ScanState) || IsA(noden, SeqScanState) || IsA(noden, IndexOnlyScanState) ||
+                       IsA(noden, IndexScanState) || IsA(noden, BitmapHeapScanState) || IsA(noden, TidScanState)) {
+                subPartLengthList = ((ScanState *)noden)->subPartLengthList;
+            }
+
+            if (subPartLengthList != NIL) {
+                int subPartLength = (int)list_nth_int(subPartLengthList, node->currentItr);
+                if (node->subPartCurrentItr + 1 >= subPartLength) {
+                    return NULL;
+                }
+            } else {
+                return NULL;
+            }
+        }
 
         /* switch to next partiiton */
-        init_scan_partition(node);
+        InitScanPartition(node, partitionScan);
 
         /* For partition wise join, can not early free left tree's caching memory */
         orig_early_free = state->es_skip_early_free;
@@ -189,13 +241,15 @@ void ExecReScanPartIterator(PartIteratorState* node)
     PartIterator* pi_node = NULL;
     int paramno = -1;
     ParamExecData* param = NULL;
-    PartIterator* piterator = NULL;
-
-    piterator = (PartIterator*)node->ps.plan;
+    int subPartParamno = -1;
+    ParamExecData* subPartParam = NULL;
 
     /* do nothing if there is no partition to scan */
-    if (piterator->itrs == 0)
+    int partitionScan = GetScanPartitionNum(node);
+    if (partitionScan == 0) {
+        /* return NULL if no partition is selected */
         return;
+    }
 
     node->currentItr = -1;
 
@@ -205,6 +259,14 @@ void ExecReScanPartIterator(PartIteratorState* node)
     param->isnull = false;
     param->value = (Datum)0;
     node->ps.lefttree->chgParam = bms_add_member(node->ps.lefttree->chgParam, paramno);
+
+    node->subPartCurrentItr = -1;
+
+    subPartParamno = pi_node->param->subPartParamno;
+    subPartParam = &(node->ps.state->es_param_exec_vals[subPartParamno]);
+    subPartParam->isnull = false;
+    subPartParam->value = (Datum)0;
+    node->ps.lefttree->chgParam = bms_add_member(node->ps.lefttree->chgParam, subPartParamno);
 
     /*
      * if the pruning result isnot null, Reset the subplan node so

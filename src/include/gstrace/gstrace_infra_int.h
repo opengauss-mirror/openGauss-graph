@@ -94,6 +94,7 @@ typedef enum trace_msg_code {
     TRACE_SEQ_ERR,
     TRACE_VERSION_ERR,
     TRACE_CONFIG_SIZE_ERR,
+    TRACE_PROCESS_NOT_EXIST,
     TRACE_MSG_MAX,
 } trace_msg_code;
 
@@ -164,8 +165,11 @@ typedef struct trace_config {
     /* a magic number for validation */
     uint32_t trc_cfg_magic_no;
 
-    /* mark which process are traced */
+    /* user's identifier, now it is kernel's listening port. */
     uint32_t key;
+
+    /* mark which process are traced */
+    pid_t pid;
 
     /* whether or not trace is activated */
     volatile bool bEnabled;

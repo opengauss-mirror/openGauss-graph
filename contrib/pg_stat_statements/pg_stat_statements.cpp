@@ -55,7 +55,7 @@
 #include "parser/parsetree.h"
 #include "parser/scanner.h"
 #include "pgstat.h"
-#include "storage/fd.h"
+#include "storage/smgr/fd.h"
 #include "storage/copydir.h"
 #include "storage/ipc.h"
 #include "storage/spin.h"

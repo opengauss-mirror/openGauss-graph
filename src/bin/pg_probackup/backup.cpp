@@ -27,6 +27,10 @@
 #include "file.h"
 #include "common/fe_memutils.h"
 
+/* list of dirs which will not to be backuped
+   it will be backuped up in external dirs  */
+parray *pgdata_nobackup_dir = NULL;
+
 static int standby_message_timeout_local = 10 ;	/* 10 sec = default */
 static XLogRecPtr stop_backup_lsn = InvalidXLogRecPtr;
 static XLogRecPtr stop_stream_lsn = InvalidXLogRecPtr;
@@ -117,7 +121,7 @@ backup_stopbackup_callback(bool fatal, void *userdata)
 {
     PGconn *pg_startbackup_conn = (PGconn *) userdata;
     /*
-     * If backup is in progress, notify stop of backup to PostgreSQL
+     * If backup is in progress, notify stop of backup to openGauss
      */
     if (backup_in_progress)
     {
@@ -351,7 +355,7 @@ static void get_prev_backup_info(parray **backup_list, pgBackup **prev_back, par
     }
 
     /* For incremental backup check that start_lsn is not from the past
-     * Though it will not save us if PostgreSQL instance is actually
+     * Though it will not save us if openGauss instance is actually
      * restored STREAM backup.
      */
     if (current.backup_mode != BACKUP_MODE_FULL &&
@@ -458,7 +462,7 @@ static void sync_files(parray *database_map, const char *database_path, parray *
     if (current.from_replica && !exclusive_backup)
     {
         pgFile *pg_control = NULL;
-        for (int i = 0; i < parray_num(backup_files_list); i++)
+        for (unsigned int i = 0; i < parray_num(backup_files_list); i++)
         {
             pgFile *tmp_file = (pgFile *)parray_get(backup_files_list, (size_t)i);
             if (tmp_file->external_dir_num == 0 &&
@@ -550,7 +554,7 @@ static void sync_files(parray *database_map, const char *database_path, parray *
 }
 
 /*
- * Take a backup of a single postgresql instance.
+ * Take a backup of a single openGauss instance.
  * Move files from 'pgdata' to a subdirectory in 'backup_path'.
  */
 static void
@@ -580,13 +584,13 @@ do_backup_instance(PGconn *backup_conn, PGNodeInfo *nodeInfo, bool no_sync, bool
         check_external_for_tablespaces(external_dirs, backup_conn);
     }
 
-    /* notify start of backup to PostgreSQL server */
+    /* notify start of backup to openGauss server */
     time2iso(label, lengthof(label), current.start_time);
     rc = strncat_s(label,1024, " with pg_probackup", lengthof(label) -
         strlen(" with pg_probackup"));
     securec_check_c(rc, "\0", "\0");
 
-    /* Call pg_start_backup function in PostgreSQL connect */
+    /* Call pg_start_backup function in openGauss connect */
     pg_start_backup(label, smooth_checkpoint, &current, nodeInfo, backup_conn);
 
     /* Obtain current timeline */
@@ -740,6 +744,11 @@ do_backup_instance(PGconn *backup_conn, PGNodeInfo *nodeInfo, bool no_sync, bool
     if (external_dirs)
         free_dir_list(external_dirs);
 
+    if (pgdata_nobackup_dir) {
+        free_dir_list(pgdata_nobackup_dir);
+    }
+    pgdata_nobackup_dir = NULL;
+
     /* Cleanup */
     if (backup_list)
     {
@@ -767,7 +776,7 @@ pgdata_basic_setup(const ConnectionOptions conn_opt, PGNodeInfo *nodeInfo)
     PGconn *cur_conn;
     errno_t rc = 0;
 
-    /* Create connection for PostgreSQL */
+    /* Create connection for openGauss */
     cur_conn = pgut_connect(conn_opt.pghost, conn_opt.pgport,
                                             conn_opt.pgdatabase,
                                             conn_opt.pguser);
@@ -786,7 +795,7 @@ pgdata_basic_setup(const ConnectionOptions conn_opt, PGNodeInfo *nodeInfo)
         exclusive_backup = true;
     }
 
-    current.checksum_version = 0;
+    current.checksum_version = 1;
 
     nodeInfo->checksum_version = current.checksum_version;
 
@@ -899,7 +908,7 @@ do_backup(time_t start_time, pgSetBackupParams *set_backup_params,
     }
 
     /*
-     * Ensure that backup directory was initialized for the same PostgreSQL
+     * Ensure that backup directory was initialized for the same openGauss
      * instance we opened connection to. And that target backup database PGDATA
      * belogns to the same instance.
      */
@@ -960,7 +969,7 @@ do_backup(time_t start_time, pgSetBackupParams *set_backup_params,
 }
 
 /*
- * Ensure that backup directory was initialized for the same PostgreSQL
+ * Ensure that backup directory was initialized for the same openGauss
  * instance we opened connection to. And that target backup database PGDATA
  * belogns to the same instance.
  * All system identifiers must be equal.
@@ -1021,7 +1030,7 @@ confirm_block_size(PGconn *conn, const char *name, int blcksz)
 }
 
 /*
- * Notify start of backup to PostgreSQL server.
+ * Notify start of backup to openGauss server.
  */
 static void
 pg_start_backup(const char *label, bool smooth, pgBackup *backup,
@@ -1066,7 +1075,7 @@ pg_start_backup(const char *label, bool smooth, pgBackup *backup,
 
 
 /*
- * Check if the instance is PostgresPro fork.
+ * Check if the instance is openGauss fork.
  */
 static bool
 pgpro_support(PGconn *conn)
@@ -1277,6 +1286,7 @@ wait_wal_lsn(XLogRecPtr target_lsn, bool is_start_lsn, TimeLineID tli,
              *wal_segment_dir,
               wal_segment[MAXFNAMELEN];
     bool    file_exists = false;
+    bool    read_partial_file = false;
     uint32  try_count = 0,
                 timeout;
     int     rc = 0;
@@ -1285,14 +1295,12 @@ wait_wal_lsn(XLogRecPtr target_lsn, bool is_start_lsn, TimeLineID tli,
 #ifdef HAVE_LIBZ
     char    gz_wal_segment_path[MAXPGPATH];
 #endif
-    int nRet = 0;
 
     /* Compute the name of the WAL file containing requested LSN */
     GetXLogSegNo(target_lsn, targetSegNo, instance_config.xlog_seg_size);
     if (in_prev_segment)
         targetSegNo--;
-    GetXLogFileName(wal_segment, tli, targetSegNo,
-                                    instance_config.xlog_seg_size);
+    GetXLogFileName(wal_segment, MAXFNAMELEN, tli, targetSegNo, instance_config.xlog_seg_size);
 
     /*
      * In pg_start_backup we wait for 'target_lsn' in 'pg_wal' directory if it is
@@ -1313,6 +1321,7 @@ wait_wal_lsn(XLogRecPtr target_lsn, bool is_start_lsn, TimeLineID tli,
         join_path_components(wal_segment_path, arclog_path, wal_segment);
         wal_segment_dir = arclog_path;
     }
+
     rc = sprintf_s(partial_file, MAXPGPATH, "%s.partial", wal_segment_path);
     securec_check_ss_c(rc, "\0", "\0");
 
@@ -1326,7 +1335,7 @@ wait_wal_lsn(XLogRecPtr target_lsn, bool is_start_lsn, TimeLineID tli,
              (uint32) (target_lsn >> 32), (uint32) target_lsn, wal_segment);
 
 #ifdef HAVE_LIBZ
-    nRet = snprintf_s(gz_wal_segment_path, sizeof(gz_wal_segment_path), sizeof(gz_wal_segment_path) - 1,"%s.gz",
+    int nRet = snprintf_s(gz_wal_segment_path, sizeof(gz_wal_segment_path), sizeof(gz_wal_segment_path) - 1,"%s.gz",
         wal_segment_path);
     securec_check_ss_c(nRet, "\0", "\0");
 #endif
@@ -1337,11 +1346,15 @@ wait_wal_lsn(XLogRecPtr target_lsn, bool is_start_lsn, TimeLineID tli,
         if (!file_exists)
         {
             file_exists = fileExists(wal_segment_path, FIO_BACKUP_HOST);
-            if(!file_exists)
-            {
+            read_partial_file = (!file_exists)
+                                && XRecOffIsNull(target_lsn)
+                                && try_count > timeout / archive_timeout_deno;
+            if(read_partial_file) {
                 file_exists = fileExists(partial_file, FIO_BACKUP_HOST);
             }
+#ifdef HAVE_LIBZ
             tryToFindCompressedWALFile(&file_exists, gz_wal_segment_path, wal_segment_path);
+#endif
         }
         
             if (file_exists)
@@ -1408,7 +1421,7 @@ static void get_valid_stop_lsn(pgBackup *backup, bool *stop_lsn_exists, XLogRecP
     XLogRecPtr   lsn_tmp = InvalidXLogRecPtr;
 
     /*
-        * Even though the value is invalid, it's expected postgres behaviour
+        * Even though the value is invalid, it's expected openGauss behaviour
         * and we're trying to fix it below.
         */
     elog(LOG, "Invalid offset in stop_lsn value %X/%X, trying to fix",
@@ -1510,7 +1523,7 @@ static void get_valid_stop_lsn(pgBackup *backup, bool *stop_lsn_exists, XLogRecP
                 (uint32) (stop_backup_lsn_tmp >> 32),
                 (uint32) (stop_backup_lsn_tmp));
     }
-    /* PostgreSQL returned something very illegal as STOP_LSN, error out */
+    /* openGauss returned something very illegal as STOP_LSN, error out */
     else
         elog(ERROR, "Invalid stop_backup_lsn value %X/%X",
             (uint32) (stop_backup_lsn_tmp >> 32), (uint32) (stop_backup_lsn_tmp));
@@ -1561,7 +1574,7 @@ static void wait_stop_result(PGresult **res, PGconn  *conn)
                 elog(INFO, "wait for pg_stop_backup()");
 
             /*
-                * If postgres haven't answered in archive_timeout seconds,
+                * If openGauss haven't answered in archive_timeout seconds,
                 * send an interrupt.
                 */
             if (pg_stop_backup_timeout > (int)instance_config.archive_timeout)
@@ -1590,7 +1603,7 @@ void write_table_label_and_tablespace_map(pgBackup *backup, PGresult *res,
     char    path[MAXPGPATH];
     char    backup_label[MAXPGPATH];
     
-    if (!exclusive_backup)
+    if (!exclusive_backup && backup != NULL)
     {
         Assert(PQnfields(res) >= 4);
         pgBackupGetPath(backup, path, lengthof(path), DATABASE_DIR);
@@ -1638,10 +1651,10 @@ void write_table_label_and_tablespace_map(pgBackup *backup, PGresult *res,
     /* Get content for tablespace_map from stop_backup results
     * in case of non-exclusive backup
     */
-    if (!exclusive_backup)
+    if (!exclusive_backup && backup != NULL)
         val = PQgetvalue(res, 0, 4);
     
-    if (!exclusive_backup && val && strlen(val) > 0)
+    if (!exclusive_backup && val && strlen(val) > 0 && backup != NULL)
     {
         char    tablespace_map[MAXPGPATH];
 
@@ -1705,7 +1718,7 @@ void PgStopBackupSent(PGconn *connection, const char **stopBackupQuery)
 }
 
 /*
- * Notify end of backup to PostgreSQL server.
+ * Notify end of backup to openGauss server.
  */
 static void
 pg_stop_backup(pgBackup *backup, PGconn *pg_startbackup_conn,
@@ -1760,7 +1773,7 @@ pg_stop_backup(pgBackup *backup, PGconn *pg_startbackup_conn,
     /*
      * send pg_stop_backup asynchronously because we could came
      * here from backup_cleanup() after some error caused by
-     * postgres archive_command problem and in this case we will
+     * openGauss archive_command problem and in this case we will
      * wait for pg_stop_backup() forever.
      */
     PgStopBackupSent(conn, &stop_backup_query);
@@ -2376,8 +2389,10 @@ StreamLog(void *arg)
         ctl.synchronous = false;
         ctl.mark_done = false;
 
-        if(ReceiveXlogStream(stream_arg->conn, &ctl) == false)
+        if(ReceiveXlogStream(stream_arg->conn, &ctl) == false) {
+            interrupted = true;
             elog(ERROR, "Problem in receivexlog");
+        }
 
 #if PG_VERSION_NUM >= 100000
         if (!ctl.walmethod->finish())
@@ -2388,8 +2403,10 @@ StreamLog(void *arg)
 #else
     if(ReceiveXlogStream(stream_arg->conn, stream_arg->startpos, stream_arg->starttli,
                             NULL, (const char *) stream_arg->basedir, stop_streaming,
-                            standby_message_timeout_local, stream_arg->renamepartial) == false)
+                            standby_message_timeout_local, stream_arg->renamepartial) == false) {
+        interrupted = true;
         elog(ERROR, "Problem in receivexlog");
+    }
 #endif
 
     elog(LOG, "finished streaming WAL at %X/%X (timeline %u)",
@@ -2409,6 +2426,7 @@ check_external_for_tablespaces(parray *external_list, PGconn *backup_conn)
     int i = 0;
     int j = 0;
     char    *tablespace_path = NULL;
+    bool    in_pgdata = false;
     const char  *query = (const char *)"SELECT pg_catalog.pg_tablespace_location(oid) "
                                 "FROM pg_catalog.pg_tablespace;";
 
@@ -2418,11 +2436,21 @@ check_external_for_tablespaces(parray *external_list, PGconn *backup_conn)
     if (!res)
         elog(ERROR, "Failed to get list of tablespaces");
 
+    pgdata_nobackup_dir = parray_new();
+
     for (i = 0; i < res->ntups; i++)
     {
+        char    full_path[MAXPGPATH] = {0};
+        char    rel_path[MAXPGPATH] = {0};
         tablespace_path = PQgetvalue(res, i, 0);
         if (strlen(tablespace_path) == 0) {
             continue;
+        }
+
+        if (!is_absolute_path(tablespace_path)) {
+            join_path_components(rel_path, PG_RELATIVE_TBLSPC_DIR, tablespace_path);
+            join_path_components(full_path, instance_config.pgdata, rel_path);
+            tablespace_path = full_path;
         }
 
         canonicalize_path(tablespace_path);
@@ -2439,6 +2467,13 @@ check_external_for_tablespaces(parray *external_list, PGconn *backup_conn)
                 elog(WARNING, "External directory path (-E option) \"%s\" "
                         "is in tablespace directory \"%s\"",
                         tablespace_path, external_path);
+
+            in_pgdata = path_is_prefix_of_path(instance_config.pgdata, external_path);
+            if (in_pgdata &&
+                strcmp(external_path, tablespace_path) == 0) {
+                char *no_backup_dir = pg_strdup(rel_path);
+                parray_append(pgdata_nobackup_dir, no_backup_dir);
+            }
         }
     }
     PQclear(res);
@@ -2525,9 +2560,9 @@ static bool PathContainPath(const char* path1, const char* path2)
         size_t path2Len = strlen(path2);
         if (path1Len == path2Len) {
             return false;
-        } else if ((path2Len == (path1Len + 1)) && !IS_DIR_SEP(path2[path1Len - 1])) {
+        } else if ((path2Len >= (path1Len + 1)) && !IS_DIR_SEP(path2[path1Len])) {
             return false;
-        } else if ((path2Len == (path1Len + 1)) && IS_DIR_SEP(path2[path1Len - 1])) {
+        } else if ((path2Len >= (path1Len + 1)) && IS_DIR_SEP(path2[path1Len])) {
             return true;
         } else {
             return false;

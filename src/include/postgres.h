@@ -7,6 +7,7 @@
  * Client-side code should include postgres_fe.h instead.
  *
  *
+ * Portions Copyright (c) 2021, openGauss Contributors
  * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
  * Portions Copyright (c) 1995, Regents of the University of California
  * Portions Copyright (c) 2010-2012 Postgres-XC Development Group
@@ -53,6 +54,7 @@
 #include "utils/elog.h"
 #include "utils/palloc.h"
 #include "storage/spin.h"
+// #include "utils/expandeddatum.h"
 
 #ifndef WIN32
 #include <cxxabi.h>
@@ -113,8 +115,13 @@
 #define AUXILIARY_BACKENDS 20
 /* the maximum number of autovacuum launcher thread */
 #define AV_LAUNCHER_PROCS 2
+#define BITS_PER_INT (BITS_PER_BYTE * sizeof(int))
 
 #define STREAM_RESERVE_PROC_TIMES (16)
+
+/* for CLOB/BLOB more than 1GB, the first chunk threadhold. */
+#define MAX_TOAST_CHUNK_SIZE 1073741771
+
 /* this struct is used to store connection info got from pool */
 typedef struct {
     /* hostname of the connection */
@@ -153,6 +160,21 @@ typedef struct varatt_external {
     Oid va_toastrelid; /* RelID of TOAST table containing it */
 } varatt_external;
 
+typedef struct varatt_lob_external {
+    int64 va_rawsize;  /* Original data size (includes header) */
+    Oid va_valueid;    /* Unique ID of value within TOAST table */
+    Oid va_toastrelid; /* RelID of TOAST table containing it */
+} varatt_lob_external;
+
+typedef struct varatt_lob_pointer {
+    Oid relid;
+    int2 columid;
+    int2 bucketid;
+    uint16 bi_hi;
+    uint16 bi_lo;
+    uint16 ip_posid;
+} varatt_lob_pointer;
+
 /*
  * Out-of-line Datum thats stored in memory in contrast to varatt_external
  * pointers which points to data in an external toast relation.
@@ -164,18 +186,31 @@ typedef struct varatt_indirect {
     struct varlena* pointer; /* Pointer to in-memory varlena */
 } varatt_indirect;
 
+typedef struct ExpandedObjectHeader ExpandedObjectHeader;
+
+typedef struct varatt_expanded
+{
+	ExpandedObjectHeader *eohptr;
+} varatt_expanded;
+
 /*
  * Type of external toast datum stored. The peculiar value for VARTAG_ONDISK
  * comes from the requirement for on-disk compatibility with the older
  * definitions of varattrib_1b_e where v_tag was named va_len_1be...
  */
-typedef enum vartag_external { VARTAG_INDIRECT = 1, VARTAG_BUCKET = 8, VARTAG_ONDISK = 18 } vartag_external;
+typedef enum vartag_external { VARTAG_INDIRECT = 1, VARTAG_EXPANDED_RO = 2, VARTAG_BUCKET = 8, VARTAG_ONDISK = 18, VARTAG_EXPANDED_RW = 3, VARTAG_LOB = 28 } vartag_external;
 
-#define VARTAG_SIZE(tag) \
+#define VARTAG_SIZE(tag) ((tag & 0x80) == 0x00 ? \
    ((tag) == VARTAG_INDIRECT ? sizeof(varatt_indirect) :       \
-    (tag) == VARTAG_ONDISK ? sizeof(varatt_external) : \
-    (tag) == VARTAG_BUCKET ? sizeof(varatt_external) + sizeof(int2) : \
-    TrapMacro(true, "unknown vartag"))
+    ((tag) == VARTAG_ONDISK ? sizeof(varatt_external) : \
+    ((tag) == VARTAG_BUCKET ? sizeof(varatt_external) + sizeof(int2) : \
+    ((tag) == VARTAG_LOB ? sizeof(varatt_lob_pointer) : \
+    TrapMacro(true, "unknown vartag"))))) : \
+    ((tag & 0x7f) == VARTAG_INDIRECT ? sizeof(varatt_indirect) :       \
+    ((tag & 0x7f) == VARTAG_ONDISK ? sizeof(varatt_lob_external) : \
+    ((tag & 0x7f) == VARTAG_BUCKET ? sizeof(varatt_lob_external) + sizeof(int2) : \
+    ((tag & 0x7f) == VARTAG_LOB ? sizeof(varatt_lob_pointer) : \
+    TrapMacro(true, "unknown vartag"))))))
 
 /*
  * These structs describe the header of a varlena object that may have been
@@ -223,6 +258,7 @@ typedef struct {
 #ifndef HAVE_DATABASE_TYPE
 #define HAVE_DATABASE_TYPE
 /*Type of database; increase for sql compatibility*/
+
 typedef enum { 
     A_FORMAT = 0x0001,
     B_FORMAT = 0x0002,
@@ -232,6 +268,7 @@ typedef enum {
 
 #define IS_CMPT(cmpt, flag) (((uint32)cmpt & (uint32)(flag)) != 0)
 #define DB_IS_CMPT(flag) IS_CMPT(u_sess->attr.attr_sql.sql_compatibility, (flag))
+
 #endif /* HAVE_DATABASE_TYPE */
 
 typedef enum { EXPLAIN_NORMAL, EXPLAIN_PRETTY, EXPLAIN_SUMMARY, EXPLAIN_RUN } ExplainStyle;
@@ -292,6 +329,18 @@ typedef enum {
 #define VARATT_IS_4B_C(PTR) ((((varattrib_1b*)(PTR))->va_header & 0xC0) == 0x40)
 #define VARATT_IS_1B(PTR) ((((varattrib_1b*)(PTR))->va_header & 0x80) == 0x80)
 #define VARATT_IS_1B_E(PTR) ((((varattrib_1b*)(PTR))->va_header) == 0x80)
+#define VARATT_IS_HUGE_TOAST_POINTER(PTR) ((((varattrib_1b*)(PTR))->va_header) == 0x80 && \
+    ((((varattrib_1b_e*)(PTR))->va_tag) & 0x01) == 0x01)
+
+#define FUNC_CHECK_HUGE_POINTER(is_null, ptr, funcName)                                                      \
+    do {                                                                                                     \
+        if (!is_null && unlikely(VARATT_IS_HUGE_TOAST_POINTER((varlena *)ptr))) {                                      \
+            ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),                                        \
+                errmsg("%s could not support larger than 1GB clob/blob data", funcName),                     \
+                    errcause("parameter larger than 1GB"), erraction("parameter must less than 1GB")));      \
+        }                                                                                                    \
+    } while (0)
+
 #define VARATT_NOT_PAD_BYTE(PTR) (*((uint8*)(PTR)) != 0)
 
 /* VARSIZE_4B() should only be used on known-aligned data */
@@ -303,13 +352,37 @@ typedef enum {
 #define SET_VARSIZE_4B_C(PTR, len) (((varattrib_4b*)(PTR))->va_4byte.va_header = ((len)&0x3FFFFFFF) | 0x40000000)
 #define SET_VARSIZE_1B(PTR, len) (((varattrib_1b*)(PTR))->va_header = (len) | 0x80)
 #define SET_VARTAG_1B_E(PTR, tag) (((varattrib_1b_e*)(PTR))->va_header = 0x80, ((varattrib_1b_e*)(PTR))->va_tag = (tag))
+#define SET_HUGE_TOAST_POINTER_TAG(PTR, tag) (((varattrib_1b_e*)(PTR))->va_header = 0x80, \
+    ((varattrib_1b_e*)(PTR))->va_tag = (tag) | 0x01)
 #else /* !WORDS_BIGENDIAN */
 
+
+
+/* this test relies on the specific tag values above */
+#define VARTAG_IS_EXPANDED(tag) \
+	(((tag) & ~1) == VARTAG_EXPANDED_RO)
+#define VARATT_IS_EXTERNAL_EXPANDED(PTR) \
+	(VARATT_IS_EXTERNAL(PTR) && VARTAG_IS_EXPANDED(VARTAG_EXTERNAL(PTR)))
+
+#define VARATT_IS_EXTERNAL_EXPANDED_RW(PTR) \
+	(VARATT_IS_EXTERNAL(PTR) && VARTAG_EXTERNAL(PTR) == VARTAG_EXPANDED_RW)
 #define VARATT_IS_4B(PTR) ((((varattrib_1b*)(PTR))->va_header & 0x01) == 0x00)
 #define VARATT_IS_4B_U(PTR) ((((varattrib_1b*)(PTR))->va_header & 0x03) == 0x00)
 #define VARATT_IS_4B_C(PTR) ((((varattrib_1b*)(PTR))->va_header & 0x03) == 0x02)
 #define VARATT_IS_1B(PTR) ((((varattrib_1b*)(PTR))->va_header & 0x01) == 0x01)
 #define VARATT_IS_1B_E(PTR) ((((varattrib_1b*)(PTR))->va_header) == 0x01)
+#define VARATT_IS_HUGE_TOAST_POINTER(PTR) ((((varattrib_1b*)(PTR))->va_header) == 0x01 && \
+    ((((varattrib_1b_e*)(PTR))->va_tag) >> 7) == 0x01)
+
+#define FUNC_CHECK_HUGE_POINTER(is_null, ptr, funcName)                                                      \
+    do {                                                                                                     \
+        if (!is_null && VARATT_IS_HUGE_TOAST_POINTER((varlena *)ptr)) {                                      \
+            ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),                                        \
+                errmsg("%s could not support larger than 1GB clob/blob data", funcName),                     \
+                    errcause("parameter larger than 1GB"), erraction("parameter must less than 1GB")));      \
+        }                                                                                                    \
+    } while (0)
+
 #define VARATT_NOT_PAD_BYTE(PTR) (*((uint8*)(PTR)) != 0)
 
 /* VARSIZE_4B() should only be used on known-aligned data */
@@ -320,6 +393,8 @@ typedef enum {
 #define SET_VARSIZE_4B_C(PTR, len) (((varattrib_4b*)(PTR))->va_4byte.va_header = (((uint32)(len)) << 2) | 0x02)
 #define SET_VARSIZE_1B(PTR, len) (((varattrib_1b*)(PTR))->va_header = (((uint8)(len)) << 1) | 0x01)
 #define SET_VARTAG_1B_E(PTR, tag) (((varattrib_1b_e*)(PTR))->va_header = 0x01, ((varattrib_1b_e*)(PTR))->va_tag = (tag))
+#define SET_HUGE_TOAST_POINTER_TAG(PTR, tag) (((varattrib_1b_e*)(PTR))->va_header = 0x01, \
+    ((varattrib_1b_e*)(PTR))->va_tag = (tag) | 0x80)
 #endif /* WORDS_BIGENDIAN */
 
 #define VARHDRSZ_SHORT offsetof(varattrib_1b, va_data)
@@ -371,6 +446,7 @@ typedef enum {
 #define VARATT_IS_EXTERNAL_INDIRECT(PTR) (VARATT_IS_EXTERNAL(PTR) && VARTAG_EXTERNAL(PTR) == VARTAG_INDIRECT)
 #define VARATT_IS_EXTERNAL_BUCKET(PTR) \
     (VARATT_IS_EXTERNAL(PTR) && VARTAG_EXTERNAL(PTR) == VARTAG_BUCKET)
+#define VARATT_IS_EXTERNAL_LOB(PTR) (VARATT_IS_EXTERNAL(PTR) && VARTAG_EXTERNAL(PTR) == VARTAG_LOB)
 #define VARATT_IS_EXTERNAL_ONDISK_B(PTR) \
     (VARATT_IS_EXTERNAL_ONDISK(PTR) || VARATT_IS_EXTERNAL_BUCKET(PTR))
 
@@ -385,9 +461,9 @@ typedef enum {
 #define VARSIZE_ANY(PTR) \
     (VARATT_IS_1B_E(PTR) ? VARSIZE_EXTERNAL(PTR) : (VARATT_IS_1B(PTR) ? VARSIZE_1B(PTR) : VARSIZE_4B(PTR)))
 
-#define VARSIZE_ANY_EXHDR(PTR)                                       \
-    (VARATT_IS_1B_E(PTR) ? VARSIZE_EXTERNAL(PTR) - VARHDRSZ_EXTERNAL \
-                         : (VARATT_IS_1B(PTR) ? VARSIZE_1B(PTR) - VARHDRSZ_SHORT : VARSIZE_4B(PTR) - VARHDRSZ))
+#define VARSIZE_ANY_EXHDR(PTR)                                             \
+        (VARATT_IS_1B_E(PTR) ? VARSIZE_EXTERNAL(PTR) - VARHDRSZ_EXTERNAL : \
+                               (VARATT_IS_1B(PTR) ? VARSIZE_1B(PTR) - VARHDRSZ_SHORT : VARSIZE_4B(PTR) - VARHDRSZ))
 
 /* caution: this will not work on an external or compressed-in-line Datum */
 /* caution: this will return a possibly unaligned pointer */
@@ -400,7 +476,7 @@ typedef enum {
 
 /*
  * Port Notes:
- *	Postgres makes the following assumptions about datatype sizes:
+ *	openGauss makes the following assumptions about datatype sizes:
  *
  *	sizeof(Datum) == sizeof(void *) == 4 or 8
  *	sizeof(char) == 1
@@ -609,7 +685,7 @@ typedef Datum* DatumPtr;
  * DatumGetCString
  *		Returns C string (null-terminated string) value of a datum.
  *
- * Note: C string is not a full-fledged Postgres type at present,
+ * Note: C string is not a full-fledged openGauss type at present,
  * but type input functions use this conversion for their inputs.
  */
 
@@ -619,7 +695,7 @@ typedef Datum* DatumPtr;
  * CStringGetDatum
  *		Returns datum representation for a C string (null-terminated string).
  *
- * Note: C string is not a full-fledged Postgres type at present,
+ * Note: C string is not a full-fledged openGauss type at present,
  * but type output functions use this conversion for their outputs.
  * Note: CString is pass-by-reference; caller must ensure the pointed-to
  * value has adequate lifetime.
@@ -697,6 +773,12 @@ extern Datum Int64GetDatum(int64 X);
 #define UInt64GetDatum(X) ((Datum)SET_8_BYTES(X))
 #else
 #define UInt64GetDatum(X) Int64GetDatum((int64)(X))
+#endif
+
+#ifndef WIN32
+/* Always pass by reference for int128 type. */
+extern Datum Int128GetDatum(int128 X);
+#define DatumGetInt128(X) (*((int128*)DatumGetPointer(X)))
 #endif
 
 /*
@@ -871,8 +953,15 @@ extern THR_LOCAL PGDLLIMPORT bool assert_enabled;
 #endif /* USE_ASSERT_CHECKING */
 #endif /* PC_LINT */
 
-extern void ExceptionalCondition(const char* conditionName, const char* errorType, const char* fileName, int lineNumber)
-    __attribute__((noreturn));
+typedef enum {
+    ENV_OK,
+    ENV_ERR_LENGTH,
+    ENV_ERR_NULL,
+    ENV_ERR_DANGER_CHARACTER
+} EnvCheckResult;
+
+extern void ExceptionalCondition(const char *conditionName, const char *errorType, const char *fileName,
+    int lineNumber);
 
 extern void ConnFree(void* conn);
 
@@ -901,6 +990,7 @@ extern void execute_simple_query(const char* query_string);
 
 /* check the value from environment variablethe to prevent command injection. */
 extern void check_backend_env(const char* input_env_value);
+extern EnvCheckResult check_backend_env_sigsafe(const char* input_env_value);
 extern bool backend_env_valid(const char* input_env_value, const char* stamp);
 
 extern void CleanSystemCaches(bool is_in_read_command);
@@ -914,16 +1004,35 @@ extern void cJSON_internal_free(void* pointer);
 
 extern void InitThreadLocalWhenSessionExit();
 extern void RemoveTempNamespace();
-
-#define CacheIsProcNameArgNsp(cache) ((cache)->id == PROCNAMEARGSNSP)
-#define CacheIsProcOid(cache) ((cache)->id == PROCOID)
+#ifndef ENABLE_MULTIPLE_NODES
+#define CacheIsProcNameArgNsp(cc_id) ((cc_id) == PROCNAMEARGSNSP || (cc_id) == PROCALLARGS)
+#else 
+#define CacheIsProcNameArgNsp(cc_id) ((cc_id) == PROCNAMEARGSNSP)
+#endif 
+#define CacheIsProcOid(cc_id) ((cc_id) == PROCOID)
 #define IsBootingPgProc(rel) IsProcRelation(rel)
 #define BootUsingBuiltinFunc true
 
 extern int errdetail_abort(void);
 
 void log_disconnections(int code, Datum arg);
+void cleanGPCPlanProcExit(int code, Datum arg);
+
+void ResetInterruptCxt();
 
 #define MSG_A_REPEAT_NUM_MAX 1024
 #define OVERRIDE_STACK_LENGTH_MAX 1024
+
+typedef enum {
+    RUN_MODE_PRIMARY,
+    RUN_MODE_STANDBY,
+} ClusterRunMode;
+
+#ifdef ENABLE_UT
+#include "lib/stringinfo.h"
+extern void exec_describe_statement_message(const char* stmt_name);
+extern void exec_get_ddl_params(StringInfo input_message);
+#endif
+
+
 #endif /* POSTGRES_H */

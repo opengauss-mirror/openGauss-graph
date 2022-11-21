@@ -70,7 +70,7 @@ public:
     ThreadPoolListener* m_listener;
 
     ThreadPoolGroup(int maxWorkerNum, int expectWorkerNum, int maxStreamNum,
-                    int groupId, int numaId, int cpuNum, int* cpuArr);
+                    int groupId, int numaId, int cpuNum, int* cpuArr, bool enableBindCpuNuma);
     ~ThreadPoolGroup();
     void Init(bool enableNumaDistribute);
     void InitWorkerSentry();
@@ -86,7 +86,11 @@ public:
     void WaitReady();
     float4 GetSessionPerThread();
     void GetThreadPoolGroupStat(ThreadPoolStat* stat);
+    /* get ready session list check for hang */
     bool IsGroupHang();
+    /* check for hang flag */
+    void SetGroupHanged(bool isHang);
+    bool IsGroupHanged();
 
     inline ThreadPoolListener* GetListener()
     {
@@ -130,6 +134,7 @@ public:
 private:
     void AttachThreadToCPU(ThreadId thread, int cpu);
     void AttachThreadToNodeLevel(ThreadId thread) const;
+    void AttachThreadToCpuNuma(ThreadId thread);
 
 private:
     int m_maxWorkerNum;
@@ -145,13 +150,16 @@ private:
     volatile int m_sessionCount;           // all session count;
     volatile int m_waitServeSessionCount;  // wait for worker to server
     volatile int m_processTaskCount;
+    volatile int m_hasHanged;
 
     int m_groupId;
     int m_numaId;
     int m_groupCpuNum;
     int* m_groupCpuArr;
     bool m_enableNumaDistribute;
+    bool m_enableBindCpuNuma;
     cpu_set_t m_nodeCpuSet; /* for numa node distribution only */
+    cpu_set_t m_CpuNumaSet; /* for numa node distribution only */
 
     ThreadWorkerSentry* m_workers;
     MemoryContext m_context;

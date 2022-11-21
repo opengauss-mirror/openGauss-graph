@@ -1,11 +1,12 @@
 /* -------------------------------------------------------------------------
  *
  * tupdesc.cpp
- *	  POSTGRES tuple descriptor support code
+ *	  openGauss tuple descriptor support code
  *
  * Portions Copyright (c) 2020 Huawei Technologies Co.,Ltd.
  * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
+ * Portions Copyright (c) 2021, openGauss Contributors
  *
  *
  * IDENTIFICATION
@@ -21,6 +22,7 @@
 #include "knl/knl_variable.h"
 
 #include "access/transam.h"
+#include "catalog/dependency.h"
 #include "catalog/pg_type.h"
 #include "miscadmin.h"
 #include "parser/parse_type.h"
@@ -94,6 +96,7 @@ TupleDesc CreateTemplateTupleDesc(int natts, bool hasoid, TableAmType tam)
     desc->tdhasoid = hasoid;
     desc->tdrefcount = -1;    /* assume not reference-counted */
     desc->initdefvals = NULL; /* initialize the attrinitdefvals */
+    desc->tdhasuids = false;
     desc->tdisredistable = false;
     desc->tdTableAmType = tam;
 
@@ -130,6 +133,7 @@ TupleDesc CreateTupleDesc(int natts, bool hasoid, Form_pg_attribute* attrs, Tabl
     desc->tdrefcount = -1;    /* assume not reference-counted */
     desc->initdefvals = NULL; /* initialize the attrinitdefvals */
     desc->tdisredistable = false;
+    desc->tdhasuids = false;
     desc->tdTableAmType = tam;
 
     return desc;
@@ -140,7 +144,7 @@ TupleDesc CreateTupleDesc(int natts, bool hasoid, Form_pg_attribute* attrs, Tabl
  *		This function creates a new TupInitDefVal by copying from an existing
  *		TupInitDefVal.
  */
-static TupInitDefVal *tupInitDefValCopy(TupInitDefVal *pInitDefVal, int nAttr)
+TupInitDefVal *tupInitDefValCopy(TupInitDefVal *pInitDefVal, int nAttr)
 {
     TupInitDefVal *dvals = (TupInitDefVal *)palloc(nAttr * sizeof(TupInitDefVal));
     for (int i = 0; i < nAttr; ++i) {
@@ -182,6 +186,7 @@ TupleDesc CreateTupleDescCopy(TupleDesc tupdesc)
     desc->tdtypeid = tupdesc->tdtypeid;
     desc->tdtypmod = tupdesc->tdtypmod;
     desc->tdisredistable = tupdesc->tdisredistable;
+    desc->tdhasuids = tupdesc->tdhasuids;
 
     /* copy the attinitdefval */
     if (tupdesc->initdefvals) {
@@ -195,7 +200,7 @@ TupleDesc CreateTupleDescCopy(TupleDesc tupdesc)
  * TupleConstrCopy
  *    This function creates a new TupleConstr by copying from an existing TupleConstr.
  */
-static TupleConstr *TupleConstrCopy(const TupleDesc tupdesc)
+TupleConstr *TupleConstrCopy(const TupleDesc tupdesc)
 {
     TupleConstr *constr = tupdesc->constr;
     TupleConstr *cpy = (TupleConstr *)palloc0(sizeof(TupleConstr));
@@ -316,6 +321,7 @@ void FreeTupleDesc(TupleDesc tupdesc)
             }
             pfree(check);
         }
+        pfree_ext(tupdesc->constr->clusterKeys);
         pfree(tupdesc->constr);
         tupdesc->constr = NULL;
     }
@@ -501,7 +507,8 @@ bool equalTupleDescs(TupleDesc tupdesc1, TupleDesc tupdesc2)
         if (strcmp(NameStr(attr1->attname), NameStr(attr2->attname)) != 0) {
             return false;
         }
-        if (attr1->atttypid != attr2->atttypid) {
+        const bool cl_skip = IsClientLogicType(attr1->atttypid) && (Oid)attr1->atttypmod == attr2->atttypid;
+        if (attr1->atttypid != attr2->atttypid && !cl_skip) {
             return false;
         }
         if (attr1->attstattarget != attr2->attstattarget) {
@@ -513,13 +520,13 @@ bool equalTupleDescs(TupleDesc tupdesc1, TupleDesc tupdesc2)
         if (attr1->attndims != attr2->attndims) {
             return false;
         }
-        if (attr1->atttypmod != attr2->atttypmod) {
+        if (attr1->atttypmod != attr2->atttypmod && !cl_skip) {
             return false;
         }
         if (attr1->attbyval != attr2->attbyval) {
             return false;
         }
-        if (attr1->attstorage != attr2->attstorage) {
+        if (attr1->attstorage != attr2->attstorage && !cl_skip) {
             return false;
         }
         if (attr1->attkvtype != attr2->attkvtype) {
@@ -546,7 +553,7 @@ bool equalTupleDescs(TupleDesc tupdesc1, TupleDesc tupdesc2)
         if (attr1->attinhcount != attr2->attinhcount) {
             return false;
         }
-        if (attr1->attcollation != attr2->attcollation) {
+        if (attr1->attcollation != attr2->attcollation && !cl_skip) {
             return false;
         }
         /* attacl, attoptions and attfdwoptions are not even present... */
@@ -897,13 +904,32 @@ int UpgradeAdaptAttr(Oid atttypid, ColumnDef *entry)
     return attdim;
 }
 
-static void BlockRowCompressRelOption(const Node *orientedFrom, const ColumnDef *entry)
+static void BlockRowCompressRelOption(const char *tableFormat, const ColumnDef *entry)
 {
-    if (pg_strcasecmp(ORIENTATION_ROW, strVal(orientedFrom)) == 0 &&  ATT_CMPR_NOCOMPRESS < entry->cmprs_mode
-        && entry->cmprs_mode <= ATT_CMPR_NUMSTR) {
+    if (pg_strcasecmp(ORIENTATION_ROW, tableFormat) == 0 &&  ATT_CMPR_NOCOMPRESS < entry->cmprs_mode &&
+        entry->cmprs_mode <= ATT_CMPR_NUMSTR) {
         ereport(ERROR,
             (errcode(ERRCODE_INVALID_TABLE_DEFINITION),
              errmsg("row-oriented table does not support compression")));
+    }
+}
+
+static void BlockColumnRelOption(const char *tableFormat, const Oid atttypid, const int32 atttypmod)
+{
+    if (((pg_strcasecmp(ORIENTATION_COLUMN, tableFormat)) == 0 ||
+        (pg_strcasecmp(ORIENTATION_TIMESERIES, tableFormat)) == 0) &&
+        !IsTypeSupportedByCStore(atttypid)) {
+        ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+            errmsg("type \"%s\" is not supported in column store", format_type_with_typemod(atttypid, atttypmod))));
+    }
+}
+
+static void BlockORCRelOption(const char *tableFormat, const Oid atttypid, const int32 atttypmod)
+{
+    if ((pg_strcasecmp(ORIENTATION_ORC, tableFormat) == 0) && !IsTypeSupportedByORCRelation(atttypid)) {
+        ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                        errmsg("type \"%s\" is not supported in DFS ORC format column store",
+                               format_type_with_typemod(atttypid, atttypmod))));
     }
 }
 
@@ -928,6 +954,11 @@ TupleDesc BuildDescForRelation(List *schema, Node *orientedFrom, char relkind)
     int32 atttypmod;
     Oid attcollation;
     int attdim;
+    const char *tableFormat = "";
+
+    if (orientedFrom != NULL) {
+        tableFormat = strVal(orientedFrom);
+    }
 
     /*
      * allocate a new tuple descriptor
@@ -953,6 +984,18 @@ TupleDesc BuildDescForRelation(List *schema, Node *orientedFrom, char relkind)
         attname = entry->colname;
 
         typenameTypeIdAndMod(NULL, entry->typname, &atttypid, &atttypmod);
+#ifndef ENABLE_MULTIPLE_NODES
+    /* don't allow package or procedure type as column type */
+    if (u_sess->plsql_cxt.curr_compile_context == NULL && IsPackageDependType(atttypid, InvalidOid)) {
+        ereport(ERROR,
+            (errcode(ERRCODE_DATATYPE_MISMATCH),
+                errmodule(MOD_PLSQL),
+                errmsg("type \"%s\" is not supported as column type", TypeNameToString(entry->typname)),
+                errdetail("\"%s\" is a package or procedure type", TypeNameToString(entry->typname)),
+                errcause("feature not supported"),
+                erraction("check type name")));
+    }
+#endif
         if (relkind == RELKIND_COMPOSITE_TYPE && IS_PGXC_COORDINATOR) {
             HeapTuple typTupe;
             Form_pg_type typForm;
@@ -989,17 +1032,8 @@ TupleDesc BuildDescForRelation(List *schema, Node *orientedFrom, char relkind)
         attcollation = GetColumnDefCollation(NULL, entry, atttypid);
         attdim = UpgradeAdaptAttr(atttypid, entry);
 
-        if (((0 == pg_strcasecmp(ORIENTATION_COLUMN, strVal(orientedFrom))) ||
-             (0 == pg_strcasecmp(ORIENTATION_TIMESERIES, strVal(orientedFrom)))) &&
-            !IsTypeSupportedByCStore(atttypid, atttypmod))
-            ereport(ERROR,
-                    (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("type \"%s\" is not supported in column store",
-                                                                    format_type_with_typemod(atttypid, atttypmod))));
-
-        if ((0 == pg_strcasecmp(ORIENTATION_ORC, strVal(orientedFrom))) && !IsTypeSupportedByORCRelation(atttypid))
-            ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-                            errmsg("type \"%s\" is not supported in DFS ORC format column store",
-                                   format_type_with_typemod(atttypid, atttypmod))));
+        BlockColumnRelOption(tableFormat, atttypid, atttypmod);
+        BlockORCRelOption(tableFormat, atttypid, atttypmod);
 
         if (entry->typname->setof)
             ereport(ERROR, (errcode(ERRCODE_INVALID_TABLE_DEFINITION),
@@ -1026,7 +1060,7 @@ TupleDesc BuildDescForRelation(List *schema, Node *orientedFrom, char relkind)
         VerifyAttrCompressMode(entry->cmprs_mode, thisatt->attlen, attname);
         thisatt->attcmprmode = entry->cmprs_mode;
 
-        BlockRowCompressRelOption(orientedFrom, entry);
+        BlockRowCompressRelOption(tableFormat, entry);
     }
 
     if (has_not_null) {

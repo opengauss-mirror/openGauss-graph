@@ -25,7 +25,8 @@
 
 #include "bin/elog.h"
 #include "nodes/pg_list.h"
-#include "storage/fd.h"
+#include "replication/replicainternal.h"
+#include "storage/smgr/fd.h"
 #include "utils/builtins.h"
 #include "utils/datetime.h"
 #include "common/fe_memutils.h"
@@ -42,6 +43,16 @@ static const char* config_para_build[MAX_REPLNODE_NUM] = {"",
     "replconninfo5",
     "replconninfo6",
     "replconninfo7"};
+static const char* config_para_cross_cluster_build[MAX_REPLNODE_NUM] = {
+    "",
+    "cross_cluster_replconninfo1",
+    "cross_cluster_replconninfo2",
+    "cross_cluster_replconninfo3",
+    "cross_cluster_replconninfo4",
+    "cross_cluster_replconninfo5",
+    "cross_cluster_replconninfo6",
+    "cross_cluster_replconninfo7"
+};
 
 /* Node name */
 char pgxcnodename[MAX_VALUE_LEN] = {0};
@@ -54,6 +65,7 @@ char g_buildprimary_slotname[MAX_VALUE_LEN] = {0};
 char g_str_replication_type[MAX_VALUE_LEN] = {0};
 int g_replconn_idx = -1;
 int g_replication_type = -1;
+bool is_cross_region_build = false;
 #define RT_WITH_DUMMY_STANDBY 0
 #define RT_WITH_MULTI_STANDBY 1
 
@@ -350,10 +362,8 @@ int GetLengthAndCheckReplConn(const char* ConnInfoList)
  * Description        :
  * Notes            :
  */
-ReplConnInfo* ParseReplConnInfo(const char* ConnInfoList, int* InfoLength)
+bool ParseReplConnInfo(const char* ConnInfoList, int* InfoLength, ReplConnInfo* repl)
 {
-    ReplConnInfo* repl = NULL;
-
     int repl_length = 0;
     char* iter = NULL;
     char* pNext = NULL;
@@ -363,20 +373,22 @@ ReplConnInfo* ParseReplConnInfo(const char* ConnInfoList, int* InfoLength)
     int parsed = 0;
     int iplen = 0;
     char tmp_localhost[IP_LEN] = {0};
+    char cascadeToken[IP_LEN] = {0};
+    char crossRegionToken[IP_LEN] = {0};
     int tmp_localport = 0;
-    int tmp_localservice = 0;
     char tmp_remotehost[IP_LEN] = {0};
     int tmp_remoteport = 0;
-    int tmp_remoteservice = 0;
+    int cascadeLen = strlen("iscascade");
+    int corssRegionLen = strlen("isCrossRegion");
     errno_t rc = EOK;
     char* p = NULL;
 
     if (ConnInfoList == NULL) {
-        return NULL;
+        return false;
     } else {
         ReplStr = strdup(ConnInfoList);
         if (ReplStr == NULL) {
-            return NULL;
+            return false;
         }
 
         ptr = ReplStr;
@@ -389,22 +401,16 @@ ReplConnInfo* ParseReplConnInfo(const char* ConnInfoList, int* InfoLength)
         if (*ptr == '\0') {
             free(ReplStr);
             ReplStr = NULL;
-            return NULL;
+            return false;
         }
 
         repl_length = GetLengthAndCheckReplConn(ReplStr);
         if (repl_length == 0) {
             free(ReplStr);
             ReplStr = NULL;
-            return NULL;
+            return false;
         }
 
-        repl = (ReplConnInfo*)malloc(sizeof(ReplConnInfo));
-        if (repl == NULL) {
-            free(ReplStr);
-            ReplStr = NULL;
-            return NULL;
-        }
         rc = memset_s(repl, sizeof(ReplConnInfo), 0, sizeof(ReplConnInfo));
         securec_check_c(rc, "", "");
 
@@ -458,20 +464,6 @@ ReplConnInfo* ParseReplConnInfo(const char* ConnInfoList, int* InfoLength)
             }
             tmp_localport = atoi(iter);
 
-            /* localservice */
-            iter = strstr(token, "localservice");
-            if (iter != NULL) {
-                iter += strlen("localservice");
-                ;
-                while (*iter == ' ' || *iter == '=') {
-                    iter++;
-                }
-
-                if (isdigit(*iter)) {
-                    tmp_localservice = atoi(iter);
-                }
-            }
-
             /* remotehost */
             iter = strstr(token, "remotehost");
             if (iter == NULL) {
@@ -513,16 +505,31 @@ ReplConnInfo* ParseReplConnInfo(const char* ConnInfoList, int* InfoLength)
             }
             tmp_remoteport = atoi(iter);
 
-            /* remoteservice */
-            iter = strstr(token, "remoteservice");
-            if (NULL != iter) {
-                iter += strlen("remoteservice");
+            /* is cascade? */
+            iter = strstr(token, "iscascade");
+            if (iter != NULL) {
+                iter += cascadeLen;
                 while (*iter == ' ' || *iter == '=') {
                     iter++;
                 }
+                rc = strncpy_s(cascadeToken, IP_LEN, iter, strlen("true"));
+                securec_check_c(rc, "", "");
+                if (strcmp(cascadeToken, "true") == 0) {
+                    repl->isCascade = true;
+                }
+            }
 
-                if (isdigit(*iter)) {
-                    tmp_remoteservice = atoi(iter);
+            /* is cross region? */
+            iter = strstr(token, "iscrossregion");
+            if (iter != NULL) {
+                iter += corssRegionLen;
+                while (*iter == ' ' || *iter == '=') {
+                    iter++;
+                }
+                rc = strncpy_s(crossRegionToken, IP_LEN, iter, strlen("true"));
+                securec_check_c(rc, "", "");
+                if (strcmp(crossRegionToken, "true") == 0) {
+                    repl->isCrossRegion = true;
                 }
             }
 
@@ -532,14 +539,12 @@ ReplConnInfo* ParseReplConnInfo(const char* ConnInfoList, int* InfoLength)
 
             repl->localhost[IP_LEN - 1] = '\0';
             repl->localport = tmp_localport;
-            repl->localservice = tmp_localservice;
 
             rc = strncpy_s(repl->remotehost, IP_LEN, tmp_remotehost, IP_LEN - 1);
             securec_check_c(rc, "", "");
 
             repl->remotehost[IP_LEN - 1] = '\0';
             repl->remoteport = tmp_remoteport;
-            repl->remoteservice = tmp_remoteservice;
 
             token = strtok_r(NULL, ",", &p);
             parsed++;
@@ -550,7 +555,7 @@ ReplConnInfo* ParseReplConnInfo(const char* ConnInfoList, int* InfoLength)
     ReplStr = NULL;
     *InfoLength = repl_length;
 
-    return repl;
+    return true;
 }
 
 /*
@@ -561,6 +566,7 @@ ReplConnInfo* ParseReplConnInfo(const char* ConnInfoList, int* InfoLength)
 void get_conninfo(const char* filename)
 {
     char** optlines;
+    const char **conninfo_para = NULL;
     int lines_index = 0;
     int optvalue_off;
     int optvalue_len;
@@ -572,6 +578,19 @@ void get_conninfo(const char* filename)
         exit(1);
     }
 
+    if (build_mode == CROSS_CLUSTER_FULL_BUILD || build_mode == CROSS_CLUSTER_INC_BUILD ||
+        build_mode == CROSS_CLUSTER_STANDBY_FULL_BUILD) {
+        /* For shared storage cluster */
+        conninfo_para = config_para_cross_cluster_build;
+    } else {
+        conninfo_para = config_para_build;
+    }
+
+    /* cleaning global conninfo list */
+    for (int i = 0; i < MAX_REPLNODE_NUM; i++) {
+        rc = memset_s(conninfo_global[i], MAX_VALUE_LEN, 0, MAX_VALUE_LEN);
+        securec_check_ss_c(rc, "", "");
+    }
     /**********************************************************
     Try to read the config file
     ************************************************************/
@@ -590,7 +609,7 @@ void get_conninfo(const char* filename)
             /* read repconninfo[...] */
             for (i = 1; i < MAX_REPLNODE_NUM; i++) {
                 lines_index = find_gucoption((const char**)optlines,
-                    (const char*)config_para_build[i],
+                    (const char*)conninfo_para[i],
                     NULL,
                     NULL,
                     &optvalue_off,
@@ -803,7 +822,13 @@ static PGconn* check_and_get_primary_conn(const char* repl_conninfo, uint32 term
 
     /* 1. Connect server */
     conn_get = PQconnectdb(repl_conninfo);
-    if ((conn_get == NULL) || PQstatus(conn_get) != CONNECTION_OK) {
+    if (conn_get == NULL) {
+        pg_log(PG_WARNING, _("build connection failed cause get connection is null.\n"));
+        disconnect_and_return_null(conn_get);
+    }
+    if (PQstatus(conn_get) != CONNECTION_OK) {
+        pg_log(PG_WARNING, _("build connection to %s failed cause %s.\n"),
+            (conn_get->pghost != NULL) ? conn_get->pghost : conn_get->pghostaddr, PQerrorMessage(conn_get));
         disconnect_and_return_null(conn_get);
     }
 
@@ -813,9 +838,11 @@ static PGconn* check_and_get_primary_conn(const char* repl_conninfo, uint32 term
     }
 
     /* 3. IDENTIFY_MODE */
-    remote_mode = get_remote_mode(conn_get);
-    if (remote_mode != NORMAL_MODE && remote_mode != PRIMARY_MODE) {
-        disconnect_and_return_null(conn_get);
+    if (!need_copy_upgrade_file) {
+        remote_mode = get_remote_mode(conn_get);
+        if (remote_mode != NORMAL_MODE && remote_mode != PRIMARY_MODE) {
+            disconnect_and_return_null(conn_get);
+        }
     }
 
     /* here we get the right primary connect */
@@ -830,10 +857,92 @@ PGconn* check_and_conn(int conn_timeout, int recv_timeout, uint32 term)
     int repl_arr_length;
     int i = 0;
     int parse_failed_num = 0;
+    ReplConnInfo repl_conn_info;
 
     for (i = 1; i < MAX_REPLNODE_NUM; i++) {
-        ReplConnInfo* repl_conn_info = ParseReplConnInfo(conninfo_global[i - 1], &repl_arr_length);
-        if (repl_conn_info == NULL) {
+        bool parseOk = ParseReplConnInfo(conninfo_global[i - 1], &repl_arr_length, &repl_conn_info);
+        if (!parseOk) {
+            parse_failed_num++;
+            continue;
+        }
+
+        tnRet = memset_s(repl_conninfo_str, MAXPGPATH, 0, MAXPGPATH);
+        securec_check_ss_c(tnRet, "", "");
+        is_cross_region_build = false;
+        if (register_username != NULL && register_password != NULL) {
+            if (*register_username == '.') {
+                    register_username += 2;
+            }
+            tnRet = snprintf_s(repl_conninfo_str,
+                sizeof(repl_conninfo_str),
+                sizeof(repl_conninfo_str) - 1,
+                "localhost=%s localport=%d host=%s port=%d "
+                "dbname=postgres replication=hadr_main_standby "
+                "fallback_application_name=gs_ctl "
+                "connect_timeout=%d rw_timeout=%d "
+                "options='-c remotetype=application' user=%s password=%s",
+                repl_conn_info.localhost,
+                repl_conn_info.localport,
+                repl_conn_info.remotehost,
+                repl_conn_info.remoteport,
+                conn_timeout,
+                recv_timeout, register_username, register_password);
+            is_cross_region_build = true;
+        } else {
+            tnRet = snprintf_s(repl_conninfo_str,
+                sizeof(repl_conninfo_str),
+                sizeof(repl_conninfo_str) - 1,
+                "localhost=%s localport=%d host=%s port=%d "
+                "dbname=replication replication=true "
+                "fallback_application_name=gs_ctl "
+                "connect_timeout=%d rw_timeout=%d "
+                "options='-c remotetype=application'",
+                repl_conn_info.localhost,
+                repl_conn_info.localport,
+                repl_conn_info.remotehost,
+                repl_conn_info.remoteport,
+                conn_timeout,
+                recv_timeout);
+        }
+        securec_check_ss_c(tnRet, "", "");
+        con_get = check_and_get_primary_conn(repl_conninfo_str, term);
+        tnRet = memset_s(repl_conninfo_str, MAXPGPATH, 0, MAXPGPATH);
+        securec_check_ss_c(tnRet, "", "");
+        if (con_get != NULL) {
+            pg_log(PG_WARNING, "build try host(%s) port(%d) success\n", repl_conn_info.remotehost,
+                repl_conn_info.remoteport);
+            break;
+        }
+        pg_log(PG_WARNING, "build try host(%s) port(%d) failed\n", repl_conn_info.remotehost,
+            repl_conn_info.remoteport);
+    }
+
+    if (parse_failed_num == MAX_REPLNODE_NUM - 1) {
+        pg_log(PG_WARNING, " invalid value for parameter \"replconninfo\" in postgresql.conf.\n");
+        if (con_get != NULL)
+            PQfinish(con_get);
+
+        return NULL;
+    }
+
+    return con_get;
+}
+
+/* check connection for standby build standby */
+PGconn* check_and_conn_for_standby(int conn_timeout, int recv_timeout, uint32 term)
+{
+    PGconn* con_get = NULL;
+    char repl_conninfo_str[MAXPGPATH];
+    ServerMode remote_mode = UNKNOWN_MODE;
+    int tnRet = 0;
+    int repl_arr_length;
+    int i = 0;
+    int parse_failed_num = 0;
+    ReplConnInfo repl_conn_info;
+
+    for (i = 1; i < MAX_REPLNODE_NUM; i++) {
+        bool parseOk = ParseReplConnInfo(conninfo_global[i - 1], &repl_arr_length, &repl_conn_info);
+        if (!parseOk || repl_conn_info.isCrossRegion) {
             parse_failed_num++;
             continue;
         }
@@ -849,26 +958,44 @@ PGconn* check_and_conn(int conn_timeout, int recv_timeout, uint32 term)
             "fallback_application_name=gs_ctl "
             "connect_timeout=%d rw_timeout=%d "
             "options='-c remotetype=application'",
-            repl_conn_info->localhost,
-            repl_conn_info->localport,
-            repl_conn_info->remotehost,
-            repl_conn_info->remoteport,
+            repl_conn_info.localhost,
+            repl_conn_info.localport,
+            repl_conn_info.remotehost,
+            repl_conn_info.remoteport,
             conn_timeout,
             recv_timeout);
         securec_check_ss_c(tnRet, "", "");
 
-        free(repl_conn_info);
-        repl_conn_info = NULL;
-        con_get = check_and_get_primary_conn(repl_conninfo_str, term);
-        if (con_get != NULL)
-            break;
+
+        con_get = PQconnectdb(repl_conninfo_str);
+        if (con_get != NULL && PQstatus(con_get) == CONNECTION_OK && check_remote_version(con_get, term)) {
+            remote_mode = get_remote_mode(con_get);
+            if ((remote_mode == STANDBY_MODE || remote_mode == MAIN_STANDBY_MODE) &&
+                (g_replconn_idx == -1 || i == g_replconn_idx)) {
+                g_replconn_idx = i;
+                pg_log(PG_WARNING, "standby build try host(%s) port(%d) success\n", repl_conn_info.remotehost,
+                    repl_conn_info.remoteport);
+                break;
+            }
+        } else {
+            if (con_get != NULL) {
+                PQfinish(con_get);
+                con_get = NULL;
+            }
+            if (conn_str != NULL) {
+                pg_log(PG_WARNING, "The given address can not been access.\n");
+                exit(1);
+            }
+        }
+        pg_log(PG_WARNING, "standby build try host(%s) port(%d) failed\n", repl_conn_info.remotehost,
+            repl_conn_info.remoteport);
     }
 
     if (parse_failed_num == MAX_REPLNODE_NUM - 1) {
-        pg_log(PG_WARNING, " invalid value for parameter \"replconninfo\" in postgresql.conf.\n");
-        if (con_get != NULL)
+        pg_log(PG_WARNING, "Invalid value for parameter \"replconninfo\" in postgresql.conf or no correct standby.\n");
+        if (con_get != NULL) {
             PQfinish(con_get);
-
+        }
         exit(1);
     }
 
@@ -936,6 +1063,247 @@ int find_gucoption(
     }
 
     return INVALID_LINES_IDX;
+}
+
+/*
+ * Get paxos value of key from postgres.conf.
+ * Value is a char array whose length is MAXPGPATH.
+ */
+static bool GetDCFKeyValue(const char *filename, const char *key, char *value)
+{
+    char **optlines;
+    int optvalue_off;
+    int optvalue_len;
+    int line_index = 0;
+    int opt_index = 0;
+
+    if (filename == nullptr || key == nullptr || value == nullptr) {
+        return false;
+    }
+
+    if ((optlines = readfile(filename)) == nullptr) {
+        return false;
+    }
+
+    line_index = find_gucoption((const char**)optlines,
+        key, nullptr, nullptr, &optvalue_off, &optvalue_len);
+    if (INVALID_LINES_IDX == line_index) {
+        return false;
+    }
+    int len = strlen(optlines[line_index] + optvalue_off);
+    const int minLen = 2; /* There is at least a '\n' and a character in the value. */
+    if (len < minLen) {
+        return false;
+    }
+    errno_t rc = strcpy_s(value, MAXPGPATH, optlines[line_index] + optvalue_off);
+    securec_check_c(rc, "\0", "\0");
+    value[len - 1] = '\0'; /* Remove '\n'. */
+    pg_log(PG_WARNING, _("DCF path is %s\n"), value);
+    while (optlines[opt_index] != nullptr) {
+        free(optlines[opt_index]);
+        optlines[opt_index] = nullptr;
+        opt_index++;
+    }
+
+    free(optlines);
+    optlines = nullptr;
+    /* Remove single quote from value */
+    if (value != nullptr && value[0] == '\'') {
+        int i = 0;
+        int len = strlen(value);
+        while (i < len) {
+            value[i] = value[i + 1];
+            i++;
+        }
+        const int singleToEnd = 2;
+        int endSingleQIdx = len - singleToEnd;
+        if (endSingleQIdx >= 0 && value[endSingleQIdx] == '\'') {
+            value[endSingleQIdx] = '\0';
+        }
+    }
+    pg_log(PG_WARNING, _("Final DCF path is %s\n"), value);
+    return true;
+}
+
+static void DeleteSubDataDir(const char* dirname)
+{
+    DIR* dir = NULL;
+    char fullpath[MAXPGPATH] = {0};
+    struct dirent* de = NULL;
+    struct stat st;
+    errno_t rc = 0;
+    int nRet = 0;
+    /* data dir */
+    /* Delete dcf data path first for it maybe not under data dir */
+    char pgConfFile[MAXPGPATH] = {0};
+    nRet = snprintf_s(pgConfFile, MAXPGPATH, MAXPGPATH - 1, "%s/postgresql.conf", dirname);
+    securec_check_ss_c(nRet, "", "");
+    bool enableDCF = GetPaxosValue(pgConfFile);
+    char dcfLogPath[MAXPGPATH] = {0};
+    bool hasLogPath = false;
+    if (enableDCF) {
+        char dcfDataPath[MAXPGPATH] = {0};
+        bool hasDataPath = GetDCFKeyValue(pgConfFile, "dcf_data_path", dcfDataPath);
+        if (hasDataPath) {
+            /* Don't remove the dcf data path if it didn't exist. */
+            if (lstat(dcfDataPath, &st) != 0) {
+                pg_log(PG_WARNING, _("could not stat file or directory %s.\n"), dcfDataPath);
+            } else {
+                if (!rmtree(dcfDataPath, true)) {
+                    pg_log(PG_WARNING, _("failed to remove dcf data dir %s.\n"), dcfDataPath);
+                    exit(1);
+                }
+                pg_log(PG_WARNING, _("Remove dcf data dir %s.\n"), dcfDataPath);
+            }
+        }
+        hasLogPath = GetDCFKeyValue(pgConfFile, "dcf_log_path", dcfLogPath);
+    }
+
+    if ((dir = opendir(dirname)) != NULL) {
+        while ((de = gs_readdir(dir)) != NULL) {
+            /* Skip special stuff */
+            if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
+                continue;
+            if (strcmp(de->d_name, "pg_log") == 0 || strcmp(de->d_name, "pg_location") == 0)
+                continue;
+            if (strcmp(de->d_name, "full_upgrade_bak") == 0)
+                continue;
+            if (strcmp(de->d_name, "pg_xlog") == 0)
+                continue;
+            if (g_is_obsmode && (strcmp(de->d_name, "pg_replslot") == 0))
+                continue;
+            rc = memset_s(fullpath, MAXPGPATH, 0, MAXPGPATH);
+            securec_check_c(rc, "", "");
+            /* others */
+            nRet = snprintf_s(fullpath, MAXPGPATH, sizeof(fullpath) - 1, "%s/%s", dirname, de->d_name);
+            securec_check_ss_c(nRet, "", "");
+
+            if (lstat(fullpath, &st) != 0) {
+                pg_log(PG_WARNING, _("could not stat file or directory %s.\n"), fullpath);
+                continue;
+            }
+            /* Don't delete dcf log path */
+            if (enableDCF && hasLogPath) {
+                char comparedFullPath[MAXPGPATH] = {0};
+                char comparedLogPath[MAXPGPATH] = {0};
+                nRet = snprintf_s(comparedFullPath, MAXPGPATH, MAXPGPATH - 1, "%s/", fullpath);
+                securec_check_ss_c(nRet, "", "");
+                nRet = snprintf_s(comparedLogPath, MAXPGPATH, MAXPGPATH - 1, "%s/", dcfLogPath);
+                securec_check_ss_c(nRet, "", "");
+                int comparedFullPathLen = strlen(comparedFullPath);
+                if (strncmp(comparedFullPath, comparedLogPath, comparedFullPathLen) == 0) {
+                    hasLogPath = false;
+                    pg_log(PG_WARNING, _("Skip dcf log path %s.\n"), dcfLogPath);
+                    continue;
+                }
+            }
+
+#ifndef WIN32
+            if (S_ISLNK(st.st_mode))
+#else
+            if (pgwin32_is_junction(fullpath))
+#endif
+            {
+#if defined(HAVE_READLINK) || defined(WIN32)
+                char linkpath[MAXPGPATH] = {0};
+                int rllen;
+
+                rllen = readlink(fullpath, linkpath, sizeof(linkpath));
+                if (rllen < 0) {
+                    pg_log(PG_WARNING, _("could not read symbolic link.\n"));
+                    continue;
+                }
+                if (rllen >= (int)sizeof(linkpath)) {
+                    pg_log(PG_WARNING, _("symbolic link target is too long.\n"));
+                    continue;
+                }
+                linkpath[MAXPGPATH - 1] = '\0';
+
+                /* delete linktarget */
+                if (!rmtree(linkpath, true)) {
+                    pg_log(PG_WARNING, _("failed to remove dir %s.\n"), linkpath);
+                    (void)closedir(dir);
+                    exit(1);
+                }
+
+                /* delete link */
+                (void)unlink(fullpath);
+#else
+                /*
+                 * If the platform does not have symbolic links, it should not be
+                 * possible to have tablespaces - clearly somebody else created
+                 * them. Warn about it and ignore.
+                 */
+                pg_log(PG_WARNING, _("symbolic links are not supported on this platform.\n"));
+                (void)closedir(dir);
+                exit(1);
+#endif /* HAVE_READLINK */
+            } else if (S_ISDIR(st.st_mode)) {
+                if (strcmp(de->d_name, "pg_replslot") == 0) {
+                    /* remove physical slot and remain logic slot */
+                    DIR* dir_slot = NULL;
+                    struct dirent* de_slot = NULL;
+                    if ((dir_slot = opendir(fullpath)) != NULL) {
+                        while ((de_slot = gs_readdir(dir_slot)) != NULL) {
+                            /* Skip special stuff */
+                            if (strncmp(de_slot->d_name, ".", 1) == 0 || strncmp(de_slot->d_name, "..", 2) == 0)
+                                continue;
+
+                            /* others */
+                            nRet = snprintf_s(fullpath,
+                                MAXPGPATH,
+                                sizeof(fullpath) - 1,
+                                "%s/%s/%s",
+                                dirname,
+                                "pg_replslot",
+                                de_slot->d_name);
+                            securec_check_ss_c(nRet, "", "");
+                            if (!rmtree(fullpath, true)) {
+                                pg_log(PG_WARNING, _("failed to remove dir %s,errno=%d.\n"), fullpath, errno);
+                                (void)closedir(dir);
+                                exit(1);
+                            }
+                        }
+                        (void)closedir(dir_slot);
+                    }
+                } else if (!rmtree(fullpath, true)) {
+                    pg_log(PG_WARNING, _("failed to remove dir %s, errno=%d.\n"), fullpath, errno);
+                    (void)closedir(dir);
+                    exit(1);
+                }
+            } else if (S_ISREG(st.st_mode)) {
+                if (strcmp(de->d_name, "postgresql.conf") == 0 || strcmp(de->d_name, "pg_ctl.lock") == 0 ||
+                    strcmp(de->d_name, "postgresql.conf.lock") == 0 || strcmp(de->d_name, "postgresql.conf.bak.old") == 0 ||
+                    strcmp(de->d_name, "build_completed.start") == 0 || strcmp(de->d_name, "gs_build.pid") == 0 ||
+                    strcmp(de->d_name, "postmaster.opts") == 0 || strcmp(de->d_name, "gaussdb.state") == 0 ||
+                    strcmp(de->d_name, "disc_readonly_test") == 0 || strcmp(de->d_name, ssl_cert_file) == 0 ||
+                    strcmp(de->d_name, ssl_key_file) == 0 || strcmp(de->d_name, ssl_ca_file) == 0 ||
+                    strcmp(de->d_name, ssl_crl_file) == 0 || strcmp(de->d_name, ssl_cipher_file) == 0 ||
+                    strcmp(de->d_name, ssl_rand_file) == 0 || strcmp(de->d_name, "rewind_lable") == 0 ||
+                    strcmp(de->d_name, "gs_gazelle.conf") == 0 ||
+                    (g_is_obsmode && strcmp(de->d_name, "base.tar.gz") == 0) ||
+                    (g_is_obsmode && strcmp(de->d_name, "pg_hba.conf") == 0)||
+                    (g_is_obsmode && strcmp(de->d_name, "pg_ident.conf") == 0) ||
+                    (IS_CROSS_CLUSTER_BUILD && strcmp(de->d_name, "pg_hba.conf") == 0) ||
+                    strcmp(de->d_name, "pg_hba.conf.old") == 0)
+                    continue;
+                /* Skip paxos index files for building process will write them */
+                if (enableDCF && ((strcmp(de->d_name, "paxosindex") == 0) ||
+                    (strcmp(de->d_name, "paxosindex.backup") == 0)))
+                    continue;
+                /* build from cn reserve this file,om will modify it. */
+                if ((conn_str != NULL) && strncmp(de->d_name, "pg_hba.conf", strlen("pg_hba.conf")) == 0) {
+                    continue;
+                }
+                if (unlink(fullpath)) {
+                    pg_log(PG_WARNING, _("failed to remove file %s.\n"), fullpath);
+                    (void)closedir(dir);
+                    exit(1);
+                }
+            }
+        }
+        (void)closedir(dir);
+    }
 }
 
 /*
@@ -1089,124 +1457,7 @@ void delete_datadir(const char* dirname)
         }
     }
 
-    /* data dir */
-    if ((dir = opendir(dirname)) != NULL) {
-        while ((de = gs_readdir(dir)) != NULL) {
-            /* Skip special stuff */
-            if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
-                continue;
-            if (strcmp(de->d_name, "pg_log") == 0 || strcmp(de->d_name, "pg_location") == 0)
-                continue;
-            if (strcmp(de->d_name, "full_upgrade_bak") == 0)
-                continue;
-            if (strcmp(de->d_name, "pg_xlog") == 0)
-                continue;
-            rc = memset_s(fullpath, MAXPGPATH, 0, MAXPGPATH);
-            securec_check_c(rc, "", "");
-            /* others */
-            nRet = snprintf_s(fullpath, MAXPGPATH, sizeof(fullpath) - 1, "%s/%s", dirname, de->d_name);
-            securec_check_ss_c(nRet, "", "");
-
-            if (lstat(fullpath, &st) != 0) {
-                pg_log(PG_WARNING, _("could not stat file or directory %s.\n"), fullpath);
-                continue;
-            }
-
-#ifndef WIN32
-            if (S_ISLNK(st.st_mode))
-#else
-            if (pgwin32_is_junction(fullpath))
-#endif
-            {
-#if defined(HAVE_READLINK) || defined(WIN32)
-                char linkpath[MAXPGPATH] = {0};
-                int rllen;
-
-                rllen = readlink(fullpath, linkpath, sizeof(linkpath));
-                if (rllen < 0) {
-                    pg_log(PG_WARNING, _("could not read symbolic link.\n"));
-                    continue;
-                }
-                if (rllen >= (int)sizeof(linkpath)) {
-                    pg_log(PG_WARNING, _("symbolic link target is too long.\n"));
-                    continue;
-                }
-                linkpath[MAXPGPATH - 1] = '\0';
-
-                /* delete linktarget */
-                if (!rmtree(linkpath, true)) {
-                    pg_log(PG_WARNING, _("failed to remove dir %s.\n"), linkpath);
-                    (void)closedir(dir);
-                    exit(1);
-                }
-
-                /* delete link */
-                (void)unlink(fullpath);
-#else
-                /*
-                 * If the platform does not have symbolic links, it should not be
-                 * possible to have tablespaces - clearly somebody else created
-                 * them. Warn about it and ignore.
-                 */
-                pg_log(PG_WARNING, _("symbolic links are not supported on this platform.\n"));
-                (void)closedir(dir);
-                exit(1);
-#endif /* HAVE_READLINK */
-            } else if (S_ISDIR(st.st_mode)) {
-                if (strcmp(de->d_name, "pg_replslot") == 0) {
-                    /* remove physical slot and remain logic slot */
-                    DIR* dir_slot = NULL;
-                    struct dirent* de_slot = NULL;
-                    if ((dir_slot = opendir(fullpath)) != NULL) {
-                        while ((de_slot = gs_readdir(dir_slot)) != NULL) {
-                            /* Skip special stuff */
-                            if (strncmp(de_slot->d_name, ".", 1) == 0 || strncmp(de_slot->d_name, "..", 2) == 0)
-                                continue;
-
-                            /* others */
-                            nRet = snprintf_s(fullpath,
-                                MAXPGPATH,
-                                sizeof(fullpath) - 1,
-                                "%s/%s/%s",
-                                dirname,
-                                "pg_replslot",
-                                de_slot->d_name);
-                            securec_check_ss_c(nRet, "", "");
-                            if (!rmtree(fullpath, true)) {
-                                pg_log(PG_WARNING, _("failed to remove dir %s,errno=%d.\n"), fullpath, errno);
-                                (void)closedir(dir);
-                                exit(1);
-                            }
-                        }
-                        (void)closedir(dir_slot);
-                    }
-                } else if (!rmtree(fullpath, true)) {
-                    pg_log(PG_WARNING, _("failed to remove dir %s, errno=%d.\n"), fullpath, errno);
-                    (void)closedir(dir);
-                    exit(1);
-                }
-            } else if (S_ISREG(st.st_mode)) {
-                if (strcmp(de->d_name, "postgresql.conf") == 0 || strcmp(de->d_name, "pg_ctl.lock") == 0 ||
-                    strcmp(de->d_name, "postgresql.conf.lock") == 0 || strcmp(de->d_name, "postgresql.conf.bak.old") == 0 ||
-                    strcmp(de->d_name, "build_completed.start") == 0 || strcmp(de->d_name, "gs_build.pid") == 0 ||
-                    strcmp(de->d_name, "postmaster.opts") == 0 || strcmp(de->d_name, "gaussdb.state") == 0 ||
-                    strcmp(de->d_name, "disc_readonly_test") == 0 || strcmp(de->d_name, ssl_cert_file) == 0 ||
-                    strcmp(de->d_name, ssl_key_file) == 0 || strcmp(de->d_name, ssl_ca_file) == 0 ||
-                    strcmp(de->d_name, ssl_crl_file) == 0 || strcmp(de->d_name, ssl_cipher_file) == 0 ||
-                    strcmp(de->d_name, ssl_rand_file) == 0 || strcmp(de->d_name, "rewind_lable") == 0)
-                    continue;
-                /* build from cn reserve this file,om will modify it */
-                if ((conn_str != NULL) && 0 == strncmp(de->d_name, "pg_hba.conf", strlen("pg_hba.conf")))
-                    continue;
-                if (unlink(fullpath)) {
-                    pg_log(PG_WARNING, _("failed to remove file %s.\n"), fullpath);
-                    (void)closedir(dir);
-                    exit(1);
-                }
-            }
-        }
-        (void)closedir(dir);
-    }
+    DeleteSubDataDir(dirname);
 }
 
 /*
@@ -1230,9 +1481,15 @@ int get_replconn_number(const char* filename)
         int optvalue_len = 0;
         int lines_index = 0;
         int i;
-        for (i = 1; i < MAX_REPLNODE_NUM; i++) {
+        for (i = 1; i < DOUBLE_MAX_REPLNODE_NUM; i++) {
+            const char *para = NULL;
+            if (i > MAX_REPLNODE_NUM) {
+                para = config_para_cross_cluster_build[i - MAX_REPLNODE_NUM];
+            } else if (i < MAX_REPLNODE_NUM) {
+                para = config_para_build[i];
+            }
             lines_index = find_gucoption(
-                (const char**)optlines, (const char*)config_para_build[i], NULL, NULL, &optvalue_off, &optvalue_len);
+                (const char**)optlines, (const char*)para, NULL, NULL, &optvalue_off, &optvalue_len);
 
             if (lines_index != INVALID_LINES_IDX) {
                 repl_num++;
@@ -1255,150 +1512,6 @@ int get_replconn_number(const char* filename)
     return repl_num;
 }
 
-/*
- * Brief            : @@GaussDB@@
- * Description    : to connect the server,and return conn if success
- * Notes            :
- */
-static PGconn* get_conn(const char* repl_conninfo)
-{
-    PGconn* conn_get = NULL;
-    PGresult* res = NULL;
-    int primary_sversion = 0;
-    int standby_sversion = 0;
-    char* primary_pversion = NULL;
-    char* standby_pversion = NULL;
-    ServerMode primary_mode;
-
-    /*  to connect server */
-    conn_get = PQconnectdb(repl_conninfo);
-    if ((!conn_get) || (PQstatus(conn_get) != CONNECTION_OK)) {
-        disconnect_and_return_null(conn_get);
-    }
-
-    /* IDENTIFY_VERSION */
-    res = PQexec(conn_get, "IDENTIFY_VERSION");
-    if (PQresultStatus(res) != PGRES_TUPLES_OK) {
-        PQclear(res);
-        disconnect_and_return_null(conn_get);
-    }
-    if (PQnfields(res) != 3 || PQntuples(res) != 1) {
-        PQclear(res);
-        disconnect_and_return_null(conn_get);
-    }
-    primary_sversion = pg_atoi((const char*)PQgetvalue(res, 0, 0), 4, 0);
-    standby_sversion = PG_VERSION_NUM;
-    primary_pversion = PQgetvalue(res, 0, 1);
-    standby_pversion = strdup(PG_PROTOCOL_VERSION);
-    if (standby_pversion == NULL) {
-        PQclear(res);
-        disconnect_and_return_null(conn_get);
-    }
-
-    if (primary_sversion != standby_sversion ||
-        strncmp(primary_pversion, standby_pversion, strlen(PG_PROTOCOL_VERSION)) != 0) {
-        PQclear(res);
-
-        if (primary_sversion != standby_sversion) {
-            pg_log(PG_PRINT,
-                "%s: database system version is different between the primary and standby "
-                "The primary's system version is %d, the standby's system version is %d.\n",
-                progname,
-                primary_sversion,
-                standby_sversion);
-            free(standby_pversion);
-            standby_pversion = NULL;
-            disconnect_and_return_null(conn_get);
-        } else {
-            pg_log(PG_PRINT,
-                "%s: the primary protocal version %s is not the same as the standby protocal version %s.\n",
-                progname,
-                primary_pversion,
-                standby_pversion);
-            free(standby_pversion);
-            standby_pversion = NULL;
-            disconnect_and_return_null(conn_get);
-        }
-    }
-    PQclear(res);
-
-    /* free immediately once not used. Can't be NULL. */
-    free(standby_pversion);
-    standby_pversion = NULL;
-    /* IDENTIFY_MODE */
-    res = PQexec(conn_get, "IDENTIFY_MODE");
-    if (PQresultStatus(res) != PGRES_TUPLES_OK) {
-        PQclear(res);
-        disconnect_and_return_null(conn_get);
-    }
-    if (PQnfields(res) != 1 || PQntuples(res) != 1) {
-        PQclear(res);
-        disconnect_and_return_null(conn_get);
-    }
-    primary_mode = (ServerMode)pg_atoi((const char*)PQgetvalue(res, 0, 0), 4, 0);
-    if (!((primary_mode == PRIMARY_MODE && cascade_standby == false) ||
-            (primary_mode == STANDBY_MODE && cascade_standby == true) || (primary_mode == NORMAL_MODE))) {
-        PQclear(res);
-        disconnect_and_return_null(conn_get);
-    }
-    PQclear(res);
-    return conn_get;
-}
-
-bool check_conn(int conn_timeout, int recv_timeout)
-{
-
-    ReplConnInfo* repl_conn_info = NULL;
-
-    PGconn* con_get = NULL;
-    char repl_conninfo[MAXPGPATH];
-    int repl_array_length = 0;
-    int i = 0;
-    bool ret = false;
-
-    /* parse conninfo */
-    repl_conn_info = ParseReplConnInfo(conninfo_global[0], &repl_array_length);
-    if (repl_conn_info == NULL) {
-        pg_log(PG_PRINT, "%s: invalid value for parameter \"replconninfo1\" in postgresql.conf.\n", progname);
-        return ret;
-    }
-
-    /* check if we can get the connection. */
-    for (i = 0; i < repl_array_length; i++) {
-        if (repl_conn_info != NULL) {
-            int nRet = snprintf_s(repl_conninfo,
-                sizeof(repl_conninfo),
-                sizeof(repl_conninfo) - 1,
-                "localhost=%s localport=%d host=%s port=%d "
-                "dbname=replication replication=true "
-                "fallback_application_name=gs_ctl "
-                "connect_timeout=%d rw_timeout=%d ",
-                repl_conn_info[i].localhost,
-                repl_conn_info[i].localport,
-                repl_conn_info[i].remotehost,
-                repl_conn_info[i].remoteport,
-                conn_timeout,
-                recv_timeout);
-            securec_check_ss_c(nRet, "", "");
-
-            con_get = get_conn(repl_conninfo);
-            if (con_get != NULL) {
-                PQfinish(con_get);
-                con_get = NULL;
-                ret = true;
-                break;
-            }
-        }
-    }
-
-    if (repl_conn_info != NULL) {
-        free(repl_conn_info);
-        repl_conn_info = NULL;
-    }
-
-    return ret;
-}
-
 void get_slot_name(char* slotname, size_t len)
 {
     int errorno = memset_s(slotname, len, 0, len);
@@ -1415,19 +1528,17 @@ void get_slot_name(char* slotname, size_t len)
                 slotname, len, len - 1, "%s", pgxcnodename);
                 securec_check_ss_c(errorno, "", "");
         } else if(g_replconn_idx != -1) {
-            ReplConnInfo* repl_conn_info = NULL;
+            ReplConnInfo repl_conn_info;
             int repl_arr_length = 0;
-            repl_conn_info = ParseReplConnInfo(conninfo_global[g_replconn_idx], &repl_arr_length);
-            if (repl_conn_info != NULL) {
-                errorno = snprintf_s(slotname, len, len - 1, "%s_%s_%d", pgxcnodename, repl_conn_info->localhost, 
-                    repl_conn_info->localport);
+            bool parseOk = ParseReplConnInfo(conninfo_global[g_replconn_idx], &repl_arr_length, &repl_conn_info);
+            if (parseOk) {
+                errorno = snprintf_s(slotname, len, len - 1, "%s_%s_%d", pgxcnodename, repl_conn_info.localhost, 
+                    repl_conn_info.localport);
                 securec_check_ss_c(errorno, "", "");
-                free(repl_conn_info);
-                repl_conn_info = NULL;
             }
         }
     }
-    return;
+
 }
 
 /*
@@ -1452,6 +1563,44 @@ bool libpqRotateCbmFile(PGconn* connObj, XLogRecPtr lsn)
     }
     PQclear(res);
     return ec;
+}
+
+/* Get whether paxos is enable from postgres.conf */
+bool GetPaxosValue(const char *filename)
+{
+    char **optlines;
+    int optvalue_off;
+    int optvalue_len;
+    const char *paxosPara = "enable_dcf";
+    int line_index = 0;
+    bool ret = false;
+    int opt_index = 0;
+
+    if (filename == nullptr) {
+        return false;
+    }
+
+    if ((optlines = readfile(filename)) != nullptr) {
+        line_index = find_gucoption((const char**)optlines, 
+                                    paxosPara, nullptr, nullptr, &optvalue_off, &optvalue_len);
+        if (INVALID_LINES_IDX != line_index) {
+            if (strcmp("true\n", optlines[line_index] + optvalue_off) == 0 ||
+                strcmp("on\n", optlines[line_index] + optvalue_off) == 0 ||
+                strcmp("\'on\'\n", optlines[line_index] + optvalue_off) == 0)
+                ret = true;
+        }
+        while (optlines[opt_index] != nullptr) {
+            free(optlines[opt_index]);
+            optlines[opt_index] = nullptr;
+            opt_index++;
+        }
+
+        free(optlines);
+        optlines = nullptr;
+        return ret;
+    } else {
+        return false;
+    }
 }
 
 /*
@@ -1628,4 +1777,3 @@ int fsync_fname(const char *fname, bool isdir)
     (void) close(fd);
     return 0;
 }
-

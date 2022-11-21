@@ -43,9 +43,10 @@
 #include "catalog/pg_cast.h"
 #include "catalog/pg_type.h"
 #include "commands/typecmds.h"
-#include "executor/execdebug.h"
-#include "executor/nodeSubplan.h"
-#include "executor/nodeAgg.h"
+#include "executor/exec/execdebug.h"
+#include "executor/node/nodeSubplan.h"
+#include "executor/node/nodeAgg.h"
+#include "executor/node/nodeCtescan.h"
 #include "funcapi.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
@@ -59,6 +60,7 @@
 #include "utils/memutils.h"
 #include "utils/typcache.h"
 #include "utils/xml.h"
+#include "utils/jsonb.h"
 #include "access/hash.h"
 #include "access/transam.h"
 #ifdef PGXC
@@ -70,6 +72,38 @@
 #include "gstrace/executer_gstrace.h"
 #include "commands/trigger.h"
 #include "db4ai/gd.h"
+#include "catalog/pg_proc_fn.h"
+#include "access/tuptoaster.h"
+
+#ifdef GS_GRAPH
+#include "parser/parse_cypher_expr.h"
+#include "utils/numeric.h"
+#endif
+
+#ifdef GS_GRAPH
+typedef struct CypherIndexResult
+{
+	Oid			type;
+	Datum		value;
+	bool		isnull;
+} CypherIndexResult;
+
+#define MarkCypherIndexResultInvalid(cidxres) \
+	do { \
+		(cidxres)->type = InvalidOid; \
+	} while (0)
+
+#define IsCypherIndexResultValid(cidxres) \
+	((cidxres)->type != InvalidOid)
+
+typedef struct CypherAccessPathElem
+{
+	bool		is_slice;
+	CypherIndexResult lidx;
+	CypherIndexResult uidx;
+} CypherAccessPathElem;
+
+#endif
 
 /* static function decls */
 static Datum ExecEvalArrayRef(ArrayRefExprState* astate, ExprContext* econtext, bool* isNull, ExprDoneCond* isDone);
@@ -87,6 +121,7 @@ static Datum ExecEvalWholeRowSlow(
 static Datum ExecEvalConst(ExprState* exprstate, ExprContext* econtext, bool* isNull, ExprDoneCond* isDone);
 static Datum ExecEvalParamExec(ExprState* exprstate, ExprContext* econtext, bool* isNull, ExprDoneCond* isDone);
 static Datum ExecEvalParamExtern(ExprState* exprstate, ExprContext* econtext, bool* isNull, ExprDoneCond* isDone);
+static bool isVectorEngineSupportSetFunc(Oid funcid);
 template <bool vectorized>
 static void init_fcache(
     Oid foid, Oid input_collation, FuncExprState* fcache, MemoryContext fcacheCxt, bool needDescForSets);
@@ -147,8 +182,22 @@ static Datum ExecEvalGroupingFuncExpr(
 static Datum ExecEvalGroupingIdExpr(
     GroupingIdExprState* gstate, ExprContext* econtext, bool* isNull, ExprDoneCond* isDone);
 static bool func_has_refcursor_args(Oid Funcid, FunctionCallInfoData* fcinfo);
+extern struct varlena *heap_tuple_fetch_and_copy(Relation rel, struct varlena *attr, bool needcheck);
+static void check_huge_clob_paramter(FunctionCallInfoData* fcinfo, bool is_have_huge_clob);
 
-extern Datum ExecEvalGradientDescent(GradientDescentExprState* mlstate, ExprContext* econtext, bool* isNull, ExprDoneCond* isDone);
+#ifdef GS_GRAPH
+static Datum ExecEvalCypherMapExpr(CypherMapState* mapstate, ExprContext* econtext, bool* isNull, ExprDoneCond* isDone);
+static Datum ExecEvalCypherAccessExpr(CypherAccessState* state, ExprContext* econtext, bool* isNull, ExprDoneCond* isDone);
+static void initCypherIndex(CypherIndexResult *cidxres, ExprState* idx_state, ExprContext* econtext);
+static JsonbValue *cypher_access_object(JsonbSuperHeader sheader, CypherAccessPathElem *pathelem);
+static JsonbValue *cypher_access_bin_array(JsonbValue *ajv,
+										   CypherAccessPathElem *pathelem);
+static JsonbValue *cypher_access_mem_array(JsonbValue *ajv,
+										   CypherAccessPathElem *pathelem);
+static int cypher_access_range(CypherIndexResult *cidxres, const int nelems,
+							   const int defidx);
+static int cypher_access_index(CypherIndexResult *cidxres, const int nelems);
+#endif
 
 THR_LOCAL PLpgSQL_execstate* plpgsql_estate = NULL;
 
@@ -238,9 +287,9 @@ static Datum ExecEvalArrayRef(ArrayRefExprState* astate, ExprContext* econtext, 
     int j = 0;
     IntArray upper, lower;
     int* lIndex = NULL;
+    Oid typOid = astate->xprstate.resultType;
 
     array_source = (ArrayType*)DatumGetPointer(ExecEvalExpr(astate->refexpr, econtext, isNull, isDone));
-
     /*
      * If refexpr yields NULL, and it's a fetch, then result is NULL. In the
      * assignment case, we'll cons up something below.
@@ -251,6 +300,14 @@ static Datum ExecEvalArrayRef(ArrayRefExprState* astate, ExprContext* econtext, 
         if (!isAssignment)
             return (Datum)NULL;
     }
+    ExecTableOfIndexInfo execTableOfIndexInfo;
+    initExecTableOfIndexInfo(&execTableOfIndexInfo, econtext);
+    ExecEvalParamExternTableOfIndex((Node*)astate->refexpr->expr, &execTableOfIndexInfo);
+    if (u_sess->SPI_cxt.cur_tableof_index != NULL) {
+        u_sess->SPI_cxt.cur_tableof_index->tableOfIndexType = execTableOfIndexInfo.tableOfIndexType;
+        u_sess->SPI_cxt.cur_tableof_index->tableOfIndex = execTableOfIndexInfo.tableOfIndex;
+        u_sess->SPI_cxt.cur_tableof_index->tableOfGetNestLayer = list_length(astate->refupperindexpr);
+    }
 
     foreach (l, astate->refupperindexpr) {
         ExprState* eltstate = (ExprState*)lfirst(l);
@@ -259,8 +316,48 @@ static Datum ExecEvalArrayRef(ArrayRefExprState* astate, ExprContext* econtext, 
             ereport(ERROR,
                 (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
                     errmsg("number of array dimensions (%d) exceeds the maximum allowed (%d)", i + 1, MAXDIM)));
-
-        upper.indx[i++] = DatumGetInt32(ExecEvalExpr(eltstate, econtext, &eisnull, NULL));
+        if (OidIsValid(execTableOfIndexInfo.tableOfIndexType) || execTableOfIndexInfo.isnestedtable) {
+            bool isTran = false;
+            PLpgSQL_execstate* old_estate = plpgsql_estate;
+            Datum exprValue = ExecEvalExpr(eltstate, econtext, &eisnull, NULL);
+            plpgsql_estate = old_estate;
+            if (execTableOfIndexInfo.tableOfIndexType == VARCHAROID && !eisnull && VARATT_IS_1B(exprValue)) {
+                exprValue = transVaratt1BTo4B(exprValue);
+                isTran = true;
+            }
+            TableOfIndexKey key;
+            PLpgSQL_var* node = NULL;
+            key.exprtypeid = execTableOfIndexInfo.tableOfIndexType;
+            key.exprdatum = exprValue;
+            int index = getTableOfIndexByDatumValue(key, execTableOfIndexInfo.tableOfIndex, &node);
+            if (isTran) {
+                pfree(DatumGetPointer(exprValue));
+            }
+            if (execTableOfIndexInfo.isnestedtable) {
+                /* for nested table, we should take inner table's array and skip current indx */
+                if (node == NULL || index == -1) {
+                    eisnull = true;
+                } else {
+                    PLpgSQL_var* var = node;
+                    execTableOfIndexInfo.isnestedtable  = (var->nest_table != NULL);
+                    array_source = (ArrayType*)DatumGetPointer(var->value);
+                    execTableOfIndexInfo.tableOfIndexType = var->datatype->tableOfIndexType;
+                    execTableOfIndexInfo.tableOfIndex = var->tableOfIndex;
+                    eisnull = var->isnull;
+                    if (plpgsql_estate)
+                        plpgsql_estate->curr_nested_table_type = var->datatype->typoid;
+                    continue;
+                }
+            }
+            if (index == -1) {
+                eisnull = true;
+            } else {
+                upper.indx[i++] = index;
+            }
+        } else {
+            upper.indx[i++] = DatumGetInt32(ExecEvalExpr(eltstate, econtext, &eisnull, NULL));
+        }
+        
         /* If any index expr yields NULL, result is NULL or error */
         if (eisnull) {
             if (isAssignment)
@@ -281,7 +378,13 @@ static Datum ExecEvalArrayRef(ArrayRefExprState* astate, ExprContext* econtext, 
                     (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
                         errmsg("number of array dimensions (%d) exceeds the maximum allowed (%d)", j + 1, MAXDIM)));
 
-            lower.indx[j++] = DatumGetInt32(ExecEvalExpr(eltstate, econtext, &eisnull, NULL));
+            if (execTableOfIndexInfo.tableOfIndexType == VARCHAROID || execTableOfIndexInfo.isnestedtable) {
+                ereport(ERROR,
+                        (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+                            errmsg("index by varchar or nested table don't support two subscripts")));
+            } else {
+                lower.indx[j++] = DatumGetInt32(ExecEvalExpr(eltstate, econtext, &eisnull, NULL));
+            }
             /* If any index expr yields NULL, result is NULL or error */
             if (eisnull) {
                 if (isAssignment)
@@ -363,7 +466,7 @@ static Datum ExecEvalArrayRef(ArrayRefExprState* astate, ExprContext* econtext, 
 
         econtext->caseValue_datum = save_datum;
         econtext->caseValue_isNull = save_isNull;
-
+        
         /*
          * For an assignment to a fixed-length array type, both the original
          * array and the value to be assigned into it must be non-NULL, else
@@ -407,17 +510,33 @@ static Datum ExecEvalArrayRef(ArrayRefExprState* astate, ExprContext* econtext, 
                 astate->refelemalign);
         return PointerGetDatum(resultArray);
     }
+    /* for nested table, if get inner table's elem, need cover elem type */
+    if (list_length(astate->refupperindexpr) > i && i > 0 && plpgsql_estate) {
+        if (plpgsql_estate->curr_nested_table_type != typOid) {
+            plpgsql_estate->curr_nested_table_type = ARR_ELEMTYPE(array_source);
+            get_typlenbyvalalign(plpgsql_estate->curr_nested_table_type,
+                                &astate->refelemlength,
+                                &astate->refelembyval,
+                                &astate->refelemalign);
+        }
+    }
 
-    if (lIndex == NULL)
-        return array_ref(array_source,
-            i,
-            upper.indx,
-            astate->refattrlength,
-            astate->refelemlength,
-            astate->refelembyval,
-            astate->refelemalign,
-            isNull);
-    else {
+    if (lIndex == NULL) {
+        if (unlikely(i == 0)) {
+            /* get nested table's inner table */
+            *isNull = eisnull;
+            return (Datum)array_source;
+        } else {
+            return array_ref(array_source,
+                i,
+                upper.indx,
+                astate->refattrlength,
+                astate->refelemlength,
+                astate->refelembyval,
+                astate->refelemalign,
+                isNull);
+        }
+    } else {
         resultArray = array_get_slice(array_source,
             i,
             upper.indx,
@@ -498,6 +617,744 @@ static Datum ExecEvalWindowFunc(WindowFuncExprState* wfunc, ExprContext* econtex
     *isNull = econtext->ecxt_aggnulls[wfunc->wfuncno];
     return econtext->ecxt_aggvalues[wfunc->wfuncno];
 }
+
+#ifdef GS_GRAPH
+
+static Datum ExecEvalCypherAccessExpr(CypherAccessState* state, ExprContext* econtext, bool* isNull, ExprDoneCond* isDone)
+{
+	Jsonb	   *argjb;
+    Datum      val;
+	JsonbValue	_vjv;
+	JsonbValue *vjv;
+	CypherAccessPathElem *path;
+	int			pathlen;
+	int			i;
+
+    if (isDone != NULL)
+        *isDone = ExprSingleResult;
+
+    val = ExecEvalExpr(state->arg, econtext, isNull, isDone);
+	/*
+	 * The evaluated value of astate->arg might be NULL.
+	 * `NULL.p`, `NULL[0]`, ... are NULL.
+	 */
+	if (*isNull)
+	{
+		return (Datum) 0;
+	}
+
+	argjb = DatumGetJsonbP(val);
+	if (JB_ROOT_IS_SCALAR(argjb))
+	{
+		vjv = getIthJsonbValueFromContainer(&argjb->root, 0);
+	}
+	else
+	{
+		_vjv.type = jbvBinary;
+		_vjv.binary.len = argjb->vl_len_;
+		_vjv.binary.data = VARDATA(argjb);
+		vjv = &_vjv;
+	}
+
+    pathlen = state->pathlen;
+	Assert(pathlen > 0);
+	path = (CypherAccessPathElem *) palloc(sizeof(CypherAccessPathElem) * pathlen);
+    
+    for (i = 0; i < pathlen; i++){
+        path[i].is_slice = state->pathelems[i].is_slice;
+        initCypherIndex(&path[i].lidx, state->pathelems[i].lidx_state, econtext);
+        initCypherIndex(&path[i].uidx, state->pathelems[i].uidx_state, econtext);
+    }
+
+	for (i = 0; i < pathlen; i++)
+	{
+		switch (vjv->type)
+		{
+			case jbvNull:
+                *isNull = true;
+                return (Datum) 0;
+			case jbvString:
+			case jbvNumeric:
+			case jbvBool:
+				ereport(ERROR,
+						(errcode(ERRCODE_DATATYPE_MISMATCH),
+						 errmsg("map or list is expected but scalar value")));
+				return (Datum) 0;
+			case jbvArray:
+				/* sliced array */
+				vjv = cypher_access_mem_array(vjv, &path[i]);
+				if (vjv == NULL)
+				{
+                    *isNull = true;
+                    return (Datum) 0;
+				}
+				break;
+			case jbvObject:
+				elog(ERROR, "unexpected jsonb composite type");
+				return (Datum) 0;
+			case jbvBinary:
+				{
+					// JsonbContainer *container = vjv->binary.data;
+                    uint32 superheader = *(uint32*) vjv->binary.data;
+
+					if (superheader & JB_FOBJECT)
+					{
+						vjv = cypher_access_object(vjv->binary.data, &path[i]);
+					}
+					else
+					{
+						Assert(superheader & JB_FARRAY);
+
+						vjv = cypher_access_bin_array(vjv, &path[i]);
+					}
+
+					if (vjv == NULL)
+					{
+                        *isNull = true;
+                        return (Datum) 0;
+					}
+				}
+				break;
+			default:
+				elog(ERROR, "unknown jsonb scalar type");
+				return (Datum) 0;
+		}
+	}
+
+	if (vjv->type == jbvNull)
+	{
+        *isNull = true;
+		return (Datum) 0;
+	}
+
+    *isNull = false;
+	return JsonbPGetDatum(JsonbValueToJsonb(vjv));
+}
+
+
+/*
+ * helper function to provide a constant numeric ZERO datum,
+ * lazy initialized.
+ */
+static Datum
+get_numeric_0_datum(void)
+{
+	static Datum ZERO = 0;
+
+	if (ZERO == 0)
+	{
+		MemoryContext oldMemoryContext;
+
+		oldMemoryContext = MemoryContextSwitchTo(TopMemoryContext);
+
+		ZERO = DirectFunctionCall1(int8_numeric, Int64GetDatum(0));
+
+		MemoryContextSwitchTo(oldMemoryContext);
+	}
+
+	return ZERO;
+}
+
+Datum
+ExecEvalCypherTypeCast(CypherTypeCastState* state, ExprContext* econtext, bool* isNull, ExprDoneCond* isDone)
+{
+	Jsonb	   *argjb;
+	JsonbValue *jv;
+	char	   *str;
+	FunctionCallInfo fcinfo_data_in;
+	CypherTypeCast *cfn_expr;
+	Oid			typeCastOid;
+	TYPCATEGORY typcategory;
+	CoercionContext cctx;
+    Datum arg;
+
+    if (isDone != NULL)
+        *isDone = ExprSingleResult;
+
+    arg = ExecEvalExpr(state->arg_state, econtext, isNull, NULL);
+    Assert(*isNull == false);
+	argjb = DatumGetJsonbP(arg);
+
+	fcinfo_data_in = state->fcinfo_data_in;
+	Assert(fcinfo_data_in != NULL);
+
+	cfn_expr = (CypherTypeCast *) fcinfo_data_in->flinfo->fn_expr;
+	Assert(cfn_expr != NULL);
+
+	typeCastOid = fcinfo_data_in->arg[1];
+	typcategory = cfn_expr->typcategory;
+	cctx = cfn_expr->cctx;
+
+	/*
+	 * if the jsonb value is not a scalar, check to see if the
+	 * type cast is to boolean
+	 */
+	if (!JB_ROOT_IS_SCALAR(argjb))
+	{
+		if (typcategory == TYPCATEGORY_BOOLEAN)
+		{
+			Assert(JB_ROOT_IS_OBJECT(argjb) || JB_ROOT_IS_ARRAY(argjb));
+			*isNull = false;
+			return BoolGetDatum(JB_ROOT_COUNT(argjb) > 0);
+		}
+		else
+		{
+			ereport(ERROR,
+					(errcode(ERRCODE_DATATYPE_MISMATCH),
+					 errmsg("cannot cast ... (not scalar)")));
+            *isNull = false;
+            return (Datum) 0;
+		}
+	}
+
+	/*
+	 * get the jsonb value and switch on its type to determine if the
+	 * cast is appropriate. Note: We always allow explicit casts.
+	 */
+	jv = getIthJsonbValueFromSuperHeader(VARDATA(arg), 0);
+	switch (jv->type)
+	{
+		case jbvNull:
+			/* Null can be cast into all others */
+            *isNull = false;
+            return (Datum) 0;
+
+		case jbvString:
+			/* string to boolean cast */
+			if (typcategory == TYPCATEGORY_BOOLEAN)
+			{
+                *isNull = true;
+				return BoolGetDatum(jv->string.len > 0);
+			}
+
+			/* string to string and explicit casts */
+			if (typcategory == TYPCATEGORY_STRING ||
+				cctx == COERCION_EXPLICIT)
+				str = pnstrdup(jv->string.val, jv->string.len);
+			else
+			{
+				ereport(ERROR,
+						(errcode(ERRCODE_CANNOT_COERCE),
+						 errmsg("cannot cast %s (jsonb type string) to %s",
+								JsonbToCString(NULL, VARDATA(argjb),
+											   VARSIZE(argjb)),
+								format_type_be(typeCastOid))));
+			}
+			break;
+
+		case jbvNumeric:
+			/* numeric to boolean casts */
+			if (typcategory == TYPCATEGORY_BOOLEAN)
+			{
+                *isNull = false;
+				if (numeric_is_nan(jv->numeric))
+					return BoolGetDatum(false);
+				else
+				{
+					Datum		d;
+					d = DirectFunctionCall2(numeric_ne, get_numeric_0_datum(),
+											NumericGetDatum(jv->numeric));
+					return BoolGetDatum(d);
+				}
+			}
+
+			/* numeric to numeric and explicit casts */
+			if (typcategory == TYPCATEGORY_NUMERIC ||
+				cctx == COERCION_EXPLICIT)
+				str = JsonbToCString(NULL, VARDATA(arg), VARSIZE(argjb));
+			else
+			{
+				ereport(ERROR,
+						(errcode(ERRCODE_CANNOT_COERCE),
+						 errmsg("cannot cast %s (jsonb type numeric) to %s",
+								JsonbToCString(NULL, VARDATA(arg),
+											   VARSIZE(argjb)),
+								format_type_be(typeCastOid))));
+
+			}
+			break;
+
+		case jbvBool:
+			/* check for boolean category or explicit cast */
+			if (typcategory == TYPCATEGORY_BOOLEAN ||
+				cctx == COERCION_EXPLICIT)
+				str = JsonbToCString(NULL, VARDATA(arg), VARSIZE(argjb));
+			else
+			{
+				ereport(ERROR,
+						(errcode(ERRCODE_CANNOT_COERCE),
+						 errmsg("cannot cast %s (jsonb type bool) to %s",
+								JsonbToCString(NULL, VARDATA(arg),
+											   VARSIZE(argjb)),
+								format_type_be(typeCastOid))));
+			}
+			break;
+
+		default:
+			elog(ERROR, "unknown jsonb scalar type");
+			return (Datum) 0;
+	}
+
+	fcinfo_data_in->arg[0]= PointerGetDatum(str);
+	fcinfo_data_in->argnull[0] = false;
+
+	fcinfo_data_in->isnull = false;
+    *isNull = false;
+	return FunctionCallInvoke(fcinfo_data_in);
+}
+
+static Datum ExecEvalCypherMapExpr(CypherMapState* mapstate, ExprContext* econtext, bool* isNull, ExprDoneCond* isDone)
+{
+	int			npairs = list_length(mapstate->key_valstate) / 2; 
+	char	  **key_cstrings = (char **) palloc(sizeof(char*) *npairs);
+	Datum	   *val_values = (Datum*) palloc(sizeof(Datum) * npairs);
+	bool	   *val_nulls = (bool*) palloc(sizeof(bool) * npairs);
+	JsonbParseState *jpstate = NULL;
+	int			i;
+	JsonbValue *jb;
+    ListCell *le;
+
+    if (isDone != NULL)
+        *isDone = ExprSingleResult;
+
+    le = list_head(mapstate->key_valstate);
+    i = 0;
+    while (le != NULL){
+        Const *key;
+        ExprState *val;
+        
+        key = lfirst_node(Const, le);
+		le = lnext(le);
+
+		Assert(le != NULL);
+
+		val = (ExprState*) lfirst(le);
+		le = lnext(le);
+
+        /*
+		 * Since all keys of jsonb objects are C strings, convert
+		 * the given key constant which is text to a corresponding
+		 * C string to avoid the same conversion for every
+		 * evaluation of the CypherMapExpr.
+		 */
+		Assert(key->consttype == TEXTOID && !key->constisnull);
+		key_cstrings[i] = TextDatumGetCString(key->constvalue);
+
+        // Assert(exprType((Node *) val) == JSONBOID);
+        val_values[i] = ExecEvalExpr(val, econtext, &val_nulls[i], NULL);
+
+        i++;
+    }
+
+
+	pushJsonbValue(&jpstate, WJB_BEGIN_OBJECT, NULL);
+
+	for (i = 0; i < npairs; i++)
+	{
+		JsonbIterator *vji;
+		JsonbValue	vjv;
+		JsonbValue	kjv;
+
+		if (val_nulls[i])
+		{
+			vji = NULL;
+			vjv.type = jbvNull;
+		}
+		else
+		{
+			Jsonb	   *vjb = DatumGetJsonbP(val_values[i]);
+
+			// vji = JsonbIteratorInit(&vjb->root);
+            vji = JsonbIteratorInit(VARDATA(vjb));
+
+			if (JB_ROOT_IS_SCALAR(vjb))
+			{
+				JsonbIteratorNext(&vji, &vjv, true);
+				Assert(vjv.type == jbvArray);
+				JsonbIteratorNext(&vji, &vjv, true);
+
+				vji = NULL;
+			}
+		}
+
+		if (vji == NULL && vjv.type == jbvNull && !allow_null_properties)
+			continue;
+
+		kjv.type = jbvString;
+		kjv.string.val = key_cstrings[i];
+		kjv.string.len = strlen(kjv.string.val);
+        kjv.estSize = sizeof(JEntry) + kjv.string.len;
+		if (kjv.string.len > JENTRY_OFFLENMASK)
+		{
+			ereport(ERROR,
+					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+					 errmsg("string too long to represent as jsonb string"),
+					 errdetail("Due to an implementation restriction, "
+							   "jsonb strings cannot exceed %d bytes.",
+							   JENTRY_OFFLENMASK)));
+		}
+		pushJsonbValue(&jpstate, WJB_KEY, &kjv);
+
+		if (vji == NULL)
+		{
+			Assert(jpstate->contVal.type == jbvObject);
+			pushJsonbValue(&jpstate, WJB_VALUE, &vjv);
+		}
+		else
+		{
+			for (;;)
+			{
+				JsonbValue	ejv;
+				int tok;
+
+				tok = JsonbIteratorNext(&vji, &ejv, false);
+				if (tok == WJB_DONE)
+					break;
+
+				if (tok == WJB_KEY)
+				{
+					kjv = ejv;
+
+					tok = JsonbIteratorNext(&vji, &ejv, false);
+					Assert(tok != WJB_DONE);
+
+					if (tok == WJB_VALUE && ejv.type == jbvNull &&
+						!allow_null_properties)
+						continue;
+
+					pushJsonbValue(&jpstate, WJB_KEY, &kjv);
+				}
+
+				if (tok == WJB_VALUE || tok == WJB_ELEM)
+					pushJsonbValue(&jpstate, tok, &ejv);
+				else
+					pushJsonbValue(&jpstate, tok, NULL);
+			}
+		}
+	}
+
+	jb = pushJsonbValue(&jpstate, WJB_END_OBJECT, NULL);
+
+    *isNull = false;
+	return JsonbPGetDatum(JsonbValueToJsonb(jb));
+}
+
+
+static JsonbValue *
+cypher_access_object(JsonbSuperHeader sheader, CypherAccessPathElem *pathelem)
+{
+	CypherIndexResult *key;
+	JsonbValue	_jv;
+	JsonbValue *jv;
+	JsonbValue	kjv;
+
+	if (pathelem->is_slice)
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("slicing map not supported")));
+		return NULL;
+	}
+
+	key = &pathelem->uidx;
+	if (key->isnull)
+	{
+		_jv.type = jbvNull;
+		jv = &_jv;
+	}
+	else if (key->type == TEXTOID)
+	{
+		char	   *str = TextDatumGetCString(key->value);
+
+		_jv.type = jbvString;
+		_jv.string.len = strlen(str);
+		_jv.string.val = str;
+		jv = &_jv;
+	}
+	else if (key->type == BOOLOID)
+	{
+		_jv.type = jbvBool;
+		_jv.boolean = DatumGetBool(key->value);
+		jv = &_jv;
+	}
+	else if (key->type == JSONBOID)
+	{
+		Jsonb	   *jb = DatumGetJsonbP(key->value);
+
+		if (JB_ROOT_IS_SCALAR(jb))
+		{
+			jv = getIthJsonbValueFromContainer(&jb->root, 0);
+		}
+		else
+		{
+			ereport(ERROR,
+					(errcode(ERRCODE_DATATYPE_MISMATCH),
+					 errmsg("key value must be scalar")));
+			return NULL;
+		}
+	}
+	else
+	{
+		Assert(!"unexpected key type");
+		return NULL;
+	}
+
+	kjv.type = jbvString;
+	switch (jv->type)
+	{
+		case jbvNull:
+			kjv.string.len = 4;
+			kjv.string.val = "null";
+			break;
+		case jbvString:
+			kjv.string = jv->string;
+			break;
+		case jbvNumeric:
+			elog(ERROR, "numeric key value not supported");
+			return 0;
+		case jbvBool:
+			if (jv->boolean)
+			{
+				kjv.string.len = 4;
+				kjv.string.val = "true";
+			}
+			else
+			{
+				kjv.string.len = 5;
+				kjv.string.val = "false";
+			}
+			break;
+		default:
+			elog(ERROR, "unknown jsonb scalar type");
+			return 0;
+	}
+
+    return findJsonbValueFromSuperHeader(sheader, JB_FOBJECT, NULL, &kjv);
+}
+
+static JsonbValue *
+cypher_access_bin_array(JsonbValue *ajv, CypherAccessPathElem *pathelem)
+{
+	JsonbSuperHeader sheader = ajv->binary.data;
+    uint32 superheader = *(uint32*) sheader;
+	// int			nelems = nelems = superheader & JB_CMASK;
+	int			nelems = superheader & JB_CMASK;
+	int			idx;
+
+	if (pathelem->is_slice)
+	{
+		int			lidx;
+		int			uidx;
+		JsonbParseState *jpstate = NULL;
+		JsonbIterator *ji;
+		JsonbValue	jv;
+		int jt;
+
+		lidx = cypher_access_range(&pathelem->lidx, nelems, 0);
+		uidx = cypher_access_range(&pathelem->uidx, nelems, nelems);
+
+		if (uidx <= lidx)
+		{
+			JsonbValue *newajv;
+
+			newajv = (JsonbValue*) palloc(sizeof(*newajv));
+			newajv->type = jbvArray;
+			newajv->array.nElems = 0;
+			newajv->array.elems = NULL;
+			newajv->array.rawScalar = false;
+
+			return newajv;
+		}
+
+		if (uidx - lidx == nelems)
+			return ajv;
+
+		pushJsonbValue(&jpstate, WJB_BEGIN_ARRAY, NULL);
+
+		ji = JsonbIteratorInit(sheader);
+		jt = JsonbIteratorNext(&ji, &jv, false);
+		Assert(jt == WJB_BEGIN_ARRAY);
+		idx = 0;
+		for (;;)
+		{
+			if (idx >= uidx)
+				break;
+
+			jt = JsonbIteratorNext(&ji, &jv, true);
+			if (jt != WJB_ELEM)
+				break;
+
+			if (idx >= lidx)
+				pushJsonbValue(&jpstate, WJB_ELEM, &jv);
+
+			idx++;
+		}
+
+		return pushJsonbValue(&jpstate, WJB_END_ARRAY, NULL);
+	}
+	else
+	{
+		if (nelems == 0)
+			return NULL;
+
+		Assert(IsCypherIndexResultValid(&pathelem->uidx));
+		idx = cypher_access_index(&pathelem->uidx, nelems);
+		if (idx < 0 || idx >= nelems)
+			return NULL;
+
+		return getIthJsonbValueFromSuperHeader(sheader, idx);
+	}
+}
+
+static JsonbValue *
+cypher_access_mem_array(JsonbValue *ajv, CypherAccessPathElem *pathelem)
+{
+	int			nelems = ajv->array.nElems;
+
+	Assert(!ajv->array.rawScalar);
+
+	if (pathelem->is_slice)
+	{
+		int			lidx;
+		int			uidx;
+
+		lidx = cypher_access_range(&pathelem->lidx, nelems, 0);
+		uidx = cypher_access_range(&pathelem->uidx, nelems, nelems);
+
+		if (uidx <= lidx)
+		{
+			ajv->array.nElems = 0;
+			return ajv;
+		}
+
+		ajv->array.nElems = uidx - lidx;
+		ajv->array.elems = ajv->array.elems + lidx;
+		return ajv;
+	}
+	else
+	{
+		int			idx;
+
+		if (nelems == 0)
+			return NULL;
+
+		Assert(IsCypherIndexResultValid(&pathelem->uidx));
+		idx = cypher_access_index(&pathelem->uidx, nelems);
+		if (idx < 0 || idx >= nelems)
+			return NULL;
+
+		return ajv->array.elems + idx;
+	}
+
+	return NULL;
+}
+
+static int
+cypher_access_range(CypherIndexResult *cidxres, const int nelems,
+					const int defidx)
+{
+	int			idx;
+
+	if (!IsCypherIndexResultValid(cidxres))
+		return defidx;
+
+	idx = cypher_access_index(cidxres, nelems);
+	if (idx < 0)
+		return 0;
+	else if (idx > nelems)
+		return nelems;
+	else
+		return idx;
+}
+
+static int
+cypher_access_index(CypherIndexResult *cidxres, const int nelems)
+{
+	char	   *typestr;
+
+	if (cidxres->type == JSONBOID)
+	{
+		JsonbValue	_ijv;
+		JsonbValue *ijv;
+
+		if (cidxres->isnull)
+		{
+			_ijv.type = jbvNull;
+			ijv = &_ijv;
+		}
+		else
+		{
+			Jsonb	   *jb = DatumGetJsonbP(cidxres->value);
+
+			if (!JB_ROOT_IS_SCALAR(jb))
+			{
+				ereport(ERROR,
+						(errcode(ERRCODE_DATATYPE_MISMATCH),
+						 errmsg("index value must be scalar")));
+				return -1;
+			}
+
+			ijv = getIthJsonbValueFromContainer(&jb->root, 0);
+		}
+
+		if (ijv->type == jbvNumeric)
+		{
+			Datum		n = NumericGetDatum(ijv->numeric);
+			int			idx;
+
+			if (DatumGetInt32(DirectFunctionCall1(numeric_scale, n)) > 0)
+			{
+				ereport(ERROR,
+						(errcode(ERRCODE_DATATYPE_MISMATCH),
+						 errmsg("integer is expected for index value")));
+				return -1;
+			}
+
+			idx = DatumGetInt32(DirectFunctionCall1(numeric_int4, n));
+			if (idx < 0)
+				idx += nelems;
+
+			return idx;
+		}
+		else if (ijv->type == jbvNull)
+		{
+			typestr = "null";
+		}
+		else if (ijv->type == jbvString)
+		{
+			typestr = "string";
+		}
+		else if (ijv->type == jbvBool)
+		{
+			typestr = "boolean";
+		}
+		else
+		{
+			elog(ERROR, "unknown jsonb scalar type");
+			return -1;
+		}
+	}
+	else if (cidxres->type == TEXTOID)
+	{
+		typestr = "text";
+	}
+	else if (cidxres->type == BOOLOID)
+	{
+		typestr = "bool";
+	}
+	else
+	{
+		Assert(!"unexpected index type");
+		return -1;
+	}
+
+	ereport(ERROR,
+			(errcode(ERRCODE_DATATYPE_MISMATCH),
+			 errmsg("%s cannot be index value", typestr)));
+	return -1;
+}
+
+#endif
 
 /* ----------------------------------------------------------------
  *		ExecEvalScalarVar
@@ -988,7 +1845,11 @@ static Datum ExecEvalRownum(RownumState* exprstate, ExprContext* econtext, bool*
         *isDone = ExprSingleResult;
     *isNull = false;
 
-    return Int64GetDatum(exprstate->ps->ps_rownum + 1);
+    if (ROWNUM_TYPE_COMPAT) {
+        return DirectFunctionCall1(int8_numeric, Int64GetDatum(exprstate->ps->ps_rownum + 1));
+    } else {
+        return Int64GetDatum(exprstate->ps->ps_rownum + 1);
+    }
 }
 
 /* ----------------------------------------------------------------
@@ -1073,6 +1934,92 @@ static Datum ExecEvalParamExtern(ExprState* exprstate, ExprContext* econtext, bo
     ereport(ERROR, (errcode(ERRCODE_UNDEFINED_OBJECT), errmsg("no value found for parameter %d", thisParamId)));
     return (Datum)0; /* keep compiler quiet */
 }
+
+void initExecTableOfIndexInfo(ExecTableOfIndexInfo* execTableOfIndexInfo, ExprContext* econtext)
+{
+    execTableOfIndexInfo->econtext = econtext;
+    execTableOfIndexInfo->tableOfIndex = NULL;
+    execTableOfIndexInfo->tableOfIndexType = InvalidOid;
+    execTableOfIndexInfo->isnestedtable = false;
+    execTableOfIndexInfo->tableOfLayers = 0;
+    execTableOfIndexInfo->paramid = -1;
+    execTableOfIndexInfo->paramtype = InvalidOid;
+}
+
+/* this function is only used for getting table of index inout param */
+static bool get_tableofindex_param(Node* node, ExecTableOfIndexInfo* execTableOfIndexInfo)
+{
+    if (node == NULL)
+        return false;
+    if (IsA(node, Param)) {
+        execTableOfIndexInfo->paramid = ((Param*)node)->paramid;
+        execTableOfIndexInfo->paramtype = ((Param*)node)->paramtype;
+        return true;
+    }
+    return false;
+}
+
+static bool IsTableOfFunc(Oid funcOid)
+{
+    const Oid array_function_start_oid = 7881;
+    const Oid array_function_end_oid = 7892;
+    const Oid array_indexby_delete_oid = 7896;
+    return (funcOid >= array_function_start_oid && funcOid <= array_function_end_oid) ||
+        funcOid == array_indexby_delete_oid;
+}
+
+/* ----------------------------------------------------------------
+ *		ExecEvalParamExternTableOfIndex
+ *
+ *		Returns the value of a PARAM_EXTERN table of index and type parameter .
+ * ----------------------------------------------------------------
+ */
+void ExecEvalParamExternTableOfIndex(Node* node, ExecTableOfIndexInfo* execTableOfIndexInfo)
+{
+    if (get_tableofindex_param(node, execTableOfIndexInfo)) {
+        ExecEvalParamExternTableOfIndexById(execTableOfIndexInfo);
+    }
+}
+
+bool ExecEvalParamExternTableOfIndexById(ExecTableOfIndexInfo* execTableOfIndexInfo)
+{
+    if (execTableOfIndexInfo->paramid == -1) {
+        return false;
+    }
+
+    int thisParamId = execTableOfIndexInfo->paramid;
+    ParamListInfo paramInfo = execTableOfIndexInfo->econtext->ecxt_param_list_info;
+
+    /*
+     * PARAM_EXTERN parameters must be sought in ecxt_param_list_info.
+     */
+    if (paramInfo && thisParamId > 0 && thisParamId <= paramInfo->numParams) {
+        ParamExternData* prm = &paramInfo->params[thisParamId - 1];
+
+        /* give hook a chance in case parameter is dynamic */
+        if (!OidIsValid(prm->ptype) && paramInfo->paramFetch != NULL)
+            (*paramInfo->paramFetch)(paramInfo, thisParamId);
+
+        if (OidIsValid(prm->ptype) && prm->tabInfo != NULL &&
+            prm->tabInfo->tableOfIndex != NULL && OidIsValid(prm->tabInfo->tableOfIndexType)) {
+            /* safety check in case hook did something unexpected */
+            if (prm->ptype != execTableOfIndexInfo->paramtype)
+                ereport(ERROR,
+                    (errcode(ERRCODE_DATATYPE_MISMATCH),
+                        errmsg("type of parameter %d (%s) does not match that when preparing the plan (%s)",
+                            thisParamId,
+                            format_type_be(prm->ptype),
+                            format_type_be(execTableOfIndexInfo->paramtype))));
+            execTableOfIndexInfo->tableOfIndexType = prm->tabInfo->tableOfIndexType;
+            execTableOfIndexInfo->isnestedtable = prm->tabInfo->isnestedtable;
+            execTableOfIndexInfo->tableOfLayers = prm->tabInfo->tableOfLayers;
+            execTableOfIndexInfo->tableOfIndex = prm->tabInfo->tableOfIndex;
+            return true;
+        }
+    }
+    return false;
+}
+
 
 /* ----------------------------------------------------------------
  *		ExecEvalOper / ExecEvalFunc support routines
@@ -1226,14 +2173,32 @@ static Oid getRealFuncRetype(int arg_num, Oid* actual_arg_types, FuncExprState* 
             (errcode(ERRCODE_CACHE_LOOKUP_FAILED),
                 errmodule(MOD_EXECUTOR),
                 errmsg("cache lookup failed for function %u", funcid)));
-    Form_pg_proc procform = (Form_pg_proc)GETSTRUCT(proctup);
-    Oid* declared_arg_types = procform->proargtypes.values;
+
+    oidvector* proargs = ProcedureGetArgTypes(proctup);
+    Oid* declared_arg_types = proargs->values;
 
     /* Find the real return type based on the declared arg types and actual arg types.*/
     rettype = enforce_generic_type_consistency(actual_arg_types, declared_arg_types, arg_num, rettype, false);
 
     ReleaseSysCache(proctup);
     return rettype;
+}
+
+/*
+ * Check whether the function is a set function supported by the vector engine.
+ */
+static bool isVectorEngineSupportSetFunc(Oid funcid)
+{
+    switch (funcid) {
+        case OID_REGEXP_SPLIT_TO_TABLE:                // regexp_split_to_table
+        case OID_REGEXP_SPLIT_TO_TABLE_NO_FLAG:        // regexp_split_to_table
+        case OID_ARRAY_UNNEST:                         // unnest
+            return true;
+            break;
+        default:
+            return false;
+            break;
+    }
 }
 
 /*
@@ -1368,8 +2333,7 @@ static void init_fcache(
 
     if (vectorized) {
         if (fcache->func.fn_retset == true) {
-            if (fcache->func.fn_oid != OID_REGEXP_SPLIT_TO_TABLE &&
-                fcache->func.fn_oid != OID_REGEXP_SPLIT_TO_TABLE_NO_FLAG) {
+            if (!isVectorEngineSupportSetFunc(fcache->func.fn_oid)) {
                 ereport(ERROR,
                     (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
                         errmodule(MOD_EXECUTOR),
@@ -1511,6 +2475,8 @@ static ExprDoneCond ExecEvalFuncArgs(
 
     i = 0;
     econtext->is_cursor = false;
+    u_sess->plsql_cxt.func_tableof_index = NIL;
+    bool is_have_huge_clob = false;
     foreach (arg, argList) {
         ExprState* argstate = (ExprState*)lfirst(arg);
         ExprDoneCond thisArgIsDone;
@@ -1518,12 +2484,29 @@ static ExprDoneCond ExecEvalFuncArgs(
         if (has_refcursor && argstate->resultType == REFCURSOROID)
             econtext->is_cursor = true;
         fcinfo->arg[i] = ExecEvalExpr(argstate, econtext, &fcinfo->argnull[i], &thisArgIsDone);
+        ExecTableOfIndexInfo execTableOfIndexInfo;
+        initExecTableOfIndexInfo(&execTableOfIndexInfo, econtext);
+        ExecEvalParamExternTableOfIndex((Node*)argstate->expr, &execTableOfIndexInfo);
+        if (execTableOfIndexInfo.tableOfIndex != NULL) {
+            MemoryContext oldCxt = MemoryContextSwitchTo(SESS_GET_MEM_CXT_GROUP(MEMORY_CONTEXT_OPTIMIZER));
+            PLpgSQL_func_tableof_index* func_tableof =
+                (PLpgSQL_func_tableof_index*)palloc0(sizeof(PLpgSQL_func_tableof_index));
+            func_tableof->varno = i;
+            func_tableof->tableOfIndexType = execTableOfIndexInfo.tableOfIndexType;
+            func_tableof->tableOfIndex = copyTableOfIndex(execTableOfIndexInfo.tableOfIndex);
+            u_sess->plsql_cxt.func_tableof_index = lappend(u_sess->plsql_cxt.func_tableof_index, func_tableof);
+            MemoryContextSwitchTo(oldCxt);
+        }
+
         if (has_refcursor && econtext->is_cursor && plpgsql_var_dno != NULL) {
             plpgsql_var_dno[i] = econtext->dno;
             CopyCursorInfoData(&fcinfo->refcursor_data.argCursor[i], &econtext->cursor_data);
         }
         fcinfo->argTypes[i] = argstate->resultType;
         econtext->is_cursor = false;
+        if (is_huge_clob(fcinfo->argTypes[i], fcinfo->argnull[i], fcinfo->arg[i])) {
+            is_have_huge_clob = true;
+        }
 
         if (thisArgIsDone != ExprSingleResult) {
             /*
@@ -1539,6 +2522,7 @@ static ExprDoneCond ExecEvalFuncArgs(
         }
         i++;
     }
+    check_huge_clob_paramter(fcinfo, is_have_huge_clob);
 
     Assert(i == fcinfo->nargs);
 
@@ -1654,6 +2638,29 @@ static void tupledesc_match(TupleDesc dst_tupdesc, TupleDesc src_tupdesc)
                     errmsg("function return row and query-specified return row do not match"),
                     errdetail("Physical storage mismatch on dropped attribute at ordinal position %d.", i + 1)));
     }
+}
+
+static void set_result_for_plpgsql_language_function_with_outparam(FuncExprState *fcache, Datum *result, bool *isNull)
+{
+    if (!IsA(fcache->xprstate.expr, FuncExpr)) {
+        return;
+    }
+    FuncExpr *func = (FuncExpr *)fcache->xprstate.expr;
+    if (!is_function_with_plpgsql_language_and_outparam(func->funcid)) {
+        return;
+    }
+    HeapTupleHeader td = DatumGetHeapTupleHeader(*result);
+    TupleDesc tupdesc = lookup_rowtype_tupdesc_copy(HeapTupleHeaderGetTypeId(td), HeapTupleHeaderGetTypMod(td));
+    HeapTupleData tup;
+    tup.t_len = HeapTupleHeaderGetDatumLength(td);
+    tup.t_data = td;
+    Datum *values = (Datum *)palloc(sizeof(Datum) * tupdesc->natts);
+    bool *nulls = (bool *)palloc(sizeof(bool) * tupdesc->natts);
+    heap_deform_tuple(&tup, tupdesc, values, nulls);
+    *result = values[0];
+    *isNull = nulls[0];
+    pfree(values);
+    pfree(nulls);
 }
 
 /*
@@ -1892,6 +2899,7 @@ restart:
                         MemoryContext oldcontext = MemoryContextSwitchTo(estate->tuple_store_cxt);
                         estate->cursor_return_data =
                             (Cursor_Data*)palloc0(sizeof(Cursor_Data) * fcinfo->refcursor_data.return_number);
+                        estate->cursor_return_numbers = fcinfo->refcursor_data.return_number;
                         (void)MemoryContextSwitchTo(oldcontext);
                     }
 
@@ -2019,6 +3027,8 @@ restart:
         pfree_ext(var_dno);
     }
 
+    set_result_for_plpgsql_language_function_with_outparam(fcache, &result, isNull);
+
     return result;
 }
 
@@ -2053,6 +3063,7 @@ static Datum ExecMakeFunctionResultNoSets(
     bool savedProConfigIsSet = u_sess->SPI_cxt.is_proconfig_set;
     bool proIsProcedure = false;
     bool supportTranaction = false;
+    bool is_have_huge_clob = false;
 
 #ifdef ENABLE_MULTIPLE_NODES
     if (IS_PGXC_COORDINATOR && (t_thrd.proc->workingVersionNum  >= STP_SUPPORT_COMMIT_ROLLBACK)) {
@@ -2076,13 +3087,47 @@ static Datum ExecMakeFunctionResultNoSets(
             node->atomic = true;
             stp_set_commit_rollback_err_msg(STP_XACT_AFTER_TRIGGER_BEGIN);
         }
+        /*
+         * If proconfig is set we can't allow transaction commands because of the
+         * way the GUC stacking works: The transaction boundary would have to pop
+         * the proconfig setting off the stack.  That restriction could be lifted
+         * by redesigning the GUC nesting mechanism a bit.
+         */
+        if (!fcache->prokind) {
+            bool isNullSTP = false;
+            HeapTuple tp = SearchSysCache1(PROCOID, ObjectIdGetDatum(fexpr->funcid));
+            if (!HeapTupleIsValid(tp)) {
+                ereport(ERROR, (errcode(ERRCODE_UNDEFINED_OBJECT),
+                            errmsg("cache lookup failed for function %u", fexpr->funcid)));
+            }
+            if (!heap_attisnull(tp, Anum_pg_proc_proconfig, NULL) || u_sess->SPI_cxt.is_proconfig_set) {
+                u_sess->SPI_cxt.is_proconfig_set = true;
+                node->atomic = true;
+                stp_set_commit_rollback_err_msg(STP_XACT_GUC_IN_OPT_CLAUSE);
+            }
+            /* immutable or stable function should not support commit/rollback */
+            bool isNullVolatile = false;
+            Datum provolatile = SysCacheGetAttr(PROCOID, tp, Anum_pg_proc_provolatile, &isNullVolatile);
+            if (!isNullVolatile && CharGetDatum(provolatile) != PROVOLATILE_VOLATILE) {
+                node->atomic = true;
+                stp_set_commit_rollback_err_msg(STP_XACT_IMMUTABLE);
+            }
 
-        proIsProcedure = PROC_IS_PRO(fcache->prokind);
-        if (u_sess->SPI_cxt.is_proconfig_set) {
-            node->atomic = true;
+            Datum datum = SysCacheGetAttr(PROCOID, tp, Anum_pg_proc_prokind, &isNullSTP);
+            proIsProcedure = PROC_IS_PRO(CharGetDatum(datum));
+            if (proIsProcedure) {
+                fcache->prokind = 'p';
+            } else {
+                fcache->prokind = 'f';
+            }
+
+            /* if proIsProcedure is ture means it was a stored procedure */
+            u_sess->SPI_cxt.is_stp = savedIsSTP;
+            ReleaseSysCache(tp);
+        } else {
+            proIsProcedure = PROC_IS_PRO(fcache->prokind);
+            u_sess->SPI_cxt.is_stp = savedIsSTP;
         }
-        /* if proIsProcedure is ture means it was a stored procedure */
-        u_sess->SPI_cxt.is_stp = savedIsSTP && proIsProcedure;
     }
 
     /* Guard against stack overflow due to overly complex expressions */
@@ -2105,6 +3150,19 @@ static Datum ExecMakeFunctionResultNoSets(
         fcinfo->context = (Node *)node;
     }
 
+    /*
+     * Incause of connet_by_root() and sys_connect_by_path() we need get the
+     * current scan tuple slot so attach the econtext here
+     *
+     * NOTE: Have to revisit!! so I don't have better solution to handle the case
+     *       where scantuple is available in built in funct
+     */
+    if (fcinfo->flinfo->fn_oid == CONNECT_BY_ROOT_FUNCOID ||
+                fcinfo->flinfo->fn_oid == SYS_CONNECT_BY_PATH_FUNCOID) {
+        fcinfo->swinfo.sw_econtext = (Node *)econtext;
+        fcinfo->swinfo.sw_exprstate = (Node *)linitial(fcache->args);
+    }
+
     if (has_cursor_return) {
         /* init returnCursor to store out-args cursor info on ExprContext*/
         fcinfo->refcursor_data.returnCursor =
@@ -2124,6 +3182,7 @@ static Datum ExecMakeFunctionResultNoSets(
 
     i = 0;
     econtext->is_cursor = false;
+    u_sess->plsql_cxt.func_tableof_index = NIL;
     foreach (arg, fcache->args) {
         ExprState* argstate = (ExprState*)lfirst(arg);
 
@@ -2131,6 +3190,32 @@ static Datum ExecMakeFunctionResultNoSets(
         if (has_refcursor && fcinfo->argTypes[i] == REFCURSOROID)
             econtext->is_cursor = true;
         fcinfo->arg[i] = ExecEvalExpr(argstate, econtext, &fcinfo->argnull[i], NULL);
+        if (is_huge_clob(fcinfo->argTypes[i], fcinfo->argnull[i], fcinfo->arg[i])) {
+            is_have_huge_clob = true;
+        }
+        ExecTableOfIndexInfo execTableOfIndexInfo;
+        initExecTableOfIndexInfo(&execTableOfIndexInfo, econtext);
+        ExecEvalParamExternTableOfIndex((Node*)argstate->expr, &execTableOfIndexInfo);
+        if (execTableOfIndexInfo.tableOfIndex != NULL) {
+            if (!IsTableOfFunc(fcache->func.fn_oid)) {
+                MemoryContext oldCxt = MemoryContextSwitchTo(SESS_GET_MEM_CXT_GROUP(MEMORY_CONTEXT_OPTIMIZER));
+                PLpgSQL_func_tableof_index* func_tableof =
+                    (PLpgSQL_func_tableof_index*)palloc0(sizeof(PLpgSQL_func_tableof_index));
+                func_tableof->varno = i;
+                func_tableof->tableOfIndexType = execTableOfIndexInfo.tableOfIndexType;
+                func_tableof->tableOfIndex = copyTableOfIndex(execTableOfIndexInfo.tableOfIndex);
+                u_sess->plsql_cxt.func_tableof_index = lappend(u_sess->plsql_cxt.func_tableof_index, func_tableof);
+                MemoryContextSwitchTo(oldCxt);
+            }
+
+            u_sess->SPI_cxt.cur_tableof_index->tableOfIndexType = execTableOfIndexInfo.tableOfIndexType;
+            u_sess->SPI_cxt.cur_tableof_index->tableOfIndex = execTableOfIndexInfo.tableOfIndex;
+            u_sess->SPI_cxt.cur_tableof_index->tableOfNestLayer = execTableOfIndexInfo.tableOfLayers;
+            /* for nest table of output, save layer of this var tableOfGetNestLayer in ExecEvalArrayRef,
+            or set to zero for get whole nest table. */
+            u_sess->SPI_cxt.cur_tableof_index->tableOfGetNestLayer = -1;
+        }
+
         if (has_refcursor && econtext->is_cursor) {
             var_dno[i] = econtext->dno;
             CopyCursorInfoData(&fcinfo->refcursor_data.argCursor[i], &econtext->cursor_data);
@@ -2160,13 +3245,24 @@ static Datum ExecMakeFunctionResultNoSets(
     pgstat_init_function_usage(fcinfo, &fcusage);
 
     fcinfo->isnull = false;
+    check_huge_clob_paramter(fcinfo, is_have_huge_clob);
     if (u_sess->instr_cxt.global_instr != NULL && fcinfo->flinfo->fn_addr == plpgsql_call_handler) {
         StreamInstrumentation* save_global_instr = u_sess->instr_cxt.global_instr;
         u_sess->instr_cxt.global_instr = NULL;
-        result = FunctionCallInvoke(fcinfo);
+        result = FunctionCallInvoke(fcinfo);   // node will be free at here or else;
         u_sess->instr_cxt.global_instr = save_global_instr;
-    }
-    else {
+    } else {
+        if (fcinfo->argTypes[0] == CLOBOID && fcinfo->argTypes[1] == CLOBOID && fcinfo->flinfo->fn_addr == textcat) {
+            bool is_null = false;
+            if (fcinfo->arg[0] != 0 && VARATT_IS_EXTERNAL_LOB(fcinfo->arg[0])) {
+                struct varatt_lob_pointer* lob_pointer = (varatt_lob_pointer*)(VARDATA_EXTERNAL(fcinfo->arg[0]));
+                fcinfo->arg[0] = fetch_lob_value_from_tuple(lob_pointer, InvalidOid, &is_null);
+            }
+            if (fcinfo->arg[1] != 0 && VARATT_IS_EXTERNAL_LOB(fcinfo->arg[1])) {
+                struct varatt_lob_pointer* lob_pointer = (varatt_lob_pointer*)(VARDATA_EXTERNAL(fcinfo->arg[1]));
+                fcinfo->arg[1] = fetch_lob_value_from_tuple(lob_pointer, InvalidOid, &is_null);
+            }
+        }    
         result = FunctionCallInvoke(fcinfo);
     }
     *isNull = fcinfo->isnull;
@@ -2195,6 +3291,7 @@ static Datum ExecMakeFunctionResultNoSets(
              */
             if (estate->cursor_return_data == NULL) {
                 estate->cursor_return_data = (Cursor_Data*)palloc0(sizeof(Cursor_Data));
+                estate->cursor_return_numbers = 1;
             }
             int rc = memcpy_s(estate->cursor_return_data,
                 sizeof(Cursor_Data),
@@ -2213,14 +3310,14 @@ static Datum ExecMakeFunctionResultNoSets(
             pfree_ext(var_dno);
     }
 
-    if(node != NULL)
-        pfree_ext(node);
-
     u_sess->SPI_cxt.is_stp = savedIsSTP;
     u_sess->SPI_cxt.is_proconfig_set = savedProConfigIsSet;
     if (needResetErrMsg) {
         stp_reset_commit_rolback_err_msg();
     }
+
+    set_result_for_plpgsql_language_function_with_outparam(fcache, &result, isNull);
+
     return result;
 }
 
@@ -2278,7 +3375,6 @@ static bool func_has_refcursor_args(Oid Funcid, FunctionCallInfoData* fcinfo)
     ReleaseSysCache(proctup);
     return use_cursor;
 }
-
 /*
  *		ExecMakeTableFunctionResult
  *
@@ -2303,13 +3399,13 @@ Tuplestorestate* ExecMakeTableFunctionResult(
     bool first_time = true;
     int* var_dno = NULL;
     bool has_refcursor = false;
+    bool has_out_param = false;
 
     FuncExpr *fexpr = NULL;
     bool savedIsSTP = u_sess->SPI_cxt.is_stp;
     bool savedProConfigIsSet = u_sess->SPI_cxt.is_proconfig_set;
     bool proIsProcedure = false;
     bool supportTranaction = false;
-
 #ifdef ENABLE_MULTIPLE_NODES
     if (IS_PGXC_COORDINATOR && (t_thrd.proc->workingVersionNum  >= STP_SUPPORT_COMMIT_ROLLBACK)) {
         supportTranaction = true;
@@ -2322,6 +3418,7 @@ Tuplestorestate* ExecMakeTableFunctionResult(
     /* Only allow commit at CN, therefore only need to set atomic and relevant check at CN level. */
     if (supportTranaction && IsA(funcexpr->expr, FuncExpr)) {
         fexpr = (FuncExpr*)funcexpr->expr;
+        char prokind = (reinterpret_cast<FuncExprState*>(funcexpr))->prokind;
         if (!u_sess->SPI_cxt.is_allow_commit_rollback) {
             node->atomic = true;
         }
@@ -2329,14 +3426,46 @@ Tuplestorestate* ExecMakeTableFunctionResult(
             node->atomic = true;
             stp_set_commit_rollback_err_msg(STP_XACT_AFTER_TRIGGER_BEGIN);
         }
+        /*
+         * If proconfig is set we can't allow transaction commands because of the
+         * way the GUC stacking works: The transaction boundary would have to pop
+         * the proconfig setting off the stack.  That restriction could be lifted
+         * by redesigning the GUC nesting mechanism a bit.
+         */
+        if (!prokind) {
+            HeapTuple tp = SearchSysCache1(PROCOID, ObjectIdGetDatum(fexpr->funcid));
+            bool isNull = false;
+            if (!HeapTupleIsValid(tp)) {
+                elog(ERROR, "cache lookup failed for function %u", fexpr->funcid);
+            }
 
-        char prokind = (reinterpret_cast<FuncExprState*>(funcexpr))->prokind;
-        proIsProcedure = PROC_IS_PRO(prokind);
-        if (u_sess->SPI_cxt.is_proconfig_set) {
-            node->atomic = true;             
+            /* immutable or stable function do not support commit/rollback */
+            bool isNullVolatile = false;
+            Datum provolatile = SysCacheGetAttr(PROCOID, tp, Anum_pg_proc_provolatile, &isNullVolatile);
+            if (!isNullVolatile && CharGetDatum(provolatile) != PROVOLATILE_VOLATILE) {
+                node->atomic = true;
+                stp_set_commit_rollback_err_msg(STP_XACT_IMMUTABLE);
+            }
+
+            Datum datum = SysCacheGetAttr(PROCOID, tp, Anum_pg_proc_prokind, &isNull);
+            proIsProcedure = PROC_IS_PRO(CharGetDatum(datum));
+            if (proIsProcedure) {
+                (reinterpret_cast<FuncExprState*>(funcexpr))->prokind = 'p';
+            } else {
+                (reinterpret_cast<FuncExprState*>(funcexpr))->prokind = 'f';
+            }
+            /* if proIsProcedure means it was a stored procedure */
+            u_sess->SPI_cxt.is_stp = savedIsSTP;
+            if (!heap_attisnull(tp, Anum_pg_proc_proconfig, NULL) || u_sess->SPI_cxt.is_proconfig_set) {
+                u_sess->SPI_cxt.is_proconfig_set = true;
+                node->atomic = true;
+                stp_set_commit_rollback_err_msg(STP_XACT_GUC_IN_OPT_CLAUSE);
+            }
+            ReleaseSysCache(tp);
+        } else {
+            proIsProcedure = PROC_IS_PRO(prokind);
+            u_sess->SPI_cxt.is_stp = savedIsSTP;
         }
-        /* if proIsProcedure means it was a stored procedure */
-        u_sess->SPI_cxt.is_stp = savedIsSTP && proIsProcedure;
     }
 
     callerContext = CurrentMemoryContext;
@@ -2404,6 +3533,11 @@ Tuplestorestate* ExecMakeTableFunctionResult(
             (Node*)&rsinfo);
 
         has_refcursor = func_has_refcursor_args(fcinfo.flinfo->fn_oid, &fcinfo);
+
+        has_out_param = (is_function_with_plpgsql_language_and_outparam(fcinfo.flinfo->fn_oid) != InvalidOid);
+        if (u_sess->attr.attr_sql.sql_compatibility == A_FORMAT && has_out_param) {
+            returnsTuple = type_is_rowtype(RECORDOID);
+        }
 
         int cursor_return_number = fcinfo.refcursor_data.return_number;
         if (cursor_return_number > 0) {
@@ -2489,9 +3623,16 @@ Tuplestorestate* ExecMakeTableFunctionResult(
 
             if (econtext->plpgsql_estate != NULL) {
                 PLpgSQL_execstate* estate = econtext->plpgsql_estate;
-
-                if (fcinfo.refcursor_data.return_number > 0 && estate->cursor_return_data != NULL &&
-                    fcinfo.refcursor_data.returnCursor != NULL) {
+                bool isVaildReturn = (fcinfo.refcursor_data.return_number > 0 &&
+                    estate->cursor_return_data != NULL && fcinfo.refcursor_data.returnCursor != NULL);
+                if (isVaildReturn) {
+                    bool isVaildReturnNum = (fcinfo.refcursor_data.return_number > estate->cursor_return_numbers);
+                    if (isVaildReturnNum) {
+                        pgstat_end_function_usage(&fcusage, rsinfo.isDone != ExprMultipleResult);
+                        ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmodule(MOD_PLSQL),
+                            errmsg("The expected output of the cursor:%d and function:%d does not match",
+                            estate->cursor_return_numbers, fcinfo.refcursor_data.return_number)));
+                    }
                     for (int i = 0; i < fcinfo.refcursor_data.return_number; i++) {
                         CopyCursorInfoData(&estate->cursor_return_data[i], &fcinfo.refcursor_data.returnCursor[i]);
                     }
@@ -2537,7 +3678,7 @@ Tuplestorestate* ExecMakeTableFunctionResult(
              * set, we fall out of the loop; we'll cons up an all-nulls result
              * row below.
              */
-            if (returnsTuple && fcinfo.isnull) {
+            if (returnsTuple && fcinfo.isnull && !has_out_param) {
                 if (!returnsSet) {
                     break;
                 }
@@ -4093,6 +5234,54 @@ static Datum ExecEvalNullIf(FuncExprState* nullIfExpr, ExprContext* econtext, bo
     return fcinfo->arg[0];
 }
 
+static Datum CheckRowTypeIsNull(TupleDesc tupDesc, HeapTupleData tmptup, NullTest *ntest)
+{
+    int att;
+
+    for (att = 1; att <= tupDesc->natts; att++) {
+        /* ignore dropped columns */
+        if (tupDesc->attrs[att - 1]->attisdropped)
+            continue;
+        if (tableam_tops_tuple_attisnull(&tmptup, att, tupDesc)) {
+            /* null field disproves IS NOT NULL */
+            if (ntest->nulltesttype == IS_NOT_NULL)
+                return BoolGetDatum(false);
+        } else {
+            /* non-null field disproves IS NULL */
+            if (ntest->nulltesttype == IS_NULL)
+                return BoolGetDatum(false);
+        }
+    }
+
+    return BoolGetDatum(true);
+}
+
+static Datum CheckRowTypeIsNullForAFormat(TupleDesc tupDesc, HeapTupleData tmptup, NullTest *ntest)
+{
+    int att;
+
+    for (att = 1; att <= tupDesc->natts; att++) {
+        /* ignore dropped columns */
+        if (tupDesc->attrs[att - 1]->attisdropped)
+            continue;
+        if (!tableam_tops_tuple_attisnull(&tmptup, att, tupDesc)) {
+            /* non-null field disproves IS NULL */
+            if (ntest->nulltesttype == IS_NULL) {
+                return BoolGetDatum(false);
+            } else {
+                return BoolGetDatum(true);
+            }
+        }
+    }
+
+    /* non-null field disproves IS NULL */
+    if (ntest->nulltesttype == IS_NULL) {
+        return BoolGetDatum(true);
+    } else {
+        return BoolGetDatum(false);
+    }
+}
+
 /* ----------------------------------------------------------------
  *		ExecEvalNullTest
  *
@@ -4110,12 +5299,37 @@ static Datum ExecEvalNullTest(NullTestState* nstate, ExprContext* econtext, bool
         return result; /* nothing to check */
 
     if (ntest->argisrow && !(*isNull)) {
+        /*
+         * The SQL standard defines IS [NOT] NULL for a non-null rowtype
+         * argument as:
+         *
+         * "R IS NULL" is true if every field is the null value.
+         *
+         * "R IS NOT NULL" is true if no field is the null value.
+         *
+         * This definition is (apparently intentionally) not recursive; so our
+         * tests on the fields are primitive attisnull tests, not recursive
+         * checks to see if they are all-nulls or no-nulls rowtypes.
+         *
+         * The standard does not consider the possibility of zero-field rows,
+         * but here we consider them to vacuously satisfy both predicates.
+         * 
+         * e.g.
+         *            r      | isnull | isnotnull 
+         *      -------------+--------+-----------
+         *       (1,"(1,2)") | f      | t
+         *       (1,"(,)")   | f      | t
+         *       (1,)        | f      | f
+         *       (,"(1,2)")  | f      | f
+         *       (,"(,)")    | f      | f
+         *       (,)         | t      | f
+         * 
+         */
         HeapTupleHeader tuple;
         Oid tupType;
         int32 tupTypmod;
         TupleDesc tupDesc;
         HeapTupleData tmptup;
-        int att;
 
         tuple = DatumGetHeapTupleHeader(result);
 
@@ -4131,22 +5345,11 @@ static Datum ExecEvalNullTest(NullTestState* nstate, ExprContext* econtext, bool
         tmptup.t_len = HeapTupleHeaderGetDatumLength(tuple);
         tmptup.t_data = tuple;
 
-        for (att = 1; att <= tupDesc->natts; att++) {
-            /* ignore dropped columns */
-            if (tupDesc->attrs[att - 1]->attisdropped)
-                continue;
-            if (tableam_tops_tuple_attisnull(&tmptup, att, tupDesc)) {
-                /* null field disproves IS NOT NULL */
-                if (ntest->nulltesttype == IS_NOT_NULL)
-                    return BoolGetDatum(false);
-            } else {
-                /* non-null field disproves IS NULL */
-                if (ntest->nulltesttype == IS_NULL)
-                    return BoolGetDatum(false);
-            }
+        if (AFORMAT_NULL_TEST_MODE) {
+            return CheckRowTypeIsNullForAFormat(tupDesc, tmptup, ntest);
+        } else {
+            return CheckRowTypeIsNull(tupDesc, tmptup, ntest);
         }
-
-        return BoolGetDatum(true);
     } else {
         /* Simple scalar-argument case, or a null rowtype datum */
         switch (ntest->nulltesttype) {
@@ -4225,13 +5428,9 @@ static Datum ExecEvalHashFilter(HashFilterState* hstate, ExprContext* econtext, 
         }
     }
 
-#ifdef ENABLE_MULTIPLE_NODES
-    CheckBucketMapLenValid();
-#endif
-
     /* If has non null value, it should get nodeId and deside if need filter the value or not. */
     if (hasNonNullValue) {
-        modulo = hstate->bucketMap[abs((int)hashValue) & (BUCKETDATALEN - 1)];
+        modulo = hstate->bucketMap[abs((int)hashValue) & (hstate->bucketCnt - 1)];
         nodeIndex = hstate->nodelist[modulo];
 
         /* If there are null value and non null value, and the last value in distkey is null,
@@ -4918,29 +6117,10 @@ ExprState* ExecInitExpr(Expr* node, PlanState* parent)
         case T_FuncExpr: {
             FuncExpr* funcexpr = (FuncExpr*)node;
             FuncExprState* fstate = makeNode(FuncExprState);
-            bool isnull = true;
             fstate->xprstate.evalfunc = (ExprStateEvalFunc)ExecEvalFunc;
 
             fstate->args = (List*)ExecInitExpr((Expr*)funcexpr->args, parent);
             fstate->func.fn_oid = InvalidOid; /* not initialized */
-            HeapTuple proctup = SearchSysCache1(PROCOID, ObjectIdGetDatum(funcexpr->funcid));
-            if (!HeapTupleIsValid(proctup)) {
-                ereport(ERROR, (errcode(ERRCODE_UNDEFINED_OBJECT),
-                    errmsg("cache lookup failed for function %u", funcexpr->funcid)));
-            }
-            /*   
-             * If proconfig is set we can't allow transaction commands because of the
-             * way the GUC stacking works: The transaction boundary would have to pop
-             * the proconfig setting off the stack.  That restriction could be lifted
-             * by redesigning the GUC nesting mechanism a bit.
-             */
-            if (!heap_attisnull(proctup, Anum_pg_proc_proconfig, NULL) || u_sess->SPI_cxt.is_proconfig_set) {
-                u_sess->SPI_cxt.is_proconfig_set = true;
-                stp_set_commit_rollback_err_msg(STP_XACT_GUC_IN_OPT_CLAUSE);
-            }
-            Datum datum = SysCacheGetAttr(PROCOID, proctup, Anum_pg_proc_prokind, &isnull);
-            fstate->prokind = CharGetDatum(datum);
-            ReleaseSysCache(proctup);
             state = (ExprState*)fstate;
         } break;
         case T_OpExpr: {
@@ -5365,7 +6545,9 @@ ExprState* ExecInitExpr(Expr* node, PlanState* parent)
             }
 
             hstate->arg = outlist;
-            hstate->bucketMap = get_bucketmap_by_execnode(parent->plan->exec_nodes, parent->state->es_plannedstmt);
+            hstate->bucketMap = get_bucketmap_by_execnode(parent->plan->exec_nodes,
+                                                          parent->state->es_plannedstmt,
+                                                          &hstate->bucketCnt);
             hstate->nodelist = (uint2*)palloc(list_length(htest->nodeList) * sizeof(uint2));
             foreach (l, htest->nodeList)
                 hstate->nodelist[idx++] = lfirst_int(l);
@@ -5418,20 +6600,129 @@ ExprState* ExecInitExpr(Expr* node, PlanState* parent)
             state = (ExprState*)rnstate;
             state->evalfunc = (ExprStateEvalFunc)ExecEvalRownum;
         } break;
-        case T_GradientDescentExpr: {
-            GradientDescentExprState* ml_state = (GradientDescentExprState*)makeNode(GradientDescentExprState);
-            ml_state->ps = parent;
-            ml_state->xpr = (GradientDescentExpr*)node;
-            state = (ExprState*)ml_state;
-            if (IsA(parent, GradientDescentState)) {
-                state->evalfunc = (ExprStateEvalFunc)ExecEvalGradientDescent;
-            } else {
-                ereport(ERROR,
-                        (errmodule(MOD_DB4AI),
-                         errcode(ERRCODE_INVALID_OPERATION),
-                         errmsg("unrecognized state %d for GradientDescentExpr", parent->type)));
-            }
-        } break;
+
+#ifdef GS_GRAPH        
+        case T_CypherTypeCast:
+			{
+                CypherTypeCastState* cs = (CypherTypeCastState*) makeNode(CypherTypeCastState);
+                CypherTypeCast* tc = (CypherTypeCast*) node;
+                Oid			infunc;
+                Oid			typinparam;
+
+                Assert(exprType((Node *) tc->arg) == JSONBOID);
+                cs->arg_state = ExecInitExpr(tc->arg, parent);
+                FmgrInfo* finfo_in = (FmgrInfo*) palloc0(sizeof(FmgrInfo));
+                FunctionCallInfo fcinfo_data_in = (FunctionCallInfo) palloc0(
+                    sizeof(FunctionCallInfoData) + 3 * (sizeof(bool) + sizeof(Datum)));
+
+                getTypeInputInfo(tc->type, &infunc, &typinparam);
+
+                fmgr_info(infunc, finfo_in);
+                fmgr_info_set_expr((Node *) tc, finfo_in);
+
+                InitFunctionCallInfoData(*fcinfo_data_in, finfo_in, 3, InvalidOid, NULL, NULL);
+
+                fcinfo_data_in->argnull = (bool*)((char*)fcinfo_data_in + sizeof(FunctionCallInfoData));
+                fcinfo_data_in->arg = (Datum*)((char*)fcinfo_data_in->argnull + sizeof(bool) * 3);
+                /*
+                * The datum for the first argument will be filled every time when this
+                * expression is executed by calling ExecEvalCypherTypeCast().
+                */
+                fcinfo_data_in->arg[1] = ObjectIdGetDatum(typinparam);
+                fcinfo_data_in->argnull[1] = false;
+                fcinfo_data_in->arg[2] = Int32GetDatum(-1);
+                fcinfo_data_in->argnull[2] = false;
+
+                cs->fcinfo_data_in = fcinfo_data_in;
+                
+                state = (ExprState*) cs;
+                state->evalfunc = (ExprStateEvalFunc) ExecEvalCypherTypeCast;
+			} break;
+		case T_CypherMapExpr:
+			{
+                CypherMapState* cstate = (CypherMapState*) makeNode(CypherMapState);
+                CypherMapExpr* mapexpr = (CypherMapExpr*) node;
+
+                ListCell *le = list_head(mapexpr->keyvals);
+                while (le != NULL){
+                    Const *key;
+                    Expr *val;
+
+                    key = lfirst_node(Const, le);
+                    le = lnext(le);
+
+                    Assert(le != NULL);
+
+                    val = (Expr *) lfirst(le);
+                    le = lnext(le);
+
+                    cstate->key_valstate = lappend(cstate->key_valstate, key);
+                    cstate->key_valstate = lappend(cstate->key_valstate, ExecInitExpr(val, parent));
+                }
+                state = (ExprState*) cstate;
+                state->evalfunc = (ExprStateEvalFunc) ExecEvalCypherMapExpr;
+			} break;
+
+		case T_CypherListExpr:
+			{
+                Assert(false);
+				break;
+			}
+
+		case T_CypherListCompExpr:
+			{
+                Assert(false);
+				break;
+			}
+
+		case T_CypherListCompVar:
+			{
+                Assert(false);
+				break;
+			}
+
+		case T_CypherAccessExpr:
+			{
+                CypherAccessExpr *accessexpr = (CypherAccessExpr*) node;
+                CypherAccessState *cstate = (CypherAccessState*) makeNode(CypherAccessState);
+                ListCell* le;
+                int pathlen;
+                int i;
+                PathElem *elems;
+
+                Assert(exprType((Node *) accessexpr->arg) == JSONBOID);
+                cstate->arg = ExecInitExpr(accessexpr->arg, parent);
+                
+                pathlen = list_length(accessexpr->path);
+                elems = (PathElem*) palloc(sizeof(PathElem) * pathlen);
+
+                i = 0;
+                foreach(le, accessexpr->path)
+                {
+                    Node *node = (Node*) lfirst(le);
+
+                    if (IsA(node, CypherIndices))
+                    {
+                        CypherIndices *cind = (CypherIndices *) node;
+                        elems[i].is_slice = cind->is_slice;
+                        elems[i].lidx_state = (cind->lidx == NULL)? NULL : ExecInitExpr((Expr*)cind->lidx, parent);
+                        elems[i].uidx_state = (cind->uidx == NULL)? NULL : ExecInitExpr((Expr*)cind->uidx, parent);
+                    }
+                    else
+                    {
+                        elems[i].is_slice = false;
+                        elems[i].lidx_state = NULL;
+                        elems[i].uidx_state = (node == NULL)? NULL : ExecInitExpr((Expr*)node, parent);
+                    }
+                    i++;
+                }
+                cstate->pathlen = pathlen;
+                cstate->pathelems = elems;
+                state = (ExprState*) cstate;
+                state->evalfunc = (ExprStateEvalFunc) ExecEvalCypherAccessExpr;
+				break;
+			}
+#endif
         default:
             ereport(ERROR,
                 (errcode(ERRCODE_UNRECOGNIZED_NODE_TYPE),
@@ -5593,6 +6884,132 @@ int ExecCleanTargetListLength(List* targetlist)
     return len;
 }
 
+static HeapTuple get_tuple(Relation relation, ItemPointer tid)
+{
+    Buffer user_buf = InvalidBuffer;
+    HeapTuple tuple = NULL;
+    HeapTuple new_tuple = NULL;
+
+    /* alloc mem for old tuple and set tuple id */
+    tuple = (HeapTupleData *)heaptup_alloc(BLCKSZ);
+    tuple->t_data = (HeapTupleHeader)((char *)tuple + HEAPTUPLESIZE);
+    Assert(tid != NULL);
+    tuple->t_self = *tid;
+    
+    if (heap_fetch(relation, SnapshotAny, tuple, &user_buf, false, NULL)) {
+        new_tuple = heapCopyTuple((HeapTuple)tuple, relation->rd_att, NULL);
+        ReleaseBuffer(user_buf);
+    } else {
+        ereport(ERROR, (errcode(ERRCODE_SYSTEM_ERROR), errmsg("The tuple is not found"),
+            errdetail("Another user is getting tuple or the datum is NULL")));
+    }
+
+    heap_freetuple(tuple);
+    return new_tuple;
+}
+
+static void check_huge_clob_paramter(FunctionCallInfoData* fcinfo, bool is_have_huge_clob)
+{
+    if (!is_have_huge_clob || IsSystemObjOid(fcinfo->flinfo->fn_oid)) {
+        return;
+    }
+    Oid schema_oid = get_func_namespace(fcinfo->flinfo->fn_oid);
+    if (IsPackageSchemaOid(schema_oid)) {
+        return;
+    }
+    ereport(ERROR,
+            (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+            errmsg("huge clob do not support as function in parameter")));
+}
+
+
+bool is_external_clob(Oid type_oid, bool is_null, Datum value)
+{
+    if (type_oid == CLOBOID && !is_null && VARATT_IS_EXTERNAL_LOB(value)) {
+        return true;
+    }
+    return false;
+}
+
+bool is_huge_clob(Oid type_oid, bool is_null, Datum value)
+{
+    if (!is_external_clob(type_oid, is_null, value)) {
+        return false;
+    }
+
+    struct varatt_lob_pointer* lob_pointer = (varatt_lob_pointer*)(VARDATA_EXTERNAL(value));
+    bool is_huge_clob = false;
+    /* get relation by relid */
+    ItemPointerData tuple_ctid;
+    tuple_ctid.ip_blkid.bi_hi = lob_pointer->bi_hi;
+    tuple_ctid.ip_blkid.bi_lo = lob_pointer->bi_lo;
+    tuple_ctid.ip_posid = lob_pointer->ip_posid;
+    Relation relation = heap_open(lob_pointer->relid, RowExclusiveLock);
+    HeapTuple origin_tuple = get_tuple(relation, &tuple_ctid);
+    if (!HeapTupleIsValid(origin_tuple)) {
+        ereport(ERROR,
+            (errcode(ERRCODE_CACHE_LOOKUP_FAILED),
+            errmsg("cache lookup failed for tuple from relation %u", lob_pointer->relid)));
+    }
+    bool attr_is_null = false;
+    Datum attr = fastgetattr(origin_tuple, lob_pointer->columid, relation->rd_att, &attr_is_null);
+    if (!attr_is_null && VARATT_IS_HUGE_TOAST_POINTER(attr)) {
+        is_huge_clob = true;
+    }
+    heap_close(relation, NoLock);
+    heap_freetuple(origin_tuple);
+    return is_huge_clob;
+}
+
+Datum fetch_lob_value_from_tuple(varatt_lob_pointer* lob_pointer, Oid update_oid, bool* is_null)
+{
+    /* get relation by relid */
+    ItemPointerData tuple_ctid;
+    tuple_ctid.ip_blkid.bi_hi = lob_pointer->bi_hi;
+    tuple_ctid.ip_blkid.bi_lo = lob_pointer->bi_lo;
+    tuple_ctid.ip_posid = lob_pointer->ip_posid;
+    Relation relation = heap_open(lob_pointer->relid, RowExclusiveLock);
+    HeapTuple origin_tuple = get_tuple(relation, &tuple_ctid);
+    if (!HeapTupleIsValid(origin_tuple)) {
+        ereport(ERROR,
+            (errcode(ERRCODE_CACHE_LOOKUP_FAILED),
+            errmsg("cache lookup failed for tuple from relation %u", lob_pointer->relid)));
+    }
+
+    Datum attr = fastgetattr(origin_tuple, lob_pointer->columid, relation->rd_att, is_null);
+
+
+    if (!OidIsValid(update_oid)) {
+        heap_close(relation, NoLock);
+        return attr;
+    }
+    Datum new_attr = (Datum)0;
+    if (*is_null) {
+        new_attr = (Datum)0;
+    } else {
+        if (VARATT_IS_HUGE_TOAST_POINTER(attr)) {
+            if (unlikely(origin_tuple->tupTableType == UHEAP_TUPLE)) {
+                ereport(ERROR,
+                    (errcode(ERRCODE_INVALID_NAME),
+                        errmsg("UStore cannot update clob column that larger than 1GB")));
+            }
+            Relation update_rel = heap_open(update_oid, RowExclusiveLock);
+            struct varlena *old_value = (struct varlena *)DatumGetPointer(attr);
+            struct varlena *new_value = heap_tuple_fetch_and_copy(update_rel, old_value, false);
+            new_attr = PointerGetDatum(new_value);
+            heap_close(update_rel, NoLock);
+        } else if (VARATT_IS_SHORT(attr) || VARATT_IS_EXTERNAL(attr) || VARATT_IS_4B(attr)) {
+            new_attr = PointerGetDatum(attr);
+        } else {
+            ereport(ERROR, (errcode(ERRCODE_SYSTEM_ERROR),
+                    errmsg("lob value which fetch from tuple type is not recognized."), 
+                        errdetail("lob type is not one of the existing types")));
+        }
+    }
+    heap_close(relation, NoLock);
+    return new_attr;
+}
+
 /*
  * ExecTargetList
  *		Evaluates a targetlist with respect to the given
@@ -5634,6 +7051,31 @@ static bool ExecTargetList(List* targetlist, ExprContext* econtext, Datum* value
 
         values[resind] = ExecEvalExpr(gstate->arg, econtext, &isnull[resind], &itemIsDone[resind]);
 
+        if (T_Var == nodeTag(tle->expr) && !isnull[resind]) {
+            Var *var = (Var *)tle->expr;
+            if (var->vartype == TIDOID) {
+                Assert(ItemPointerIsValid((ItemPointer)values[resind]));
+            }
+        }
+
+
+        bool isClobAndNotNull = false;
+        isClobAndNotNull = (IsA(tle->expr, Param)) && (!isnull[resind]) && (((Param*)tle->expr)->paramtype == CLOBOID
+            || ((Param*)tle->expr)->paramtype == BLOBOID);
+        if (isClobAndNotNull) {
+            /* if is big lob, fetch and copy from toast */
+            if (VARATT_IS_HUGE_TOAST_POINTER(values[resind])) {
+                Datum new_attr = (Datum)0;
+                Oid update_oid = econtext->ecxt_scantuple != NULL ?
+                    ((HeapTuple)(econtext->ecxt_scantuple->tts_tuple))->t_tableOid : InvalidOid;
+                Relation update_rel = heap_open(update_oid, RowExclusiveLock);
+                struct varlena *old_value = (struct varlena *)DatumGetPointer(values[resind]);
+                struct varlena *new_value = heap_tuple_fetch_and_copy(update_rel, old_value,true);
+                new_attr = PointerGetDatum(new_value);
+                heap_close(update_rel, NoLock);
+                values[resind] = new_attr;
+            }
+        }
         ELOG_FIELD_NAME_END;
 
         if (itemIsDone[resind] != ExprSingleResult) {
@@ -5909,3 +7351,20 @@ void ExecCopyDataToDatum(PLpgSQL_datum** datums, int dno, Cursor_Data* source_cu
     cursor_var->value = Int32GetDatum(source_cursor->row_count);
     cursor_var->isnull = source_cursor->null_open;
 }
+
+
+#ifdef GS_GRAPH
+
+static void initCypherIndex(CypherIndexResult *cidxres, ExprState* idx_state, ExprContext* econtext){
+    if (idx_state == NULL)
+    {
+        MarkCypherIndexResultInvalid(cidxres);
+    }
+    else
+    {
+        cidxres->type = exprType((Node*) idx_state->expr);
+        cidxres->value = ExecEvalExpr(idx_state, econtext, &cidxres->isnull, NULL);
+    }
+}
+
+#endif

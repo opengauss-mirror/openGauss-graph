@@ -1,7 +1,7 @@
 /* -------------------------------------------------------------------------
  *
  * outfuncs.cpp
- *	  Output functions for Postgres tree nodes.
+ *	  Output functions for openGauss tree nodes.
  *
  * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
@@ -25,6 +25,9 @@
 #include "bulkload/dist_fdw.h"
 #include "foreign/fdwapi.h"
 #include "nodes/plannodes.h"
+#ifdef GS_GRAPH
+#include "nodes/graphnodes.h"
+#endif /* GS_GRAPH */
 #include "nodes/relation.h"
 #include "nodes/nodeFuncs.h"
 #include "parser/parse_hint.h"
@@ -38,6 +41,7 @@
 #include "catalog/pg_synonym.h"
 #include "catalog/pg_type.h"
 #include "optimizer/streamplan.h"
+#include "storage/tcap.h"
 #include "tcop/utility.h"
 #ifdef PGXC
 #include "optimizer/dataskew.h"
@@ -154,7 +158,7 @@
 /*
  * Write full-text search configuration's name out of its oid
  *
- * PostgreSQL defines a special type(regconfig) to express full-text search
+ * openGauss defines a special type(regconfig) to express full-text search
  * configuration type, and almost all the full-text search functions has a input
  * para of type regconfig, and the value of the para indicates a user-defined
  * full-text search configuration.
@@ -572,13 +576,14 @@ static void _outPlannedStmt(StringInfo str, PlannedStmt* node)
     WRITE_INT_FIELD(assigned_query_mem[1]);
 
     WRITE_INT_FIELD(num_bucketmaps);
-#ifdef ENABLE_MULTIPLE_NODES
-    CheckBucketMapLenValid();
-#endif
     for (int j = 0; j < node->num_bucketmaps; j++) {
+        if (t_thrd.proc->workingVersionNum >= SEGMENT_PAGE_VERSION_NUM) {
+            appendStringInfo(str, " :bucketCnt");
+            appendStringInfo(str, " %d", node->bucketCnt[j]);
+        }
         appendStringInfo(str, " :bucketMap");
         if (node->bucketMap[j]) {
-            for (int i = 0; i < BUCKETDATALEN; i++) {
+            for (int i = 0; i < node->bucketCnt[j]; i++) {
                 appendStringInfo(str, " %d", node->bucketMap[j][i]);
             }
         } else {
@@ -604,6 +609,12 @@ static void _outPlannedStmt(StringInfo str, PlannedStmt* node)
     }
     WRITE_BOOL_FIELD(isRowTriggerShippable);
     WRITE_BOOL_FIELD(is_stream_plan);
+#ifdef GS_GRAPH
+    /* withCheckOptions intentionally omitted, see comment in parsenodes.h */
+	WRITE_LOCATION_FIELD(stmt_location);
+	WRITE_LOCATION_FIELD(stmt_len);
+    WRITE_BOOL_FIELD(hasGraphwriteClause);
+#endif /* GS_GRAPH */
 }
 
 /*
@@ -626,6 +637,9 @@ static void _outPlanInfo(StringInfo str, Plan* node)
     WRITE_NODE_FIELD(righttree);
     WRITE_BOOL_FIELD(ispwj);
     WRITE_INT_FIELD(paramno);
+    if (t_thrd.proc->workingVersionNum >= SUBPARTITION_VERSION_NUM) {
+        WRITE_INT_FIELD(subparamno);
+    }
     WRITE_NODE_FIELD(initPlan);
     WRITE_NODE_FIELD(distributed_keys);
     WRITE_NODE_FIELD(exec_nodes);
@@ -667,9 +681,24 @@ static void _outPruningResult(StringInfo str, PruningResult* node)
     WRITE_INT_FIELD(intervalOffset);
     WRITE_BITMAPSET_FIELD(intervalSelectedPartitions);
     WRITE_NODE_FIELD(ls_rangeSelectedPartitions);
+    if (t_thrd.proc->workingVersionNum >= SUBPARTITION_VERSION_NUM) {
+        WRITE_NODE_FIELD(ls_selectedSubPartitions);
+    }
     if (t_thrd.proc->workingVersionNum >= num) {
         WRITE_NODE_FIELD(expr);
     }
+    if (t_thrd.proc->workingVersionNum >= PBESINGLEPARTITION_VERSION_NUM) {
+        WRITE_BOOL_FIELD(isPbeSinlePartition);
+    }
+}
+
+static void _outSubPartitionPruningResult(StringInfo str, SubPartitionPruningResult* node)
+{
+    WRITE_NODE_TYPE("SUBPARTITIONPRUNINGRESULT");
+
+    WRITE_INT_FIELD(partSeq);
+    WRITE_BITMAPSET_FIELD(bm_selectedSubPartitions);
+    WRITE_NODE_FIELD(ls_selectedSubPartitions);
 }
 
 /*
@@ -692,6 +721,9 @@ static void _outScanInfo(StringInfo str, Scan* node)
     WRITE_NODE_FIELD(tablesample);
 
     out_mem_info(str, &node->mem_info);
+    if (t_thrd.proc->workingVersionNum >= SCAN_BATCH_MODE_VERSION_NUM) {
+        WRITE_BOOL_FIELD(scanBatchMode);
+    }
 }
 
 /*
@@ -706,6 +738,9 @@ static void _outJoinPlanInfo(StringInfo str, Join* node)
     WRITE_BOOL_FIELD(optimizable);
     WRITE_NODE_FIELD(nulleqqual);
     WRITE_UINT_FIELD(skewoptimize);
+#ifdef GS_GRAPH
+    WRITE_BOOL_FIELD(inner_unique);
+#endif
 }
 
 static void _outPlan(StringInfo str, Plan* node)
@@ -758,14 +793,16 @@ static void _outModifyTable(StringInfo str, ModifyTable* node)
         WRITE_NODE_FIELD(updateTlist);
         WRITE_NODE_FIELD(exclRelTlist);
         WRITE_INT_FIELD(exclRelRTIndex);
-        WRITE_BOOL_FIELD(partKeyUpsert);
+    }
+    if (t_thrd.proc->workingVersionNum >= UPSERT_WHERE_VERSION_NUM) {
+        WRITE_NODE_FIELD(upsertWhere);
     }
 #else
     WRITE_ENUM_FIELD(upsertAction, UpsertAction);
     WRITE_NODE_FIELD(updateTlist);
     WRITE_NODE_FIELD(exclRelTlist);
     WRITE_INT_FIELD(exclRelRTIndex);
-    WRITE_BOOL_FIELD(partKeyUpsert);
+    WRITE_NODE_FIELD(upsertWhere);
 #endif		
 }
 
@@ -775,6 +812,9 @@ static void _outUpsertClause(StringInfo str, const UpsertClause* node)
 
     WRITE_NODE_FIELD(targetList);
     WRITE_INT_FIELD(location);
+    if (t_thrd.proc->workingVersionNum >= UPSERT_WHERE_VERSION_NUM) {
+        WRITE_NODE_FIELD(whereClause);
+    }
 }
 
 static void _outUpsertExpr(StringInfo str, const UpsertExpr* node)
@@ -785,7 +825,7 @@ static void _outUpsertExpr(StringInfo str, const UpsertExpr* node)
     WRITE_NODE_FIELD(updateTlist);
     WRITE_NODE_FIELD(exclRelTlist);
     WRITE_INT_FIELD(exclRelIndex);
-    WRITE_BOOL_FIELD(partKeyUpsert);
+    WRITE_NODE_FIELD(upsertWhere);
 }
 static void _outMergeWhenClause(StringInfo str, const MergeWhenClause* node)
 {
@@ -859,6 +899,35 @@ static void _outMergeAppend(StringInfo str, MergeAppend* node)
     }
 }
 
+static void _outStartWithOp(StringInfo str, StartWithOp *node)
+{
+    WRITE_NODE_TYPE("STARTWITHOP");
+
+    _outPlanInfo(str, (Plan*)node);
+
+    WRITE_NODE_FIELD(cteplan);
+    WRITE_NODE_FIELD(ruplan);
+
+    WRITE_NODE_FIELD(keyEntryList);
+    WRITE_NODE_FIELD(colEntryList);
+    WRITE_NODE_FIELD(internalEntryList);
+    WRITE_NODE_FIELD(fullEntryList);
+
+    WRITE_NODE_FIELD(swoptions);
+}
+
+static void _outStartWithOptions(StringInfo str, StartWithOptions* node)
+{
+    WRITE_NODE_TYPE("STARTWITHOPTIONS");
+
+    WRITE_NODE_FIELD(siblings_orderby_clause);
+    WRITE_NODE_FIELD(prior_key_index);
+    WRITE_ENUM_FIELD(connect_by_type, StartWithConnectByType);
+    WRITE_NODE_FIELD(connect_by_level_quals);
+    WRITE_NODE_FIELD(connect_by_other_quals);
+    WRITE_BOOL_FIELD(nocycle);
+}
+
 static void _outRecursiveUnion(StringInfo str, RecursiveUnion* node)
 {
     int i;
@@ -881,6 +950,9 @@ static void _outRecursiveUnion(StringInfo str, RecursiveUnion* node)
     WRITE_BOOL_FIELD(has_outer_stream);
     WRITE_BOOL_FIELD(is_used);
     WRITE_BOOL_FIELD(is_correlated);
+    if (t_thrd.proc->workingVersionNum >= SWCB_VERSION_NUM) {
+        WRITE_NODE_FIELD(internalEntryList);
+    }
 }
 
 static void _outBitmapAnd(StringInfo str, BitmapAnd* node)
@@ -890,6 +962,9 @@ static void _outBitmapAnd(StringInfo str, BitmapAnd* node)
     _outPlanInfo(str, (Plan*)node);
 
     WRITE_NODE_FIELD(bitmapplans);
+    if (t_thrd.proc->workingVersionNum >= INPLACE_UPDATE_VERSION_NUM) {
+        WRITE_BOOL_FIELD(is_ustore);
+    }
 }
 
 static void _outBitmapOr(StringInfo str, BitmapOr* node)
@@ -899,6 +974,9 @@ static void _outBitmapOr(StringInfo str, BitmapOr* node)
     _outPlanInfo(str, (Plan*)node);
 
     WRITE_NODE_FIELD(bitmapplans);
+    if (t_thrd.proc->workingVersionNum >= INPLACE_UPDATE_VERSION_NUM) {
+        WRITE_BOOL_FIELD(is_ustore);
+    }
 }
 static void _outCStoreIndexOr(StringInfo str, CStoreIndexOr* node)
 {
@@ -963,6 +1041,9 @@ static void _outIndexScan(StringInfo str, IndexScan* node)
 {
     WRITE_NODE_TYPE("INDEXSCAN");
     _outCommonIndexScanPart<IndexScan>(str, node);
+    if (t_thrd.proc->workingVersionNum >= INPLACE_UPDATE_VERSION_NUM) {
+        WRITE_BOOL_FIELD(is_ustore);
+    }
 }
 
 static void _outCStoreIndexScan(StringInfo str, CStoreIndexScan* node)
@@ -1250,6 +1331,9 @@ static void _outBitmapIndexScan(StringInfo str, BitmapIndexScan* node)
         _outToken(str, get_namespace_name(get_rel_namespace(node->indexid)));
     }
 #endif  // STREAMPLAN
+    if (t_thrd.proc->workingVersionNum >= INPLACE_UPDATE_VERSION_NUM) {
+        WRITE_BOOL_FIELD(is_ustore);
+    }
 }
 
 static void _outBitmapHeapScan(StringInfo str, BitmapHeapScan* node)
@@ -1305,6 +1389,9 @@ static void _outPartIteratorParam(StringInfo str, PartIteratorParam* node)
     WRITE_NODE_TYPE("PARTITERATORPARAM");
 
     WRITE_INT_FIELD(paramno);
+    if (t_thrd.proc->workingVersionNum >= SUBPARTITION_VERSION_NUM) {
+        WRITE_INT_FIELD(subPartParamno);
+    }
 }
 
 static void _outPartIterator(StringInfo str, PartIterator* node)
@@ -1360,6 +1447,10 @@ static void _outCteScan(StringInfo str, CteScan* node)
 
     WRITE_INT_FIELD(ctePlanId);
     WRITE_INT_FIELD(cteParam);
+    if (t_thrd.proc->workingVersionNum >= SWCB_VERSION_NUM) {
+        WRITE_NODE_FIELD(cteRef);
+        WRITE_NODE_FIELD(internalEntryList);
+    }
 }
 
 static void _outWorkTableScan(StringInfo str, WorkTableScan* node)
@@ -1369,6 +1460,9 @@ static void _outWorkTableScan(StringInfo str, WorkTableScan* node)
     _outScanInfo(str, (Scan*)node);
 
     WRITE_INT_FIELD(wtParam);
+    if (t_thrd.proc->workingVersionNum >= SWCB_VERSION_NUM) {
+        WRITE_BOOL_FIELD(forStartWith);
+    }
 }
 
 template <typename T>
@@ -1440,6 +1534,21 @@ static void _outNestLoop(StringInfo str, NestLoop* node)
     WRITE_BOOL_FIELD(materialAll);
 }
 
+#ifdef GS_GRAPH
+static void _outNestLoopVLE(StringInfo str, const NestLoopVLE *node)
+{
+	WRITE_NODE_TYPE("NESTLOOPVLE");
+
+	_outJoinPlanInfo(str, (Join *) node);
+
+	WRITE_NODE_FIELD(nl.nestParams);
+    WRITE_BOOL_FIELD(nl.materialAll);
+    
+	WRITE_INT_FIELD(minHops);
+	WRITE_INT_FIELD(maxHops);
+}
+#endif
+
 static void _outVecNestLoop(StringInfo str, VecNestLoop* node)
 {
     WRITE_NODE_TYPE("VECNESTLOOP");
@@ -1467,6 +1576,9 @@ static void _outCommonJoinPart(StringInfo str, T* node)
 
     _outJoinPlanInfo(str, (Join*)node);
 
+#ifdef GS_GRAPH
+    WRITE_BOOL_FIELD(skip_mark_restore);
+#endif
     WRITE_NODE_FIELD(mergeclauses);
 
     numCols = list_length(node->mergeclauses);
@@ -1884,6 +1996,90 @@ static void _outLimit(StringInfo str, Limit* node)
     WRITE_NODE_FIELD(limitCount);
 }
 
+#ifdef GS_GRAPH
+static void
+_outModifyGraph(StringInfo str, const ModifyGraph *node)
+{
+	WRITE_NODE_TYPE("MODIFYGRAPH");
+
+	_outPlanInfo(str, (Plan *) node);
+
+	WRITE_ENUM_FIELD(operation, GraphWriteOp);
+	WRITE_BOOL_FIELD(last);
+	WRITE_NODE_FIELD(targets);
+	WRITE_NODE_FIELD(subplan);
+	WRITE_UINT_FIELD(nr_modify);
+	WRITE_BOOL_FIELD(detach);
+	WRITE_BOOL_FIELD(eagerness);
+	WRITE_NODE_FIELD(pattern);
+	WRITE_NODE_FIELD(exprs);
+	WRITE_NODE_FIELD(sets);
+	WRITE_INT_FIELD(ert_base_index);
+	WRITE_INT_FIELD(ert_rtes_added);
+}
+
+static void
+_outSparqlLoadPlan(StringInfo str, const SparqlLoadPlan *node)
+{
+	WRITE_NODE_TYPE("SPARQLLOAD");
+
+	_outPlanInfo(str, (Plan *) node);
+    WRITE_NODE_FIELD(subplan);
+}
+
+static void
+_outShortestpath(StringInfo str, const Shortestpath *node)
+{
+	WRITE_NODE_TYPE("SHORTESTPATH");
+
+	_outJoinPlanInfo(str, (Join *) node);
+
+	WRITE_NODE_FIELD(hashclauses);
+
+	WRITE_INT_FIELD(end_id_left);
+	WRITE_INT_FIELD(end_id_right);
+	WRITE_INT_FIELD(tableoid_left);
+	WRITE_INT_FIELD(tableoid_right);
+	WRITE_INT_FIELD(ctid_left);
+	WRITE_INT_FIELD(ctid_right);
+	WRITE_NODE_FIELD(source);
+	WRITE_NODE_FIELD(target);
+	WRITE_LONG_FIELD(minhops);
+	WRITE_LONG_FIELD(maxhops);
+	WRITE_LONG_FIELD(limit);
+}
+
+static void
+_outHash2Side(StringInfo str, const Hash2Side *node)
+{
+	WRITE_NODE_TYPE("HASH2SIDE");
+
+	_outPlanInfo(str, (Plan *) node);
+
+	WRITE_OID_FIELD(skewTable);
+	WRITE_INT_FIELD(skewColumn);
+	WRITE_BOOL_FIELD(skewInherit);
+	WRITE_OID_FIELD(skewColType);
+	WRITE_INT_FIELD(skewColTypmod);
+}
+
+static void
+_outDijkstra(StringInfo str, const Dijkstra *node)
+{
+	WRITE_NODE_TYPE("DIJKSTRA");
+
+	_outPlanInfo(str, (Plan *) node);
+
+	WRITE_INT_FIELD(weight);
+	WRITE_BOOL_FIELD(weight_out);
+	WRITE_INT_FIELD(end_id);
+	WRITE_INT_FIELD(edge_id);
+	WRITE_NODE_FIELD(source);
+	WRITE_NODE_FIELD(target);
+	WRITE_NODE_FIELD(limit);
+}
+#endif /* GS_GRAPH */
+
 static void _outNestLoopParam(StringInfo str, NestLoopParam* node)
 {
     WRITE_NODE_TYPE("NESTLOOPPARAM");
@@ -1901,6 +2097,9 @@ static void _outPlanRowMark(StringInfo str, PlanRowMark* node)
     WRITE_UINT_FIELD(rowmarkId);
     WRITE_ENUM_FIELD(markType, RowMarkType);
     WRITE_BOOL_FIELD(noWait);
+    if (t_thrd.proc->workingVersionNum >= WAIT_N_TUPLE_LOCK_VERSION_NUM) {
+        WRITE_INT_FIELD(waitSec);
+    }
     WRITE_BOOL_FIELD(isParent);
     WRITE_INT_FIELD(numAttrs);
     WRITE_BITMAPSET_FIELD(bms_nodeids);
@@ -1939,15 +2138,24 @@ static void _outRangeVar(StringInfo str, RangeVar* node)
     WRITE_STRING_FIELD(schemaname);
     WRITE_STRING_FIELD(relname);
     WRITE_STRING_FIELD(partitionname);
+    if (t_thrd.proc->workingVersionNum >= SUBPARTITION_VERSION_NUM) {
+        WRITE_STRING_FIELD(subpartitionname);
+    }
     WRITE_ENUM_FIELD(inhOpt, InhOption);
     WRITE_CHAR_FIELD(relpersistence);
     WRITE_NODE_FIELD(alias);
     WRITE_LOCATION_FIELD(location);
     WRITE_BOOL_FIELD(ispartition);
+    if (t_thrd.proc->workingVersionNum >= SUBPARTITION_VERSION_NUM) {
+        WRITE_BOOL_FIELD(issubpartition);
+    }
     WRITE_NODE_FIELD(partitionKeyValuesList);
     if (t_thrd.proc->workingVersionNum >= 92063) {
         WRITE_BOOL_FIELD(isbucket);
         WRITE_NODE_FIELD(buckets);
+    }
+    if (TcapFeatureAvail()) {
+        WRITE_BOOL_FIELD(withVerExpr);
     }
 }
 
@@ -2061,8 +2269,17 @@ static void _outParam(StringInfo str, Param* node)
     WRITE_INT_FIELD(paramtypmod);
     WRITE_OID_FIELD(paramcollid);
     WRITE_LOCATION_FIELD(location);
-
     WRITE_TYPEINFO_FIELD(paramtype);
+    
+    if (t_thrd.proc->workingVersionNum >= COMMENT_ROWTYPE_TABLEOF_VERSION_NUM)
+    {
+        WRITE_OID_FIELD(tableOfIndexType);
+    }
+    if (t_thrd.proc->workingVersionNum >= COMMENT_RECORD_PARAM_VERSION_NUM)
+    {
+        WRITE_OID_FIELD(recordVarTypOid);
+    }
+
 }
 
 static void _outRownum(StringInfo str, const Rownum* node)
@@ -2225,6 +2442,9 @@ static void _outFuncExpr(StringInfo str, FuncExpr* node)
     WRITE_NODE_TYPE("FUNCEXPR");
     WRITE_OID_FIELD(funcid);
     WRITE_OID_FIELD(funcresulttype);
+    if (t_thrd.proc->workingVersionNum >= CLIENT_ENCRYPTION_PROC_VERSION_NUM) {
+        WRITE_INT_FIELD(funcresulttype_orig);
+    }
     WRITE_BOOL_FIELD(funcretset);
     WRITE_ENUM_FIELD(funcformat, CoercionForm);
     WRITE_OID_FIELD(funccollid);
@@ -2244,7 +2464,11 @@ static void _outFuncExpr(StringInfo str, FuncExpr* node)
             ereport(ERROR, (errcode(ERRCODE_UNEXPECTED_NULL_VALUE), errmsg("seqname of nextval() is not found")));
         }
 
-        Assert(IsA(firstArg, Const));
+        if (!IsA(firstArg, Const)) {
+            ereport(ERROR, (errcode(ERRCODE_UNRECOGNIZED_NODE_TYPE),
+                            errmsg("argument of nextval() must be plain const value")));
+        }
+
         Oid seqId = DatumGetObjectId(firstArg->constvalue);
 
         getNameById(seqId, "SEQUENCE", &seqNameSpace, &seqName);
@@ -2706,6 +2930,14 @@ static void _outTargetEntry(StringInfo str, TargetEntry* node)
     WRITE_BOOL_FIELD(resjunk);
 }
 
+static void _outPseudoTargetEntry(StringInfo str, PseudoTargetEntry* node)
+{
+    WRITE_NODE_TYPE("PSEUDOTARGETENTRY");
+
+    WRITE_NODE_FIELD(tle);
+    WRITE_NODE_FIELD(srctle);
+}
+
 static void _outRangeTblRef(StringInfo str, RangeTblRef* node)
 {
     WRITE_NODE_TYPE("RANGETBLREF");
@@ -2725,6 +2957,10 @@ static void _outJoinExpr(StringInfo str, JoinExpr* node)
     WRITE_NODE_FIELD(quals);
     WRITE_NODE_FIELD(alias);
     WRITE_INT_FIELD(rtindex);
+#ifdef GS_GRAPH
+    WRITE_INT_FIELD(minHops);
+	WRITE_INT_FIELD(maxHops);
+#endif
 }
 
 static void _outFromExpr(StringInfo str, FromExpr* node)
@@ -2745,6 +2981,77 @@ static void _outMergeAction(StringInfo str, const MergeAction* node)
     WRITE_NODE_FIELD(targetList);
     WRITE_NODE_FIELD(pulluped_targetList);
 }
+
+#ifdef GS_GRAPH
+static void
+_outCypherTypeCast(StringInfo str, const CypherTypeCast *node)
+{
+	WRITE_NODE_TYPE("CYPHERTYPECAST");
+
+	WRITE_OID_FIELD(type);
+	WRITE_ENUM_FIELD(cform, CoercionForm);
+	WRITE_NODE_FIELD(arg);
+	WRITE_LOCATION_FIELD(location);
+}
+
+static void
+_outCypherMapExpr(StringInfo str, const CypherMapExpr *node)
+{
+	WRITE_NODE_TYPE("CYPHERMAPEXPR");
+
+	WRITE_NODE_FIELD(keyvals);
+	WRITE_LOCATION_FIELD(location);
+}
+
+static void
+_outCypherListExpr(StringInfo str, const CypherListExpr *node)
+{
+	WRITE_NODE_TYPE("CYPHERLISTEXPR");
+
+	WRITE_NODE_FIELD(elems);
+	WRITE_LOCATION_FIELD(location);
+}
+
+static void
+_outCypherListCompExpr(StringInfo str, const CypherListCompExpr *node)
+{
+	WRITE_NODE_TYPE("CYPHERLISTCOMPEXPR");
+
+	WRITE_NODE_FIELD(list);
+	WRITE_STRING_FIELD(varname);
+	WRITE_NODE_FIELD(cond);
+	WRITE_NODE_FIELD(elem);
+	WRITE_LOCATION_FIELD(location);
+}
+
+static void
+_outCypherListCompVar(StringInfo str, const CypherListCompVar *node)
+{
+	WRITE_NODE_TYPE("CYPHERLISTCOMPVAR");
+
+	WRITE_STRING_FIELD(varname);
+	WRITE_LOCATION_FIELD(location);
+}
+
+static void
+_outCypherAccessExpr(StringInfo str, const CypherAccessExpr *node)
+{
+	WRITE_NODE_TYPE("CYPHERACCESSEXPR");
+
+	WRITE_NODE_FIELD(arg);
+	WRITE_NODE_FIELD(path);
+}
+
+static void
+_outCypherIndices(StringInfo str, const CypherIndices *node)
+{
+	WRITE_NODE_TYPE("CYPHERINDICES");
+
+	WRITE_BOOL_FIELD(is_slice);
+	WRITE_NODE_FIELD(lidx);
+	WRITE_NODE_FIELD(uidx);
+}
+#endif /* GS_GRAPH */
 
 /*****************************************************************************
  *
@@ -2796,6 +3103,12 @@ static void _outJoinPathInfo(StringInfo str, JoinPath* node)
     WRITE_NODE_FIELD(outerjoinpath);
     WRITE_NODE_FIELD(innerjoinpath);
     WRITE_NODE_FIELD(joinrestrictinfo);
+
+#ifdef GS_GRAPH
+    WRITE_BOOL_FIELD(inner_unique);
+    WRITE_INT_FIELD(minhops);
+	WRITE_INT_FIELD(maxhops);
+#endif    
 }
 
 static void _outPath(StringInfo str, Path* node)
@@ -2820,6 +3133,9 @@ static void _outIndexPath(StringInfo str, IndexPath* node)
     WRITE_ENUM_FIELD(indexscandir, ScanDirection);
     WRITE_FLOAT_FIELD(indextotalcost, "%.2f");
     WRITE_FLOAT_FIELD(indexselectivity, "%.4f");
+    if (t_thrd.proc->workingVersionNum >= INPLACE_UPDATE_VERSION_NUM) {
+        WRITE_BOOL_FIELD(is_ustore);
+    }
 }
 
 static void _outBitmapHeapPath(StringInfo str, BitmapHeapPath* node)
@@ -2839,6 +3155,9 @@ static void _outBitmapAndPath(StringInfo str, BitmapAndPath* node)
 
     WRITE_NODE_FIELD(bitmapquals);
     WRITE_FLOAT_FIELD(bitmapselectivity, "%.4f");
+    if (t_thrd.proc->workingVersionNum >= INPLACE_UPDATE_VERSION_NUM) {
+        WRITE_BOOL_FIELD(is_ustore);
+    }
 }
 
 static void _outBitmapOrPath(StringInfo str, BitmapOrPath* node)
@@ -2849,6 +3168,9 @@ static void _outBitmapOrPath(StringInfo str, BitmapOrPath* node)
 
     WRITE_NODE_FIELD(bitmapquals);
     WRITE_FLOAT_FIELD(bitmapselectivity, "%.4f");
+    if (t_thrd.proc->workingVersionNum >= INPLACE_UPDATE_VERSION_NUM) {
+        WRITE_BOOL_FIELD(is_ustore);
+    }
 }
 
 static void _outTidPath(StringInfo str, TidPath* node)
@@ -2975,6 +3297,9 @@ static void _outMergePath(StringInfo str, MergePath* node)
     WRITE_NODE_FIELD(path_mergeclauses);
     WRITE_NODE_FIELD(outersortkeys);
     WRITE_NODE_FIELD(innersortkeys);
+#ifdef GS_GRAPH
+    WRITE_BOOL_FIELD(skip_mark_restore);
+#endif
     WRITE_BOOL_FIELD(materialize_inner);
 }
 
@@ -3072,6 +3397,9 @@ static void _outPlannerInfo(StringInfo str, PlannerInfo* node)
     WRITE_BITMAPSET_FIELD(curOuterRels);
     WRITE_NODE_FIELD(curOuterParams);
     WRITE_UINT_FIELD(curIteratorParamIndex);
+    if (t_thrd.proc->workingVersionNum >= SUBPARTITION_VERSION_NUM) {
+        WRITE_UINT_FIELD(curSubPartIteratorParamIndex);
+    }
     WRITE_BOOL_FIELD(isPartIteratorPlanning);
     WRITE_INT_FIELD(curItrs);
     WRITE_NODE_FIELD(subqueryRestrictInfo);
@@ -3394,7 +3722,70 @@ static void _outPartitionState(StringInfo str, PartitionState* node)
     WRITE_NODE_FIELD(partitionKey);
     WRITE_NODE_FIELD(partitionList);
     WRITE_ENUM_FIELD(rowMovement, RowMovementValue);
+    WRITE_NODE_FIELD(subPartitionState);
+    WRITE_NODE_FIELD(partitionNameList);
 }
+
+#ifdef GS_GRAPH
+static void
+_outCreateLabelStmt(StringInfo str, const CreateLabelStmt *node)
+{
+	WRITE_NODE_TYPE("CREATELABELSTMT");
+
+	WRITE_NODE_FIELD(relation);
+	WRITE_NODE_FIELD(inhRelations);
+	WRITE_ENUM_FIELD(labelKind, LabelKind);
+	WRITE_NODE_FIELD(options);
+	WRITE_STRING_FIELD(tablespacename);
+	WRITE_BOOL_FIELD(if_not_exists);
+}
+
+static void
+_outCreateConstraintStmt(StringInfo str, const CreateConstraintStmt *node)
+{
+	WRITE_NODE_TYPE("CREATECONSTRAINTSTMT");
+
+	WRITE_ENUM_FIELD(contype, ConstrType);
+	WRITE_NODE_FIELD(graphlabel);
+	WRITE_STRING_FIELD(conname);
+	WRITE_NODE_FIELD(expr);
+}
+
+static void
+_outDropConstraintStmt(StringInfo str, const DropConstraintStmt *node)
+{
+	WRITE_NODE_TYPE("DROPCONSTRAINTSTMT");
+
+	WRITE_NODE_FIELD(graphlabel);
+	WRITE_STRING_FIELD(conname);
+}
+
+static void
+_outCreatePropertyIndexStmt(StringInfo str, const CreatePropertyIndexStmt *node)
+{
+	WRITE_NODE_TYPE("CREATEPROPERTYINDEXSTMT");
+
+	WRITE_STRING_FIELD(idxname);
+	WRITE_NODE_FIELD(relation);
+	WRITE_STRING_FIELD(accessMethod);
+	WRITE_STRING_FIELD(tableSpace);
+	WRITE_NODE_FIELD(indexParams);
+	WRITE_NODE_FIELD(options);
+	WRITE_NODE_FIELD(whereClause);
+	WRITE_NODE_FIELD(excludeOpNames);
+	WRITE_STRING_FIELD(idxcomment);
+	WRITE_OID_FIELD(indexOid);
+	WRITE_OID_FIELD(oldNode);
+	WRITE_BOOL_FIELD(unique);
+	WRITE_BOOL_FIELD(primary);
+	WRITE_BOOL_FIELD(isconstraint);
+	WRITE_BOOL_FIELD(deferrable);
+	WRITE_BOOL_FIELD(initdeferred);
+	// WRITE_BOOL_FIELD(transformed);
+	WRITE_BOOL_FIELD(concurrent);
+	// WRITE_BOOL_FIELD(if_not_exists);
+}
+#endif /* GS_GRAPH */
 
 static void _outRangePartitionindexDefState(StringInfo str, RangePartitionindexDefState* node)
 {
@@ -3402,7 +3793,226 @@ static void _outRangePartitionindexDefState(StringInfo str, RangePartitionindexD
 
     WRITE_STRING_FIELD(name);
     WRITE_STRING_FIELD(tablespace);
+    WRITE_NODE_FIELD(sublist);
 }
+
+#ifdef GS_GRAPH
+static void
+_outCypherStmt(StringInfo str, const CypherStmt *node)
+{
+	WRITE_NODE_TYPE("CYPHER");
+
+	WRITE_NODE_FIELD(last);
+}
+
+static void
+_outCypherListComp(StringInfo str, const CypherListComp *node)
+{
+	WRITE_NODE_TYPE("CYPHERLISTCOMP");
+
+	WRITE_NODE_FIELD(list);
+	WRITE_STRING_FIELD(varname);
+	WRITE_NODE_FIELD(cond);
+	WRITE_NODE_FIELD(elem);
+	WRITE_LOCATION_FIELD(location);
+}
+
+static void
+_outCypherGenericExpr(StringInfo str, const CypherGenericExpr *node)
+{
+	WRITE_NODE_TYPE("CYPHERGENERICEXPR");
+
+	WRITE_NODE_FIELD(expr);
+}
+
+static void
+_outCypherSubPattern(StringInfo str, const CypherSubPattern *node)
+{
+	WRITE_NODE_TYPE("CYPHERSUBPATTERN");
+
+	WRITE_ENUM_FIELD(kind, CSPKind);
+	WRITE_NODE_FIELD(pattern);
+}
+
+static void
+_outCypherClause(StringInfo str, const CypherClause *node)
+{
+	WRITE_NODE_TYPE("CYPHERCLAUSE");
+
+	WRITE_NODE_FIELD(detail);
+	WRITE_NODE_FIELD(prev);
+}
+
+static void
+_outCypherMatchClause(StringInfo str, const CypherMatchClause *node)
+{
+	WRITE_NODE_TYPE("CYPHERMATCHCLAUSE");
+
+	WRITE_NODE_FIELD(pattern);
+	WRITE_NODE_FIELD(where);
+	WRITE_BOOL_FIELD(optional);
+}
+
+static void
+_outCypherProjection(StringInfo str, const CypherProjection *node)
+{
+	WRITE_NODE_TYPE("CYPHERPROJECTION");
+
+	WRITE_ENUM_FIELD(kind, CPKind);
+	WRITE_NODE_FIELD(distinct);
+	WRITE_NODE_FIELD(items);
+	WRITE_NODE_FIELD(order);
+	WRITE_NODE_FIELD(skip);
+	WRITE_NODE_FIELD(limit);
+	WRITE_NODE_FIELD(where);
+}
+
+static void
+_outCypherCreateClause(StringInfo str, const CypherCreateClause *node)
+{
+	WRITE_NODE_TYPE("CYPHERCREATECLAUSE");
+
+	WRITE_NODE_FIELD(pattern);
+}
+
+static void
+_outCypherDeleteClause(StringInfo str, const CypherDeleteClause *node)
+{
+	WRITE_NODE_TYPE("CYPHERDELETECLAUSE");
+
+	WRITE_BOOL_FIELD(detach);
+	WRITE_NODE_FIELD(exprs);
+}
+
+static void
+_outCypherSetClause(StringInfo str, const CypherSetClause *node)
+{
+	WRITE_NODE_TYPE("CYPHERSETCLAUSE");
+
+	WRITE_BOOL_FIELD(is_remove);
+	WRITE_ENUM_FIELD(kind, CSetKind);
+	WRITE_NODE_FIELD(items);
+}
+
+static void
+_outCypherMergeClause(StringInfo str, const CypherMergeClause *node)
+{
+	WRITE_NODE_TYPE("CYPHERMERGECLAUSE");
+
+	WRITE_NODE_FIELD(pattern);
+	WRITE_NODE_FIELD(sets);
+}
+
+static void
+_outCypherLoadClause(StringInfo str, const CypherLoadClause *node)
+{
+	WRITE_NODE_TYPE("CYPHERLOADCLAUSE");
+
+	WRITE_NODE_FIELD(relation);
+}
+
+static void
+_outCypherPath(StringInfo str, const CypherPath *node)
+{
+	WRITE_NODE_TYPE("CYPHERPATH");
+
+	WRITE_ENUM_FIELD(kind, CPathKind);
+	WRITE_NODE_FIELD(variable);
+	WRITE_NODE_FIELD(chain);
+}
+
+static void
+_outCypherNode(StringInfo str, const CypherNode *node)
+{
+	WRITE_NODE_TYPE("CYPHERNODE");
+
+	WRITE_NODE_FIELD(variable);
+	WRITE_NODE_FIELD(label);
+	WRITE_BOOL_FIELD(only);
+	WRITE_NODE_FIELD(prop_map);
+}
+
+static void
+_outCypherRel(StringInfo str, const CypherRel *node)
+{
+	WRITE_NODE_TYPE("CYPHERREL");
+
+	WRITE_INT_FIELD(direction);
+	WRITE_NODE_FIELD(variable);
+	WRITE_NODE_FIELD(types);
+	WRITE_BOOL_FIELD(only);
+	WRITE_NODE_FIELD(varlen);
+}
+
+static void
+_outCypherName(StringInfo str, const CypherName *node)
+{
+	WRITE_NODE_TYPE("CYPHERNAME");
+
+	WRITE_STRING_FIELD(name);
+	WRITE_LOCATION_FIELD(location);
+}
+
+static void
+_outCypherSetProp(StringInfo str, const CypherSetProp *node)
+{
+	WRITE_NODE_TYPE("CYPHERSETPROP");
+
+	WRITE_NODE_FIELD(prop);
+	WRITE_NODE_FIELD(expr);
+}
+
+static void
+_outGraphPath(StringInfo str, const GraphPath *node)
+{
+	WRITE_NODE_TYPE("GRAPHPATH");
+
+	WRITE_STRING_FIELD(variable);
+	WRITE_NODE_FIELD(chain);
+}
+
+static void
+_outGraphVertex(StringInfo str, const GraphVertex *node)
+{
+	WRITE_NODE_TYPE("GRAPHVERTEX");
+
+	WRITE_INT_FIELD(resno);
+	WRITE_BOOL_FIELD(create);
+	WRITE_OID_FIELD(relid);
+	WRITE_NODE_FIELD(expr);
+}
+
+static void
+_outGraphEdge(StringInfo str, const GraphEdge *node)
+{
+	WRITE_NODE_TYPE("GRAPHEDGE");
+
+	WRITE_INT_FIELD(direction);
+	WRITE_INT_FIELD(resno);
+	WRITE_OID_FIELD(relid);
+	WRITE_NODE_FIELD(expr);
+}
+
+static void
+_outGraphSetProp(StringInfo str, const GraphSetProp *node)
+{
+	WRITE_NODE_TYPE("GRAPHSETPROP");
+
+	WRITE_ENUM_FIELD(kind, GSPKind);
+	WRITE_STRING_FIELD(variable);
+	WRITE_NODE_FIELD(elem);
+	WRITE_NODE_FIELD(expr);
+}
+
+static void
+_outGraphDelElem(StringInfo str, const GraphDelElem *node)
+{
+	WRITE_NODE_TYPE("GRAPHDELELEM");
+
+	WRITE_STRING_FIELD(variable);
+	WRITE_NODE_FIELD(elem);
+}
+#endif /* GS_GRAPH */
 
 static void _outRangePartitionStartEndDefState(StringInfo str, RangePartitionStartEndDefState* node)
 {
@@ -3422,6 +4032,15 @@ static void _outAddPartitionState(StringInfo str, AddPartitionState* node)
     WRITE_NODE_FIELD(partitionList);
     WRITE_BOOL_FIELD(isStartEnd);
 }
+
+static void _outAddSubPartitionState(StringInfo str, const AddSubPartitionState* node)
+{
+    WRITE_NODE_TYPE("ADDSUBPARTITIONSTATE");
+
+    WRITE_STRING_FIELD(partitionName);
+    WRITE_NODE_FIELD(subPartitionList);
+}
+
 
 static void _outCreateStmt(StringInfo str, const CreateStmt* node)
 {
@@ -3512,6 +4131,7 @@ static void _outMergeStmt(StringInfo str, MergeStmt* node)
     WRITE_NODE_FIELD(mergeWhenClauses);
     WRITE_BOOL_FIELD(is_insert_update);
     WRITE_NODE_FIELD(insert_stmt);
+    WRITE_NODE_FIELD(hintState);
 }
 
 static void _outInsertStmt(StringInfo str, InsertStmt* node)
@@ -3530,6 +4150,7 @@ static void _outInsertStmt(StringInfo str, InsertStmt* node)
 #else
 	WRITE_NODE_FIELD(upsertClause);
 #endif	
+    WRITE_NODE_FIELD(hintState);
 }
 
 static void _outUpdateStmt(StringInfo str, UpdateStmt* node)
@@ -3542,6 +4163,7 @@ static void _outUpdateStmt(StringInfo str, UpdateStmt* node)
     WRITE_NODE_FIELD(fromClause);
     WRITE_NODE_FIELD(returningList);
     WRITE_NODE_FIELD(withClause);
+    WRITE_NODE_FIELD(hintState);
 }
 
 static void _outSelectStmt(StringInfo str, SelectStmt* node)
@@ -3552,6 +4174,9 @@ static void _outSelectStmt(StringInfo str, SelectStmt* node)
     WRITE_NODE_FIELD(intoClause);
     WRITE_NODE_FIELD(targetList);
     WRITE_NODE_FIELD(fromClause);
+    if (t_thrd.proc->workingVersionNum >= SWCB_VERSION_NUM) {
+        WRITE_NODE_FIELD(startWithClause);
+    }
     WRITE_NODE_FIELD(whereClause);
     WRITE_NODE_FIELD(groupClause);
     WRITE_NODE_FIELD(havingClause);
@@ -3567,6 +4192,7 @@ static void _outSelectStmt(StringInfo str, SelectStmt* node)
     WRITE_NODE_FIELD(larg);
     WRITE_NODE_FIELD(rarg);
     WRITE_BOOL_FIELD(hasPlus);
+    WRITE_NODE_FIELD(hintState);
 }
 
 static void _outFuncCall(StringInfo str, FuncCall* node)
@@ -3601,6 +4227,12 @@ static void _outLockingClause(StringInfo str, LockingClause* node)
     WRITE_NODE_FIELD(lockedRels);
     WRITE_BOOL_FIELD(forUpdate);
     WRITE_BOOL_FIELD(noWait);
+    if (t_thrd.proc->workingVersionNum >= ENHANCED_TUPLE_LOCK_VERSION_NUM) {
+        WRITE_ENUM_FIELD(strength, LockClauseStrength);
+    }
+    if (t_thrd.proc->workingVersionNum >= WAIT_N_TUPLE_LOCK_VERSION_NUM) {
+        WRITE_BOOL_FIELD(waitSec);
+    }
 }
 
 static void _outXmlSerialize(StringInfo str, XmlSerialize* node)
@@ -3659,6 +4291,14 @@ static void _outTypeName(StringInfo str, TypeName* node)
     WRITE_INT_FIELD(typemod);
     WRITE_NODE_FIELD(arrayBounds);
     WRITE_LOCATION_FIELD(location);
+    if (t_thrd.proc->workingVersionNum >= COMMENT_ROWTYPE_TABLEOF_VERSION_NUM)
+    {
+        WRITE_BOOL_FIELD(pct_rowtype);
+    }
+    if (t_thrd.proc->workingVersionNum >= COMMENT_PCT_TYPE_VERSION_NUM)
+    {
+        WRITE_LOCATION_FIELD(end_location);
+    }
 
     WRITE_TYPEINFO_FIELD(typeOid);
 }
@@ -3741,6 +4381,41 @@ static void _outDefElem(StringInfo str, DefElem* node)
     WRITE_STRING_FIELD(defname);
     WRITE_NODE_FIELD(arg);
     WRITE_ENUM_FIELD(defaction, DefElemAction);
+
+    if (t_thrd.proc->workingVersionNum >= COPY_TRANSFORM_VERSION_NUM) {
+        WRITE_INT_FIELD(begin_location);
+        WRITE_INT_FIELD(end_location);
+    }
+}
+
+static void _outPLDebug_variable(StringInfo str, PLDebug_variable* node)
+{
+    WRITE_NODE_TYPE("PLDEBUG_VARIABLE");
+    WRITE_STRING_FIELD(name);
+    WRITE_STRING_FIELD(var_type);
+    WRITE_STRING_FIELD(value);
+    WRITE_STRING_FIELD(pkgname);
+    WRITE_BOOL_FIELD(isconst);
+}
+
+static void _outPLDebug_breakPoint(StringInfo str, PLDebug_breakPoint* node)
+{
+    WRITE_NODE_TYPE("PLDEBUG_BREAKPOINT");
+    WRITE_INT_FIELD(bpIndex);
+    WRITE_OID_FIELD(funcoid);
+    WRITE_INT_FIELD(lineno);
+    WRITE_STRING_FIELD(query);
+    WRITE_BOOL_FIELD(active);
+}
+
+static void _outPLDebug_frame(StringInfo str, PLDebug_frame* node)
+{
+    WRITE_NODE_TYPE("PLDEBUG_FRAME");
+    WRITE_INT_FIELD(frameno);
+    WRITE_STRING_FIELD(funcname);
+    WRITE_INT_FIELD(lineno);
+    WRITE_STRING_FIELD(query);
+    WRITE_INT_FIELD(funcoid);
 }
 
 /*
@@ -3753,6 +4428,53 @@ static void _outBaseHint(StringInfo str, Hint* node)
     WRITE_NODE_FIELD(relnames);
     WRITE_ENUM_FIELD(hint_keyword, HintKeyword);
     WRITE_ENUM_FIELD(state, HintStatus);
+}
+
+/*
+ * @Description: No GPC hint node to string.
+ * @out str: String buf.
+ * @in node: No GPC hint struct.
+ */
+static void _outNoGPCHint(StringInfo str, const NoGPCHint* node)
+{
+    WRITE_NODE_TYPE("NOGPCHINT");
+    _outBaseHint(str, (Hint*)node);
+}
+
+/*
+ * @Description: No Expand hint node to string.
+ * @out str: String buf.
+ * @in node: No Expand hint struct.
+ */
+static void _outNoExpandHint(StringInfo str, const NoExpandHint* node)
+{
+    WRITE_NODE_TYPE("NOEXPANDHINT");
+    _outBaseHint(str, (Hint*)node);
+}
+
+/*
+ * @Description: Set hint node to string.
+ * @out str: String buf.
+ * @in node: Set hint struct.
+ */
+static void _outSetHint(StringInfo str, const SetHint* node)
+{
+    WRITE_NODE_TYPE("SETHINT");
+    _outBaseHint(str, (Hint*)node);
+    WRITE_STRING_FIELD(name);
+    WRITE_STRING_FIELD(value);
+}
+
+/*
+ * @Description: Plancache hint node to string.
+ * @out str: String buf.
+ * @in node: Plancache hint struct.
+ */
+static void _outPlanCacheHint(StringInfo str, const PlanCacheHint* node)
+{
+    WRITE_NODE_TYPE("PLANCACHEHINT");
+    _outBaseHint(str, (Hint*)node);
+    WRITE_BOOL_FIELD(chooseCustomPlan);
 }
 
 /*
@@ -3783,6 +4505,21 @@ static void _outPredpushHint(StringInfo str, PredpushHint* node)
 }
 
 /*
+ * @Description: Predpush same level hint node to string.
+ * @out str: String buf.
+ * @in node: Predpush same level hint struct.
+ */
+static void _outPredpushSameLevelHint(StringInfo str, PredpushSameLevelHint* node)
+{
+    WRITE_NODE_TYPE("PREDPUSHSAMELEVELHINT");
+    _outBaseHint(str, (Hint*)node);
+    WRITE_BOOL_FIELD(negative);
+    WRITE_STRING_FIELD(dest_name);
+    WRITE_INT_FIELD(dest_id);
+    WRITE_BITMAPSET_FIELD(candidates);
+}
+
+/*
  * @Description: Rewrite hint node to string.
  * @out str: String buf.
  * @in node: Rewrite hint struct.
@@ -3793,6 +4530,18 @@ static void _outRewriteHint(StringInfo str, RewriteHint* node)
     _outBaseHint(str, (Hint*)node);
     WRITE_NODE_FIELD(param_names);
     WRITE_UINT_FIELD(param_bits);
+}
+
+/*
+ * @Description: Gather hint node to string.
+ * @out str: String buf.
+ * @in node: Gather hint struct.
+ */
+static void _outGatherHint(StringInfo str, GatherHint* node)
+{
+    WRITE_NODE_TYPE("GATHERHINT");
+    _outBaseHint(str, (Hint*)node);
+    WRITE_ENUM_FIELD(source, GatherSource);
 }
 
 /*
@@ -3982,7 +4731,19 @@ static void _outHintState(StringInfo str, HintState* node)
     if (t_thrd.proc->workingVersionNum >= PREDPUSH_VERSION_NUM) {
         WRITE_NODE_FIELD(predpush_hint);
     }
-    WRITE_NODE_FIELD(rewrite_hint);
+    if (t_thrd.proc->workingVersionNum >= EXECUTE_DIRECT_ON_MULTI_VERSION_NUM) {
+        WRITE_NODE_FIELD(rewrite_hint);
+    }
+    if (t_thrd.proc->workingVersionNum >= HINT_ENHANCEMENT_VERSION_NUM) {
+        WRITE_NODE_FIELD(gather_hint);
+        WRITE_NODE_FIELD(no_expand_hint);
+        WRITE_NODE_FIELD(set_hint);
+        WRITE_NODE_FIELD(cache_plan_hint);
+        WRITE_NODE_FIELD(no_gpc_hint);
+    }
+    if (t_thrd.proc->workingVersionNum >= PREDPUSH_SAME_LEVEL_VERSION_NUM) {
+        WRITE_NODE_FIELD(predpush_same_level_hint);
+    }
 }
 
 static void _outQuery(StringInfo str, Query* node)
@@ -4004,6 +4765,9 @@ static void _outQuery(StringInfo str, Query* node)
     if (node->utilityStmt) {
         switch (nodeTag(node->utilityStmt)) {
             case T_CreateStmt:
+#ifdef GS_GRAPH
+            case T_CreateLabelStmt:
+#endif /* GS_GRAPH */
             case T_IndexStmt:
             case T_NotifyStmt:
             case T_DeclareCursorStmt:
@@ -4031,6 +4795,9 @@ static void _outQuery(StringInfo str, Query* node)
     if (t_thrd.proc->workingVersionNum >= SYNONYM_VERSION_NUM) {
         WRITE_BOOL_FIELD(hasSynonyms);
     }
+#ifdef GS_GRAPH
+    WRITE_BOOL_FIELD(hasGraphwriteClause);
+#endif /* GS_GRAPH */
     WRITE_NODE_FIELD(cteList);
     WRITE_NODE_FIELD(rtable);
     WRITE_NODE_FIELD(jointree);
@@ -4086,6 +4853,39 @@ static void _outQuery(StringInfo str, Query* node)
     if (t_thrd.proc->workingVersionNum >= SUBLINKPULLUP_VERSION_NUM) {
         WRITE_BOOL_FIELD(unique_check);
     }
+
+#ifdef GS_GRAPH
+    /* withCheckOptions intentionally omitted, see comment in parsenodes.h */
+	WRITE_LOCATION_FIELD(stmt_location);
+	WRITE_LOCATION_FIELD(stmt_len);
+
+    WRITE_INT_FIELD(dijkstraWeight);
+	WRITE_BOOL_FIELD(dijkstraWeightOut);
+	WRITE_NODE_FIELD(dijkstraEndId);
+	WRITE_NODE_FIELD(dijkstraEdgeId);
+	WRITE_NODE_FIELD(dijkstraLimit);
+	WRITE_NODE_FIELD(shortestpathEndIdLeft);
+	WRITE_NODE_FIELD(shortestpathEndIdRight);
+	WRITE_NODE_FIELD(shortestpathTableOidLeft);
+	WRITE_NODE_FIELD(shortestpathTableOidRight);
+	WRITE_NODE_FIELD(shortestpathCtidLeft);
+	WRITE_NODE_FIELD(shortestpathCtidRight);
+	WRITE_NODE_FIELD(shortestpathSource);
+	WRITE_NODE_FIELD(shortestpathTarget);
+	WRITE_LONG_FIELD(shortestpathMinhops);
+	WRITE_LONG_FIELD(shortestpathMaxhops);
+	WRITE_LONG_FIELD(shortestpathLimit);
+
+	WRITE_ENUM_FIELD(graph.writeOp, GraphWriteOp);
+	WRITE_BOOL_FIELD(graph.last);
+	WRITE_NODE_FIELD(graph.targets);
+	WRITE_UINT_FIELD(graph.nr_modify);
+	WRITE_BOOL_FIELD(graph.detach);
+	WRITE_BOOL_FIELD(graph.eager);
+	WRITE_NODE_FIELD(graph.pattern);
+	WRITE_NODE_FIELD(graph.exprs);
+	WRITE_NODE_FIELD(graph.sets);
+#endif /* GS_GRAPH */
 }
 
 static void _outSortGroupClause(StringInfo str, SortGroupClause* node)
@@ -4134,7 +4934,13 @@ static void _outRowMarkClause(StringInfo str, RowMarkClause* node)
     WRITE_UINT_FIELD(rti);
     WRITE_BOOL_FIELD(forUpdate);
     WRITE_BOOL_FIELD(noWait);
+    if (t_thrd.proc->workingVersionNum >= WAIT_N_TUPLE_LOCK_VERSION_NUM) {
+        WRITE_INT_FIELD(waitSec);
+    }
     WRITE_BOOL_FIELD(pushedDown);
+    if (t_thrd.proc->workingVersionNum >= ENHANCED_TUPLE_LOCK_VERSION_NUM) {
+        WRITE_ENUM_FIELD(strength, LockClauseStrength);
+    }
 }
 
 static void _outWithClause(StringInfo str, WithClause* node)
@@ -4144,6 +4950,22 @@ static void _outWithClause(StringInfo str, WithClause* node)
     WRITE_NODE_FIELD(ctes);
     WRITE_BOOL_FIELD(recursive);
     WRITE_LOCATION_FIELD(location);
+    if (t_thrd.proc->workingVersionNum >= SWCB_VERSION_NUM) {
+        WRITE_NODE_FIELD(sw_clause);
+    }
+}
+
+static void _outStartWithClause(StringInfo str, StartWithClause* node)
+{
+    WRITE_NODE_TYPE("STARTWITHCLAUSE");
+
+    WRITE_NODE_FIELD(startWithExpr);
+    WRITE_NODE_FIELD(connectByExpr);
+    WRITE_NODE_FIELD(siblingsOrderBy);
+
+    WRITE_BOOL_FIELD(priorDirection);
+    WRITE_BOOL_FIELD(nocycle);
+    WRITE_BOOL_FIELD(opt);
 }
 
 static void _outCommonTableExpr(StringInfo str, CommonTableExpr* node)
@@ -4152,6 +4974,9 @@ static void _outCommonTableExpr(StringInfo str, CommonTableExpr* node)
 
     WRITE_STRING_FIELD(ctename);
     WRITE_NODE_FIELD(aliascolnames);
+    if (t_thrd.proc->workingVersionNum >= MATERIALIZED_CTE_NUM) {
+        WRITE_ENUM_FIELD(ctematerialized, CTEMaterialize);
+    }
     WRITE_NODE_FIELD(ctequery);
     WRITE_LOCATION_FIELD(location);
     WRITE_BOOL_FIELD(cterecursive);
@@ -4162,6 +4987,30 @@ static void _outCommonTableExpr(StringInfo str, CommonTableExpr* node)
     WRITE_NODE_FIELD(ctecolcollations);
     WRITE_TYPEINFO_LIST(ctecoltypes);
     /* Not write locator_type in accordance with old version. */
+    if (t_thrd.proc->workingVersionNum >= MATERIALIZED_CTE_NUM) {
+        WRITE_BOOL_FIELD(self_reference);
+    }
+    if (t_thrd.proc->workingVersionNum >= SWCB_VERSION_NUM) {
+        WRITE_NODE_FIELD(swoptions);
+    }
+    if (t_thrd.proc->workingVersionNum >= DEFAULT_MAT_CTE_NUM) {
+        WRITE_BOOL_FIELD(referenced_by_subquery);
+    }
+}
+
+static void _outStartWithTargetRelInfo(StringInfo str, StartWithTargetRelInfo* node)
+{
+    WRITE_NODE_TYPE("STARTWITHTARGETRELINFO");
+
+    WRITE_STRING_FIELD(relname);
+    WRITE_STRING_FIELD(aliasname);
+    WRITE_STRING_FIELD(ctename);
+    WRITE_NODE_FIELD(columns);
+    WRITE_NODE_FIELD(tblstmt);
+
+    WRITE_ENUM_FIELD(rtekind, RTEKind);
+    WRITE_NODE_FIELD(rte);
+    WRITE_NODE_FIELD(rtr);
 }
 
 static void _outSetOperationStmt(StringInfo str, SetOperationStmt* node)
@@ -4188,8 +5037,15 @@ static void _outRteRelation(StringInfo str, const RangeTblEntry *node)
         WRITE_BOOL_FIELD(isResultRel);
     }
     WRITE_NODE_FIELD(tablesample);
+    if (TcapFeatureAvail()) {
+        WRITE_NODE_FIELD(timecapsule);
+    }
     WRITE_OID_FIELD(partitionOid);
     WRITE_BOOL_FIELD(isContainPartition);
+    if (t_thrd.proc->workingVersionNum >= SUBPARTITION_VERSION_NUM) {
+        WRITE_OID_FIELD(subpartitionOid);
+        WRITE_BOOL_FIELD(isContainSubPartition);
+    }
     if (t_thrd.proc->workingVersionNum >= SYNONYM_VERSION_NUM) {
         WRITE_OID_FIELD(refSynOid);
     }
@@ -4251,6 +5107,9 @@ static void _outRangeTblEntry(StringInfo str, RangeTblEntry* node)
         case RTE_SUBQUERY:
             WRITE_NODE_FIELD(subquery);
             WRITE_BOOL_FIELD(security_barrier);
+#ifdef GS_GRAPH
+            WRITE_BOOL_FIELD(isVLE);
+#endif            
             break;
         case RTE_JOIN:
             WRITE_ENUM_FIELD(jointype, JoinType);
@@ -4272,9 +5131,19 @@ static void _outRangeTblEntry(StringInfo str, RangeTblEntry* node)
             WRITE_STRING_FIELD(ctename);
             WRITE_UINT_FIELD(ctelevelsup);
             WRITE_BOOL_FIELD(self_reference);
+            if (t_thrd.proc->workingVersionNum >= MATERIALIZED_CTE_NUM) {
+                WRITE_BOOL_FIELD(cterecursive);
+            }
             WRITE_NODE_FIELD(ctecoltypes);
             WRITE_NODE_FIELD(ctecoltypmods);
             WRITE_NODE_FIELD(ctecolcollations);
+
+            if (t_thrd.proc->workingVersionNum >= SWCB_VERSION_NUM) {
+                WRITE_BOOL_FIELD(swConverted);
+                WRITE_NODE_FIELD(origin_index);
+                WRITE_BOOL_FIELD(swAborted);
+                WRITE_BOOL_FIELD(swSubExist);
+            }
 
             WRITE_TYPEINFO_LIST(ctecoltypes);
             break;
@@ -4283,6 +5152,9 @@ static void _outRangeTblEntry(StringInfo str, RangeTblEntry* node)
             /* Everything relevant already copied */
             break;
 #endif /* PGXC */
+        case RTE_RESULT:
+            /* no extra fields */
+            break;
         default:
             ereport(ERROR,
                 (errcode(ERRCODE_UNRECOGNIZED_NODE_TYPE), errmsg("unrecognized RTE kind: %d", (int)node->rtekind)));
@@ -4307,13 +5179,21 @@ static void _outRangeTblEntry(StringInfo str, RangeTblEntry* node)
     if (t_thrd.proc->workingVersionNum >= 92063) {
         WRITE_BOOL_FIELD(relhasbucket);
         WRITE_BOOL_FIELD(isbucket);
+        if (t_thrd.proc->workingVersionNum >= SEGMENT_PAGE_VERSION_NUM) {
+            WRITE_INT_FIELD(bucketmapsize);
+        }
         WRITE_NODE_FIELD(buckets);
     }
+
     if (t_thrd.proc->workingVersionNum >= UPSERT_ROW_STORE_VERSION_NUM) {
         WRITE_BOOL_FIELD(isexcluded);
     }
     if (t_thrd.proc->workingVersionNum >= SUBLINKPULLUP_VERSION_NUM) {
         WRITE_BOOL_FIELD(sublink_pull_up);
+    }
+
+    if (t_thrd.proc->workingVersionNum >= INPLACE_UPDATE_VERSION_NUM) {
+        WRITE_BOOL_FIELD(is_ustore);
     }
 
     if (t_thrd.proc->workingVersionNum >= GENERATED_COL_VERSION_NUM) {
@@ -4337,6 +5217,22 @@ static void _outTableSampleClause(StringInfo str, const TableSampleClause* node)
     WRITE_ENUM_FIELD(sampleType, TableSampleType);
     WRITE_NODE_FIELD(args);
     WRITE_NODE_FIELD(repeatable);
+}
+
+/*
+ * Description: Write TimeCapsuleClause struct to string.
+ *
+ * Parameters: @in node: TimeCapsuleClause node.
+ *             @out str: TimeCapsuleClause string.
+ *
+ * Return: void
+ */
+static void OutTimeCapsuleClause(StringInfo str, const TimeCapsuleClause* node)
+{
+    WRITE_NODE_TYPE("TIMECAPSULECLAUSE");
+
+    WRITE_ENUM_FIELD(tvtype, TvVersionType);
+    WRITE_NODE_FIELD(tvver);
 }
 
 static void _outAExpr(StringInfo str, A_Expr* node)
@@ -4432,6 +5328,12 @@ static void _outColumnRef(StringInfo str, ColumnRef* node)
     WRITE_NODE_TYPE("COLUMNREF");
 
     WRITE_NODE_FIELD(fields);
+    if (t_thrd.proc->workingVersionNum >= SWCB_VERSION_NUM) {
+        WRITE_BOOL_FIELD(prior);
+    }
+    if (t_thrd.proc->workingVersionNum >= FUNC_PARAM_COL_VERSION_NUM) {
+        WRITE_INT_FIELD(indnum);
+    }
     WRITE_LOCATION_FIELD(location);
 }
 
@@ -4538,9 +5440,8 @@ static void _outRangeFunction(StringInfo str, RangeFunction* node)
 /*
  * Description: Write node RangeTableSample to string.
  *
- * Parameters:
- *	@in node: RangeTableSample node.
- * 	@out str: RangeTableSample string.
+ * Parameters: @in node: RangeTableSample node.
+ *             @out str: RangeTableSample string.
  *
  * Return: void
  */
@@ -4552,6 +5453,25 @@ static void _outRangeTableSample(StringInfo str, RangeTableSample* node)
     WRITE_NODE_FIELD(method);
     WRITE_NODE_FIELD(args);
     WRITE_NODE_FIELD(repeatable);
+    WRITE_LOCATION_FIELD(location);
+}
+
+/*
+ * Description: Write node RangeTimeCapsule to string.
+ *
+ * Parameters:
+ *	@in node: RangeTimeCapsule node.
+ * 	@out str: RangeTimeCapsule string.
+ *
+ * Return: void
+ */
+static void OutRangeTimeCapsule(StringInfo str, RangeTimeCapsule* node)
+{
+    WRITE_NODE_TYPE("RANGETIMECAPSULE");
+
+    WRITE_NODE_FIELD(relation);
+    WRITE_ENUM_FIELD(tvtype, TvVersionType);
+    WRITE_NODE_FIELD(tvver);
     WRITE_LOCATION_FIELD(location);
 }
 
@@ -5073,6 +5993,34 @@ static void _outBloomFilterSet(StringInfo str, BloomFilterSet* node)
 }
 
 /*
+ * @Description: serialze PurgeStmt
+ * @out str: String buf.
+ * @in node: PurgeStmt struct.
+ */
+static void OutPurgeStmt(StringInfo str, PurgeStmt* node)
+{
+    WRITE_NODE_TYPE("PURGESTMT");
+    WRITE_ENUM_FIELD(purtype, PurgeType);
+    WRITE_NODE_FIELD(purobj);
+}
+
+/*
+ * @Description: serialze TimeCapsuleStmt
+ * @out str: String buf.
+ * @in node: TimeCapsuleStmt struct.
+ */
+static void OutTimeCapsuleStmt(StringInfo str, TimeCapsuleStmt* node)
+{
+    WRITE_NODE_TYPE("TIMECAPSULESTME");
+    WRITE_ENUM_FIELD(tcaptype, TimeCapsuleType);
+    WRITE_NODE_FIELD(relation);
+    WRITE_STRING_FIELD(new_relname);
+
+    WRITE_NODE_FIELD(tvver); 
+    WRITE_ENUM_FIELD(tvtype, TvVersionType);
+}
+
+/*
  * @Description: serialze CommentStmt
  * @out str: String buf.
  * @in node: CommentStmt struct.
@@ -5130,31 +6078,58 @@ static void _outIndexVar(StringInfo str, IndexVar* node)
     WRITE_BOOL_FIELD(indexpath);
 }
 
-static void _outGradientDescent(StringInfo str, GradientDescent* node)
+static void _outTrainModel(StringInfo str, TrainModel* node)
 {
-    WRITE_NODE_TYPE("SGD");
+    AlgorithmAPI *api = get_algorithm_api(node->algorithm);
+    int num_hyperp;
+    const HyperparameterDefinition* definition = api->get_hyperparameters_definitions(api, &num_hyperp);
+
+    if (node->configurations != 1)
+        elog(ERROR, "TODO_DB4AI_API: more than one hyperparameter configuration");
+
+    WRITE_NODE_TYPE("TrainModel");
     _outPlanInfo(str, (Plan*)node);
     appendStringInfoString(str, " :algorithm ");
-    appendStringInfoString(str, gd_get_algorithm(node->algorithm)->name);
-    appendStringInfoString(str, " :optimizer ");
-    appendStringInfoString(str, gd_get_optimizer_name(node->optimizer));
-    WRITE_INT_FIELD(targetcol);
-    WRITE_INT_FIELD(max_iterations);
-    WRITE_INT_FIELD(max_seconds);
-    WRITE_INT_FIELD(batch_size);
-    WRITE_BOOL_FIELD(verbose);
-    WRITE_FLOAT_FIELD(learning_rate, "%.16g");
-    WRITE_FLOAT_FIELD(decay, "%.16g");
-    WRITE_FLOAT_FIELD(tolerance, "%.16g");
-    WRITE_INT_FIELD(seed);
-    WRITE_FLOAT_FIELD(lambda, "%.16g");
-}
+    appendStringInfoString(str, api->name);
 
-static void _outGradientDescentExpr(StringInfo str, GradientDescentExpr* node)
-{
-    WRITE_NODE_TYPE("GradientDescentExpr");
-    WRITE_UINT_FIELD(field);
-    WRITE_OID_FIELD(fieldtype);
+    HyperparametersGD *hyperp = (HyperparametersGD *)node->hyperparameters[0];
+    while (num_hyperp-- > 0) {
+        switch (definition->type) {
+            case INT4OID: {
+                int32_t *value_addr = (int32_t *)((char *)hyperp + definition->offset);
+                appendStringInfo(str, " : %s %d", definition->name, *value_addr);
+                break;
+            }
+            case INT8OID: {
+                int64_t *value_addr = (int64_t *)((char *)hyperp + definition->offset);
+                appendStringInfo(str, " : %s %ld", definition->name, *value_addr);
+                break;
+            }
+            case FLOAT8OID: {
+                double *value_addr = (double *)((char *)hyperp + definition->offset);
+                appendStringInfo(str, " : %s %.16g", definition->name, *value_addr);
+                break;
+            }
+            case BOOLOID: {
+                bool *value_addr = (bool *)((char *)hyperp + definition->offset);
+                appendStringInfo(str, " : %s %s", definition->name, booltostr(*value_addr));
+                break;
+            }
+            case CSTRINGOID: {
+                char **value_addr = (char **)((char *)hyperp + definition->offset);
+                appendStringInfo(str, " : %s %s", definition->name, *value_addr);
+                break;
+            }
+            case ANYENUMOID: {
+                void *value_addr = (void *)((char *)hyperp + definition->offset);
+                appendStringInfo(str, " : %s %s", definition->name, definition->validation.enum_getter(value_addr));
+                break;
+            }
+            default:
+                break;
+        }
+        definition++;
+    }
 }
 
 /*
@@ -5202,6 +6177,12 @@ static void _outNode(StringInfo str, const void* obj)
                 break;
             case T_RecursiveUnion:
                 _outRecursiveUnion(str, (RecursiveUnion*)obj);
+                break;
+            case T_StartWithOptions:
+                _outStartWithOptions(str, (StartWithOptions*)obj);
+                break;
+            case T_StartWithOp:
+                _outStartWithOp(str, (StartWithOp*)obj);
                 break;
             case T_BitmapAnd:
                 _outBitmapAnd(str, (BitmapAnd*)obj);
@@ -5301,6 +6282,11 @@ static void _outNode(StringInfo str, const void* obj)
             case T_NestLoop:
                 _outNestLoop(str, (NestLoop*)obj);
                 break;
+#ifdef GS_GRAPH
+            case T_NestLoopVLE:
+                _outNestLoopVLE(str, (NestLoopVLE*)obj);
+                break;
+#endif
             case T_MergeJoin:
                 _outMergeJoin(str, (MergeJoin*)obj);
                 break;
@@ -5337,6 +6323,23 @@ static void _outNode(StringInfo str, const void* obj)
             case T_Limit:
                 _outLimit(str, (Limit*)obj);
                 break;
+#ifdef GS_GRAPH
+            case T_ModifyGraph:
+				_outModifyGraph(str, (ModifyGraph *)obj);
+				break;
+            case T_SparqlLoadPlan:
+                _outSparqlLoadPlan(str, (SparqlLoadPlan*)obj);
+                break;
+            case T_Shortestpath:
+				_outShortestpath(str, (Shortestpath *)obj);
+				break;
+			case T_Hash2Side:
+				_outHash2Side(str, (Hash2Side *)obj);
+				break;
+			case T_Dijkstra:
+				_outDijkstra(str, (Dijkstra *)obj);
+				break;
+#endif /* GS_GRAPH */
             case T_NestLoopParam:
                 _outNestLoopParam(str, (NestLoopParam*)obj);
                 break;
@@ -5484,6 +6487,9 @@ static void _outNode(StringInfo str, const void* obj)
             case T_TargetEntry:
                 _outTargetEntry(str, (TargetEntry*)obj);
                 break;
+            case T_PseudoTargetEntry:
+                _outPseudoTargetEntry(str, (PseudoTargetEntry*)obj);
+                break;
             case T_RangeTblRef:
                 _outRangeTblRef(str, (RangeTblRef*)obj);
                 break;
@@ -5493,6 +6499,29 @@ static void _outNode(StringInfo str, const void* obj)
             case T_FromExpr:
                 _outFromExpr(str, (FromExpr*)obj);
                 break;
+#ifdef GS_GRAPH
+            case T_CypherTypeCast:
+				_outCypherTypeCast(str, (CypherTypeCast*)obj);
+				break;
+			case T_CypherMapExpr:
+				_outCypherMapExpr(str, (CypherMapExpr*)obj);
+				break;
+			case T_CypherListExpr:
+				_outCypherListExpr(str, (CypherListExpr*)obj);
+				break;
+			case T_CypherListCompExpr:
+				_outCypherListCompExpr(str, (CypherListCompExpr*)obj);
+				break;
+			case T_CypherListCompVar:
+				_outCypherListCompVar(str, (CypherListCompVar*)obj);
+				break;
+			case T_CypherAccessExpr:
+				_outCypherAccessExpr(str, (CypherAccessExpr*)obj);
+				break;
+			case T_CypherIndices:
+				_outCypherIndices(str, (CypherIndices*)obj);
+				break;
+#endif /* GS_GRAPH */
             case T_MergeAction:
                 _outMergeAction(str, (MergeAction*)obj);
                 break;
@@ -5602,6 +6631,87 @@ static void _outNode(StringInfo str, const void* obj)
             case T_PartitionState:
                 _outPartitionState(str, (PartitionState*)obj);
                 break;
+#ifdef GS_GRAPH
+            case T_CreateLabelStmt:
+				_outCreateLabelStmt(str, (CreateLabelStmt*)obj);
+				break;
+            case T_CreateConstraintStmt:
+				_outCreateConstraintStmt(str, (CreateConstraintStmt*)obj);
+				break;
+			case T_DropConstraintStmt:
+				_outDropConstraintStmt(str, (DropConstraintStmt*)obj);
+				break;
+			case T_CreatePropertyIndexStmt:
+				_outCreatePropertyIndexStmt(str, (CreatePropertyIndexStmt*)obj);
+				break;
+			case T_CypherStmt:
+				_outCypherStmt(str, (CypherStmt*)obj);
+				break;
+			case T_CypherListComp:
+				_outCypherListComp(str, (CypherListComp*)obj);
+				break;
+			case T_CypherGenericExpr:
+				_outCypherGenericExpr(str, (CypherGenericExpr*)obj);
+				break;
+			case T_CypherSubPattern:
+				_outCypherSubPattern(str, (CypherSubPattern*)obj);
+				break;
+			case T_CypherClause:
+				_outCypherClause(str, (CypherClause*)obj);
+				break;
+			case T_CypherMatchClause:
+				_outCypherMatchClause(str, (CypherMatchClause*)obj);
+				break;
+			case T_CypherProjection:
+				_outCypherProjection(str, (CypherProjection*)obj);
+				break;
+			case T_CypherCreateClause:
+				_outCypherCreateClause(str, (CypherCreateClause*)obj);
+				break;
+			case T_CypherDeleteClause:
+				_outCypherDeleteClause(str, (CypherDeleteClause*)obj);
+				break;
+			case T_CypherSetClause:
+				_outCypherSetClause(str, (CypherSetClause*)obj);
+				break;
+			case T_CypherMergeClause:
+				_outCypherMergeClause(str, (CypherMergeClause*)obj);
+				break;
+			case T_CypherLoadClause:
+				_outCypherLoadClause(str, (CypherLoadClause*)obj);
+				break;
+			case T_CypherPath:
+				_outCypherPath(str, (CypherPath*)obj);
+				break;
+			case T_CypherNode:
+				_outCypherNode(str, (CypherNode*)obj);
+				break;
+			case T_CypherRel:
+				_outCypherRel(str, (CypherRel*)obj);
+				break;
+			case T_CypherName:
+				_outCypherName(str, (CypherName*)obj);
+				break;
+			case T_CypherSetProp:
+				_outCypherSetProp(str, (CypherSetProp*)obj);
+				break;
+
+			case T_GraphPath:
+				_outGraphPath(str, (GraphPath*)obj);
+				break;
+			case T_GraphVertex:
+				_outGraphVertex(str, (GraphVertex*)obj);
+				break;
+			case T_GraphEdge:
+				_outGraphEdge(str, (GraphEdge*)obj);
+				break;
+			case T_GraphSetProp:
+				_outGraphSetProp(str, (GraphSetProp*)obj);
+				break;
+			case T_GraphDelElem:
+				_outGraphDelElem(str, (GraphDelElem*)obj);
+				break;
+#endif /* GS_GRAPH */
             case T_RangePartitionDefState:
                 _outRangePartitionDefState(str, (RangePartitionDefState*)obj);
                 break;
@@ -5622,6 +6732,9 @@ static void _outNode(StringInfo str, const void* obj)
                 break;
             case T_AddPartitionState:
                 _outAddPartitionState(str, (AddPartitionState*)obj);
+                break;
+            case T_AddSubPartitionState:
+                _outAddSubPartitionState(str, (AddSubPartitionState*)obj);
                 break;
             case T_CreateForeignTableStmt:
                 _outCreateForeignTableStmt(str, (CreateForeignTableStmt*)obj);
@@ -5701,11 +6814,17 @@ static void _outNode(StringInfo str, const void* obj)
             case T_WithClause:
                 _outWithClause(str, (WithClause*)obj);
                 break;
+            case T_StartWithClause:
+                _outStartWithClause(str, (StartWithClause*)obj);
+                break;
             case T_UpsertClause:
                 _outUpsertClause(str, (UpsertClause*)obj);
                 break;
             case T_CommonTableExpr:
                 _outCommonTableExpr(str, (CommonTableExpr*)obj);
+                break;
+            case T_StartWithTargetRelInfo:
+                _outStartWithTargetRelInfo(str, (StartWithTargetRelInfo*) obj);
                 break;
             case T_SetOperationStmt:
                 _outSetOperationStmt(str, (SetOperationStmt*)obj);
@@ -5715,6 +6834,9 @@ static void _outNode(StringInfo str, const void* obj)
                 break;
             case T_TableSampleClause:
                 _outTableSampleClause(str, (TableSampleClause*)obj);
+                break;
+            case T_TimeCapsuleClause:
+                OutTimeCapsuleClause(str, (TimeCapsuleClause*)obj);
                 break;
             case T_A_Expr:
                 _outAExpr(str, (A_Expr*)obj);
@@ -5758,6 +6880,9 @@ static void _outNode(StringInfo str, const void* obj)
             case T_RangeTableSample:
                 _outRangeTableSample(str, (RangeTableSample*)obj);
                 break;
+            case T_RangeTimeCapsule:
+                OutRangeTimeCapsule(str, (RangeTimeCapsule*)obj);
+                break;
             case T_Constraint:
                 _outConstraint(str, (Constraint*)obj);
                 break;
@@ -5793,7 +6918,10 @@ static void _outNode(StringInfo str, const void* obj)
 
 #endif
             case T_PruningResult:
-                _outPruningResult(str, (PruningResult*)obj);
+                _outPruningResult(str, (PruningResult *)obj);
+                break;
+            case T_SubPartitionPruningResult:
+                _outSubPartitionPruningResult(str, (SubPartitionPruningResult *)obj);
                 break;
             case T_DistFdwDataNodeTask:
                 _outDistFdwDataNodeTask(str, (DistFdwDataNodeTask*)obj);
@@ -5941,6 +7069,12 @@ static void _outNode(StringInfo str, const void* obj)
             case T_PgFdwRemoteInfo:
                 _outPgFdwRemoteInfo(str, (PgFdwRemoteInfo*)obj);
                 break;
+            case T_PurgeStmt:
+                OutPurgeStmt(str, (PurgeStmt*)obj);
+                break;
+            case T_TimeCapsuleStmt:
+                OutTimeCapsuleStmt(str, (TimeCapsuleStmt*)obj);
+                break;
             case T_CommentStmt:
                 _outCommentStmt(str, (CommentStmt*)obj);
                 break;
@@ -5971,13 +7105,37 @@ static void _outNode(StringInfo str, const void* obj)
             case T_PredpushHint:
                 _outPredpushHint(str, (PredpushHint *)obj);
                 break;
+            case T_PredpushSameLevelHint:
+                _outPredpushSameLevelHint(str, (PredpushSameLevelHint *)obj);
+                break;
             case T_RewriteHint:
                 _outRewriteHint(str, (RewriteHint *)obj);
-            case T_GradientDescent:
-                _outGradientDescent(str, (GradientDescent*)obj);
                 break;
-            case T_GradientDescentExpr:
-                _outGradientDescentExpr(str, (GradientDescentExpr*)obj);
+            case T_GatherHint:
+                _outGatherHint(str, (GatherHint *)obj);
+                break;
+            case T_NoExpandHint:
+                _outNoExpandHint(str, (NoExpandHint*) obj);
+                break;
+            case T_SetHint:
+                _outSetHint(str, (SetHint*) obj);
+                break;
+            case T_PlanCacheHint:
+                _outPlanCacheHint(str, (PlanCacheHint*) obj);
+                break;
+            case T_NoGPCHint:
+                _outNoGPCHint(str, (NoGPCHint*) obj);
+            case T_TrainModel:
+                _outTrainModel(str, (TrainModel*)obj);
+                break;
+            case T_PLDebug_variable:
+                _outPLDebug_variable(str, (PLDebug_variable*) obj);
+                break;
+            case T_PLDebug_breakPoint:
+                _outPLDebug_breakPoint(str, (PLDebug_breakPoint*) obj);
+                break;
+            case T_PLDebug_frame:
+                _outPLDebug_frame(str, (PLDebug_frame*) obj);
                 break;
             default:
 

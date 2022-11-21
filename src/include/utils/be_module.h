@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2020 Huawei Technologies Co.,Ltd.
+ * Portions Copyright (c) 2021, openGauss Contributors
  *
  * openGauss is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
@@ -36,8 +37,10 @@ enum ModuleId {
     MOD_ALL = 0,
     /* add your module id following */
 
+    MOD_COMMAND,      /* Commands */
     MOD_DFS,          /* DFS */
     MOD_GUC,          /* GUC */
+    MOD_GSCLEAN,      /* gs_clean */
     MOD_HDFS,         /* HDFS feature */
     MOD_ORC,          /* ORC storage format */
     MOD_SLRU,         /* Simple LRU buffering manager */
@@ -50,9 +53,11 @@ enum ModuleId {
     MOD_TBLSPC,       /* Tablespace */
     MOD_WLM,          /* workload manager*/
     MOD_OBS,          /* OBS */
+    MOD_INDEX,        /* index */
     MOD_EXECUTOR,     /* Row Executor */
     MOD_OPFUSION,     /* Bypass Opfusion */
     MOD_GPC,          /* Global plancache */
+    MOD_GSC,          /* Global syscache */
     MOD_VEC_EXECUTOR, /* Vector Executor */
     MOD_STREAM,       /* Stream */
     MOD_LLVM,         /* LLVM */
@@ -60,9 +65,11 @@ enum ModuleId {
     MOD_OPT_REWRITE,  /* Optimizer sub-module:rewrite */
     MOD_OPT_JOIN,     /* Optimizer sub-module:join */
     MOD_OPT_AGG,      /* Optimizer sub-module:agg */
+    MOD_OPT_CHOICE,   /* Optimizer sub-module: choice of gplan or cplan */
     MOD_OPT_SUBPLAN,  /* Optimizer sub-module:subplan */
     MOD_OPT_SETOP,    /* Optimizer sub-module:setop */
     MOD_OPT_SKEW,     /* Optimizer sub-module:data skew */
+    MOD_OPT_PLANNER,  /* Optimizer sub-module:planner */
     MOD_UDF,          /* fenced udf */
     MOD_COOP_ANALYZE, /* cooperation analyze */
     MOD_WLM_CP,       /* wlm for the comupte pool */
@@ -70,6 +77,7 @@ enum ModuleId {
     MOD_MOT,          /* MOT */
     MOD_PLANHINT,     /* plan hint */
     MOD_PARQUET,      /* Parquet storage format */
+    MOD_PGSTAT,       /* pgstat */
     MOD_CARBONDATA,   /* Carbondata storage format */
 
     /* MODULE FOR TRANSACTION LOG CONTROL , USE LOG LEVEL*/
@@ -88,6 +96,7 @@ enum ModuleId {
     MOD_FUNCTION,   /* internal function */
     MOD_PARSER,     /* parser module*/
     MOD_INSTR,      /* Instrumentation */
+    MOD_WDR_SNAPSHOT,  /* wdr snapshot */
     MOD_INCRE_CKPT, /* incremental checkpoint */
     MOD_INCRE_BG,   /* incremental checkpoint bgwriter */
     MOD_DW,         /* double write */
@@ -97,14 +106,42 @@ enum ModuleId {
     MOD_COMM_PARAM, /* comm session params */
     MOD_TIMESERIES, /* timeseries feature */
     MOD_SCHEMA,     /* schema search */
+    
+    MOD_SEGMENT_PAGE,  /* segment page storage */
     MOD_LIGHTPROXY, /* lightProxy */
     MOD_HOTKEY,     /* hotkey */
     MOD_THREAD_POOL,  /* thread_pool */
     MOD_OPT_AI,     /* ai optimizer */
+    MOD_WALRECEIVER,  /* walreceiver */
+    MOD_USTORE,     /* ustore */
+    MOD_UNDO,       /* undo */
     MOD_GEN_COL,   /* generated column */
+    MOD_DCF,        /* DCF paxos */
     MOD_DB4AI,      /* DB4AI & AUTOML */
+    MOD_PLDEBUGGER,
+    MOD_ADVISOR,    /* sql advisor */
 
-    /* add your module id above */
+    MOD_SEC,           /* Security default module */
+    MOD_SEC_FE,        /* Security sub-module: full encryption */
+    MOD_SEC_LEGER,     /* Security sub-module: ledger database */
+    MOD_SEC_POLICY,    /* Security sub-module: masking, auditing and RLS policies */
+    MOD_SEC_SDD,       /* Security sub-module: sensitive data discovery */
+    MOD_SEC_TDE,       /* Security sub-module: transparent data encryption */
+
+    MOD_COMM_PROXY,    /* for cbb comm_proxy */
+    MOD_COMM_POOLER,   /* for pooler communication */
+    MOD_VACUUM,     /* lazy vacuum */
+    MOD_JOB,        /* job/scheduler job related */
+    MOD_SPI,
+    MOD_NEST_COMPILE,
+    MOD_RESOWNER,
+    MOD_LOGICAL_DECODE,    /* logical decode */
+    MOD_GPRC, /* global package runtime cache */
+
+    /*
+     * Add your module id above.
+     * Do not forget to fill up module_map[] about module name, and keep their ordering;
+     */
     MOD_MAX
 };
 

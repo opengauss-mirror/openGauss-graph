@@ -6,6 +6,7 @@
  * Portions Copyright (c) 2020 Huawei Technologies Co.,Ltd.
  * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
+ * Portions Copyright (c) 2021, openGauss Contributors
  *
  *
  * IDENTIFICATION
@@ -26,7 +27,8 @@
 #include "catalog/pg_type.h"
 #include "executor/executor.h"
 #include "executor/functions.h"
-#include "executor/nodeModifyTable.h"
+#include "executor/node/nodeCtescan.h"
+#include "executor/node/nodeModifyTable.h"
 #include "funcapi.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
@@ -54,6 +56,7 @@
 #include "utils/memutils.h"
 #include "utils/syscache.h"
 #include "utils/typcache.h"
+#include "catalog/pg_proc_fn.h"
 
 typedef struct {
     PlannerInfo* root;
@@ -94,6 +97,7 @@ typedef enum { CONTAIN_FUNCTION_ID, CONTAIN_MUTABLE_FUNCTION, CONTAIN_VOLATILE_F
 typedef struct {
     Oid funcid;
     checkFuntionType checktype;
+    bool deep;
 } check_function_context;
 
 typedef struct not_strict_context {
@@ -142,7 +146,6 @@ static bool is_exec_external_param_const(PlannerInfo* root, Node* node);
 static bool is_operator_pushdown(Oid opno);
 static bool contain_var_unsubstitutable_functions_walker(Node* node, void* context);
 static bool is_accurate_estimatable_func(Oid funcId);
-static Node* convert_equalsimplevar_to_nulltest(Oid opno, List* args);
 
 /*****************************************************************************
  *		OPERATOR clause functions
@@ -482,7 +485,7 @@ bool need_adjust_agg_inner_func_type(Aggref* aggref)
      * You can extend here when you need support stream plan for other agg which
      * also have no collect function, e.g. array_agg,listagg and so on.
      */
-    if (aggref->aggfnoid == STRINGAGGFUNCOID)
+    if (aggref->aggfnoid == STRINGAGGFUNCOID || aggref->aggfnoid == ARRAYAGGFUNCOID)
         return false;
     else
         return true;
@@ -988,6 +991,7 @@ bool contain_mutable_functions(Node* clause)
 {
     check_function_context context;
     context.checktype = CONTAIN_MUTABLE_FUNCTION;
+    context.deep = false;
     return contain_specified_functions_walker<false>(clause, &context);
 }
 
@@ -1005,10 +1009,11 @@ bool contain_mutable_functions(Node* clause)
  * XXX we do not examine sub-selects to see if they contain uses of
  * volatile functions.	It's not real clear if that is correct or not...
  */
-bool contain_volatile_functions(Node* clause)
+bool contain_volatile_functions(Node* clause, bool deep)
 {
     check_function_context context;
     context.checktype = CONTAIN_VOLATILE_FUNTION;
+    context.deep = deep;
     return contain_specified_functions_walker<false>(clause, &context);
 }
 
@@ -1024,6 +1029,7 @@ bool contain_specified_function(Node* clause, Oid funcid)
     check_function_context context;
     context.funcid = funcid;
     context.checktype = CONTAIN_FUNCTION_ID;
+    context.deep = false;
     return contain_specified_functions_walker<false>(clause, &context);
 }
 
@@ -1135,6 +1141,9 @@ static bool contain_specified_functions_walker(Node* node, check_function_contex
     } else if (IsA(node, Rownum)) {
         /* ROWNUM is volatile */
         return context->checktype == CONTAIN_VOLATILE_FUNTION;
+    } else if (IsA(node, Query) && context->deep) {
+        /* Recurse into subselects */
+        return query_tree_walker((Query*)node, (bool (*)())contain_specified_functions_walker<isSimpleVar>, context, 0);
     }
     return expression_tree_walker(node, (bool (*)())contain_specified_functions_walker<isSimpleVar>, context);
 }
@@ -1154,6 +1163,7 @@ bool exec_simple_check_mutable_function(Node* clause)
 {
     check_function_context context;
     context.checktype = CONTAIN_MUTABLE_FUNCTION;
+    context.deep = false;
     return contain_specified_functions_walker<true>(clause, &context);
 }
 
@@ -1594,7 +1604,24 @@ static Relids find_nonnullable_rels_walker(Node* node, bool top_level)
     } else if (IsA(node, PlaceHolderVar)) {
         PlaceHolderVar* phv = (PlaceHolderVar*)node;
 
+        /*
+         * If the contained expression forces any rels non-nullable, so does
+         * the PHV.
+         */
         result = find_nonnullable_rels_walker((Node*)phv->phexpr, top_level);
+        /*
+         * If the PHV's syntactic scope is exactly one rel, it will be forced
+         * to be evaluated at that rel, and so it will behave like a Var of
+         * that rel: if the rel's entire output goes to null, so will the PHV.
+         * (If the syntactic scope is a join, we know that the PHV will go to
+         * null if the whole join does; but that is AND semantics while we
+         * need OR semantics for find_nonnullable_rels' result, so we can't do
+         * anything with the knowledge.)
+         */
+        if (phv->phlevelsup == 0 &&
+            bms_membership(phv->phrels) == BMS_SINGLETON)
+            result = bms_add_members(result, phv->phrels);
+
     }
     return result;
 }
@@ -2151,6 +2178,109 @@ static bool rowtype_field_matches(
     return true;
 }
 
+static Node *GetNullExprFromRowExpr(RowExpr *rarg, NullTest *ntest)
+{
+    List *newargs = NIL;
+    ListCell *l = NULL;
+    NullTest* newntest = NULL;
+
+    foreach (l, rarg->args) {
+        Node *relem = (Node *)lfirst(l);
+
+        /*
+         * A constant field refutes the whole NullTest if it's
+         * of the wrong nullness; else we can discard it.
+         */
+        if (relem && IsA(relem, Const)) {
+            Const *carg = (Const *)relem;
+
+            if (carg->constisnull ? (ntest->nulltesttype == IS_NOT_NULL) : (ntest->nulltesttype == IS_NULL)) {
+                return makeBoolConst(false, false);
+            }
+            continue;
+        }
+        /*
+         * Else, make a scalar (argisrow == false) NullTest
+         * for this field.  Scalar semantics are required
+         * because IS [NOT] NULL doesn't recurse; see comments
+         * in ExecEvalNullTest().
+         */
+        newntest = makeNode(NullTest);
+        newntest->arg = (Expr *)relem;
+        newntest->nulltesttype = ntest->nulltesttype;
+        newntest->argisrow = false;
+        newargs = lappend(newargs, newntest);
+    }
+    /* If all the inputs were constants, result is TRUE */
+    if (newargs == NIL) {
+        return makeBoolConst(true, false);
+    }
+    /* If only one nonconst input, it's the result */
+    if (list_length(newargs) == 1) {
+        return (Node *)linitial(newargs);
+    }
+    /* Else we need an AND node */
+    return (Node *)make_andclause(newargs);
+}
+
+static Node *GetNullExprFromRowExprForAFormat(RowExpr *rarg, NullTest *ntest)
+{
+    List *newargs = NIL;
+    ListCell *l = NULL;
+    NullTest* newntest = NULL;
+
+    foreach (l, rarg->args) {
+        Node *relem = (Node *)lfirst(l);
+
+        /*
+         * A constant field refutes the whole NullTest if it's
+         * of the wrong nullness; else we can discard it.
+         */
+        if (relem && IsA(relem, Const)) {
+            Const *carg = (Const *)relem;
+
+            if (!(carg->constisnull)) {
+                if (ntest->nulltesttype == IS_NOT_NULL) {
+                    return makeBoolConst(true, false);
+                }
+                if (ntest->nulltesttype == IS_NULL) {
+                    return makeBoolConst(false, false);
+                }
+            }
+            continue;
+        }
+        /*
+         * Else, make a scalar (argisrow == false) NullTest
+         * for this field.  Scalar semantics are required
+         * because IS [NOT] NULL doesn't recurse; see comments
+         * in ExecEvalNullTest().
+         */
+        newntest = makeNode(NullTest);
+        newntest->arg = (Expr *)relem;
+        newntest->nulltesttype = IS_NULL;
+        newntest->argisrow = false;
+        newargs = lappend(newargs, newntest);
+    }
+    /* If all the inputs were constants, result is TRUE */
+    if (newargs == NIL) {
+        if (ntest->nulltesttype == IS_NOT_NULL) {
+            return makeBoolConst(false, false);
+        }
+        if (ntest->nulltesttype == IS_NULL) {
+            return makeBoolConst(true, false);
+        }
+    }
+    /* If only one nonconst input, it's the result */
+    if (list_length(newargs) == 1)
+        return (Node *)linitial(newargs);
+    if (ntest->nulltesttype == IS_NULL) {
+        /* Else we need an AND node */
+        return (Node *)make_andclause(newargs);
+    } else {
+        return (Node *)make_notclause((Expr *)make_andclause(newargs));
+    }
+}
+
 /* --------------------
  * eval_const_expressions
  *
@@ -2373,6 +2503,7 @@ Node* eval_const_expressions_mutator(Node* node, eval_const_expressions_context*
             newexpr = makeNode(FuncExpr);
             newexpr->funcid = expr->funcid;
             newexpr->funcresulttype = expr->funcresulttype;
+            newexpr->funcresulttype_orig = expr->funcresulttype_orig;
             newexpr->funcretset = expr->funcretset;
             newexpr->funcvariadic = expr->funcvariadic;
             newexpr->funcformat = expr->funcformat;
@@ -2412,11 +2543,6 @@ Node* eval_const_expressions_mutator(Node* node, eval_const_expressions_context*
                 if (simple != NULL) /* successfully simplified it */
                     return (Node*)simple;
             }
-
-            /* convert qual to nulltest if the qual is "Var = Var" and two Vars are equal. */
-            simple = (Expr*)convert_equalsimplevar_to_nulltest(expr->opno, args);
-            if (simple != NULL)
-                return (Node*)simple;
 
             /*
              * The expression cannot be simplified any further, so build
@@ -3051,46 +3177,18 @@ Node* eval_const_expressions_mutator(Node* node, eval_const_expressions_context*
             Node* arg = NULL;
 
             arg = eval_const_expressions_mutator((Node*)ntest->arg, context);
-            if (arg && IsA(arg, RowExpr)) {
+            if (ntest->argisrow && arg && IsA(arg, RowExpr)) {
                 /*
                  * We break ROW(...) IS [NOT] NULL into separate tests on
                  * its component fields.  This form is usually more
                  * efficient to evaluate, as well as being more amenable
                  * to optimization.
                  */
-                RowExpr* rarg = (RowExpr*)arg;
-                List* newargs = NIL;
-                ListCell* l = NULL;
-
-                AssertEreport(ntest->argisrow, MOD_OPT, "");
-                foreach (l, rarg->args) {
-                    Node* relem = (Node*)lfirst(l);
-
-                    /*
-                     * A constant field refutes the whole NullTest if it's
-                     * of the wrong nullness; else we can discard it.
-                     */
-                    if (relem && IsA(relem, Const)) {
-                        Const* carg = (Const*)relem;
-
-                        if (carg->constisnull ? (ntest->nulltesttype == IS_NOT_NULL) : (ntest->nulltesttype == IS_NULL))
-                            return makeBoolConst(false, false);
-                        continue;
-                    }
-                    newntest = makeNode(NullTest);
-                    newntest->arg = (Expr*)relem;
-                    newntest->nulltesttype = ntest->nulltesttype;
-                    newntest->argisrow = type_is_rowtype(exprType(relem));
-                    newargs = lappend(newargs, newntest);
+                if (AFORMAT_NULL_TEST_MODE) {
+                    return GetNullExprFromRowExprForAFormat((RowExpr *)arg, ntest);
+                } else {
+                    return GetNullExprFromRowExpr((RowExpr *)arg, ntest);
                 }
-                /* If all the inputs were constants, result is TRUE */
-                if (newargs == NIL)
-                    return makeBoolConst(true, false);
-                /* If only one nonconst input, it's the result */
-                if (list_length(newargs) == 1)
-                    return (Node*)linitial(newargs);
-                /* Else we need an AND node */
-                return (Node*)make_andclause(newargs);
             }
             if (!ntest->argisrow && arg && IsA(arg, Const)) {
                 Const* carg = (Const*)arg;
@@ -3769,9 +3867,16 @@ static List* reorder_function_arguments(List* args, HeapTuple func_tuple)
         int pos = 0;
 
         proallargs = get_func_arg_info(func_tuple, &argtypes, &argnames, &argmodes);
-        defposdatum = SysCacheGetAttr(PROCOID, func_tuple, Anum_pg_proc_prodefaultargpos, &isnull);
-        AssertEreport(!isnull, MOD_OPT, "");
-        defpos = (int2vector*)DatumGetPointer(defposdatum);
+        if (pronargs <= FUNC_MAX_ARGS_INROW) {
+            defposdatum = SysCacheGetAttr(PROCOID, func_tuple, Anum_pg_proc_prodefaultargpos, &isnull);
+            AssertEreport(!isnull, MOD_OPT, "");
+            defpos = (int2vector*)DatumGetPointer(defposdatum);
+        } else {
+            defposdatum = SysCacheGetAttr(PROCOID, func_tuple, Anum_pg_proc_prodefaultargposext, &isnull);
+            AssertEreport(!isnull, MOD_OPT, "");
+            defpos = (int2vector*)PG_DETOAST_DATUM(defposdatum);
+        }
+
         FetchDefaultArgumentPos(&argdefpos, defpos, argmodes, proallargs);
 
         defaults = fetch_function_defaults(func_tuple);
@@ -3900,7 +4005,8 @@ static void recheck_cast_function_args(List* args, Oid result_type, HeapTuple fu
     func_package = DatumGetBool(ispackage);
     if (!func_package || nargs <= funcform->pronargs) {
         Assert(nargs == funcform->pronargs);
-        proargtypes = funcform->proargtypes.values;
+        oidvector* proargs = ProcedureGetArgTypes(func_tuple);
+        proargtypes = proargs->values;
     } else if (nargs > funcform->pronargs) {
         Datum proallargtypes;
         ArrayType* arr = NULL;
@@ -3909,6 +4015,14 @@ static void recheck_cast_function_args(List* args, Oid result_type, HeapTuple fu
             arr = DatumGetArrayTypeP(proallargtypes); /* ensure not toasted */
             proc_arg = ARR_DIMS(arr)[0];
             proargtypes = (Oid*)ARR_DATA_PTR(arr);
+        }
+    }
+
+    /* if argtype is table of, change its element type */
+    for (int i = 0; i < nargs; i++) {
+        Oid baseOid = InvalidOid;
+        if (isTableofType(proargtypes[i], &baseOid, NULL)) {
+            proargtypes[i] = baseOid;
         }
     }
 
@@ -3991,6 +4105,11 @@ static Expr* evaluate_function(Oid funcid, Oid result_type, int32 result_typmod,
      */
     if (funcform->prorettype == RECORDOID)
         return NULL;
+
+    /* For hierarchical query the value is calculated in runtime stage, so just return */
+    if (IsHierarchicalQueryFuncOid(funcid)) {
+        return NULL;
+    }
 
     /*
      * Check for constant inputs and especially constant-NULL inputs.
@@ -4550,73 +4669,6 @@ Expr* evaluate_expr(Expr* expr, Oid result_type, int32 result_typmod, Oid result
 }
 
 /*
- * search_cte_by_parse_tree
- *	Attempt to find a CTE in parse tree of current level
- *
- * Parameters:
- *	@in root: planner info struct for current query level
- *	@in rte: cte table entry to substitute
- * Returns:
- *	substituted parse tree, or null if can't substituted
- */
-Query* search_cte_by_parse_tree(Query* parse, RangeTblEntry* rte, bool underRecursive)
-{
-    ListCell* lc = NULL;
-
-    /*
-     * Lookup current CTE by name
-     */
-    foreach (lc, parse->cteList) {
-        CommonTableExpr* cte = (CommonTableExpr*)lfirst(lc);
-
-        if (strcmp(cte->ctename, rte->ctename) == 0) {
-            Query* ctequery = (Query*)cte->ctequery;
-
-            /*
-             * For a recursive-cte and u_sess->attr.attr_sql.enable_stream_recursive is disabled, we disable
-             * streaming plan.
-             */
-            if (!u_sess->attr.attr_sql.enable_stream_recursive && cte->cterecursive) {
-                errno_t sprintf_rc = sprintf_s(u_sess->opt_cxt.not_shipping_info->not_shipping_reason,
-                    NOTPLANSHIPPING_LENGTH,
-                    "Unsupported CTE substitution causes SQL unshipped");
-                securec_check_ss_c(sprintf_rc, "\0", "\0");
-                mark_stream_unsupport();
-            }
-
-            if (underRecursive && cte->cterecursive && !rte->self_reference) {
-                errno_t sprintf_rc = sprintf_s(u_sess->opt_cxt.not_shipping_info->not_shipping_reason,
-                    NOTPLANSHIPPING_LENGTH,
-                    "Recursive CTE references recursive CTE \"%s\"",
-                    cte->ctename);
-                securec_check_ss_c(sprintf_rc, "\0", "\0");
-                mark_stream_unsupport();
-            }
-
-            if (cte->cterecursive || !IsA(ctequery, Query) || ctequery->commandType != CMD_SELECT ||
-                ctequery->utilityStmt != NULL || ctequery->returningList != NIL) {
-                return NULL;
-            }
-
-            /*
-             * Always copy cte if it's referenced multiple times, to prevent other
-             * rewrite rules on some of cte. We don't know how many times it got
-             * referenced because the cte uses it can be referenced multiple times
-             */
-            ctequery = (Query*)copyObject(ctequery);
-
-            return ctequery;
-        }
-    }
-
-    ereport(ERROR,
-        (errmodule(MOD_OPT),
-            errcode(ERRCODE_OPTIMIZER_INCONSISTENT_STATE),
-            (errmsg("could not find CTE \"%s\"", rte->ctename))));
-    return NULL;
-}
-
-/*
  * inline_set_returning_function
  *		Attempt to "inline" a set-returning function in the FROM clause.
  *
@@ -5170,36 +5222,6 @@ static bool is_accurate_estimatable_func(Oid funcId)
 }
 
 /*
- * @Description: convert qual to nulltest if the qual is "Var = Var" and two Vars are equal,
- *                      because the selectivity of the qual is DEFAULT_EQ_SEL
- *                      result in underestimate the joinrel's rows.
- *
- * @in opno - oid of the operator
- * @in args - arguments of the operator
- * @return - if qual is "Var = Var" and two Vars are equal return NullTest node, otherwise return NULL.
- */
-static Node* convert_equalsimplevar_to_nulltest(Oid opno, List* args)
-{
-    Node* larg = NULL;
-    Node* rarg = NULL;
-    Node* nullTest = NULL;
-
-    if (list_length(args) != 2)
-        return NULL;
-
-    larg = (Node*)linitial(args);
-    rarg = (Node*)lsecond(args);
-
-    if (_equalSimpleVar(larg, rarg) && ((Var*)larg)->varlevelsup == ((Var*)rarg)->varlevelsup &&
-        (get_oprrest(opno) == EQSELRETURNOID)) {
-        nullTest = (Node*)makeNullTest(IS_NOT_NULL, (Expr*)larg);
-    }
-
-    return nullTest;
-}
-
-#ifndef ENABLE_MULTIPLE_NODES
-/*
  * check whether the node have rownum expr or not, test all kinds of nodes,
  * check if it has the volatile rownum. If the node include rownum
  * function, it will return true, else it will return false.
@@ -5217,6 +5239,11 @@ bool contain_rownum_walker(Node *node, void *context)
     return expression_tree_walker(node, (bool (*)())contain_rownum_walker, context);
 }
 
+
+extern bool ContainRownumExpr(Node *node)
+{
+    return contain_rownum_walker(node, NULL);
+}
 
 /*
  * get the jtnode's qualifiers list, make query tree's table jion tree's
@@ -5238,4 +5265,4 @@ List *get_quals_lists(Node *jtnode)
 
     return quallist;
 }
-#endif
+

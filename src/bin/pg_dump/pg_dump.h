@@ -74,6 +74,7 @@ typedef enum {
     DO_FK_CONSTRAINT, /* see note for ConstraintInfo */
     DO_PROCLANG,
     DO_CAST,
+    DO_PACKAGE,
     DO_TABLE_DATA,
     DO_DUMMY_TYPE,
     DO_TSPARSER,
@@ -88,7 +89,10 @@ typedef enum {
     DO_PRE_DATA_BOUNDARY,
     DO_POST_DATA_BOUNDARY,
     DO_FTBL_CONSTRAINT, /* dump informational constraint info of the HDFS foreign table, also used for MOT table */
-    DO_RLSPOLICY        /* dump row level security policy of table */
+    DO_RLSPOLICY,       /* dump row level security policy of table */
+    DO_PUBLICATION,
+    DO_PUBLICATION_REL,
+    DO_SUBSCRIPTION
 } DumpableObjectType;
 
 typedef struct _dumpableObject {
@@ -108,6 +112,7 @@ typedef struct _namespaceInfo {
     DumpableObject dobj;
     char* rolname; /* name of owner, or empty string */
     char* nspacl;
+    bool hasBlockchain;
 } NamespaceInfo;
 
 typedef struct _extensionInfo {
@@ -157,6 +162,13 @@ typedef struct _funcInfo {
     Oid prorettype;
     char* proacl;
 } FuncInfo;
+
+
+typedef struct _pkgInfo {
+    DumpableObject dobj;
+    char* rolname; /* name of owner, or empty string */
+    char* pkgacl;
+} PkgInfo;
 
 /* AggInfo is a superset of FuncInfo */
 typedef struct _aggInfo {
@@ -211,6 +223,7 @@ typedef struct _tableInfo {
     bool hastriggers;         /* does it have any triggers? */
     bool hasoids;             /* does it have OIDs? */
     bool isMOT;               /* true if it is MOT table */
+    bool isblockchain;        /* is it in blockchain schema? */
     uint32 frozenxid;         /* for restore frozen xid */
     uint64 frozenxid64;       /* for restore frozen xid64 */
     Oid toast_oid;            /* for restore toast frozen xid */
@@ -248,6 +261,7 @@ typedef struct _tableInfo {
     char* attstorage;                   /* attribute storage scheme */
     char* typstorage;                   /* type storage scheme */
     bool* attisdropped;                 /* true if attr is dropped; don't dump it */
+    bool* attisblockchainhash;          /* true if attr is "hash" column in blockchain table */
     int* attlen;                        /* attribute length, used by binary_upgrade */
     char* attalign;                     /* attribute align, used by binary_upgrade */
     bool* attislocal;                   /* true if attr has local definition */
@@ -263,17 +277,17 @@ typedef struct _tableInfo {
     /*
      * Stuff computed only for dumpable tables.
      */
-    int numParents;                 /* number of (immediate) parent tables */
-    struct _tableInfo** parents;    /* TableInfos of immediate parents */
-    struct _tableDataInfo* dataObj; /* TableDataInfo, if dumping its data */
+    int numParents;                     /* number of (immediate) parent tables */
+    struct _tableInfo** parents;        /* TableInfos of immediate parents */
+    struct _tableDataInfo* dataObj;     /* TableDataInfo, if dumping its data */
 } TableInfo;
 
 typedef struct _attrDefInfo {
     DumpableObject dobj; /* note: dobj.name is name of table */
     TableInfo* adtable;  /* link to table of attribute */
     int adnum;
-    char* adef_expr; /* decompiled DEFAULT expression */
-    bool separate;   /* TRUE if must dump as separate item */
+    char* adef_expr;     /* decompiled DEFAULT expression */
+    bool separate;       /* TRUE if must dump as separate item */
     char generatedCol;
 } AttrDefInfo;
 
@@ -288,11 +302,15 @@ typedef struct _indxInfo {
     DumpableObject dobj;
     TableInfo* indextable; /* link to table the index is for */
     char* indexdef;
-    char* tablespace; /* tablespace in which index is stored */
-    char* options;    /* options specified by WITH (...) */
+    char* tablespace;      /* tablespace in which index is stored */
+    char* options;         /* options specified by WITH (...) */
     int indnkeys;
-    Oid* indkeys;
+    int indnkeyattrs;	   /* number of index key attributes */
+    int	indnattrs;         /* total number of index attributes */
+    Oid* indkeys;          /* In spite of the name 'indkeys' this field
+                            * contains both key and nonkey attributes */
     bool indisclustered;
+    bool indisusable;
     bool indisreplident;
     /* if there is an associated constraint object, its dumpId: */
     DumpId indexconstraint;
@@ -448,6 +466,40 @@ typedef struct _blobInfo {
     char* blobacl;
 } BlobInfo;
 
+/*
+ * The PublicationInfo struct is used to represent publications.
+ */
+typedef struct _PublicationInfo {
+    DumpableObject dobj;
+    char *rolname;
+    bool puballtables;
+    bool pubinsert;
+    bool pubupdate;
+    bool pubdelete;
+} PublicationInfo;
+
+/*
+ * The PublicationRelInfo struct is used to represent publication table
+ * mapping.
+ */
+typedef struct _PublicationRelInfo {
+    DumpableObject dobj;
+    TableInfo *pubtable;
+    char *pubname;
+} PublicationRelInfo;
+
+/*
+ * The SubscriptionInfo struct is used to represent subscription.
+ */
+typedef struct _SubscriptionInfo {
+    DumpableObject dobj;
+    char *rolname;
+    char *subconninfo;
+    char *subslotname;
+    char *subsynccommit;
+    char *subpublications;
+} SubscriptionInfo;
+
 /* global decls */
 extern bool force_quotes; /* double-quotes for identifiers flag */
 extern bool g_verbose;    /* verbose flag */
@@ -498,6 +550,7 @@ extern NamespaceInfo* getNamespaces(Archive* fout, int* numNamespaces);
 extern ExtensionInfo* getExtensions(Archive* fout, int* numExtensions);
 extern TypeInfo* getTypes(Archive* fout, int* numTypes);
 extern FuncInfo* getFuncs(Archive* fout, int* numFuncs);
+extern PkgInfo* getPackages(Archive* fout, int* numPackages); 
 extern AggInfo* getAggregates(Archive* fout, int* numAggregates);
 extern OprInfo* getOperators(Archive* fout, int* numOperators);
 extern OpclassInfo* getOpclasses(Archive* fout, int* numOpclasses);
@@ -526,6 +579,11 @@ extern ForeignServerInfo* getForeignServers(Archive* fout, int* numForeignServer
 extern DefaultACLInfo* getDefaultACLs(Archive* fout, int* numDefaultACLs);
 extern void getExtensionMembership(Archive* fout, ExtensionInfo extinfo[], int numExtensions);
 extern void help(const char* progname);
+extern bool IsRbObject(Archive* fout, Oid classid, Oid objid, const char* objname);
+extern uint32 GetVersionNum(Archive* fout);
+extern void getPublications(Archive *fout);
+extern void getPublicationTables(Archive *fout, TableInfo tblinfo[], int numTables);
+extern void getSubscriptions(Archive *fout);
 
 #ifdef GSDUMP_LLT
 void stopLLT();

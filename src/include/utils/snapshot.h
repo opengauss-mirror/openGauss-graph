@@ -1,7 +1,7 @@
 /* -------------------------------------------------------------------------
  *
  * snapshot.h
- *	  POSTGRES snapshot definition
+ *	  openGauss snapshot definition
  *
  * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
@@ -30,9 +30,8 @@
  * that that allows to use the same snapshot for different table AMs without
  * having one callback per AM.
  */
-typedef enum SnapshotSatisfiesMethod
-{
-    /*-------------------------------------------------------------------------
+typedef enum SnapshotSatisfiesMethod {
+    /* -------------------------------------------------------------------------
      * A tuple is visible iff the tuple is valid for the given MVCC snapshot.
      *
      * Here, we consider the effects of:
@@ -48,20 +47,46 @@ typedef enum SnapshotSatisfiesMethod
     SNAPSHOT_MVCC = 0,
 
     /* -------------------------------------------------------------------------
-     * A tuple is visible iff the tuple is valid for the given local MVCC snapshot.
+     * A tuple is visible if the tuple is valid for the given snapshot.
      *
      * Here, we consider the effects of:
-     * - all transactions local committed as of the time of the given snapshot
-     * - previous commands of this transaction
+     * - all transactions committed before the CSN of the given snapshot, that is:
+           - all transactions committed as of the time of the given snapshot
      *
      * Does _not_ include:
-     * - transactions committed in gtm but not committed locally
-     * - transactions shown as in-progress by the snapshot
-     * - transactions started after the snapshot was taken
-     * - changes made by the current command
+     * - transactions committed after CSN of the given snapshot, that is:
+     *     - transactions shown as in-progress by the snapshot
+     *     - transactions started after the snapshot was taken
      * -------------------------------------------------------------------------
      */
-    SNAPSHOT_LOCAL_MVCC,
+    SNAPSHOT_VERSION_MVCC,
+
+    /* -------------------------------------------------------------------------
+     * A tuple is visible if the tuple is invalid for the given snapshot, and
+     * is valid for SnapshotNow. the pseudocode as follow:
+     * !TupleIsVisible(SNAPSHOT_VERSION_MVCC) && TupleIsVisible(SnapshotNow)
+     * -------------------------------------------------------------------------
+     */
+    SNAPSHOT_DELTA,
+
+    /* -------------------------------------------------------------------------
+     * A tuple is visible if the tuple is valid for the given CSN snapshot
+     * but invalid for SnapshotNow.
+     *
+     * Here, we consider the effects of:
+     * - all transactions committed before given CSN
+     *
+     * Does _not_ include:
+     * - transactions committed after given CSN
+     * -------------------------------------------------------------------------
+     */
+    /* -------------------------------------------------------------------------
+     * A tuple is visible if the tuple is valid for the given snapshot, and
+     * is invalid for SnapshotNow. the pseudocode as follow:
+     * TupleIsVisible(SNAPSHOT_VERSION_MVCC) && !TupleIsVisible(SnapshotNow)
+     * -------------------------------------------------------------------------
+     */
+    SNAPSHOT_LOST,
 
     /* -------------------------------------------------------------------------
      * A tuple is visible iff heap tuple is valid "now".
@@ -76,7 +101,16 @@ typedef enum SnapshotSatisfiesMethod
      */
     SNAPSHOT_NOW,
 
-    /*-------------------------------------------------------------------------
+#ifdef ENABLE_MULTIPLE_NODES
+    /* -------------------------------------------------------------------------
+     * Same as SNAPSHOT_NOW, skip sync in distribute mode.
+     * If we scan pg_class in seqscan, skip sync.
+     * -------------------------------------------------------------------------
+     */
+    SNAPSHOT_NOW_NO_SYNC,
+#endif
+
+    /* -------------------------------------------------------------------------
      * A tuple is visible iff the tuple is valid "for itself".
      *
      * Here, we consider the effects of:
@@ -100,7 +134,7 @@ typedef enum SnapshotSatisfiesMethod
      */
     SNAPSHOT_TOAST,
 
-    /*-------------------------------------------------------------------------
+    /* -------------------------------------------------------------------------
      * A tuple is visible iff the tuple is valid including effects of open
      * transactions.
      *
@@ -134,6 +168,11 @@ typedef enum SnapshotSatisfiesMethod
      * contents in the context of logical decoding).
      */
     SNAPSHOT_HISTORIC_MVCC,
+    /*
+     * Whether a tuple is visible is decided by CSN,
+     * which is used in parallel decoding.
+     */
+    SNAPSHOT_DECODE_MVCC
 } SnapshotSatisfiesMethod;
 
 typedef struct SnapshotData* Snapshot;
@@ -172,6 +211,10 @@ typedef struct SnapshotData {
      */
     TransactionId xmin; /* all XID < xmin are visible to me */
     TransactionId xmax; /* all XID >= xmax are invisible to me */
+
+     /* subxid is in progress and it's the last one modify tuple */
+    SubTransactionId subxid;
+
     /*
      * For normal MVCC snapshot this contains the all xact IDs that are in
      * progress, unless the snapshot was taken during recovery in which case
@@ -253,8 +296,30 @@ typedef enum TM_Result
      * to wait.
      */
     TM_BeingModified,
-	TM_SelfCreated,
-	TM_SelfUpdated
+    TM_SelfCreated,
+    TM_SelfUpdated,
+
+    /*GRAPH add for THM_result */
+	HeapTupleMayBeUpdated,
+	HeapTupleInvisible,
+	HeapTupleSelfUpdated,
+	HeapTupleUpdated,
+	HeapTupleBeingUpdated,
+	HeapTupleWouldBlock			/* can be returned by heap_tuple_lock */
 } TM_Result;
+
+/*
+ * Result codes for HeapTupleSatisfiesUpdate.  This should really be in
+ * tqual.h, but we want to avoid including that file elsewhere.
+ */
+// typedef enum
+// {
+// 	HeapTupleMayBeUpdated,
+// 	HeapTupleInvisible,
+// 	HeapTupleSelfUpdated,
+// 	HeapTupleUpdated,
+// 	HeapTupleBeingUpdated,
+// 	HeapTupleWouldBlock			/* can be returned by heap_tuple_lock */
+// } HTSU_Result;
 
 #endif /* SNAPSHOT_H */

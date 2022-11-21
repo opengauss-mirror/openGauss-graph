@@ -1,0 +1,38 @@
+CREATE graph test;
+NOTICE:  CREATE TABLE / PRIMARY KEY will create implicit index "gs_vertex_pkey" for table "gs_vertex"
+SET graph_path=test;
+CREATE SERVER import_server0 FOREIGN DATA WRAPPER file_fdw;
+create foreign table  fdwComment
+(
+    id int8,
+    creationDate varchar(80),
+    locationIP varchar(80),
+    browserUsed varchar(80),
+    content varchar(2000),
+    length int4
+)
+server import_server0
+options
+(
+ FORMAT 'csv',
+ HEADER 'false',
+ DELIMITER '|',
+ NULL '',
+ FILENAME '../../comment.csv'
+ );
+CYPHER LOAD FROM fdwComment AS row 
+CREATE (:comment = JSONB_STRIP_NULLS(
+  TO_JSONB(ROW_TO_JSON(row))
+));
+NOTICE:  merging column "id" with inherited definition
+CONTEXT:  SQL statement "CREATE VLABEL "comment""
+NOTICE:  merging column "properties" with inherited definition
+CONTEXT:  SQL statement "CREATE VLABEL "comment""
+NOTICE:  CREATE TABLE / PRIMARY KEY will create implicit index "comment_pkey" for table "comment"
+CONTEXT:  SQL statement "CREATE VLABEL "comment""
+Drop graph test CASCADE;
+NOTICE:  drop cascades to 4 other objects
+DETAIL:  drop cascades to sequence test.gs_label_seq
+drop cascades to vlabel gs_vertex
+drop cascades to elabel gs_edge
+drop cascades to vlabel comment

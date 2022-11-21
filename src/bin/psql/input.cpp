@@ -20,6 +20,10 @@
 #ifdef USE_READLINE
 bool useReadline = false;
 
+#ifdef ENABLE_UT
+#define static
+#endif
+
 /*
  * Preserve newlines in saved queries by mapping '\n' to NL_IN_HISTORY
  *
@@ -240,7 +244,9 @@ bool SensitiveStrCheck(const char* target)
     
     if (strstr(target_copy, "PASSWORD") != NULL || strstr(target_copy, "IDENTIFIED") != NULL ||
         strstr(target_copy, "GS_ENCRYPT_AES128") != NULL || strstr(target_copy, "GS_DECRYPT_AES128") != NULL ||
-        strstr(target_copy, "GS_ENCRYPT") != NULL || strstr(target_copy, "GS_DECRYPT") != NULL) {
+        strstr(target_copy, "GS_ENCRYPT") != NULL || strstr(target_copy, "GS_DECRYPT") != NULL ||
+        strstr(target_copy, "PG_CREATE_PHYSICAL_REPLICATION_SLOT_EXTERN") != NULL ||
+        strstr(target_copy, "SECRETKEY") != NULL || strstr(target_copy, "CREATE_CREDENTIAL") != NULL) {
         free(target_copy);
         return TRUE;
     } else {
@@ -297,14 +303,9 @@ void setHistSize(const char* targetName, const char* targetValue, bool setToDefa
 void initializeInput(int flags)
 {
 #ifdef USE_READLINE
-
-#ifndef ENABLE_MULTIPLE_NODES
     flags &= useReadline;
-#endif
 
     if (flags & 1) {
-        useReadline = true;
-
         /* these two things must be done in this order: */
         initialize_readline();
         rl_variable_bind ("enable-meta-key", "off");

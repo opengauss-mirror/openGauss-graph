@@ -120,7 +120,7 @@ static void pg_fdw_exit(int code, Datum arg)
 }
 
 /*
- * Get a PGconn which can be used to execute queries on the remote PostgreSQL
+ * Get a PGconn which can be used to execute queries on the remote openGauss
  * server with the user's authorization.  A new connection is established
  * if we don't already have a suitable one, and a transaction is opened at
  * the right subtransaction nesting depth if we didn't do that already.
@@ -158,8 +158,8 @@ PGconn *GetConnection(ForeignServer *server, UserMapping *user, bool will_prep_s
         RegisterXactCallback(pgfdw_xact_callback, NULL);
         RegisterSubXactCallback(pgfdw_subxact_callback, NULL);
 
-        CacheRegisterSyscacheCallback(FOREIGNSERVEROID, pgfdw_inval_callback, (Datum)0);
-        CacheRegisterSyscacheCallback(USERMAPPINGOID, pgfdw_inval_callback, (Datum)0);
+        CacheRegisterSessionSyscacheCallback(FOREIGNSERVEROID, pgfdw_inval_callback, (Datum)0);
+        CacheRegisterSessionSyscacheCallback(USERMAPPINGOID, pgfdw_inval_callback, (Datum)0);
 
         if (IS_THREAD_POOL_SESSION) {
             u_sess->ext_fdw_ctx[POSTGRES_TYPE_FDW].fdwExitFunc = pg_fdw_exit;
@@ -303,7 +303,7 @@ static PGconn *connect_pg_server(ForeignServer *server, UserMapping *user)
 
         /*
          * Check that non-superuser has used password to establish connection;
-         * otherwise, he's piggybacking on the postgres server's user
+         * otherwise, he's piggybacking on the openGauss server's user
          * identity. See also dblink_security_check() in contrib/dblink.
          */
         if (!superuser() && !PQconnectionUsedPassword(conn)) {

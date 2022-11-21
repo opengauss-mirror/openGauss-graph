@@ -94,12 +94,12 @@
 #include "knl/knl_variable.h"
 
 #include "access/nbtree.h"
-#include "executor/execdebug.h"
-#include "executor/execStream.h"
-#include "executor/nodeMergejoin.h"
+#include "executor/exec/execdebug.h"
+#include "executor/exec/execStream.h"
+#include "executor/node/nodeMergejoin.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
-#include "executor/nodeHashjoin.h"
+#include "executor/node/nodeHashjoin.h"
 
 /*
  * Runtime data for each mergejoin clause
@@ -789,6 +789,11 @@ TupleTableSlot* ExecMergeJoin(MergeJoinState* node)
                     if (node->js.jointype == JOIN_SEMI)
                         node->mj_JoinState = EXEC_MJ_NEXTOUTER;
 
+#ifdef GS_GRAPH
+					if (node->js.single_match)
+						node->mj_JoinState = EXEC_MJ_NEXTOUTER;
+#endif
+
                     qual_result = (other_qual == NIL || ExecQual(other_qual, econtext, false));
                     MJ_DEBUG_QUAL(other_qual, qual_result);
 
@@ -1040,6 +1045,21 @@ TupleTableSlot* ExecMergeJoin(MergeJoinState* node)
                      * forcing the merge clause to never match, so we never
                      * get here.
                      */
+#ifdef GS_GRAPH
+                    if (!node->mj_SkipMarkRestore)
+                    {
+                        ExecRestrPos(inner_plan);
+
+                        /*
+                         * ExecRestrPos probably should give us back a new Slot,
+                         * but since it doesn't, use the marked slot.  (The
+                         * previously returned mj_InnerTupleSlot cannot be assumed
+                         * to hold the required tuple.)
+                         */
+                        node->mj_InnerTupleSlot = inner_tuple_slot;
+                        /* we need not do MJEvalInnerValues again */
+                    }
+#else
                     ExecRestrPos(inner_plan);
 
                     /*
@@ -1050,6 +1070,7 @@ TupleTableSlot* ExecMergeJoin(MergeJoinState* node)
                      */
                     node->mj_InnerTupleSlot = inner_tuple_slot;
                     /* we need not do MJEvalInnerValues again */
+#endif                    
                     node->mj_JoinState = EXEC_MJ_JOINTUPLES;
                 } else {
                     /* ----------------
@@ -1146,12 +1167,24 @@ TupleTableSlot* ExecMergeJoin(MergeJoinState* node)
                 MJ_DEBUG_COMPARE(compare_result);
 
                 if (compare_result == 0) {
+#ifdef GS_GRAPH
+                    if (!node->mj_SkipMarkRestore)
+                    {
+                        ExecMarkPos(inner_plan);
+                        if (node->mj_InnerTupleSlot == NULL) {
+                            ereport(ERROR,
+                                    (errcode(ERRCODE_UNEXPECTED_NULL_VALUE),
+                                     errmsg("mj_InnerTupleSlot cannot be NULL")));
+                        }
+                    }
+#else
                     ExecMarkPos(inner_plan);
                     if (node->mj_InnerTupleSlot == NULL) {
                         ereport(ERROR,
                                 (errcode(ERRCODE_UNEXPECTED_NULL_VALUE),
                                  errmsg("mj_InnerTupleSlot cannot be NULL")));
                     }
+#endif
                     MarkInnerTuple(node->mj_InnerTupleSlot, node);
 
                     node->mj_JoinState = EXEC_MJ_JOINTUPLES;
@@ -1423,6 +1456,18 @@ MergeJoinState* ExecInitMergeJoin(MergeJoin* node, EState* estate, int eflags)
     merge_state->mj_OuterEContext = CreateExprContext(estate);
     merge_state->mj_InnerEContext = CreateExprContext(estate);
 
+#ifdef GS_GRAPH
+    /*
+	 * initialize child nodes
+	 *
+	 * inner child must support MARK/RESTORE, unless we have detected that we
+	 * don't need that.  Note that skip_mark_restore must never be set if
+	 * there are non-mergeclause joinquals, since the logic wouldn't work.
+	 */
+	Assert(node->join.joinqual == NIL || !node->skip_mark_restore);
+	merge_state->mj_SkipMarkRestore = node->skip_mark_restore;
+#endif
+
     /*
      * initialize child expressions
      */
@@ -1439,7 +1484,11 @@ MergeJoinState* ExecInitMergeJoin(MergeJoin* node, EState* estate, int eflags)
      * inner child must support MARK/RESTORE.
      */
     outerPlanState(merge_state) = ExecInitNode(outerPlan(node), estate, eflags);
+#ifdef GS_GRAPH
+    innerPlanState(merge_state) = ExecInitNode(innerPlan(node), estate, merge_state->mj_SkipMarkRestore ? eflags : (eflags | EXEC_FLAG_MARK));
+#else
     innerPlanState(merge_state) = ExecInitNode(innerPlan(node), estate, eflags | EXEC_FLAG_MARK);
+#endif
 
     /*
      * For certain types of inner child nodes, it is advantageous to issue
@@ -1451,7 +1500,11 @@ MergeJoinState* ExecInitMergeJoin(MergeJoin* node, EState* estate, int eflags)
      * Currently, only Material wants the extra MARKs, and it will be helpful
      * only if eflags doesn't specify REWIND.
      */
+#ifdef GS_GRAPH
+    if (IsA(innerPlan(node), Material) && (eflags & EXEC_FLAG_REWIND) == 0 && !merge_state->mj_SkipMarkRestore)
+#else
     if (IsA(innerPlan(node), Material) && (eflags & EXEC_FLAG_REWIND) == 0)
+#endif
         merge_state->mj_ExtraMarks = true;
     else
         merge_state->mj_ExtraMarks = false;
@@ -1463,6 +1516,14 @@ MergeJoinState* ExecInitMergeJoin(MergeJoin* node, EState* estate, int eflags)
 
     merge_state->mj_MarkedTupleSlot = ExecInitExtraTupleSlot(estate);
     ExecSetSlotDescriptor(merge_state->mj_MarkedTupleSlot, ExecGetResultType(innerPlanState(merge_state)));
+
+#ifdef GS_GRAPH
+    /*
+	 * detect whether we need only consider the first matching inner tuple
+	 */
+	merge_state->js.single_match = (node->join.inner_unique ||
+								node->join.jointype == JOIN_SEMI);
+#endif
 
     switch (node->join.jointype) {
         case JOIN_INNER:

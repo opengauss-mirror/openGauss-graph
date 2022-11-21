@@ -7,6 +7,7 @@ set enable_seqscan=off;
 set opfusion_debug_mode = 'log';
 set log_min_messages=debug;
 set logging_module = 'on(OPFUSION)';
+set sql_beta_feature = 'index_cost_with_leaf_pages_only';
 
 -- create table
 drop table if exists test_bypass_sq1;
@@ -137,10 +138,13 @@ explain select * from test_bypass_sq1 where col3='test_update2';
 --bypass
 explain select * from test_bypass_sq1 where col1>0 and col2>0 order by col1 limit 3 offset 3;
 select * from test_bypass_sq1 where col1>0 and col2>0 order by col1 limit 3 offset 3;
+select * from test_bypass_sq1 where col1>0 and col2>0 order by col1 limit 3 offset 30;
 explain select * from test_bypass_sq1 where col1>0  order by col1 for update limit 3 offset 3;
 explain select * from test_bypass_sq1 where col1>0  order by col1 for update limit 3 offset null;
+explain select * from test_bypass_sq1 where col1>0  order by col1 for update limit 3 offset 30;
 explain select * from test_bypass_sq1 where col1>0 and col2>0 order by col1 offset 3;
 select * from test_bypass_sq1 where col1>0 and col2>0 order by col1 offset 3;
+select * from test_bypass_sq1 where col1>0  order by col1 for update limit 3 offset 30;
 explain select * from test_bypass_sq1 where col1>0 order by col1 for update offset 3;
 explain update test_bypass_sq1 set col2=3*7  where col1=3 and col2=2;
 update test_bypass_sq1 set col2=3*7  where col1=3 and col2=2;
@@ -412,6 +416,20 @@ revoke update on test_bypass_sq7 from qps;
 revoke select on test_bypass_sq7 from qps;
 DROP OWNED BY qps;
 DROP ROLE qps;
+
+-- test rule do nothing
+create table test(a int);
+create view v_test as select * from test;
+
+CREATE OR REPLACE RULE v_delete as ON DELETE TO v_test DO INSTEAD NOTHING;
+delete from v_test;
+
+set explain_perf_mode=pretty;
+explain delete from v_test;
+reset explain_perf_mode;
+
+drop table test cascade;
+
 -- end
 reset track_activities;
 set track_sql_count = off;

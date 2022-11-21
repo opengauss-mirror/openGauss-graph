@@ -35,7 +35,6 @@
 #define GTM 3
 #define SHELL 4
 
-//#define BUILD_BY_CMAKE
 #ifdef BUILD_BY_CMAKE
 char* code_base_src = NULL;
 char* current_exe_dir = NULL;
@@ -108,6 +107,7 @@ char* bindir = PGBINDIR;
 char* libdir = LIBDIR;
 char* datadir = PGSHAREDIR;
 char* host_platform = HOST_TUPLE;
+char* top_builddir = NULL;
 
 #ifndef WIN32_ONLY_COMPILER
 static char* makeprog = MAKEPROG;
@@ -324,9 +324,6 @@ static struct timeval g_stRegrStopTimeTmp[REG_MAX_NUM];
             g_dOneGroupTotalTime = (stRegrEndTime.tv_sec - g_stRegrStartTimeTmp[0].tv_sec) +             \
                                    (stRegrEndTime.tv_usec - g_stRegrStartTimeTmp[0].tv_usec) * 0.000001; \
             g_dGroupTotalTime = g_dGroupTotalTime + g_dOneGroupTotalTime;                                \
-            /*status(_("TIME TAKEN: [%9.3lf]    MEM: [%-9s]"),                                           \
-                    g_dOneGroupTotalTime,                                                                \
-                    g_stResourceUsageDetails.acMemUsage);\ */                                            \
             g_dOneGroupTotalTime = 0;                                                                    \
         }                                                                                                \
     }
@@ -368,13 +365,11 @@ static char* encoding = NULL;
 static _stringlist* schedulelist = NULL;
 static int upgrade_cn_num = 1;
 static int upgrade_dn_num = 4;
-static int gray_upgrade_step = 0;
 static _stringlist* upgrade_schedulelist = NULL;
 static _stringlist* extra_tests = NULL;
 static char* pcRegConfFile = NULL;
 static char* temp_install = NULL;
 static char* temp_config = NULL;
-static char* top_builddir = NULL;
 static bool nolocale = false;
 static bool use_existing = false;
 static char* hostname = NULL;
@@ -401,6 +396,9 @@ static FILE* stop_script;
 /* define ai engine ip and port */
 static char* g_aiehost = "nohostname";
 static char* g_aieport = "noport";
+
+static bool g_enable_segment = false;
+
 /* internal variables */
 static const char* progname;
 static char* logfilename;
@@ -459,6 +457,13 @@ static bool passwd_altered = true;
 bool test_single_node = false;
 static char* platform = "euleros2.0_sp2_x86_64";
 
+/* client logic jdbc run regression tests */
+static bool use_jdbc_client = false;
+static bool to_create_jdbc_user = false;
+static bool is_skip_environment_cleanup = false;
+static char* client_logic_hook = "encryption";
+static _stringlist* destination_files = NULL;
+
 static bool directory_exists(const char* dir);
 static void make_directory(const char* dir);
 static void convertSourcefilesIn(char*, char*, char*, char*);
@@ -475,6 +480,7 @@ static void regrCalcCpuUsagePct(const REGR_RESRC_STAT_STRU* pstCurrUsage, const 
     double* pdUcpuUsagePct, double* pdScpuUsagePct);
 static void regrConvertSizeInBytesToReadableForm(unsigned long int ulValue, char* pcBuf, unsigned int uiBufSize);
 static void kill_node(int i, int type);
+static void cleanup_environment();
 
 static void header(const char* fmt, ...)
     /* This extension allows gcc to check the format string for consistency with
@@ -514,7 +520,7 @@ static void setBinAndLibPath(bool);
 /*
  * allow core files if possible.
  */
-void restartPostmaster();
+void restartPostmaster(bool isOld);
 
 void checkProcInsert();
 
@@ -730,7 +736,6 @@ static int regrGetResrcUsage(const pid_t pid, REGR_RESRC_STAT_STRU* result)
         goto LB_ERR_LVL_3;
     }
 
-    /* Converting kb value into bytes */
     ulTotalMemory *= 1024;
     result->dMemPct = (result->rss * 100) / ulTotalMemory;
 
@@ -1174,38 +1179,23 @@ static void stop_postmaster(void)
     if (postmaster_running) {
 #ifdef PGXC
 
-        if (gray_upgrade_step == UPGRADE_GRAY_STAGE || gray_upgrade_step == UPGRADE_GRAY_STAGE_ROLLBACK) {
-            stop_node(0, COORD, false);
-            for (i = 1; i < upgrade_cn_num; i++) {
-                stop_node(i, COORD, false);
-            }
-            for (i = 0; i < upgrade_dn_num; i++) {
-                stop_node(i, DATANODE, standby_defined);
-            }
-            for (i = 0; i < myinfo.shell_count; i++) {
-                (void)kill(myinfo.shell_pid[i], SIGKILL);
-            }
-        } else {
-            /*
-             * It is necessary to stop first the Coordinator 1,
-             * Then other nodes are stopped nicely.
-             * This is due to connection dependencies between nodes.
-             */
-            for (i = 0; i < myinfo.co_num; i++) {
-                stop_node(i, COORD, false);
-            }
-            for (i = 0; i < myinfo.dn_num; i++) {
-                stop_node(i, DATANODE, standby_defined);
-            }
+        /*
+         * stop cn\dn
+         */
+        for (i = 0; i < myinfo.co_num; i++) {
+            stop_node(i, COORD, false);
+        }
+        for (i = 0; i < myinfo.dn_num; i++) {
+            stop_node(i, DATANODE, standby_defined);
+        }
 
-            for (i = 0; i < myinfo.shell_count; i++) {
-                (void)kill(myinfo.shell_pid[i], SIGKILL);
-            }
+        for (i = 0; i < myinfo.shell_count; i++) {
+            (void)kill(myinfo.shell_pid[i], SIGKILL);
+        }
 
-            if (!test_single_node) {
-                /* Stop GTM at the end */
-                stop_gtm();
-            }
+        if (!test_single_node) {
+            /* Stop GTM at the end */
+            stop_gtm();
         }
 
 #else
@@ -1231,6 +1221,12 @@ static void stop_postmaster(void)
 
         postmaster_running = false;
     }
+}
+
+static void atexit_cleanup()
+{
+    stop_postmaster();
+    cleanup_environment();
 }
 
 #ifdef PGXC
@@ -1293,13 +1289,6 @@ static void start_gtm(void)
     PID_TYPE node_pid;
     FILE* gtm_conf_file = NULL;
 
-    /*
-     * Before starting GTM, set up an empty configuration file as
-     * all the necessary parameters are provided in command.
-     */
-    //	snprintf(buf, sizeof(buf), "%s/%s", temp_install, data_folder);
-    //	make_directory(buf);
-
     (void)snprintf(buf, sizeof(buf), "%s/%s/gtm.conf", temp_install, data_folder);
     gtm_conf_file = fopen(buf, PG_BINARY_W);
     if (gtm_conf_file == NULL) {
@@ -1330,7 +1319,6 @@ static void start_gtm(void)
 
     /* Save static PID number */
     myinfo.gtm_pid = node_pid;
-    // set_node_pid(PGXC_GTM, node_pid);
 }
 
 /* Start single datanode for test */
@@ -1339,12 +1327,75 @@ static void start_single_node()
     char buf[MAXPGPATH * 4];
     int port_number = myinfo.dn_port[0];
     char* data_folder = get_node_info_name(0, DATANODE, false);
+    PID_TYPE guc_pid;
+    char guc_buf[MAXPGPATH * 4];
+    char upgrade_from_str[MAXPGPATH] = {'\0'};
+
+    if (inplace_upgrade || grayscale_upgrade != -1) {
+        (void)snprintf(guc_buf,
+            sizeof(guc_buf),
+            SYSTEMQUOTE "\"%s/gs_guc\" set -Z datanode -D \"%s/%s\" -c \"%s\" > /dev/null 2>&1" SYSTEMQUOTE,
+            bindir,
+            temp_install,
+            data_folder,
+            upgrade_from == 0 ? "upgrade_mode=0" : grayscale_upgrade == -1 ? "upgrade_mode=1" : "upgrade_mode=2");
+        guc_pid = spawn_process(guc_buf);
+        if (guc_pid == INVALID_PID) {
+            fprintf(stderr, _("\n%s: could not spawn GUC parameter: %s\n"), progname, strerror(errno));
+            exit_nicely(2);
+        }
+        // check if guc parameter is set successfully
+        int result = 0;
+        int count = 0;
+        while (result != 1) {
+            count++;
+            char cmd[MAXPGPATH] = {'\0'};
+#ifdef BUILD_BY_CMAKE
+            (void)snprintf(cmd,
+                sizeof(cmd),
+                "find %s/%s/ -name \"postgresql.conf\" | xargs grep \"upgrade_mode = %s\" | wc -l",
+                temp_install,
+                data_folder,
+                upgrade_from == 0 ? "0" : grayscale_upgrade == -1 ? "1" : "2");
+
+#else
+            (void)snprintf(cmd,
+                sizeof(cmd),
+                "sync; find ./tmp_check/%s/ -name \"postgresql.conf\" | xargs grep \"upgrade_mode = %s\" | wc -l",
+                data_folder,
+                upgrade_from == 0 ? "0" : grayscale_upgrade == -1 ? "1" : "2");
+#endif
+
+            FILE* fstream = NULL;
+            char buf[1000];
+            memset(buf, 0, sizeof(buf));
+            fstream = popen(cmd, "r");
+            if (NULL != fgets(buf, sizeof(buf), fstream)) {
+                result = atoi(buf);
+            }
+            if (result != 1) {
+                sleep(1);
+            }
+            if (count > 180) {
+                fprintf(stderr, _("\n%s: fail to set upgrade_mode GUC\n count %d"), progname, count);
+                exit(2);
+            }
+            if (NULL != fstream) {
+                pclose(fstream);
+            }
+        }
+
+        if (upgrade_from)
+            (void)snprintf(
+                upgrade_from_str, sizeof(upgrade_from_str), "-u %d -c allow_system_table_mods=true", upgrade_from);
+    }
 
     (void)snprintf(buf,
         sizeof(buf),
-        SYSTEMQUOTE "\"%s/gaussdb\" %s  %s -i -p %d -D \"%s/%s\"%s -c log_statement=all -c logging_collector=true -c "
+        SYSTEMQUOTE "\"%s/gaussdb\" %s %s %s -i -p %d -D \"%s/%s\"%s -c log_statement=all -c logging_collector=true -c "
                     "\"listen_addresses=%s\" > \"%s/log/postmaster_%s.log\" 2>&1" SYSTEMQUOTE,
         bindir,
+        upgrade_from_str,
         "--single_node",
         (securitymode) ? "--securitymode" : " ",
         port_number,
@@ -1354,7 +1405,7 @@ static void start_single_node()
         hostname ? hostname : "*",
         outputdir,
         data_folder);
-
+    header( _("\nstart cmd is : %s\n"), buf);
     PID_TYPE datanode_pid = spawn_process(buf);
     if (datanode_pid == INVALID_PID) {
         fprintf(stderr, _("\n%s: could not spawn postmaster: %s\n"), progname, strerror(errno));
@@ -1481,6 +1532,7 @@ static void start_my_node(int i, int type, bool is_main, bool standby, int upgra
             outputdir,
             data_folder);
     }
+    header( _("\nstart cmd is : %s\n"), buf);
     node_pid = spawn_process(buf);
     if (node_pid == INVALID_PID) {
         fprintf(stderr, _("\n%s: could not spawn postmaster: %s\n"), progname, strerror(errno));
@@ -1494,7 +1546,6 @@ static void start_my_node(int i, int type, bool is_main, bool standby, int upgra
     } else {
         myinfo.dn_pid[i] = node_pid;
     }
-    // set_node_pid(node,node_pid);
     free(data_folder);
 }
 
@@ -1726,6 +1777,41 @@ static void wait_thread(thread_desc* thread)
     }
 }
 
+/* Copy data file to data dir */
+static void CopyFile()
+{
+    char dstDatadir[MAXPGPATH];
+    char cmdBuf[MAXPGPATH * 2];
+
+    errno_t rc = snprintf_s(dstDatadir, sizeof(dstDatadir), sizeof(dstDatadir) - 1, "%s/%s/pg_copydir",
+        temp_install, get_node_info_name(0, DATANODE, false));
+    securec_check_ss_c(rc, "", "");
+    rc = snprintf_s(cmdBuf, sizeof(cmdBuf), sizeof(cmdBuf) - 1,
+        SYSTEMQUOTE "mkdir -p %s ; cp ./data/* %s -r" SYSTEMQUOTE, dstDatadir, dstDatadir);
+    securec_check_ss_c(rc, "", "");
+    if (regr_system(cmdBuf)) {
+        (void)fprintf(stderr,
+            _("\n%s: cp data file failed\nCommand was: %s\n"),
+            progname,
+            cmdBuf);
+        exit_nicely(2);
+    }
+
+    /* mkdir results dir */
+    rc = snprintf_s(dstDatadir, sizeof(dstDatadir), sizeof(dstDatadir) - 1, "%s/%s/pg_copydir/results",
+        temp_install, get_node_info_name(0, DATANODE, false));
+    securec_check_ss_c(rc, "", "");
+    rc = snprintf_s(cmdBuf, sizeof(cmdBuf), sizeof(cmdBuf) - 1, SYSTEMQUOTE "mkdir -p %s" SYSTEMQUOTE, dstDatadir);
+    securec_check_ss_c(rc, "", "");
+    if (regr_system(cmdBuf)) {
+        (void)fprintf(stderr,
+            _("\n%s: mkdir failed\nCommand was: %s\n"),
+            progname,
+            cmdBuf);
+        exit_nicely(2);
+    }
+}
+
 /*
  * initdb for cn and dn
  *
@@ -1761,6 +1847,8 @@ static void initdb_node_info_parallel(bool standby)
 
     /* free the memory */
     free_thread_desc(thread);
+
+    CopyFile();
 }
 
 static void initdb_node_info(bool standby)
@@ -1823,6 +1911,8 @@ static void initdb_node_info(bool standby)
         }
         free(data_folder);
     }
+
+    CopyFile();
 
     /* no standby configed, skip to init standby. */
     if (!standby)
@@ -1894,11 +1984,25 @@ int get_local_ip(char* local_ip)
     return 0;
 }
 
+static void config_cn();
+static void config_dn(bool standby);
+static void config_standby();
+
 static void initdb_node_config_file(bool standby)
+{
+    config_cn();
+
+    config_dn(standby);
+
+    if (!standby)
+        return;
+    config_standby();
+}
+
+static void config_cn()
 {
     int i;
     char local_ip[LOCAL_IP_LEN];
-
     for (i = 0; i < myinfo.co_num; i++) {
         char* data_folder = get_node_info_name(i, COORD, false);
         FILE* pg_conf = NULL;
@@ -1914,12 +2018,6 @@ static void initdb_node_config_file(bool standby)
         fputs("\n# Configuration added by pg_regress\n\n", pg_conf);
 
         (void)snprintf(buf, sizeof(buf), "port = %d\n", myinfo.co_port[i]);
-        fputs(buf, pg_conf);
-
-        (void)snprintf(buf, sizeof(buf), "comm_control_port = %d\n", myinfo.co_ctl_port[i]);
-        fputs(buf, pg_conf);
-
-        (void)snprintf(buf, sizeof(buf), "comm_sctp_port = %d\n", myinfo.co_sctp_port[i]);
         fputs(buf, pg_conf);
 
         /*
@@ -1943,13 +2041,14 @@ static void initdb_node_config_file(bool standby)
         /* make enable_fast_query_shipping to true */
         fputs("enable_fast_query_shipping = on\n", pg_conf);
 
-        /* To satisfy LLT, we need to modify the initial password, there is no need now. */
-        // if(change_password)
-        //	fputs("modify_initial_password = true\n", pg_conf);
-
         /* always use LLVM optimization */
         fputs("codegen_cost_threshold=0\n", pg_conf);
 
+#ifdef USE_ASSERT_CHECKING
+        if (g_enable_segment) {
+            fputs("enable_segment = on\n", pg_conf);
+        }
+#endif
         if (dop > 0) {
             (void)snprintf(buf, sizeof(buf), "query_dop = %d\n", dop);
             fputs(buf, pg_conf);
@@ -1993,7 +2092,12 @@ static void initdb_node_config_file(bool standby)
         fclose(pg_conf);
         free(data_folder);
     }
+}
 
+static void config_dn(bool standby)
+{
+    int i;
+    char local_ip[LOCAL_IP_LEN];
     for (i = 0; i < myinfo.dn_num; i++) {
         char* data_folder = get_node_info_name(i, DATANODE, false);
         FILE* pg_conf = NULL;
@@ -2021,16 +2125,10 @@ static void initdb_node_config_file(bool standby)
         if (!test_single_node) {
             (void)snprintf(buf, sizeof(buf), "pooler_port = %d\n", myinfo.dn_pool_port[i]);
             fputs(buf, pg_conf);
+
+            if (comm_tcp_mode == false)
+                fputs("comm_tcp_mode = false\n", pg_conf);
         }
-
-        (void)snprintf(buf, sizeof(buf), "comm_control_port = %d\n", myinfo.dn_ctl_port[i]);
-        fputs(buf, pg_conf);
-
-        (void)snprintf(buf, sizeof(buf), "comm_sctp_port = %d\n", myinfo.dn_sctp_port[i]);
-        fputs(buf, pg_conf);
-
-        if (comm_tcp_mode == false)
-            fputs("comm_tcp_mode = false\n", pg_conf);
 
         /*Turn on the guc control support_extended_features*/
         fputs("support_extended_features = on\n", pg_conf);
@@ -2040,12 +2138,14 @@ static void initdb_node_config_file(bool standby)
             fputs("enable_fast_query_shipping = on\n", pg_conf);
         }
 
-        /* To satisfy LLT, we need to modify the initial password, there is no need now.*/
-        // if(change_password)
-        //	fputs("modify_initial_password = true\n", pg_conf);
-
         /* always use LLVM optimization */
         fputs("codegen_cost_threshold=0\n", pg_conf);
+
+#ifdef USE_ASSERT_CHECKING
+        if (g_enable_segment) {
+            fputs("enable_segment = on\n", pg_conf);
+        }
+#endif
 
         if (dop > 0) {
             (void)snprintf(buf, sizeof(buf), "query_dop = %d\n", dop);
@@ -2082,6 +2182,10 @@ static void initdb_node_config_file(bool standby)
                 exit_nicely(2);
             }
             while (fgets(line_buf, sizeof(line_buf), extra_conf) != NULL) {
+                if (test_single_node && (strncmp(line_buf, "comm_tcp_mode", 13) == 0 ||
+                    strncmp(line_buf, "enable_stateless_pooler_reuse", 29) == 0)) {
+                    continue;
+                }
                 fputs(line_buf, pg_conf);
             }
             fclose(extra_conf);
@@ -2109,10 +2213,11 @@ static void initdb_node_config_file(bool standby)
         fclose(pg_conf);
         free(data_folder);
     }
+}
 
-    if (!standby)
-        return;
-
+static void config_standby()
+{
+    int i;
     for (i = 0; i < myinfo.dn_num; i++) {
         char* data_folder = get_node_info_name(i, DATANODE, false);
         FILE* pg_conf = NULL;
@@ -2128,12 +2233,6 @@ static void initdb_node_config_file(bool standby)
         fputs("\n# Configuration added by pg_regress\n\n", pg_conf);
 
         (void)snprintf(buf, sizeof(buf), "port = %d\n", myinfo.dns_port[i]);
-        fputs(buf, pg_conf);
-
-        (void)snprintf(buf, sizeof(buf), "comm_control_port = %d\n", myinfo.dns_ctl_port[i]);
-        fputs(buf, pg_conf);
-
-        (void)snprintf(buf, sizeof(buf), "comm_sctp_port = %d\n", myinfo.dns_sctp_port[i]);
         fputs(buf, pg_conf);
 
         (void)snprintf(buf, sizeof(buf),
@@ -2835,7 +2934,6 @@ static char* GetStartNodeCmdString(int i, int type)
 static char* GetPgxcCleanCmdString(int i, int type)
 {
     int port_number;
-    // const char* data_folder = get_node_info_name(i, type, false);
     if (type == COORD) {
         port_number = test_single_node ? 0 : myinfo.co_port[i];
     } else {
@@ -2994,6 +3092,7 @@ static void convertSourcefilesIn(char* pcSourceSubdir, char* pcDestDir, char* pc
             fprintf(stderr, _("%s: could not open file \"%s\" for writing: %s\n"), progname, destfile, strerror(errno));
             exit_nicely(2);
         }
+        add_stringlist_item(&destination_files, destfile);
         while (fgets(line, sizeof(line), infile)) {
             if (!is_cmdline(line)) {
                 for (iIter = 0; iIter < g_stRegrReplcPatt.iNumOfPatterns; iIter++)
@@ -3015,10 +3114,11 @@ static void convertSourcefilesIn(char* pcSourceSubdir, char* pcDestDir, char* pc
                 replace_string(line, "@coordinator1@", get_node_info_name(0, COORD, true));
                 replace_string(line, "@coordinator2@", get_node_info_name(1, COORD, true));
                 replace_string(line, "@pgbench_dir@", pgbenchdir);
-
+                replace_string(line, "@client_logic_hook@", client_logic_hook);
                 char* ptr = GetStartNodeCmdString(0, DATANODE);
                 replace_string(line, "@start_datanode1@", ptr);
                 free(ptr);
+#ifdef ENABLE_MULTIPLE_NODES
                 ptr = GetStartNodeCmdString(1, DATANODE);
                 replace_string(line, "@start_datanode2@", ptr);
                 free(ptr);
@@ -3028,7 +3128,7 @@ static void convertSourcefilesIn(char* pcSourceSubdir, char* pcDestDir, char* pc
                 ptr = GetStartNodeCmdString(1, COORD);
                 replace_string(line, "@start_coordinator2@", ptr);
                 free(ptr);
-
+#endif
                 ptr = GetStopGtmCmdString(0, GTM);
                 replace_string(line, "@stop_gtm@", ptr);
                 free(ptr);
@@ -3107,6 +3207,7 @@ static void convertSourcefilesIn(char* pcSourceSubdir, char* pcDestDir, char* pc
 /* Create the .sql and .out files from the .source files, if any */
 static void convert_sourcefiles(void)
 {
+    errno_t rc = EOK;
     convertSourcefilesIn("input", inputdir, "sql", "sql");
     convertSourcefilesIn("output", outputdir, "expected", "out");
 
@@ -3117,6 +3218,20 @@ static void convert_sourcefiles(void)
 
     if (g_stRegrReplcPatt.puiPatternOffset != NULL)
         REGR_FREE(g_stRegrReplcPatt.puiPatternOffset);
+
+    /*
+     * backup the sql directory
+     */
+    char buff[MAXPGPATH * 4] = {0};
+    char src[MAXPGPATH] = {0};
+    char dest[MAXPGPATH] = {0};
+    rc = snprintf_s(src, sizeof(src), sizeof(src) - 1, "%s/sql", inputdir);
+    securec_check_ss_c(rc, "", "");
+    rc = snprintf_s(dest, sizeof(dest), sizeof(dest) - 1, "%s/.sql", inputdir);
+    securec_check_ss_c(rc, "", "");
+    rc = snprintf_s(buff, sizeof(buff), sizeof(buff) - 1, "cp -r %s %s", src, dest);
+    securec_check_ss_c(rc, "", "");
+    system(buff);
 }
 
 /*
@@ -3323,7 +3438,9 @@ static void initialize_environment(void)
         const char* old_pgoptions = getenv("PGOPTIONS");
         char* new_pgoptions = NULL;
 
-        old_pgoptions = old_pgoptions ? old_pgoptions : "";
+        if (!old_pgoptions) {
+            old_pgoptions = "";
+        }
         new_pgoptions = (char*)malloc(strlen(old_pgoptions) + strlen(my_pgoptions) + 12);
         (void)sprintf(new_pgoptions, "PGOPTIONS=%s %s", old_pgoptions, my_pgoptions);
         (void)putenv(new_pgoptions);
@@ -3387,7 +3504,9 @@ static void initialize_environment(void)
         pghost = getenv("PGHOST");
         pgport = getenv("PGPORT");
 #ifndef HAVE_UNIX_SOCKETS
-        pghost = (pghost ? pghost : "localhost");
+        if (!pghost) {
+            pghost = "localhost";
+        }
 #endif
 
         if (pghost && pgport) {
@@ -3407,6 +3526,20 @@ static void initialize_environment(void)
     convert_sourcefiles();
     load_resultmap();
 }
+
+static void cleanup_environment()
+{ 
+    if (is_skip_environment_cleanup) { 
+        return;
+    }
+    for (; destination_files != NULL; destination_files = destination_files->next) {
+        unlink(destination_files->str);
+    }
+    for (; destination_files != NULL; destination_files = destination_files->next) {
+        unlink(destination_files->str);
+    }
+}
+
 #define MAKEFILE_BUF_MORE_LEN 32
 static void setBinAndLibPath(bool isOld)
 {
@@ -3909,6 +4042,14 @@ static bool results_differ(const char* testname, const char* resultsfile, const 
     best_line_count = file_line_count(diff);
     strlcpy(acBestExpectFile, expectfile, sizeof(acBestExpectFile));
 
+    /* framing smartmatch.pl script complete file name */
+    int rc = snprintf_s(smartmatch, sizeof(smartmatch), sizeof(smartmatch) - 1, "%s/%s", outputdir, "smartmatch.pl");
+    securec_check_ss_c(rc, "\0", "\0");
+    if (!file_exists(smartmatch)) {
+        int rc = snprintf_s(smartmatch, sizeof(smartmatch), sizeof(smartmatch) - 1, "%s/%s", inputdir, "smartmatch.pl");
+        securec_check_ss_c(rc, "\0", "\0");
+    }
+
     for (i = 0; i <= 9; i++) {
         char* alt_expectfile = NULL;
 
@@ -3937,6 +4078,51 @@ static bool results_differ(const char* testname, const char* resultsfile, const 
             /* This diff was a better match than the last one */
             best_line_count = l;
             strlcpy(acBestExpectFile, alt_expectfile, sizeof(acBestExpectFile));
+        }
+
+        if (file_exists(smartmatch)) {
+            /* Name to use for temporary diff file */
+            rc = snprintf_s(smartmatchfile, sizeof(smartmatchfile), sizeof(smartmatchfile) - 1, "%s.smartmatch",
+                acBestExpectFile);
+            securec_check_ss_c(rc, "\0", "\0");
+            /*
+            * Is the unordered result set is leading to test failure? check and
+            * verify the unordered result set as if test specifies that the result
+            * can vary with comments of unordered.
+            */
+            rc = snprintf_s(cmd, sizeof(cmd), sizeof(cmd) - 1, SYSTEMQUOTE "%s \"%s\" \"%s\" \"%s\" " SYSTEMQUOTE,
+                smartmatch, alt_expectfile, resultsfile, smartmatchfile);
+            securec_check_ss_c(rc, "\0", "\0");
+            result = system(cmd);
+            if (WEXITSTATUS(result) == 1) {
+                /* In a success of smartmatch, there is no need of smartmatch file */
+                unlink(smartmatchfile);
+                unlink(diff);
+                free(alt_expectfile);
+                return false;
+            } else if (WEXITSTATUS(result) == 2) {
+                unlink(smartmatchfile);
+                pcPrettyDiffFile = acBestExpectFile;
+            } else
+                pcPrettyDiffFile = smartmatchfile;
+        } else
+            pcPrettyDiffFile = acBestExpectFile;
+
+        /*
+        * Use the best comparison file to generate the "pretty" diff, which we
+        * append to the diffs summary file.
+        */
+        rc = snprintf_s(cmd, sizeof(cmd), sizeof(cmd) - 1,
+            SYSTEMQUOTE "diff %s \"%s\" \"%s\" >> \"%s\" 2>&1" SYSTEMQUOTE, pretty_diff_opts, pcPrettyDiffFile,
+            resultsfile, difffilename);
+        securec_check_ss_c(rc, "\0", "\0");
+        (void)run_diff(cmd, difffilename);
+
+        l = file_line_count(diff);
+        if (l < best_line_count) {
+            /* This diff was a better match than the last one */
+            best_line_count = l;
+            strlcpy(acBestExpectFile, pcPrettyDiffFile, sizeof(acBestExpectFile));
         }
         free(alt_expectfile);
     }
@@ -3968,11 +4154,6 @@ static bool results_differ(const char* testname, const char* resultsfile, const 
             strlcpy(acBestExpectFile, default_expectfile, sizeof(acBestExpectFile));
         }
     }
-
-    /* framing smartmatch.pl script complete file name */
-    (void)snprintf(smartmatch, sizeof(smartmatch), "%s/%s", outputdir, "smartmatch.pl");
-    if (!file_exists(smartmatch))
-        (void)snprintf(smartmatch, sizeof(smartmatch), "%s/%s", inputdir, "smartmatch.pl");
 
     if (file_exists(smartmatch)) {
         /* Name to use for temporary diff file */
@@ -4669,6 +4850,8 @@ static void run_schedule(const char* schedule, test_function tfunc, diag_functio
                     status(_("system_table_ddl_test %-24s .... "), tests[0]);
                 } else if (isPlanAndProto) {
                     status(_("plan_proto_test %-24s .... "), tests[0]);
+                } else if (use_jdbc_client) {
+                    status(_("jdbc test %-24s .... "), tests[0]);
                 } else {
                     status(_("test %-24s .... "), tests[0]);
                 }
@@ -4676,7 +4859,7 @@ static void run_schedule(const char* schedule, test_function tfunc, diag_functio
 
                 REGR_START_TIMER_TEMP(0);
 
-                pids[0] = (tfunc)(tests[0], &resultfiles[0], &expectfiles[0], &tags[0]);
+                pids[0] = (tfunc)(tests[0], &resultfiles[0], &expectfiles[0], &tags[0], use_jdbc_client);
             }
 
             wait_for_tests(pids, statuses, NULL, 1);
@@ -4700,7 +4883,7 @@ static void run_schedule(const char* schedule, test_function tfunc, diag_functio
                     REGR_START_TIMER;
 
                     /* Invoke the single test file */
-                    pids[i] = (tfunc)(tests[i], &resultfiles[i], &expectfiles[i], &tags[i]);
+                    pids[i] = (tfunc)(tests[i], &resultfiles[i], &expectfiles[i], &tags[i], use_jdbc_client);
                     i++;
                 }
 
@@ -4751,7 +4934,7 @@ static void run_schedule(const char* schedule, test_function tfunc, diag_functio
 
                     REGR_START_TIMER_TEMP(i);
 
-                    pids[i] = (tfunc)(tests[i], &resultfiles[i], &expectfiles[i], &tags[i]);
+                    pids[i] = (tfunc)(tests[i], &resultfiles[i], &expectfiles[i], &tags[i], use_jdbc_client);
 
                     i++;
                 }
@@ -4849,40 +5032,22 @@ static void run_schedule(const char* schedule, test_function tfunc, diag_functio
                     status(_("%-18s"), "failed (ignored)");
                     fail_ignore_count++;
                 } else if (isSystemTableDDL) {
-                    if (gray_upgrade_step == 2) {
-                        status(_("%-18s"), "ok (grayscale observe stage)");
-                    } else {
-                        status(_("%-18s"), "ok (grayscale stage)");
-                    }
+                    status(_("%-18s"), "ok (grayscale stage)");
                     success_count++;
                 } else if (isPlanAndProto) {
-                    if (gray_upgrade_step == 1) {
-                        status(_("%-18s"), "ok (grayscale stage)");
-                        success_count++;
-                    } else {
-                        status(_("%-18s"), "FAILED (grayscale observe stage)");
-                        fail_count++;
-                    }
+                    status(_("%-18s"), "FAILED (grayscale observe stage)");
+                    fail_count++;
                 } else {
                     status(_("%-18s"), "FAILED");
                     fail_count++;
                 }
             } else {
                 if (isSystemTableDDL) {
-                    if (gray_upgrade_step == 2) {
-                        status(_("%-18s"), "FAILED (grayscale observe stage)");
-                    } else {
-                        status(_("%-18s"), "FAILED (grayscale stage)");
-                    }
+                    status(_("%-18s"), "FAILED (grayscale stage)");
                     fail_count++;
                 } else if (isPlanAndProto) {
-                    if (gray_upgrade_step == 2) {
-                        status(_("%-18s"), "ok (grayscale observe stage)");
-                        success_count++;
-                    } else {
-                        status(_("%-18s"), "FAILED (grayscale stage)");
-                        fail_count++;
-                    }
+                    status(_("%-18s"), "FAILED (grayscale stage)");
+                    fail_count++;
                 } else {
                     status(_("%-18s"), "ok");
                     success_count++;
@@ -4938,12 +5103,16 @@ static void run_single_test(const char* test, test_function tfunc, diag_function
     _stringlist *rl, *el, *tl;
     bool differ = false;
 
-    status(_("test %-24s .... "), test);
+    if (!use_jdbc_client) { 
+        status(_("test %-24s .... "), test); 
+    } else {
+        status(_("jdbc test %-24s .... "), test); 
+    }
 
     makeNestedDirectory(test);
 
     REGR_START_TIMER;
-    pid = (tfunc)(test, &resultfiles, &expectfiles, &tags);
+    pid = (tfunc)(test, &resultfiles, &expectfiles, &tags, use_jdbc_client);
     wait_for_tests(&pid, &exit_status, NULL, 1);
     REGR_STOP_TIMER;
 
@@ -5021,13 +5190,11 @@ static void CheckCleanCodeWarningInfo(const int baseNum, const int currentNum,
     (void)fflush(stdout);
     return;
 }
-#ifdef BUILD_BY_CMAKE
-#define BASE_GLOBAL_VARIABLE_NUM 213
-#else
-#define BASE_GLOBAL_VARIABLE_NUM 217
-#endif
+
+#define BASE_GLOBAL_VARIABLE_NUM 223
 
 #define CMAKE_CMD_BUF_LEN 1000
+
 static void check_global_variables()
 {
 #ifdef BUILD_BY_CMAKE
@@ -5071,7 +5238,7 @@ static void check_global_variables()
     }
 }
 
-#define BASE_PGXC_LIKE_MACRO_NUM 1422
+#define BASE_PGXC_LIKE_MACRO_NUM 1404
 static void check_pgxc_like_macros()
 {
 #ifdef BUILD_BY_CMAKE 
@@ -5098,7 +5265,7 @@ static void check_pgxc_like_macros()
         if (macros != BASE_PGXC_LIKE_MACRO_NUM) {
             CheckCleanCodeWarningInfo(BASE_PGXC_LIKE_MACRO_NUM, macros,
                 GET_VARIABLE_NAME(PGXC/STREAMPLAN/IS_SINGLE_NODE), GET_VARIABLE_NAME(BASE_PGXC_LIKE_MACRO_NUM));
-            //exit_nicely(2);
+            exit_nicely(2);
         }
     }
     pclose(fstream);
@@ -5111,6 +5278,7 @@ static void open_result_files(void)
 {
     char file[MAXPGPATH];
     FILE* difffile = NULL;
+    errno_t rc = EOK;
 
     /* create the log file (copy of running status output) */
     (void)snprintf(file, sizeof(file), "%s/regression.out", outputdir);
@@ -5122,7 +5290,14 @@ static void open_result_files(void)
     }
 
     /* create the diffs file as empty */
-    (void)snprintf(file, sizeof(file), "%s/regression.diffs", outputdir);
+    if (to_create_jdbc_user) {
+        rc = snprintf_s(file, sizeof(file), sizeof(file) - 1, "%s/regression_jdbc.diffs", outputdir);
+        securec_check_ss_c(rc, "", ""); 
+    } else {
+        rc = snprintf_s(file, sizeof(file), sizeof(file) - 1, "%s/regression.diffs", outputdir);
+        securec_check_ss_c(rc, "", ""); 
+    }
+
     difffilename = strdup(file);
     difffile = fopen(difffilename, "w");
     if (!difffile) {
@@ -5133,9 +5308,27 @@ static void open_result_files(void)
     fclose(difffile);
 
     /* also create the output directory if not present */
-    (void)snprintf(file, sizeof(file), "%s/results", outputdir);
+    if (!use_jdbc_client) { 
+        rc = snprintf_s(file, sizeof(file), sizeof(file) - 1, "%s/results", outputdir);
+        securec_check_ss_c(rc, "", ""); 
+    } else {
+        rc = snprintf_s(file, sizeof(file), sizeof(file) - 1, "%s/results_jdbc", outputdir);
+        securec_check_ss_c(rc, "", ""); 
+    }
     if (!directory_exists(file)) {
         make_directory(file);
+    }
+}
+
+/* create jdbc_user & grant all database to it */
+static void create_jdbc_user(const _stringlist* granted_dbs) {
+    const char *user_name = "jdbc_regress";
+    const char *user_password = "1q@W3e4r";
+    header(_("creating user for JDBC: \"%s\""), user_name);
+    psql_command("postgres", "CREATE USER %s WITH PASSWORD '%s' LOGIN", user_name, user_password);
+    psql_command("postgres", "ALTER USER %s sysadmin CREATEROLE createdb", user_name);
+    for (; granted_dbs != NULL; granted_dbs = granted_dbs->next) {
+        psql_command("postgres", "GRANT ALL ON DATABASE \"%s\" TO \"%s\"", granted_dbs->str, user_name);
     }
 }
 
@@ -5159,17 +5352,6 @@ static void create_database(const char* dbname)
             "CREATE DATABASE \"%s\" DBCOMPATIBILITY='A' TEMPLATE=TEMPLATE0%s",
             dbname,
             (nolocale) ? " LC_COLLATE='C' LC_CTYPE='C'" : "");
-    psql_command(dbname,
-        "ALTER DATABASE \"%s\" SET lc_messages TO 'C';"
-        "ALTER DATABASE \"%s\" SET lc_monetary TO 'C';"
-        "ALTER DATABASE \"%s\" SET lc_numeric TO 'C';"
-        "ALTER DATABASE \"%s\" SET lc_time TO 'C';"
-        "ALTER DATABASE \"%s\" SET timezone_abbreviations TO 'Default';",
-        dbname,
-        dbname,
-        dbname,
-        dbname,
-        dbname);
 
     /*
      * Install any requested procedural languages.	We use CREATE OR REPLACE
@@ -5225,7 +5407,7 @@ static char* make_absolute_path(const char* in)
 
 static void help(void)
 {
-    printf(_("PostgreSQL regression test driver\n"));
+    printf(_("openGauss regression test driver\n"));
     printf(_("\n"));
     printf(_("Usage: %s [options...] [extra tests...]\n"), progname);
     printf(_("\n"));
@@ -5248,6 +5430,7 @@ static void help(void)
     printf(_("  --temp-install=DIR        create a temporary installation in DIR\n"));
     printf(_("  --use-existing            use an existing installation\n"));
     printf(_("  --launcher=CMD            use CMD as launcher of gsql\n"));
+    printf(_("  --skip_environment_cleanup do not clean generated sql scripts\n"));
     printf(_("\n"));
     printf(_("Options for \"temp-install\" mode:\n"));
     printf(_("  --no-locale               use C locale\n"));
@@ -5271,11 +5454,11 @@ static void help(void)
     printf(_("  --port=PORT               use postmaster running at PORT\n"));
     printf(_("  --user=USER               connect as USER\n"));
     printf(_("  --psqldir=DIR             use gsql in DIR (default: find in PATH)\n"));
+    printf(_("  --enable-segment          create table default with segment=on"));
+    printf(_("  --jdbc          enable jdbc regression test"));
     printf(_("\n"));
     printf(_("The exit status is 0 if all tests passed, 1 if some tests failed, and 2\n"));
     printf(_("if the tests could not be run for some reason.\n"));
-    printf(_("\n"));
-    printf(_("Report bugs to <pgsql-bugs@postgresql.org>.\n"));
 }
 
 static int initialize_myinfo(
@@ -5988,26 +6171,16 @@ static void start_postmaster(void)
     header(_("starting postmaster"));
 
     if (!test_single_node) {
-        if (gray_upgrade_step == UPGRADE_GRAY_STAGE || gray_upgrade_step == UPGRADE_GRAY_STAGE_ROLLBACK) {
-            start_my_node(0, COORD, true, false, upgrade_from);
-            for (i = 1; i < upgrade_cn_num; i++) {
-                start_my_node(i, COORD, false, false, upgrade_from);
-            }
-            for (i = 0; i < upgrade_dn_num; i++) {
-                start_my_node(i, DATANODE, false, standby_defined, upgrade_from);
-            }
-        } else {
-            /* Start GTM */
-            start_gtm();
+        /* Start GTM */
+        start_gtm();
 
-            start_my_node(0, COORD, true, false, upgrade_from);
-            for (i = 1; i < myinfo.co_num; i++) {
-                start_my_node(i, COORD, false, false, upgrade_from);
-            }
+        start_my_node(0, COORD, true, false, upgrade_from);
+        for (i = 1; i < myinfo.co_num; i++) {
+            start_my_node(i, COORD, false, false, upgrade_from);
+        }
 
-            for (i = 0; i < myinfo.dn_num; i++) {
-                start_my_node(i, DATANODE, false, standby_defined, upgrade_from);
-            }
+        for (i = 0; i < myinfo.dn_num; i++) {
+            start_my_node(i, DATANODE, false, standby_defined, upgrade_from);
         }
     } else {
         assert(0 == myinfo.co_num && 1 == myinfo.dn_num);
@@ -6079,9 +6252,9 @@ int regression_main(int argc, char* argv[], init_function ifunc, test_function t
 #ifdef BUILD_BY_CMAKE
     get_value_from_env(&code_base_src, "CODE_BASE_SRC");
     get_value_from_cwd(&current_exe_dir);
-    get_value_from_env(&CMAKE_PGBINDIR, "prefix_home");
-    get_value_from_env(&CMAKE_LIBDIR, "prefix_home");
-    get_value_from_env(&CMAKE_PGSHAREDIR, "prefix_home");
+    get_value_from_env(&CMAKE_PGBINDIR, "PREFIX_HOME");
+    get_value_from_env(&CMAKE_LIBDIR, "PREFIX_HOME");
+    get_value_from_env(&CMAKE_PGSHAREDIR, "PREFIX_HOME");
 
     printf("--------------------------------------------------------------------------------------");
     printf("\ncode_base_src:%s\n", code_base_src);
@@ -6110,6 +6283,11 @@ int regression_main(int argc, char* argv[], init_function ifunc, test_function t
     struct timeval start_time;
     struct timeval end_time;
     double total_time;
+
+    struct timeval start_time_total;
+    struct timeval end_time_total;
+
+    (void)gettimeofday(&start_time_total, NULL);
 
     static struct option long_options[] = {{"help", no_argument, NULL, 'h'},
         {"version", no_argument, NULL, 'V'},
@@ -6169,6 +6347,10 @@ int regression_main(int argc, char* argv[], init_function ifunc, test_function t
         {"platform", required_argument, NULL, 55},
         {"g_aiehost", required_argument, NULL, 56},
         {"g_aieport", required_argument, NULL, 57},
+        {"enable-segment", no_argument, NULL, 58},
+        {"client_logic_hook", required_argument, NULL, 59},
+        {"jdbc", no_argument, NULL, 60},
+        {"skip_environment_cleanup", no_argument, NULL, 61},
         {NULL, 0, NULL, 0}
     };
 
@@ -6402,11 +6584,13 @@ int regression_main(int argc, char* argv[], init_function ifunc, test_function t
                 break;
             case 50:
                 grayscale_upgrade = 0;
+                inplace_upgrade = true;
                 super_user_altered = false;
                 passwd_altered = false;
                 break;
             case 51:
                 grayscale_upgrade = 1;
+                inplace_upgrade = true;
                 super_user_altered = false;
                 passwd_altered = false;
                 break;
@@ -6434,11 +6618,30 @@ int regression_main(int argc, char* argv[], init_function ifunc, test_function t
             case 57:
                 g_aieport = strdup(optarg);
                 break;
+            case 58:
+                g_enable_segment = true;
+                break;
+            case 59:
+                client_logic_hook = make_absolute_path(optarg);
+                break;
+            case 60:
+                printf("\n starting with jdbc\n");
+                use_jdbc_client = true;
+                to_create_jdbc_user = true;
+                break;
+            case 61:
+                is_skip_environment_cleanup = true;
+                break;
             default:
                 /* getopt_long already emitted a complaint */
                 fprintf(stderr, _("\nTry \"%s -h\" for more information.\n"), progname);
                 exit_nicely(2);
         }
+    }
+
+    if (strcmp(platform, "openeuler_aarch64") == 0) {
+        grayscale_upgrade = -1;
+        inplace_upgrade = false;
     }
 
     if (run_test_case && run_qunit) {
@@ -6502,7 +6705,7 @@ int regression_main(int argc, char* argv[], init_function ifunc, test_function t
 
     // Do not stop postmaster if we are told not to run test cases.
     if (run_test_case)
-        (void)atexit(stop_postmaster);
+        (void)atexit(atexit_cleanup);
 
     /*
      * create regression.out regression.diff result
@@ -6530,8 +6733,6 @@ int regression_main(int argc, char* argv[], init_function ifunc, test_function t
         }
 #ifndef ENABLE_LLT
         if (myinfo.keep_data) {
-            //	header(_("removing existing gtm file"));
-            //	rmtree(temp_gtm_install, true);
 
             /* "make install" */
 #ifndef WIN32_ONLY_COMPILER
@@ -6724,8 +6925,10 @@ int regression_main(int argc, char* argv[], init_function ifunc, test_function t
             }
 
             /* If only init database for inplace upgrade, we are done. */
-            if (init_database)
+            if (init_database) {
+                cleanup_environment();
                 return 0;
+            }
 
             /*
              * Adjust the default postgresql.conf as needed for regression
@@ -6738,7 +6941,9 @@ int regression_main(int argc, char* argv[], init_function ifunc, test_function t
              * and 2PC related information.
              * PGXCTODO: calculate port of GTM before setting configuration files
              */
-            initdb_node_config_file(standby_defined);
+            if (!(inplace_upgrade || grayscale_upgrade != -1)) {
+                initdb_node_config_file(standby_defined);
+            }
         }
         /*Execute shell cmds in source files*/
         exec_cmds_from_inputfiles();
@@ -6748,153 +6953,159 @@ int regression_main(int argc, char* argv[], init_function ifunc, test_function t
          */
         (void)start_postmaster();
 
+        if (inplace_upgrade || grayscale_upgrade != -1) {
+            checkProcInsert();
+            setup_super_user();
+
+            super_user_altered = true;
+            // Execute the upgrade script in the old bin
+            (void)snprintf_s(buf,
+                             sizeof(buf),
+                             sizeof(buf) - 1,
+                             SYSTEMQUOTE "python %s/upgradeCheck.py -u -p %d -f %d -s %s%sgsql" SYSTEMQUOTE,
+                    upgrade_script_dir,
+                    get_port_number(0, DATANODE),
+                    upgrade_from,
+                    psqldir ? psqldir : "",
+                    psqldir ? "/" : "");
+            header("%s", buf);
+            (void)gettimeofday(&end_time, NULL);
+            if (regr_system(buf)) {
+                fprintf(stderr, _("Failed to exec upgrade.\nCommand was: %s\n"), buf);
+                exit_nicely(2);
+            }
+
+            // start with new bin
+            (void)gettimeofday(&start_time, NULL);
+            header(_("shutting down postmaster"));
+            (void)stop_postmaster();
+            setBinAndLibPath(false);
+
+            if (grayscale_upgrade == 1) {
+                (void)start_postmaster();
+                header(_("sleeping"));
+                pg_usleep(10000000L);
+                (void)gettimeofday(&end_time, NULL);
+                total_time = (end_time.tv_sec - start_time.tv_sec) + (end_time.tv_usec - start_time.tv_usec) * 0.000001;
+                printf("It takes %fs to restart cluster.\n", total_time);
+                /* Execute the post upgrade script */
+                (void)snprintf_s(buf,
+                                 sizeof(buf),
+                                 sizeof(buf) - 1,
+                                 SYSTEMQUOTE "python %s/upgradeCheck.py --post -p %d -f %d -s %s%sgsql" SYSTEMQUOTE,
+                        upgrade_script_dir,
+                        get_port_number(0, DATANODE),
+                        upgrade_from,
+                        psqldir ? psqldir : "",
+                        psqldir ? "/" : "");
+                header("%s", buf);
+                (void)gettimeofday(&end_time, NULL);
+                if (regr_system(buf)) {
+                    fprintf(stderr, _("Failed to exec post-upgrade.\nCommand was: %s\n"), buf);
+                    exit_nicely(2);
+                }
+
+                /* Execute the post rollback script */
+                (void)snprintf_s(buf,
+                                 sizeof(buf),
+                                 sizeof(buf) - 1,
+                                 SYSTEMQUOTE "python %s/upgradeCheck.py --rollback -p %d -f %d -s %s%sgsql" SYSTEMQUOTE,
+                        upgrade_script_dir,
+                        get_port_number(0, DATANODE),
+                        upgrade_from,
+                        psqldir ? psqldir : "",
+                        psqldir ? "/" : "");
+                header("%s", buf);
+                (void)gettimeofday(&end_time, NULL);
+                if (regr_system(buf)) {
+                    fprintf(stderr, _("Failed to exec post-rollback.\nCommand was: %s\n"), buf);
+                    exit_nicely(2);
+                }
+
+                // start with old bin
+                restartPostmaster(true);
+
+                /* Execute the rollback script */
+                (void)snprintf_s(buf,
+                                 sizeof(buf),
+                                 sizeof(buf) - 1,
+                                 SYSTEMQUOTE "python %s/upgradeCheck.py -o -p %d -f %d -s %s%sgsql" SYSTEMQUOTE,
+                        upgrade_script_dir,
+                        get_port_number(0, DATANODE),
+                        upgrade_from,
+                        psqldir ? psqldir : "",
+                        psqldir ? "/" : "");
+                header("%s", buf);
+                (void)gettimeofday(&end_time, NULL);
+                if (regr_system(buf)) {
+                    fprintf(stderr, _("Failed to exec post-rollback.\nCommand was: %s\n"), buf);
+                    exit_nicely(2);
+                }
+
+                // Execute the upgrade script in the old bin
+                (void)snprintf_s(buf,
+                                 sizeof(buf),
+                                 sizeof(buf) - 1,
+                                 SYSTEMQUOTE "python %s/upgradeCheck.py -u -p %d -f %d -s %s%sgsql" SYSTEMQUOTE,
+                        upgrade_script_dir,
+                        get_port_number(0, DATANODE),
+                        upgrade_from,
+                        psqldir ? psqldir : "",
+                        psqldir ? "/" : "");
+                header("%s", buf);
+                (void)gettimeofday(&end_time, NULL);
+                if (regr_system(buf)) {
+                    fprintf(stderr, _("Failed to exec upgrade.\nCommand was: %s\n"), buf);
+                    exit_nicely(2);
+                }
+
+                // start with new bin
+                (void)gettimeofday(&start_time, NULL);
+                header(_("shutting down postmaster"));
+                (void)stop_postmaster();
+                setBinAndLibPath(false);
+
+            }
+
+
+            initdb_node_config_file(standby_defined);
+            (void)start_postmaster();
+            header(_("sleeping"));
+            pg_usleep(10000000L);
+            (void)gettimeofday(&end_time, NULL);
+            total_time = (end_time.tv_sec - start_time.tv_sec) + (end_time.tv_usec - start_time.tv_usec) * 0.000001;
+            printf("It takes %fs to restart cluster.\n", total_time);
+            /* Execute the post upgrade script */
+            (void)snprintf_s(buf,
+                             sizeof(buf),
+                             sizeof(buf) - 1,
+                             SYSTEMQUOTE "python %s/upgradeCheck.py --post -p %d -f %d -s %s%sgsql" SYSTEMQUOTE,
+                    upgrade_script_dir,
+                    get_port_number(0, DATANODE),
+                    upgrade_from,
+                    psqldir ? psqldir : "",
+                    psqldir ? "/" : "");
+            header("%s", buf);
+            (void)gettimeofday(&end_time, NULL);
+            if (regr_system(buf)) {
+                fprintf(stderr, _("Failed to exec post-upgrade.\nCommand was: %s\n"), buf);
+                exit_nicely(2);
+            }
+
+            header(_("shutting down postmaster"));
+            (void)stop_postmaster();
+            upgrade_from = 0;
+            // switch to the new binary
+            setBinAndLibPath(false);
+            (void)start_postmaster();
+            header(_("sleeping"));
+            pg_usleep(10000000L);
+        }
+
         if (!test_single_node) {
             /* Postmaster is finally running, so set up connection information on Coordinators */
             if (myinfo.keep_data == false) {
                 setup_connection_information(standby_defined);
-                if (inplace_upgrade || grayscale_upgrade != -1) {
-                    checkProcInsert();
-                    setup_super_user();
-
-                    super_user_altered = true;
-                    // Execute the upgrade script
-                    (void)snprintf(buf,
-                        sizeof(buf),
-                        SYSTEMQUOTE "python %s/upgradeCheck.py -p %d -f %d -s %s%sgsql" SYSTEMQUOTE,
-                        upgrade_script_dir,
-                        get_port_number(0, COORD),
-                        upgrade_from,
-                        psqldir ? psqldir : "",
-                        psqldir ? "/" : "");
-                    header("%s", buf);
-                    if (regr_system(buf)) {
-                        fprintf(stderr, _("Failed to exec upgrade.\nCommand was: %s\n"), buf);
-                        exit_nicely(2);
-                    }
-                    if (grayscale_upgrade != -1) {
-                        for (int step = UPGRADE_GRAY_STAGE; step < UPGRADE_FINASH; step += 2) {
-                            gray_upgrade_step = step;
-                            restartPostmaster();
-                            // create database
-                            if (!use_existing) {
-                                for (ssl = dblist; ssl; ssl = ssl->next) {
-                                    create_database(ssl->str);
-                                }
-                                for (ssl = extraroles; ssl; ssl = ssl->next) {
-                                    create_role(ssl->str, dblist);
-                                }
-                                use_existing = true;
-                            }
-                            /*
-                             * Ready to run the tests
-                             */
-                            if (gray_upgrade_step == UPGRADE_GRAY_STAGE) {
-                                header(_("running regression test queries during the grayscale stage of the grayscale "
-                                         "upgrade"));
-                            } else {
-                                header(_("running regression test queries during the grayscale observe stage of the "
-                                         "grayscale upgrade"));
-                            }
-                            (void)gettimeofday(&start_time, NULL);
-                            // run use cases
-                            for (ssl = upgrade_schedulelist; ssl != NULL; ssl = ssl->next) {
-                                run_schedule(ssl->str, tfunc, dfunc);
-                            }
-
-                            (void)gettimeofday(&end_time, NULL);
-
-                            total_time = (end_time.tv_sec - start_time.tv_sec) +
-                                         (end_time.tv_usec - start_time.tv_usec) * 0.000001;
-
-                            /*
-                             * Emit nice-looking summary message
-                             */
-                            if (fail_count == 0 && fail_ignore_count == 0) {
-                                (void)snprintf(buf,
-                                    sizeof(buf),
-                                    _(" All %d tests execution results are normal during grayscale upgrade. "),
-                                    success_count);
-                            } else if (fail_count == 0) { /* fail_count=0, fail_ignore_count>0 */
-                                (void)snprintf(buf,
-                                    sizeof(buf),
-                                    _(" %d of %d tests execution results are normal, %d failed test(s) ignored. "),
-                                    success_count,
-                                    success_count + fail_ignore_count,
-                                    fail_ignore_count);
-                            } else if (fail_ignore_count == 0) { /* fail_count>0 && fail_ignore_count=0 */
-                                (void)snprintf(buf,
-                                    sizeof(buf),
-                                    _(" %d of %d tests execution results are abnormal. "),
-                                    fail_count,
-                                    success_count + fail_count);
-                            } else { /* fail_count>0 && fail_ignore_count>0 */
-                                (void)snprintf(buf,
-                                    sizeof(buf),
-                                    _(" %d of %d tests execution results are abnormal., %d of these failures "
-                                      "ignored. "),
-                                    fail_count + fail_ignore_count,
-                                    success_count + fail_count + fail_ignore_count,
-                                    fail_ignore_count);
-                            }
-
-                            (void)putchar('\n');
-                            for (i = strlen(buf); i > 0; i--) {
-                                (void)putchar('=');
-                            }
-                            printf("\n%s\n", buf);
-                            printf(" Total Time: %fs\n", total_time);
-                            for (i = strlen(buf); i > 0; i--) {
-                                (void)putchar('=');
-                            }
-                            (void)putchar('\n');
-                            (void)putchar('\n');
-
-                            if (file_size(difffilename) > 0) {
-                                printf(_("The differences that caused some tests to fail can be viewed in the\n"
-                                         "file \"%s\".  A copy of the test summary that you see\n"
-                                         "above is saved in the file \"%s\".\n\n"),
-                                    difffilename,
-                                    logfilename);
-                            } else {
-                                unlink(difffilename);
-                                unlink(logfilename);
-                            }
-                            if (fail_count != 0) {
-                                exit_nicely(1);
-                            }
-                            // run rollback
-                            gray_upgrade_step++;
-                            stop_postmaster();
-                            setBinAndLibPath(true);
-                            start_postmaster();
-                            sleep(60);
-                            // Execute the upgrade rollback script
-                            (void)snprintf(buf,
-                                sizeof(buf),
-                                SYSTEMQUOTE "python %s/upgradeCheck.py --rollback -p %d -f %d -s %s%sgsql" SYSTEMQUOTE,
-                                upgrade_script_dir,
-                                get_port_number(0, COORD),
-                                upgrade_from,
-                                psqldir ? psqldir : "",
-                                psqldir ? "/" : "");
-                            header("%s", buf);
-                            if (regr_system(buf)) {
-                                fprintf(stderr, _("Failed to exec rollback.\nCommand was: %s\n"), buf);
-                                exit_nicely(2);
-                            }
-                        }
-                        gray_upgrade_step = UPGRADE_FINASH;
-                    }
-
-                    header(_("shutting down postmaster"));
-                    (void)stop_postmaster();
-                    upgrade_from = 0;
-                    // switch to the new binary锟斤拷
-                    setBinAndLibPath(false);
-                    (void)start_postmaster();
-                    header(_("sleeping"));
-                    pg_usleep(10000000L);
-                }
             } else {
                 pg_usleep(2000000L);
                 rebuild_node_group();
@@ -6957,9 +7168,15 @@ int regression_main(int argc, char* argv[], init_function ifunc, test_function t
     }
 
     if (myinfo.run_check == true) {
+        (void)gettimeofday(&end_time_total, NULL);
+        total_time = (end_time_total.tv_sec - start_time_total.tv_sec) + (end_time_total.tv_usec - start_time_total.tv_usec) * 0.000001;
+        printf("Preparation before the test case execution takes %fs..\n", total_time);
         if (!use_existing) {
             for (ssl = dblist; ssl; ssl = ssl->next) {
                 create_database(ssl->str);
+            }
+            if (to_create_jdbc_user) {
+                create_jdbc_user(dblist);
             }
             for (ssl = extraroles; ssl; ssl = ssl->next) {
                 create_role(ssl->str, dblist);
@@ -7097,7 +7314,7 @@ int regression_main(int argc, char* argv[], init_function ifunc, test_function t
             stop_postmaster();
         }
     }
-
+    cleanup_environment();
     return 0;
 }
 
@@ -7132,12 +7349,19 @@ void checkProcInsert()
 }
 
 // only for restart during grayscale upgrade
-void restartPostmaster()
+void restartPostmaster(bool isOld)
 {
+    struct timeval start_time;
+    struct timeval end_time;
+    double total_time;
+    (void)gettimeofday(&start_time, NULL);
     header(_("shutting down postmaster"));
     (void)stop_postmaster();
-    setBinAndLibPath(false);
+    setBinAndLibPath(isOld);
     (void)start_postmaster();
     header(_("sleeping"));
     pg_usleep(10000000L);
+    (void)gettimeofday(&end_time, NULL);
+    total_time = (end_time.tv_sec - start_time.tv_sec) + (end_time.tv_usec - start_time.tv_usec) * 0.000001;
+    printf("It takes %fs to restart cluster.\n", total_time);
 }

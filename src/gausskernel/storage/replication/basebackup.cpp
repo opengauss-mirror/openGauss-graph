@@ -21,17 +21,20 @@
 #include "access/cbmparsexlog.h"
 #include "catalog/catalog.h"
 #include "catalog/pg_type.h"
+#include "gs_thread.h"
 #include "lib/stringinfo.h"
 #include "libpq/libpq.h"
 #include "libpq/pqformat.h"
 #include "nodes/pg_list.h"
 #include "replication/basebackup.h"
+#include "replication/dcf_data.h"
 #include "replication/walsender.h"
 #include "replication/walsender_private.h"
 #include "replication/slot.h"
 #include "access/xlog.h"
-#include "storage/fd.h"
+#include "storage/smgr/fd.h"
 #include "storage/ipc.h"
+#include "storage/page_compression.h"
 #include "storage/pmsignal.h"
 #include "storage/checksum.h"
 #ifdef ENABLE_MOT
@@ -47,6 +50,7 @@
 
 /* t_thrd.proc_cxt.DataDir */
 #include "miscadmin.h"
+#include "replication/dcf_replication.h"
 
 typedef struct {
     const char *label;
@@ -55,6 +59,10 @@ typedef struct {
     bool nowait;
     bool includewal;
     bool sendtblspcmapfile;
+    bool isBuildFromStandby;
+    bool isCopySecureFiles;
+    bool isCopyUpgradeFile;
+    bool isObsmode;
 } basebackup_options;
 
 #define BUILD_PATH_LEN 2560 /* (MAXPGPATH*2 + 512) */
@@ -74,7 +82,7 @@ const int MATCH_SEVEN = 7;
 #define EREPORT_WAL_NOT_FOUND(segno)                                              \
     do {                                                                          \
         char walErrorName[MAXFNAMELEN];                                           \
-        XLogFileName(walErrorName, t_thrd.xlog_cxt.ThisTimeLineID, segno);        \
+        XLogFileName(walErrorName, MAXFNAMELEN, t_thrd.xlog_cxt.ThisTimeLineID, segno);        \
         ereport(ERROR, (errmsg("could not find WAL file \"%s\"", walErrorName))); \
     } while (0)
 
@@ -87,6 +95,8 @@ static int64 sendDir(
 static int64 sendDir(const char *path, int basepathlen, bool sizeonly, List *tablespaces, bool sendtblspclinks);
 #endif
 int64 sendTablespace(const char *path, bool sizeonly);
+static void SendTableSpaceForBackup(basebackup_options* opt, List* tablespaces, char* labelfile,
+    char* tblspc_map_file);
 static bool sendFile(char *readfilename, char *tarfilename, struct stat *statbuf, bool missing_ok);
 static void sendFileWithContent(const char *filename, const char *content);
 static void _tarWriteHeader(const char *filename, const char *linktarget, struct stat *statbuf);
@@ -96,13 +106,19 @@ static void SendBackupHeader(List *tablespaces);
 static void SendMotCheckpointHeader(const char* path);
 #endif
 static void base_backup_cleanup(int code, Datum arg);
+static void SendSecureFileToDisasterCluster(basebackup_options *opt);
 static void perform_base_backup(basebackup_options *opt, DIR *tblspcdir);
 static void parse_basebackup_options(List *options, basebackup_options *opt);
 static int CompareWalFileNames(const void* a, const void* b);
-static void SendXlogRecPtrResult(XLogRecPtr ptr);
+static void SendXlogRecPtrResult(XLogRecPtr ptr, unsigned long long consensusPaxosIdx = 0);
+
 static void send_xlog_location();
 static void send_xlog_header(const char *linkpath);
 static void save_xlogloc(const char *xloglocation);
+static XLogRecPtr GetMinArchiveSlotLSN(void);
+
+/* compressed Function */
+static void SendCompressedFile(char* readFileName, int basePathLen, struct stat& statbuf, bool missingOk, int64* size);
 
 /*
  * save xlog location
@@ -222,6 +238,130 @@ static void base_backup_cleanup(int code, Datum arg)
     do_pg_abort_backup();
 }
 
+#ifndef ENABLE_MULTIPLE_NODES
+static void SetPaxosIndex(unsigned long long *consensusPaxosIdx)
+{
+    if (g_instance.attr.attr_storage.dcf_attr.enable_dcf) {
+        unsigned long long minAppliedIdx = 0;
+        /*
+         * Get the DCF min applied index from DCF in case that dcfData.realMinAppliedIdx was stale.
+         * Save min applied index in dcfData.realMinAppliedIdx in case that switchover happened and
+         * get min applied index 0 from DCF leader if the leader can't get response from some nodes
+         * at the beginning. It because these nodes have had exceptions before switchover.
+         */
+        if (dcf_get_cluster_min_applied_idx(1, &minAppliedIdx) == 0) {
+            minAppliedIdx = (minAppliedIdx > t_thrd.shemem_ptr_cxt.dcfData->realMinAppliedIdx) ?
+                minAppliedIdx : t_thrd.shemem_ptr_cxt.dcfData->realMinAppliedIdx;
+            /*
+             * Let the leader replicates DCF log from min applied index (include min applied index)
+             */
+            *consensusPaxosIdx = minAppliedIdx;
+            ereport(LOG, (errmsg("Enable DCF and sending paxos index is %llu", *consensusPaxosIdx)));
+        } else {
+            ereport(ERROR, (errmsg("Enable DCF and get min applied index from dcf failed!")));
+        }
+    }
+}
+#endif
+
+static void ProcessSecureFilesForDisasterCluster(const char *path)
+{
+#define BASE_PATH_LEN 2
+    struct dirent *de = NULL;
+    char pathbuf[MAXPGPATH];
+    struct stat statbuf;
+    int64 size = 0;
+    int rc = 0;
+
+
+    DIR *dir = AllocateDir(path);
+
+    while ((de = ReadDir(dir, path)) != NULL) {
+        if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0) {
+            continue;
+        }
+        if (!PostmasterIsAlive()) {
+            ereport(ERROR, (errcode_for_file_access(), errmsg("Postmaster exited, aborting active base backup")));
+        }
+
+        if (t_thrd.walsender_cxt.walsender_shutdown_requested || t_thrd.walsender_cxt.walsender_ready_to_stop) {
+            ereport(ERROR, (errcode_for_file_access(), errmsg("shutdown requested, aborting active base backup")));
+        }
+        if (t_thrd.postmaster_cxt.HaShmData &&
+            (t_thrd.walsender_cxt.server_run_mode != t_thrd.postmaster_cxt.HaShmData->current_mode)) {
+            ereport(ERROR, (errcode_for_file_access(), errmsg("server run mode changed, aborting active base backup")));
+        }
+        rc = snprintf_s(pathbuf, MAXPGPATH, MAXPGPATH - 1, "%s/%s", path, de->d_name);
+        securec_check_ss(rc, "", "");
+
+        if (lstat(pathbuf, &statbuf) != 0) {
+            if (errno != ENOENT) {
+                ereport(ERROR,
+                    (errcode_for_file_access(), errmsg("could not stat file or directory \"%s\": %m", pathbuf)));
+            }
+            /* If the file went away while scanning, it's no error. */
+            continue;
+        }
+        if (S_ISDIR(statbuf.st_mode)) {
+            _tarWriteHeader(pathbuf + BASE_PATH_LEN, NULL, &statbuf);
+            size += BUILD_PATH_LEN;
+            ProcessSecureFilesForDisasterCluster(pathbuf);
+        } else if (S_ISREG(statbuf.st_mode)) {
+            bool sent = sendFile(pathbuf, pathbuf + BASE_PATH_LEN, &statbuf, true);
+            size = size + ((statbuf.st_size + 511) & ~511) + BUILD_PATH_LEN;
+            if (!sent) {
+                ereport(ERROR,
+                    (errcode_for_file_access(), errmsg("could not send file \"%s\"", pathbuf)));
+            }
+        }
+    }
+    FreeDir(dir);
+}
+
+static void SendSecureFileToDisasterCluster(basebackup_options *opt)
+{
+    char pathbuf[MAXPGPATH];
+    struct stat statbuf;
+    StringInfoData buf;
+    tablespaceinfo *ti = (tablespaceinfo *)palloc0(sizeof(tablespaceinfo));
+    List *tablespaces = NIL;
+    int64 size = 0;
+    int rc = 0;
+
+    ti->size = size;
+    tablespaces = (List *)lappend(tablespaces, ti);
+    SendBackupHeader(tablespaces);
+    pq_beginmessage(&buf, 'H');
+    pq_sendbyte(&buf, 0);  /* overall format */
+    pq_sendint16(&buf, 0); /* natts */
+    pq_endmessage_noblock(&buf);
+    if (opt->isCopyUpgradeFile) {
+        rc = snprintf_s(pathbuf, MAXPGPATH, MAXPGPATH - 1, "./upgrade_phase_info");
+        securec_check_ss(rc, "", "");
+        if (lstat(pathbuf, &statbuf) != 0) {
+            if (errno != ENOENT) {
+                ereport(ERROR,
+                    (errcode_for_file_access(), errmsg("could not stat file or directory \"%s\": %m", pathbuf)));
+            } else {
+                ereport(ERROR,
+                    (errcode_for_file_access(), errmsg("upgrade file \"%s\" does not exist.", pathbuf)));
+            }
+        }
+        bool sent = sendFile(pathbuf, pathbuf + BASE_PATH_LEN, &statbuf, true);
+        size = size + ((statbuf.st_size + 511) & ~511) + BUILD_PATH_LEN;
+        if (!sent) {
+            ereport(ERROR,
+                (errcode_for_file_access(), errmsg("could not send file \"%s\"", pathbuf)));
+        }
+        pq_putemptymessage_noblock('c');
+        pfree(ti);
+        return;
+    }
+    ProcessSecureFilesForDisasterCluster("./gs_secure_files");
+    pq_putemptymessage_noblock('c');
+    pfree(ti);
+}
+
 /*
  * Actually do a base backup for the specified tablespaces.
  *
@@ -230,14 +370,25 @@ static void base_backup_cleanup(int code, Datum arg)
  */
 static void perform_base_backup(basebackup_options *opt, DIR *tblspcdir)
 {
+    XLogRecPtr startptr;
     XLogRecPtr endptr;
+    XLogRecPtr disasterSlotRestartPtr = InvalidXLogRecPtr;
     char *labelfile = NULL;
     char* tblspc_map_file = NULL;
     List* tablespaces = NIL;
+    XLogSegNo startSegNo;
 
-    XLogRecPtr startptr =
-        do_pg_start_backup(opt->label, opt->fastcheckpoint, &labelfile, tblspcdir, &tblspc_map_file, &tablespaces,
+    if (opt->isBuildFromStandby) {
+        startptr = StandbyDoStartBackup(opt->label, &labelfile, &tblspc_map_file, &tablespaces,
+            tblspcdir, opt->progress);
+    } else {
+        startptr =
+            do_pg_start_backup(opt->label, opt->fastcheckpoint, &labelfile, tblspcdir, &tblspc_map_file, &tablespaces,
             opt->progress, opt->sendtblspcmapfile);
+    }
+    if (opt->isObsmode) {
+        t_thrd.walsender_cxt.is_obsmode = true;
+    }
     /* Get the slot minimum LSN */
     ReplicationSlotsComputeRequiredXmin(false);
     ReplicationSlotsComputeRequiredLSN(NULL);
@@ -247,6 +398,12 @@ static void perform_base_backup(basebackup_options *opt, DIR *tblspcdir)
         /* If xlog file has been recycled, don't use this minlsn */
         if (XlogFileIsExisted(t_thrd.proc_cxt.DataDir, minlsn, DEFAULT_TIMELINE_ID) == true) {
             startptr = minlsn;
+        }
+    }
+    disasterSlotRestartPtr = GetMinArchiveSlotLSN();
+    if (disasterSlotRestartPtr != InvalidXLogRecPtr && XLByteLT(disasterSlotRestartPtr, startptr)) {
+        if (XlogFileIsExisted(t_thrd.proc_cxt.DataDir, disasterSlotRestartPtr, DEFAULT_TIMELINE_ID) == true) {
+            startptr = disasterSlotRestartPtr;
         }
     }
     LWLockAcquire(FullBuildXlogCopyStartPtrLock, LW_EXCLUSIVE);
@@ -259,91 +416,22 @@ static void perform_base_backup(basebackup_options *opt, DIR *tblspcdir)
 #ifdef ENABLE_MULTIPLE_NODES
     cbm_rotate_file(startptr);
 #endif
+    XLByteToSeg(startptr, startSegNo);
+    XLogSegNo lastRemovedSegno = XLogGetLastRemovedSegno();
+    if (startSegNo <= lastRemovedSegno) {
+        startptr = (lastRemovedSegno + 1) * XLOG_SEG_SIZE;
+    }
     SendXlogRecPtrResult(startptr);
 
     PG_ENSURE_ERROR_CLEANUP(base_backup_cleanup, (Datum)0);
-    {
-        ListCell *lc = NULL;
-        /* Add a node for the base directory at the end */
-        tablespaceinfo *ti = (tablespaceinfo *)palloc0(sizeof(tablespaceinfo));
-        ti->size = opt->progress ? sendDir(".", 1, true, tablespaces, true) : -1;
-        tablespaces = (List *)lappend(tablespaces, ti);
-
-        /* Send tablespace header */
-        SendBackupHeader(tablespaces);
-
-        /* Send off our tablespaces one by one */
-        foreach (lc, tablespaces) {
-            tablespaceinfo *iterti = (tablespaceinfo *)lfirst(lc);
-            StringInfoData buf;
-
-            /* Send CopyOutResponse message */
-            pq_beginmessage(&buf, 'H');
-            pq_sendbyte(&buf, 0);  /* overall format */
-            pq_sendint16(&buf, 0); /* natts */
-            pq_endmessage_noblock(&buf);
-
-            /* In the main tar, include the backup_label first. */
-            if (iterti->path == NULL)
-                sendFileWithContent(BACKUP_LABEL_FILE, labelfile);
-
-            /*
-             * if the tblspc created in datadir , the files under tblspc do not send,
-             * and send them as normal under datadir,
-             * so we just send these tblspcs only once.
-             */
-            if (iterti->path != NULL) {
-                /* Skip the tablespace if it's created in GAUSSDATA */
-                sendTablespace(iterti->path, false);
-            } else {
-                /* Then the tablespace_map file, if required... */
-                if (tblspc_map_file && opt->sendtblspcmapfile) {
-                    sendFileWithContent(TABLESPACE_MAP, tblspc_map_file);
-                    sendDir(".", 1, false, tablespaces, false);
-                } else
-                    sendDir(".", 1, false, tablespaces, true);
-            }
-
-            /* In the main tar, include pg_control last. */
-            if (iterti->path == NULL) {
-                struct stat statbuf;
-                TimeLineID primay_tli = 0;
-                char path[MAXPGPATH] = {0};
-
-                if (lstat(XLOG_CONTROL_FILE, &statbuf) != 0) {
-                    LWLockAcquire(FullBuildXlogCopyStartPtrLock, LW_EXCLUSIVE);
-                    XlogCopyStartPtr = InvalidXLogRecPtr;
-                    LWLockRelease(FullBuildXlogCopyStartPtrLock);
-                    ereport(ERROR, (errcode_for_file_access(),
-                                    errmsg("could not stat control file \"%s\": %m", XLOG_CONTROL_FILE)));
-                }
-
-                sendFile(XLOG_CONTROL_FILE, XLOG_CONTROL_FILE, &statbuf, false);
-                /* In the main tar, include the last timeline history file at last. */
-                primay_tli = t_thrd.xlog_cxt.ThisTimeLineID;
-                while (primay_tli > 1) {
-                    TLHistoryFilePath(path, primay_tli);
-                    if (lstat(path, &statbuf) == 0)
-                        sendFile(path, path, &statbuf, false);
-                    primay_tli--;
-                }
-            }
-
-            /*
-             * If we're including WAL, and this is the main data directory we
-             * don't terminate the tar stream here. Instead, we will append
-             * the xlog files below and terminate it then. This is safe since
-             * the main data directory is always sent *last*.
-             */
-            if (opt->includewal && iterti->path == NULL) {
-                Assert(lnext(lc) == NULL);
-            } else
-                pq_putemptymessage_noblock('c'); /* CopyDone */
-        }
-    }
+    SendTableSpaceForBackup(opt, tablespaces, labelfile, tblspc_map_file);
     PG_END_ENSURE_ERROR_CLEANUP(base_backup_cleanup, (Datum)0);
 
-    endptr = do_pg_stop_backup(labelfile, !opt->nowait);
+    if (opt->isBuildFromStandby) {
+        endptr = StandbyDoStopBackup(labelfile);
+    } else {
+        endptr = do_pg_stop_backup(labelfile, !opt->nowait);
+    }
 
     if (opt->includewal) {
         /*
@@ -376,9 +464,9 @@ static void perform_base_backup(basebackup_options *opt, DIR *tblspcdir)
          * including them.
          */
         XLByteToSeg(startptr, startsegno);
-        XLogFileName(firstoff, t_thrd.xlog_cxt.ThisTimeLineID, startsegno);
+        XLogFileName(firstoff, MAXFNAMELEN, t_thrd.xlog_cxt.ThisTimeLineID, startsegno);
         XLByteToPrevSeg(endptr, endsegno);
-        XLogFileName(lastoff, t_thrd.xlog_cxt.ThisTimeLineID, endsegno);
+        XLogFileName(lastoff, MAXFNAMELEN, t_thrd.xlog_cxt.ThisTimeLineID, endsegno);
 
         DIR* dir = AllocateDir("pg_xlog");
         if (!dir) {
@@ -509,7 +597,7 @@ static void perform_base_backup(basebackup_options *opt, DIR *tblspcdir)
              * walreceiver.c always doing a XLogArchiveForceDone() after a
              * complete segment.
              */
-            StatusFilePath(pathbuf, walFiles[i], ".done");
+            StatusFilePath(pathbuf, MAXPGPATH, walFiles[i], ".done");
             sendFileWithContent(pathbuf, "");
         }
 
@@ -525,7 +613,7 @@ static void perform_base_backup(basebackup_options *opt, DIR *tblspcdir)
         foreach (lc, historyFileList) {
             char* fname = (char*)lfirst(lc);
 
-            int rt = snprintf_s(pathbuf, MAXPGPATH, MAXPGPATH-1, XLOGDIR "/%s", fname);
+            int rt = snprintf_s(pathbuf, MAXPGPATH, MAXPGPATH-1, "/%s", fname);
             securec_check_ss_c(rt, "\0", "\0");
             if (lstat(pathbuf, &statbuf) != 0)
                 ereport(ERROR, (errcode_for_file_access(), errmsg("could not stat file \"%s\": %m", pathbuf)));
@@ -533,14 +621,18 @@ static void perform_base_backup(basebackup_options *opt, DIR *tblspcdir)
             sendFile(pathbuf, pathbuf, &statbuf, false);
 
             /* unconditionally mark file as archived */
-            StatusFilePath(pathbuf, fname, ".done");
+            StatusFilePath(pathbuf, MAXPGPATH, fname, ".done");
             sendFileWithContent(pathbuf, "");
         }
 
         /* Send CopyDone message for the last tar file */
         pq_putemptymessage('c');
     }
-    SendXlogRecPtrResult(endptr);
+    unsigned long long consensusPaxosIdx = 0;
+#ifndef ENABLE_MULTIPLE_NODES
+    SetPaxosIndex(&consensusPaxosIdx);
+#endif
+    SendXlogRecPtrResult(endptr, consensusPaxosIdx);
     LWLockAcquire(FullBuildXlogCopyStartPtrLock, LW_EXCLUSIVE);
     XlogCopyStartPtr = InvalidXLogRecPtr;
     LWLockRelease(FullBuildXlogCopyStartPtrLock);
@@ -580,38 +672,36 @@ void PerformMotCheckpointFetch()
     MOTCheckpointFetchLock();
     PG_ENSURE_ERROR_CLEANUP(mot_checkpoint_fetch_cleanup, (Datum)0);
     {
-        if (MOTCheckpointExists(ctrlFilePath, MAXPGPATH, fullChkptDir, MAXPGPATH, basePathLen) == false) {
-            /* no checkpoint exists */
-            break;
+        /* Nothing to do, if no MOT checkpoint exists. */
+        if (MOTCheckpointExists(ctrlFilePath, MAXPGPATH, fullChkptDir, MAXPGPATH, basePathLen)) {
+            /* send mot header */
+            SendMotCheckpointHeader(fullChkptDir);
+            StringInfoData buf;
+
+            /* send mot.ctrl file */
+            pq_beginmessage(&buf, 'H');
+            pq_sendbyte(&buf, 0);  /* overall format */
+            pq_sendint16(&buf, 0); /* natts */
+            pq_endmessage_noblock(&buf);
+
+            struct stat statbuf;
+            if (lstat(ctrlFilePath, &statbuf) != 0) {
+                ereport(ERROR,
+                    (errcode_for_file_access(), errmsg("could not stat mot ctrl file \"%s\": %m", ctrlFilePath)));
+            }
+
+            /* send the MOT control file */
+            sendFile(ctrlFilePath, "mot.ctrl", &statbuf, false);
+
+            /* send the checkpoint dir */
+            sendDir(fullChkptDir, (int)basePathLen, false, NIL, false);
+
+            /* CopyDone */
+            pq_putemptymessage_noblock('c');
         }
-
-        /* send mot header */
-        SendMotCheckpointHeader(fullChkptDir);
-        StringInfoData buf;
-
-        /* send mot.ctrl file */
-        pq_beginmessage(&buf, 'H');
-        pq_sendbyte(&buf, 0);  /* overall format */
-        pq_sendint16(&buf, 0); /* natts */
-        pq_endmessage_noblock(&buf);
-
-        struct stat statbuf;
-        if (lstat(ctrlFilePath, &statbuf) != 0) {
-            ereport(
-                ERROR, (errcode_for_file_access(), errmsg("could not stat mot ctrl file \"%s\": %m", ctrlFilePath)));
-        }
-
-        /* send the MOT control file */
-        sendFile(ctrlFilePath, "mot.ctrl", &statbuf, false);
-
-        /* send the checkpoint dir */
-        sendDir(fullChkptDir, (int)basePathLen, false, NIL, false);
-
-        /* CopyDone */
-        pq_putemptymessage_noblock('c');
     }
     PG_END_ENSURE_ERROR_CLEANUP(mot_checkpoint_fetch_cleanup, (Datum)0);
-    mot_checkpoint_fetch_cleanup(0, (Datum)0);
+    MOTCheckpointFetchUnlock();
 }
 #endif
 
@@ -626,7 +716,11 @@ static void parse_basebackup_options(List *options, basebackup_options *opt)
     bool o_fast = false;
     bool o_nowait = false;
     bool o_wal = false;
+    bool o_buildstandby = false;
+    bool o_copysecurefiles = false;
+    bool o_iscopyupgradefile = false;
     bool o_tablespace_map = false;
+    bool o_isobsmode = false;
     errno_t rc = memset_s(opt, sizeof(*opt), 0, sizeof(*opt));
     securec_check(rc, "", "");
     foreach (lopt, options) {
@@ -656,14 +750,39 @@ static void parse_basebackup_options(List *options, basebackup_options *opt)
                 ereport(ERROR, (errcode(ERRCODE_SYNTAX_ERROR), errmsg("duplicate option \"%s\"", defel->defname)));
             opt->includewal = true;
             o_wal = true;
+        } else if (strcmp(defel->defname, "buildstandby") == 0) {
+            if (o_buildstandby) {
+                ereport(ERROR, (errcode(ERRCODE_SYNTAX_ERROR), errmsg("duplicate option \"%s\"", defel->defname)));
+            }
+            opt->isBuildFromStandby = true;
+            o_buildstandby = true;
         } else if (strcmp(defel->defname, "tablespace_map") == 0) {
             if (o_tablespace_map) {
                 ereport(ERROR, (errcode(ERRCODE_SYNTAX_ERROR), errmsg("duplicate option \"%s\"", defel->defname)));
             }
             opt->sendtblspcmapfile = true;
             o_tablespace_map = true;
-        } else
+        } else if (strcmp(defel->defname, "obsmode") == 0) {
+            if (o_isobsmode) {
+                ereport(ERROR, (errcode(ERRCODE_SYNTAX_ERROR), errmsg("duplicate option \"%s\"", defel->defname)));
+            }
+            opt->isObsmode = true;
+            o_isobsmode = true;
+        } else if (strcmp(defel->defname, "copysecurefile") == 0) {
+            if (o_copysecurefiles) {
+                ereport(ERROR, (errcode(ERRCODE_SYNTAX_ERROR), errmsg("duplicate option \"%s\"", defel->defname)));
+            }
+            opt->isCopySecureFiles = true;
+            o_copysecurefiles = true;
+        } else if (strcmp(defel->defname, "needupgradefile") == 0) {
+            if (o_iscopyupgradefile) {
+                ereport(ERROR, (errcode(ERRCODE_SYNTAX_ERROR), errmsg("duplicate option \"%s\"", defel->defname)));
+            }
+            opt->isCopyUpgradeFile = true;
+            o_iscopyupgradefile = true;
+        } else {
             ereport(ERROR, (errcode(ERRCODE_SYNTAX_ERROR), errmsg("option \"%s\" not recognized", defel->defname)));
+        }
     }
     if (opt->label == NULL)
         opt->label = "base backup";
@@ -691,6 +810,13 @@ void SendBaseBackup(BaseBackupCmd *cmd)
     old_context = MemoryContextSwitchTo(backup_context);
 
     WalSndSetState(WALSNDSTATE_BACKUP);
+
+    if (opt.isCopySecureFiles) {
+        SendSecureFileToDisasterCluster(&opt);
+        MemoryContextSwitchTo(old_context);
+        MemoryContextDelete(backup_context);
+        return;
+    }
 
     if (u_sess->attr.attr_common.update_process_title) {
         char activitymsg[50];
@@ -856,7 +982,7 @@ static void SendMotCheckpointHeader(const char* path)
  * Send a single resultset containing just a single
  * XlogRecPtr record (in text format)
  */
-static void SendXlogRecPtrResult(XLogRecPtr ptr)
+static void SendXlogRecPtrResult(XLogRecPtr ptr, unsigned long long consensusPaxosIdx)
 {
     StringInfoData buf;
     char str[MAXFNAMELEN];
@@ -865,24 +991,56 @@ static void SendXlogRecPtrResult(XLogRecPtr ptr)
     nRet = snprintf_s(str, MAXFNAMELEN, MAXFNAMELEN - 1, "%X/%X", (uint32)(ptr >> 32), (uint32)ptr);
     securec_check_ss(nRet, "", "");
 
-    pq_beginmessage(&buf, 'T'); /* RowDescription */
-    pq_sendint16(&buf, 1);      /* 1 field */
 
-    /* Field header */
-    pq_sendstring(&buf, "recptr");
-    pq_sendint32(&buf, 0);       /* table oid */
-    pq_sendint16(&buf, 0);       /* attnum */
-    pq_sendint32(&buf, TEXTOID); /* type oid */
-    pq_sendint16(&buf, UINT16_MAX);
-    pq_sendint32(&buf, 0);
-    pq_sendint16(&buf, 0);
-    pq_endmessage_noblock(&buf);
+    if (g_instance.attr.attr_storage.dcf_attr.enable_dcf) {
+        pq_beginmessage(&buf, 'T'); /* RowDescription */
+        pq_sendint16(&buf, 2);      /* 1 field */
 
-    /* Data row */
-    pq_beginmessage(&buf, 'D');
-    pq_sendint16(&buf, 1);           /* number of columns */
-    pq_sendint32(&buf, strlen(str)); /* length */
-    pq_sendbytes(&buf, str, strlen(str));
+        /* First field header */
+        pq_sendstring(&buf, "recptr");
+        pq_sendint32(&buf, 0);       /* table oid */
+        pq_sendint16(&buf, 0);       /* attnum */
+        pq_sendint32(&buf, TEXTOID); /* type oid */
+        pq_sendint16(&buf, UINT16_MAX);
+        pq_sendint32(&buf, 0);
+        pq_sendint16(&buf, 0);
+
+        /* Second field header */
+        pq_sendstring(&buf, "consensusPaxosIndex");
+        pq_sendint32(&buf, 0);       /* table oid */
+        pq_sendint16(&buf, 0);       /* attnum */
+        pq_sendint32(&buf, INT8OID); /* type oid */
+        pq_sendint16(&buf, 8);
+        pq_sendint32(&buf, 0);
+        pq_sendint16(&buf, 0);
+        pq_endmessage_noblock(&buf);
+
+        /* Data row */
+        pq_beginmessage(&buf, 'D');
+        pq_sendint16(&buf, 2);           /* number of columns */
+        pq_sendint32(&buf, strlen(str)); /* col1 len */
+        pq_sendbytes(&buf, str, strlen(str));
+        send_int8_string(&buf, consensusPaxosIdx); /* send col 2 */
+    } else {
+        pq_beginmessage(&buf, 'T'); /* RowDescription */
+        pq_sendint16(&buf, 1);      /* 1 field */
+
+        /* Field header */
+        pq_sendstring(&buf, "recptr");
+        pq_sendint32(&buf, 0);       /* table oid */
+        pq_sendint16(&buf, 0);       /* attnum */
+        pq_sendint32(&buf, TEXTOID); /* type oid */
+        pq_sendint16(&buf, UINT16_MAX);
+        pq_sendint32(&buf, 0);
+        pq_sendint16(&buf, 0);
+        pq_endmessage_noblock(&buf);
+
+        /* Data row */
+        pq_beginmessage(&buf, 'D');
+        pq_sendint16(&buf, 1);           /* number of columns */
+        pq_sendint32(&buf, strlen(str)); /* length */
+        pq_sendbytes(&buf, str, strlen(str));
+    }
     pq_endmessage_noblock(&buf);
 
     /* Send a CommandComplete message */
@@ -1000,15 +1158,42 @@ bool IsSkipDir(const char * dirName)
     if (strcmp(dirName, DISABLE_CONN_FILE) == 0)
         return true;
 
-    return false;	
+    return false;
 }
+
+int IsBeginWith(const char *str1, char *str2)
+{
+    if (str1 == NULL || str2 == NULL)
+        return -1;
+    int len1 = strlen(str1);
+    int len2 = strlen(str2);
+    if ((len1 < len2) || (len1 == 0 || len2 == 0)) {
+        return -1;
+    }
+
+    char *p = str2;
+    int i = 0;
+    while (*p != '\0') {
+        if (*p != str1[i]) {
+            return 0;
+        }
+        p++;
+        i++;
+    }
+    return 1;
+}
+
 
 bool IsSkipPath(const char * pathName)
 {
     /* Skip pg_control here to back up it last */
     if (strcmp(pathName, "./global/pg_control") == 0)
         return true;
+    if (IsBeginWith(pathName, "./global/pg_dw") > 0)
+        return true;
     if (strcmp(pathName, "./global/pg_dw") == 0)
+        return true;
+    if (strcmp(pathName, "./global/pg_dw_single") == 0)
         return true;
     if (strcmp(pathName, "./global/pg_dw.build") == 0)
         return true;
@@ -1035,7 +1220,76 @@ bool IsSkipPath(const char * pathName)
     if (strcmp(pathName, "./delay_xlog_recycle") == 0 || strcmp(pathName, "./delay_ddl_recycle") == 0)
         return true;
 
-    return false;	
+    if (t_thrd.walsender_cxt.is_obsmode == true && strcmp(pathName, "./pg_replslot") == 0)
+        return true;
+
+    return false;
+}
+
+static bool IsDCFPath(const char *pathname)
+{
+    char fullpath[MAXPGPATH] = {0};
+    errno_t rc = EOK;
+    /* Skip paxosindex file in DCF mode */
+    if ((strcmp(pathname, "./paxosindex") == 0) || (strcmp(pathname, "./paxosindex.backup") == 0))
+        return true;
+
+    if (strlen(pathname) <= 2) {
+        return false;
+    }
+    /* We want to get the absolute path of dirName */
+    rc = snprintf_s(fullpath, MAXPGPATH, MAXPGPATH - 1, "%s/%s/", t_thrd.proc_cxt.DataDir, pathname + 2);
+    securec_check_ss(rc, "", "");
+
+    int fullPathLen = strlen(fullpath);
+    char comparedPath[MAXPGPATH] = {0};
+
+    rc = snprintf_s(comparedPath, MAXPGPATH, MAXPGPATH - 1, "%s/",
+        g_instance.attr.attr_storage.dcf_attr.dcf_log_path);
+    securec_check_ss(rc, "", "");
+
+    /* If fullpath is prefix of log path, then skip it. */
+    if (strncmp(fullpath, comparedPath, fullPathLen) == 0) {
+        return true;
+    }
+    rc = snprintf_s(comparedPath, MAXPGPATH, MAXPGPATH - 1, "%s/",
+        g_instance.attr.attr_storage.dcf_attr.dcf_data_path);
+    securec_check_ss(rc, "", "");
+
+    /* If fullpath is prefix of data path, then skip it. */
+    if (strncmp(fullpath, comparedPath, fullPathLen) == 0) {
+        return true;
+    }
+    return false;
+}
+
+#define SEND_DIR_ADD_SIZE(size, statbuf) ((size) = (size) + (((statbuf).st_size + 511) & ~511) + BUILD_PATH_LEN)
+
+/**
+ * send file or compressed file
+ * @param sizeOnly send or not
+ * @param pathbuf path
+ * @param pathBufLen pathLen
+ * @param basepathlen subfix of path
+ * @param statbuf path stat
+ */
+static void SendRealFile(bool sizeOnly, char* pathbuf, size_t pathBufLen, int basepathlen, struct stat* statbuf)
+{
+    int64 size = 0;
+    // we must ensure the page integrity when in IncrementalCheckpoint
+    if (!sizeOnly && g_instance.attr.attr_storage.enableIncrementalCheckpoint &&
+        IsCompressedFile(pathbuf, strlen(pathbuf)) != COMPRESSED_TYPE_UNKNOWN) {
+        SendCompressedFile(pathbuf, basepathlen, (*statbuf), false, &size);
+    } else {
+        bool sent = false;
+        if (!sizeOnly) {
+            sent = sendFile(pathbuf, pathbuf + basepathlen + 1, statbuf, true);
+        }
+        if (sent || sizeOnly) {
+            /* Add size, rounded up to 512byte block */
+            SEND_DIR_ADD_SIZE(size, (*statbuf));
+        }
+    }
 }
 
 /*
@@ -1065,8 +1319,7 @@ static int64 sendDir(const char *path, int basepathlen, bool sizeonly, List *tab
         if (IsSkipDir(de->d_name)) {
 		    continue;
         }
-          
-       
+
         /*
          * Check if the postmaster has signaled us to exit, and abort with an
          * error in that case. The error handler further up will call
@@ -1085,11 +1338,16 @@ static int64 sendDir(const char *path, int basepathlen, bool sizeonly, List *tab
 
         rc = snprintf_s(pathbuf, MAXPGPATH, MAXPGPATH - 1, "%s/%s", path, de->d_name);
         securec_check_ss(rc, "", "");
-
-        /* Skip postmaster.pid and postmaster.opts in the data directory */
-        if (strcmp(pathbuf, "./postmaster.pid") == 0 || strcmp(pathbuf, "./postmaster.opts") == 0)
+        /* Skip files related to DCF and DCF dir */
+        if (g_instance.attr.attr_storage.dcf_attr.enable_dcf && IsDCFPath(pathbuf)) {
             continue;
-                
+        }
+
+        /* Skip postmaster.pid and postmaster.opts and gs_gazelle.conf in the data directory */
+        if (strcmp(pathbuf, "./postmaster.pid") == 0 || strcmp(pathbuf, "./postmaster.opts") == 0 ||
+            strcmp(pathbuf, "./gs_gazelle.conf") == 0)
+            continue;
+
         /* For gs_basebackup, we should not skip these files */
         if (strcmp(u_sess->attr.attr_common.application_name, "gs_basebackup") != 0) {
         /* For gs_backup, we should not skip these files */
@@ -1111,12 +1369,12 @@ static int64 sendDir(const char *path, int basepathlen, bool sizeonly, List *tab
                 continue;
             }
         }
+
         if (IS_PGXC_COORDINATOR && strcmp(pathbuf, "./pg_hba.conf") == 0)
             continue;
         /* Skip cn_drop_backup */
         if (IS_PGXC_COORDINATOR && strcmp(pathbuf, "./cn_drop_backup") == 0)
             continue;
-
         /* Skip pg_control here to back up it last */
         if (IsSkipPath(pathbuf)) {
             continue;
@@ -1154,6 +1412,7 @@ static int64 sendDir(const char *path, int basepathlen, bool sizeonly, List *tab
          */
         if (strcmp(path, "./pg_replslot") == 0) {
             bool isphysicalslot = false;
+            bool isArchiveSlot = false;
             LWLockAcquire(ReplicationSlotControlLock, LW_SHARED);
             for (int i = 0; i < g_instance.attr.attr_storage.max_replication_slots; i++) {
                 ReplicationSlot *s = &t_thrd.slot_cxt.ReplicationSlotCtl->replication_slots[i];
@@ -1162,10 +1421,15 @@ static int64 sendDir(const char *path, int basepathlen, bool sizeonly, List *tab
                     isphysicalslot = true;
                     break;
                 }
+                if (s->in_use && s->data.database == InvalidOid && strcmp(de->d_name, NameStr(s->data.name)) == 0 &&
+                    GET_SLOT_PERSISTENCY(s->data) != RS_BACKUP && s->extra_content != NULL) {
+                    isArchiveSlot = true;
+                    break;
+                }
             }
             LWLockRelease(ReplicationSlotControlLock);
 
-            if (isphysicalslot)
+            if (isphysicalslot || (isArchiveSlot && AM_WAL_HADR_DNCN_SENDER))
                 continue;
         }
 
@@ -1227,8 +1491,7 @@ static int64 sendDir(const char *path, int basepathlen, bool sizeonly, List *tab
                         ereport(ERROR,
                             (errcode_for_file_access(), errmsg("could not read symbolic link \"%s\": %m", pathbuf)));
                     if (rllen >= (int)sizeof(linkpath))
-                        ereport(ERROR,
-                            (errcode(ERRCODE_NAME_TOO_LONG),
+                        ereport(ERROR, (errcode(ERRCODE_NAME_TOO_LONG),
                                 errmsg("symbolic link \"%s\" target is too long", pathbuf)));
                     linkpath[MAXPGPATH - 1] = '\0';
                     _tarWriteHeader(pathbuf + basepathlen + 1, linkpath, &statbuf);
@@ -1327,15 +1590,7 @@ static int64 sendDir(const char *path, int basepathlen, bool sizeonly, List *tab
             if (!skip_this_dir)
                 size += sendDir(pathbuf, basepathlen, sizeonly, tablespaces, sendtblspclinks);
         } else if (S_ISREG(statbuf.st_mode)) {
-            bool sent = false;
-
-            if (!sizeonly)
-                sent = sendFile(pathbuf, pathbuf + basepathlen + 1, &statbuf, true);
-
-            if (sent || sizeonly) {
-                /* Add size, rounded up to 512byte block */
-                size = size + ((statbuf.st_size + 511) & ~511) + BUILD_PATH_LEN;
-            }
+            SendRealFile(sizeonly, pathbuf, strlen(pathbuf), basepathlen, &statbuf);
         } else
             ereport(WARNING, (errmsg("skipping special file \"%s\"", pathbuf)));
     }
@@ -1363,186 +1618,86 @@ static void print_val(char *s, uint64 val, unsigned int base, size_t len)
     }
 }
 
-bool check_base_path(const char *fname, int *segNo)
+/* forkname like "fsm.2" or "vm" */
+static ForkNumber forkname_to_number(char *forkName, int *segNo)
 {
-    RelFileNode rnode;
-    int columnid = 0;
-    int nmatch;
+    ForkNumber forkNum;
 
-    rnode.spcNode = InvalidOid;
-    rnode.dbNode = InvalidOid;
-    rnode.relNode = InvalidOid;
-    rnode.bucketNode = InvalidBktId;
+    if (forkName == NULL || *forkName == '\0')
+        return InvalidForkNumber;
 
-    /* Column Store Table File Name Format Checking */
-    nmatch = sscanf_s(fname, "base/%u/%u_C%d.%d", &rnode.dbNode, &rnode.relNode, &columnid, segNo);
-    if (nmatch == MATCH_FOUR) {
+    for (int iforkNum = 0; iforkNum <= MAX_FORKNUM; iforkNum++) {
+        forkNum = (ForkNumber)iforkNum;
+        if (strstr(forkName, forkNames[forkNum]) != NULL) {
+            int nmatch = sscanf_s(forkName + strlen(forkNames[forkNum]), ".%d", segNo);
+            if (nmatch == 0) {
+                /* Actually, impossible here */
+                *segNo = 0;
+            }
+            return forkNum;
+        }
+    }
+
+    return MAX_FORKNUM + 1;
+}
+
+/* filename should be basename */
+static bool check_data_filename(char *filename, int *segNo)
+{
+    if (basename(filename) != filename) {
+        /* not a base name, return directly */
         return false;
     }
 
-    /* Hashbucket Table File Name Format Checking */
-    nmatch = sscanf_s(fname, "base/%u/%u/%u_b%d.%d", &rnode.dbNode, &rnode.relNode, &rnode.relNode, &rnode.bucketNode,
-                      segNo);
-    if (nmatch == MATCH_FOUR || nmatch == MATCH_FIVE) {
-        return true;
-    }
-    nmatch = sscanf_s(fname, "base/%u/%u/%u_b%d_vm.%d", &rnode.dbNode, &rnode.relNode, &rnode.relNode,
-                      &rnode.bucketNode, segNo);
-    if (nmatch == MATCH_FOUR || nmatch == MATCH_FIVE) {
-        return true;
-    }
-    nmatch = sscanf_s(fname, "base/%u/%u/%u_b%d_fsm.%d", &rnode.dbNode, &rnode.relNode, &rnode.relNode,
-                      &rnode.bucketNode, segNo);
-    if (nmatch == MATCH_FOUR || nmatch == MATCH_FIVE) {
-        return true;
-    }
-
-    /* Normal Table File Name Format Checking */
-    nmatch = sscanf_s(fname, "base/%u/%u.%d", &rnode.dbNode, &rnode.relNode, segNo);
-    if (nmatch == MATCH_TWO || nmatch == MATCH_THREE) {
-        return true;
-    }
-
-    nmatch = sscanf_s(fname, "base/%u/%u_vm.%d", &rnode.dbNode, &rnode.relNode, segNo);
-    if (nmatch == MATCH_TWO || nmatch == MATCH_THREE) {
-        return true;
-    }
-    nmatch = sscanf_s(fname, "base/%u/%u_fsm.%d", &rnode.dbNode, &rnode.relNode, segNo);
-    if (nmatch == MATCH_TWO || nmatch == MATCH_THREE) {
-        return true;
-    }
-
-    return false;
-}
-
-bool check_rel_tblspac_path(const char *fname, int *segNo)
-{
-    char buf[FILE_NAME_MAX_LEN] = {0};
-    RelFileNode rnode;
-    int columnid = 0;
-    int nmatch;
-
-    rnode.spcNode = InvalidOid;
-    rnode.dbNode = InvalidOid;
-    rnode.relNode = InvalidOid;
-    rnode.bucketNode = InvalidBktId;
-
-    nmatch = sscanf_s(fname, "pg_tblspc/%u/%[^/]/%u/%u_C%d.%d", &rnode.spcNode, buf, sizeof(buf), &rnode.dbNode,
-                      &rnode.relNode, &columnid, segNo);
-    if (nmatch == MATCH_SIX) {
-        return false;
-    }
-
-    /* Hashbucket File Name Format Checking */
-    nmatch = sscanf_s(fname, "pg_tblspc/%u/%u/%[^/]/%u/%u_b%d.%d", &rnode.spcNode, buf, sizeof(buf), &rnode.dbNode,
-                      &rnode.relNode, &rnode.relNode, &rnode.bucketNode, segNo);
-    if (nmatch == MATCH_SIX || nmatch == MATCH_SEVEN) {
-        return true;
-    }
-
-    nmatch = sscanf_s(fname, "pg_tblspc/%u/%[^/]/%u/%u/%u_b%d_fsm.%d", &rnode.spcNode, buf, sizeof(buf), &rnode.dbNode,
-                      &rnode.relNode, &rnode.relNode, &rnode.bucketNode, segNo);
-    if (nmatch == MATCH_SIX || nmatch == MATCH_SEVEN) {
-        return true;
-    }
-
-    nmatch = sscanf_s(fname, "pg_tblspc/%u/%[^/]/%u/%u/%u_b%d_vm.%d", &rnode.spcNode, buf, sizeof(buf), &rnode.dbNode,
-                      &rnode.relNode, &rnode.relNode, &rnode.bucketNode, segNo);
-    if (nmatch == MATCH_SIX || nmatch == MATCH_SEVEN) {
-        return true;
-    }
-
-    /* Normal Table File Name Format Checking */
-    nmatch = sscanf_s(fname, "pg_tblspc/%u/%[^/]/%u/%u.%d", &rnode.spcNode, buf, sizeof(buf), &rnode.dbNode,
-                      &rnode.relNode, segNo);
-    if (nmatch == MATCH_FOUR || nmatch == MATCH_FIVE) {
-        return true;
-    }
-
-    nmatch = sscanf_s(fname, "pg_tblspc/%u/%[^/]/%u/%u_fsm.%d", &rnode.spcNode, buf, sizeof(buf), &rnode.dbNode,
-                      &rnode.relNode, segNo);
-    if (nmatch == MATCH_FOUR || nmatch == MATCH_FIVE) {
-        return true;
-    }
-
-    nmatch = sscanf_s(fname, "pg_tblspc/%u/%[^/]/%u/%u_vm.%d", &rnode.spcNode, buf, sizeof(buf), &rnode.dbNode,
-                      &rnode.relNode, segNo);
-    if (nmatch == MATCH_FOUR || nmatch == MATCH_FIVE) {
-        return true;
-    }
-
-    return false;
-}
-
-bool check_abs_tblspac_path(const char *fname, int *segNo)
-{
-    char buf[FILE_NAME_MAX_LEN] = {0};
-    RelFileNode rnode;
-    int columnid = 0;
-    int nmatch;
-
-    rnode.spcNode = InvalidOid;
-    rnode.dbNode = InvalidOid;
-    rnode.relNode = InvalidOid;
-    rnode.bucketNode = InvalidBktId;
-
-    nmatch = sscanf_s(fname, "PG_9.2_201611171_%[^/]/%u/%u_C%d.%d", buf, sizeof(buf), &rnode.dbNode, &rnode.relNode,
-                      &columnid, segNo);
-    if (nmatch == MATCH_FIVE) {
-        return false;
-    }
-
-    /* Hashbucket Table File Name Format Checking */
-    nmatch = sscanf_s(fname, "PG_9.2_201611171_%[^/]/%u/%u/%u_b%d.%d", buf, sizeof(buf), &rnode.dbNode, &rnode.relNode,
-                      &rnode.relNode, &rnode.bucketNode, segNo);
-    if (nmatch == MATCH_FIVE || nmatch == MATCH_SIX) {
-        return true;
-    }
-
-    nmatch = sscanf_s(fname, "PG_9.2_201611171_%[^/]/%u/%u/%u_b%d_fsm.%d", buf, sizeof(buf), &rnode.dbNode,
-                      &rnode.relNode, &rnode.relNode, &rnode.bucketNode, segNo);
-    if (nmatch == MATCH_FIVE || nmatch == MATCH_SIX) {
-        return true;
-    }
-
-    nmatch = sscanf_s(fname, "PG_9.2_201611171_%[^/]/%u/%u/%u_b%d_vm.%d", buf, sizeof(buf), &rnode.dbNode,
-                      &rnode.relNode, &rnode.relNode, &rnode.bucketNode, segNo);
-    if (nmatch == MATCH_FIVE || nmatch == MATCH_SIX) {
-        return true;
-    }
-
-    /* Normal Table File Name Format Checking */
-    nmatch = sscanf_s(fname, "PG_9.2_201611171_%[^/]/%u/%u.%d", buf, sizeof(buf), &rnode.dbNode, &rnode.relNode, segNo);
-    if (nmatch == MATCH_FOUR || nmatch == MATCH_FIVE) {
-        return true;
-    }
-
-    nmatch = sscanf_s(fname, "PG_9.2_201611171_%[^/]/%u/%u_fsm.%d", buf, sizeof(buf), &rnode.dbNode, &rnode.relNode,
-                      segNo);
-    if (nmatch == MATCH_FOUR || nmatch == MATCH_FIVE) {
-        return true;
-    }
-
-    nmatch = sscanf_s(fname, "PG_9.2_201611171_%[^/]/%u/%u_vm.%d", buf, sizeof(buf), &rnode.dbNode, &rnode.relNode,
-                      segNo);
-    if (nmatch == MATCH_FOUR || nmatch == MATCH_FIVE) {
-        return true;
-    }
-
-    return false;
-}
-
-bool is_row_data_file(const char *path, int *segNo)
-{
-    char *fname = NULL;
-    RelFileNode rnode;
+    char *token = NULL;
+    char *tmptoken = NULL;
     int nmatch = 0;
+    unsigned int relNode;
 
+    token = strtok_r(filename, "_", &tmptoken);
+    if ('\0' == tmptoken[0]) {
+        /* MAIN_FORK */
+        nmatch = sscanf_s(filename, "%u.%d", &relNode, segNo);
+        return (nmatch == 1 || nmatch == 2);
+    } else {
+        /* Note that after strtok, filename is broken. So we use tmptoken from here. */
+        ForkNumber forkNum = forkname_to_number(tmptoken, segNo);
+
+        if (forkNum == InvalidForkNumber) {
+            return false;
+        }
+        if (forkNum > MAX_FORKNUM) {
+            /* column store */
+            return false;
+        }
+
+        /* Only fsm and vm fork should be copied. */
+        if (forkNum == FSM_FORKNUM || forkNum == VISIBILITYMAP_FORKNUM) {
+            return true;
+        }
+        return false;
+    }
+}
+
+UndoFileType CheckUndoPath(const char* fname, int* segNo)
+{
+    RelFileNode rnode;
     rnode.spcNode = InvalidOid;
     rnode.dbNode = InvalidOid;
     rnode.relNode = InvalidOid;
     rnode.bucketNode = InvalidBktId;
+    rnode.opt = 0;
+    /* undo file and undo transaction slot file Checking */
+    if (sscanf_s(fname, "undo/permanent/%05X.%07zX", &rnode.relNode, segNo) == MATCH_TWO) {
+        return UNDO_RECORD;
+    } else if (sscanf_s(fname, "undo/permanent/%05X.meta.%07zX", &rnode.relNode, segNo) == MATCH_TWO) {
+        return UNDO_META;
+    }
+    return UNDO_INVALID;
+}
 
+bool is_row_data_file(const char *path, int *segNo, UndoFileType *undoFileType)
+{
     struct stat path_st;
     if (stat(path, &path_st) < 0) {
         if (errno != ENOENT) {
@@ -1557,27 +1712,377 @@ bool is_row_data_file(const char *path, int *segNo)
         return false;
     }
 
-    if (strstr(path, "global/") == NULL && strstr(path, "base/") == NULL && strstr(path, "pg_tblspc/") == NULL &&
-        strstr(path, "PG_9.2_201611171") == NULL) {
-        return false;
+    char buf[FILE_NAME_MAX_LEN];
+    unsigned int dbNode;
+    unsigned int spcNode;
+    int nmatch;
+    char *fname = NULL;
+
+   /* Skip compressed page files */
+    size_t pathLen = strlen(path);
+    if (pathLen >= 4) {
+        const char* suffix = path + pathLen - 4;
+        if (strncmp(suffix, "_pca", 4) == 0 || strncmp(suffix, "_pcd", 4) == 0) {
+            return false;
+        }
+    }
+
+    if ((fname = strstr((char *)path, "pg_tblspc/")) != NULL) {
+        nmatch = sscanf_s(fname, "pg_tblspc/%u/%*[^/]/%u/%s", &spcNode, &dbNode, buf, sizeof(buf));
+        if (nmatch == 3) {
+            return check_data_filename(buf, segNo);
+        }
     }
 
     if ((fname = strstr((char *)path, "global/")) != NULL) {
-        nmatch = sscanf_s(fname, "global/%u.%d", &rnode.relNode, segNo);
-        if (nmatch == MATCH_ONE || nmatch == MATCH_TWO) {
-            return true;
-        } else {
-            return false;
+        nmatch = sscanf_s(fname, "global/%s", buf, sizeof(buf));
+        if (nmatch == 1) {
+            return check_data_filename(buf, segNo);
         }
-    } else if ((fname = strstr((char *)path, "base/")) != NULL) {
-        return check_base_path(fname, segNo);
-    } else if ((fname = strstr((char *)path, "pg_tblspc/")) != NULL) {
-        return check_rel_tblspac_path(fname, segNo);
-    } else if ((fname = strstr((char *)path, "PG_9.2_201611171")) != NULL) {
-        return check_abs_tblspac_path(fname, segNo);
     }
+
+    if ((fname = strstr((char *)path, "base/")) != NULL) {
+        nmatch = sscanf_s(fname, "base/%u/%s", &dbNode, buf, sizeof(buf));
+        if (nmatch == 2) {
+            return check_data_filename(buf, segNo);
+        }
+    }
+
+    if ((fname = strstr((char *)path, "PG_9.2_201611171")) != NULL) {
+        nmatch = sscanf_s(fname, "PG_9.2_201611171_%*[^/]/%u/%s", &dbNode, buf, sizeof(buf));
+        if (nmatch == 2) {
+            return check_data_filename(buf, segNo);
+        }
+    }
+
+    if ((fname = strstr((char*)path, "undo/")) != NULL) {
+            *undoFileType = CheckUndoPath(fname, segNo);
+            return (*undoFileType != UNDO_INVALID);
+    }
+
     return false;
 }
+
+static void SendTableSpaceForBackup(basebackup_options* opt, List* tablespaces, char* labelfile, char* tblspc_map_file)
+{
+    ListCell *lc = NULL;
+    /* Add a node for the base directory at the end */
+    tablespaceinfo *ti = (tablespaceinfo *)palloc0(sizeof(tablespaceinfo));
+    ti->size = opt->progress ? sendDir(".", 1, true, tablespaces, true) : -1;
+    tablespaces = (List *)lappend(tablespaces, ti);
+
+    /* Send tablespace header */
+    SendBackupHeader(tablespaces);
+
+    /* Send off our tablespaces one by one */
+    foreach (lc, tablespaces) {
+        tablespaceinfo *iterti = (tablespaceinfo *)lfirst(lc);
+        StringInfoData buf;
+
+        /* Send CopyOutResponse message */
+        pq_beginmessage(&buf, 'H');
+        pq_sendbyte(&buf, 0);  /* overall format */
+        pq_sendint16(&buf, 0); /* natts */
+        pq_endmessage_noblock(&buf);
+
+        /* In the main tar, include the backup_label first. */
+        if (iterti->path == NULL)
+            sendFileWithContent(BACKUP_LABEL_FILE, labelfile);
+
+        /*
+         * if the tblspc created in datadir , the files under tblspc do not send,
+         * and send them as normal under datadir,
+         * so we just send these tblspcs only once.
+         */
+        if (iterti->path != NULL) {
+            /* Skip the tablespace if it's created in GAUSSDATA */
+            sendTablespace(iterti->path, false);
+        } else {
+            /* Then the tablespace_map file, if required... */
+            if (tblspc_map_file && opt->sendtblspcmapfile) {
+                sendFileWithContent(TABLESPACE_MAP, tblspc_map_file);
+                sendDir(".", 1, false, tablespaces, false);
+            } else
+                sendDir(".", 1, false, tablespaces, true);
+        }
+
+        /* In the main tar, include pg_control last. */
+        if (iterti->path == NULL) {
+            struct stat statbuf;
+            TimeLineID primay_tli = 0;
+            char path[MAXPGPATH] = {0};
+
+            if (lstat(XLOG_CONTROL_FILE, &statbuf) != 0) {
+                LWLockAcquire(FullBuildXlogCopyStartPtrLock, LW_EXCLUSIVE);
+                XlogCopyStartPtr = InvalidXLogRecPtr;
+                LWLockRelease(FullBuildXlogCopyStartPtrLock);
+                ereport(ERROR, (errcode_for_file_access(),
+                                errmsg("could not stat control file \"%s\": %m", XLOG_CONTROL_FILE)));
+            }
+
+            sendFile(XLOG_CONTROL_FILE, XLOG_CONTROL_FILE, &statbuf, false);
+            /* In the main tar, include the last timeline history file at last. */
+            primay_tli = t_thrd.xlog_cxt.ThisTimeLineID;
+            while (primay_tli > 1) {
+                TLHistoryFilePath(path, MAXPGPATH, primay_tli);
+                if (lstat(path, &statbuf) == 0)
+                    sendFile(path, path, &statbuf, false);
+                primay_tli--;
+            }
+        }
+
+        /*
+         * If we're including WAL, and this is the main data directory we
+         * don't terminate the tar stream here. Instead, we will append
+         * the xlog files below and terminate it then. This is safe since
+         * the main data directory is always sent *last*.
+         */
+        if (opt->includewal && iterti->path == NULL) {
+            Assert(lnext(lc) == NULL);
+        } else
+            pq_putemptymessage_noblock('c'); /* CopyDone */
+    }
+}
+
+/**
+ * init buf_block if not yet; repalloc PqSendBuffer if necessary
+ */
+static void SendFilePreInit(void)
+{
+    if (t_thrd.basebackup_cxt.buf_block == NULL) {
+        MemoryContext oldcxt = MemoryContextSwitchTo(THREAD_GET_MEM_CXT_GROUP(MEMORY_CONTEXT_STORAGE));
+        t_thrd.basebackup_cxt.buf_block = (char *)palloc0(TAR_SEND_SIZE);
+        MemoryContextSwitchTo(oldcxt);
+    }
+
+    /*
+     * repalloc to `MaxBuildAllocSize' in one time, to avoid many small step repalloc in `pq_putmessage_noblock'
+     * and low performance.
+     */
+    if (INT2SIZET(t_thrd.libpq_cxt.PqSendBufferSize) < MaxBuildAllocSize) {
+        t_thrd.libpq_cxt.PqSendBuffer = (char *)repalloc(t_thrd.libpq_cxt.PqSendBuffer, MaxBuildAllocSize);
+        t_thrd.libpq_cxt.PqSendBufferSize = MaxBuildAllocSize;
+    }
+}
+
+/**
+ * check file
+ * @param readFileName
+ * @param statbuf
+ * @param supress error if missingOk is false when file is not found
+ * @return return null if file.size > MAX_TAR_MEMBER_FILELEN or file cant found
+ */
+static FILE *SizeCheckAndAllocate(char *readFileName, const struct stat &statbuf, bool missingOk)
+{
+    /*
+     * Some compilers will throw a warning knowing this test can never be true
+     * because pgoff_t can't exceed the compared maximum on their platform.
+     */
+    if (statbuf.st_size > MAX_TAR_MEMBER_FILELEN) {
+        ereport(WARNING, (errcode(ERRCODE_NAME_TOO_LONG),
+                          errmsg("archive member \"%s\" too large for tar format", readFileName)));
+        return NULL;
+    }
+
+    FILE *fp = AllocateFile(readFileName, "rb");
+    if (fp == NULL) {
+        if (errno == ENOENT && missingOk)
+            return NULL;
+        ereport(ERROR, (errcode_for_file_access(), errmsg("could not open file \"%s\": %m", readFileName)));
+    }
+    return fp;
+
+}
+
+static void TransferPcaFile(const char *readFileName, int basePathLen, const struct stat &statbuf,
+                            PageCompressHeader *transfer,
+                            size_t len)
+{
+    const char *tarfilename = readFileName + basePathLen + 1;
+    _tarWriteHeader(tarfilename, NULL, (struct stat*)(&statbuf));
+    char *data = (char *) transfer;
+    size_t lenBuffer = len;
+    while (lenBuffer > 0) {
+        size_t transferLen = Min(TAR_SEND_SIZE, lenBuffer);
+        if (pq_putmessage_noblock('d', data, transferLen)) {
+            ereport(ERROR, (errcode_for_file_access(), errmsg("base backup could not send data, aborting backup")));
+        }
+        data = data + transferLen;
+        lenBuffer -= transferLen;
+    }
+    size_t pad = ((len + 511) & ~511) - len;
+    if (pad > 0) {
+        securec_check(memset_s(t_thrd.basebackup_cxt.buf_block, pad, 0, pad), "", "");
+        (void) pq_putmessage_noblock('d', t_thrd.basebackup_cxt.buf_block, pad);
+    }
+}
+
+static void FileStat(char* path, struct stat* fileStat)
+{
+    if (stat(path, fileStat) != 0) {
+        if (errno != ENOENT) {
+            ereport(ERROR, (errcode_for_file_access(), errmsg("could not stat file or directory \"%s\": %m", path)));
+        }
+    }
+}
+
+static void SendCompressedFile(char* readFileName, int basePathLen, struct stat& statbuf, bool missingOk, int64* size)
+{
+    char* tarfilename = readFileName + basePathLen + 1;
+    SendFilePreInit();
+    FILE* fp = SizeCheckAndAllocate(readFileName, statbuf, missingOk);
+    if (fp == NULL) {
+        return;
+    }
+
+    size_t readFileNameLen = strlen(readFileName);
+    /* dont send pca file */
+    if (readFileNameLen < 4 || strncmp(readFileName + readFileNameLen - 4, "_pca", 4) == 0 ||
+        strncmp(readFileName + readFileNameLen - 4, "_pcd", 4) != 0) {
+        FreeFile(fp);
+        return;
+    }
+
+    char tablePath[MAXPGPATH] = {0};
+    securec_check_c(memcpy_s(tablePath, MAXPGPATH, readFileName, readFileNameLen - 4), "", "");
+    int segmentNo = 0;
+    UndoFileType undoFileType = UNDO_INVALID;
+    if (!is_row_data_file(tablePath, &segmentNo, &undoFileType)) {
+        ereport(ERROR, (errcode(ERRCODE_INSUFFICIENT_RESOURCES), errmsg("%s is not a relation file.", tablePath)));
+    }
+
+    char pcaFilePath[MAXPGPATH];
+    securec_check(strcpy_s(pcaFilePath, MAXPGPATH, readFileName), "", "");
+    /* change pcd => pca */
+    pcaFilePath[readFileNameLen - 1] = 'a';
+
+    FILE* pcaFile = AllocateFile(pcaFilePath, "rb");
+    if (pcaFile == NULL) {
+        if (errno == ENOENT && missingOk) {
+            FreeFile(fp);
+            return;
+        }
+        ereport(ERROR, (errcode_for_file_access(), errmsg("could not open file \"%s\": %m", pcaFilePath)));
+    }
+
+    uint16 chunkSize = ReadChunkSize(pcaFile, pcaFilePath, MAXPGPATH);
+
+    struct stat pcaStruct;
+    FileStat((char*)pcaFilePath, &pcaStruct);
+
+    size_t pcaFileLen = SIZE_OF_PAGE_COMPRESS_ADDR_FILE(chunkSize);
+    PageCompressHeader* map = pc_mmap_real_size(fileno(pcaFile), pcaFileLen, true);
+    if (map == MAP_FAILED) {
+        ereport(ERROR,
+            (errcode(ERRCODE_INSUFFICIENT_RESOURCES),
+                errmsg("Failed to mmap page compression address file %s: %m", pcaFilePath)));
+    }
+
+    PageCompressHeader* transfer = (PageCompressHeader*)palloc0(pcaFileLen);
+    /* decompressed page buffer, avoid frequent allocation */
+    BlockNumber blockNum = 0;
+    size_t chunkIndex = 1;
+    off_t totalLen = 0;
+    off_t sendLen = 0;
+    /* send the pkg header containing msg like file size */
+    BlockNumber totalBlockNum = (BlockNumber)pg_atomic_read_u32(&map->nblocks);
+
+    /* some chunks may have been allocated but not used.
+     * Reserve 0 chunks for avoiding the error when the size of a compressed block extends */
+    auto reservedChunks = 0;
+    securec_check(memcpy_s(transfer, pcaFileLen, map, pcaFileLen), "", "");
+    decltype(statbuf.st_size) realSize = (map->allocated_chunks + reservedChunks)  * chunkSize;
+    statbuf.st_size = statbuf.st_size >= realSize ? statbuf.st_size : realSize;
+    _tarWriteHeader(tarfilename, NULL, (struct stat*)(&statbuf));
+    bool* onlyExtend = (bool*)palloc0(totalBlockNum * sizeof(bool));
+
+    /* allocated in advance to prevent repeated allocated */
+    ReadBlockChunksStruct rbStruct{map, fp, segmentNo, readFileName};
+    for (blockNum = 0; blockNum < totalBlockNum; blockNum++) {
+        PageCompressAddr* addr = GET_PAGE_COMPRESS_ADDR(transfer, chunkSize, blockNum);
+        /* skip some blocks which only extends. The size of blocks is 0. */
+        if (addr->nchunks == 0) {
+            onlyExtend[blockNum] = true;
+            continue;
+        }
+        /* read block to t_thrd.basebackup_cxt.buf_block */
+        size_t bufferSize = TAR_SEND_SIZE - sendLen;
+        size_t len = ReadAllChunkOfBlock(t_thrd.basebackup_cxt.buf_block + sendLen, bufferSize, blockNum, rbStruct);
+        /* merge Blocks */
+        sendLen += len;
+        if (totalLen + (off_t)len > statbuf.st_size) {
+            ReleaseMap(map, readFileName);
+            ereport(ERROR,
+                (errcode_for_file_access(),
+                    errmsg("some blocks in %s had been changed. Retry backup please. PostBlocks:%u, currentReadBlocks "
+                           ":%u, transferSize: %lu. totalLen: %lu, len: %lu",
+                        readFileName,
+                        totalBlockNum,
+                        blockNum,
+                        statbuf.st_size,
+                        totalLen,
+                        len)));
+        }
+        if (sendLen > TAR_SEND_SIZE - BLCKSZ) {
+            if (pq_putmessage_noblock('d', t_thrd.basebackup_cxt.buf_block, sendLen)) {
+                ReleaseMap(map, readFileName);
+                ereport(ERROR, (errcode_for_file_access(), errmsg("base backup could not send data, aborting backup")));
+            }
+            sendLen = 0;
+        }
+        uint8 nchunks = len / chunkSize;
+        addr->nchunks = addr->allocated_chunks = nchunks;
+        for (size_t i = 0; i < nchunks; i++) {
+            addr->chunknos[i] = chunkIndex++;
+        }
+        addr->checksum = AddrChecksum32(blockNum, addr, chunkSize);
+        totalLen += len;
+    }
+    ReleaseMap(map, readFileName);
+
+    if (sendLen != 0) {
+        if (pq_putmessage_noblock('d', t_thrd.basebackup_cxt.buf_block, sendLen)) {
+            ereport(ERROR, (errcode_for_file_access(), errmsg("base backup could not send data, aborting backup")));
+        }
+    }
+
+    /* If the file was truncated while we were sending it, pad it with zeros */
+    if (totalLen < statbuf.st_size) {
+        securec_check(memset_s(t_thrd.basebackup_cxt.buf_block, TAR_SEND_SIZE, 0, TAR_SEND_SIZE), "", "");
+        while (totalLen < statbuf.st_size) {
+            size_t cnt = Min(TAR_SEND_SIZE, statbuf.st_size - totalLen);
+            (void)pq_putmessage_noblock('d', t_thrd.basebackup_cxt.buf_block, cnt);
+            totalLen += cnt;
+        }
+    }
+
+    size_t pad = ((totalLen + 511) & ~511) - totalLen;
+    if (pad > 0) {
+        securec_check(memset_s(t_thrd.basebackup_cxt.buf_block, pad, 0, pad), "", "");
+        (void)pq_putmessage_noblock('d', t_thrd.basebackup_cxt.buf_block, pad);
+    }
+    SEND_DIR_ADD_SIZE(*size, statbuf);
+
+    // allocate chunks of some pages which only extend
+    for (size_t blockNum = 0; blockNum < totalBlockNum; ++blockNum) {
+        if (onlyExtend[blockNum]) {
+            PageCompressAddr* addr = GET_PAGE_COMPRESS_ADDR(transfer, chunkSize, blockNum);
+            for (size_t i = 0; i < addr->allocated_chunks; i++) {
+                addr->chunknos[i] = chunkIndex++;
+            }
+        }
+    }
+    transfer->nblocks = transfer->last_synced_nblocks = blockNum;
+    transfer->last_synced_allocated_chunks = transfer->allocated_chunks = chunkIndex;
+    TransferPcaFile(pcaFilePath, basePathLen, pcaStruct, transfer, pcaFileLen);
+
+    SEND_DIR_ADD_SIZE(*size, pcaStruct);
+    FreeFile(pcaFile);
+    FreeFile(fp);
+    pfree(transfer);
+    pfree(onlyExtend);
+}
+
 /*
  * Given the member, write the TAR header & send the file.
  *
@@ -1600,42 +2105,15 @@ static bool sendFile(char *readfilename, char *tarfilename, struct stat *statbuf
     int segNo = 0;
     const int MAX_RETRY_LIMIT = 60;
     int retryCnt = 0;
-
-    if (t_thrd.basebackup_cxt.buf_block == NULL) {
-        MemoryContext oldcxt = NULL;
-
-        oldcxt = MemoryContextSwitchTo(THREAD_GET_MEM_CXT_GROUP(MEMORY_CONTEXT_STORAGE));
-        t_thrd.basebackup_cxt.buf_block = (char *)palloc0(TAR_SEND_SIZE);
-        MemoryContextSwitchTo(oldcxt);
-    }
-
-    /*
-     * repalloc to `MaxBuildAllocSize' in one time, to avoid many small step repalloc in `pq_putmessage_noblock'
-     * and low performance.
-     */
-    if (INT2SIZET(t_thrd.libpq_cxt.PqSendBufferSize) < MaxBuildAllocSize) {
-        t_thrd.libpq_cxt.PqSendBuffer = (char *)repalloc(t_thrd.libpq_cxt.PqSendBuffer, MaxBuildAllocSize);
-        t_thrd.libpq_cxt.PqSendBufferSize = MaxBuildAllocSize;
-    }
-
-    /*
-     * Some compilers will throw a warning knowing this test can never be true
-     * because pgoff_t can't exceed the compared maximum on their platform.
-     */
-    if (statbuf->st_size > MAX_TAR_MEMBER_FILELEN) {
-        ereport(WARNING, (errcode(ERRCODE_NAME_TOO_LONG),
-                          errmsg("archive member \"%s\" too large for tar format", tarfilename)));
+    UndoFileType undoFileType = UNDO_INVALID;
+    
+    SendFilePreInit();
+    fp = SizeCheckAndAllocate(readfilename, *statbuf, missing_ok);
+    if (fp == NULL) {
         return false;
     }
 
-    fp = AllocateFile(readfilename, "rb");
-    if (fp == NULL) {
-        if (errno == ENOENT && missing_ok)
-            return false;
-        ereport(ERROR, (errcode_for_file_access(), errmsg("could not open file \"%s\": %m", readfilename)));
-    }
-
-    isNeedCheck = is_row_data_file(readfilename, &segNo);
+    isNeedCheck = is_row_data_file(readfilename, &segNo, &undoFileType);
     ereport(DEBUG1, (errmsg("sendFile, filename is %s, isNeedCheck is %d", readfilename, isNeedCheck)));
 
     /* make sure data file size is integer multiple of BLCKSZ and change statbuf if needed */
@@ -1656,6 +2134,8 @@ static bool sendFile(char *readfilename, char *tarfilename, struct stat *statbuf
             }
         }
         if (g_instance.attr.attr_storage.enableIncrementalCheckpoint && isNeedCheck) {
+            uint32 segSize;
+            GET_SEG_SIZE(undoFileType, segSize);
             /* len and cnt must be integer multiple of BLCKSZ. */
             if (len % BLCKSZ != 0 || cnt % BLCKSZ != 0) {
                 ereport(
@@ -1666,9 +2146,9 @@ static bool sendFile(char *readfilename, char *tarfilename, struct stat *statbuf
                             readfilename, len, cnt)));
             }
             for (check_loc = 0; (unsigned int)(check_loc) < cnt; check_loc += BLCKSZ) {
-                blkno = len / BLCKSZ + check_loc / BLCKSZ + (segNo * ((BlockNumber)RELSEG_SIZE));
+                blkno = len / BLCKSZ + check_loc / BLCKSZ + (segNo * segSize);
                 PageHeader phdr = PageHeader(t_thrd.basebackup_cxt.buf_block + check_loc);
-                if (PageIsNew(phdr)) {
+                if (!CheckPageZeroCases(phdr)) {
                     continue;
                 }
                 checksum = pg_checksum_page(t_thrd.basebackup_cxt.buf_block + check_loc, blkno);
@@ -1684,10 +2164,12 @@ static bool sendFile(char *readfilename, char *tarfilename, struct stat *statbuf
                         pg_usleep(1000000);
                         goto recheck;
                     } else if (cnt > 0 && retryCnt == MAX_RETRY_LIMIT) {
-                        ereport(ERROR, (errcode_for_file_access(),
-                                        errmsg("base backup cheksum failed in file \"%s\"(computed: %d, recorded: %d), "
-                                               "aborting backup",
-                                               readfilename, checksum, phdr->pd_checksum)));
+                        ereport(
+                            ERROR,
+                            (errcode_for_file_access(),
+                             errmsg("base backup cheksum failed in file \"%s\" block %u (computed: %d, recorded: %d), "
+                                    "aborting backup",
+                                    readfilename, blkno, checksum, phdr->pd_checksum)));
                     } else {
                         retryCnt = 0;
                         break;
@@ -1807,6 +2289,25 @@ static void _tarWriteHeader(const char *filename, const char *linktarget, struct
     (void)pq_putmessage_noblock('d', h, BUILD_PATH_LEN);
 }
 
+static XLogRecPtr GetMinArchiveSlotLSN(void)
+{
+    XLogRecPtr minArchSlotPtr = InvalidXLogRecPtr;
+
+    for (int slotno = 0; slotno < g_instance.attr.attr_storage.max_replication_slots; slotno++) {
+        XLogRecPtr restart_lsn;
+        ReplicationSlot *slot = &t_thrd.slot_cxt.ReplicationSlotCtl->replication_slots[slotno];
+        SpinLockAcquire(&slot->mutex);
+        if (slot->in_use == true && slot->archive_config != NULL && slot->archive_config->is_recovery == false) {
+            restart_lsn = slot->data.restart_lsn;
+            if ((!XLByteEQ(restart_lsn, InvalidXLogRecPtr)) &&
+                (XLByteEQ(minArchSlotPtr, InvalidXLogRecPtr) || XLByteLT(restart_lsn, minArchSlotPtr))) {
+                minArchSlotPtr = restart_lsn;
+            }
+        }
+        SpinLockRelease(&slot->mutex);
+    }
+    return minArchSlotPtr;
+}
 void ut_save_xlogloc(const char *xloglocation)
 {
     save_xlogloc(xloglocation);

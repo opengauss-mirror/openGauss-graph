@@ -18,8 +18,6 @@
 #include "knl/knl_variable.h"
 
 #include <ctype.h>
-
-
 #include <pwd.h>
 #include <fcntl.h>
 #include <sys/param.h>
@@ -36,7 +34,8 @@
 #include "postmaster/postmaster.h"
 #include "regex/regex.h"
 #include "replication/walsender.h"
-#include "storage/fd.h"
+#include "storage/smgr/fd.h"
+#include "storage/ipc.h"
 #include "utils/acl.h"
 #include "utils/guc.h"
 #include "utils/lsyscache.h"
@@ -513,11 +512,13 @@ static bool check_hostname(hbaPort* port, const char* hostname)
         return false;
 
     ret = getaddrinfo(port->remote_hostname, NULL, NULL, &gai_result);
-    if (ret != 0)
-        ereport(ERROR,
-            (errcode(ERRCODE_CONNECTION_EXCEPTION),
+    if (ret != 0) {
+        ereport(LOG,
+            (errcode(ERRCODE_CONFIG_FILE_ERROR),
                 errmsg(
                     "could not translate host name \"%s\" to address: %s", port->remote_hostname, gai_strerror(ret))));
+        return false;
+    }
 
     for (gai = gai_result; gai; gai = gai->ai_next) {
         if (gai->ai_addr->sa_family == port->raddr.addr.ss_family) {
@@ -710,6 +711,11 @@ static bool check_same_host_or_net(SockAddr* raddr, IPCompareMethod method)
             return;                                                    \
         }                                                              \
     } while (0);
+
+static void hba_rwlock_cleanup(int code, Datum arg)
+{
+    (void)pthread_rwlock_unlock(&hba_rwlock);
+}
 
 /*
  * Parse one tokenised line from the hba config file and store the result in a
@@ -1029,11 +1035,7 @@ static HbaLine* parse_hba_line(List* line, int line_num)
         unsupauth = "ident";
 #endif
     else if (strcmp(token->string, "peer") == 0)
-#ifdef USE_IDENT
         parsedline->auth_method = uaPeer;
-#else
-        unsupauth = "peer";
-#endif
     else if (strcmp(token->string, "krb5") == 0)
 #ifdef KRB5
         parsedline->auth_method = uaKrb5;
@@ -1338,26 +1340,63 @@ static bool parse_hba_auth_opt(char* name, char* val, HbaLine* hbaline)
     return true;
 }
 
+/* copy strings in HbaLine from "hba parser context"(instance level) to CurrentMemoryContext(session level) */
+static void copy_hba_line(HbaLine* hba)
+{
+    hba->databases = NIL;
+    hba->roles = NIL;
+    hba->hostname = pstrdup(hba->hostname);
+    hba->usermap = pstrdup(hba->usermap);
+    hba->pamservice = pstrdup(hba->pamservice);
+    hba->ldapserver = pstrdup(hba->ldapserver);
+    hba->ldapbinddn = pstrdup(hba->ldapbinddn);
+    hba->ldapbindpasswd = pstrdup(hba->ldapbindpasswd);
+    hba->ldapsearchattribute = pstrdup(hba->ldapsearchattribute);
+    hba->ldapbasedn = pstrdup(hba->ldapbasedn);
+    hba->ldapprefix = pstrdup(hba->ldapprefix);
+    hba->ldapsuffix = pstrdup(hba->ldapsuffix);
+    hba->krb_server_hostname = pstrdup(hba->krb_server_hostname);
+    hba->krb_realm = pstrdup(hba->krb_realm);
+}
+
 static void check_hba_replication(hbaPort* port)
 {
     ListCell* cell = NULL;
     ListCell* line = NULL;
     HbaLine* hba = NULL;
     bool gotRepl = false;
+    int ret;
 
+    hba = (HbaLine*)palloc0(sizeof(HbaLine));
     /* we do not bother local connection with GSS authentification */
     if (IS_AF_UNIX(port->raddr.addr.ss_family)) {
         goto DIRECT_TRUST;
     }
 
     /* get replication method */
-    foreach (line, t_thrd.libpq_cxt.parsed_hba_lines) {
-        hba = (HbaLine*)lfirst(line);
+    ret = pthread_rwlock_rdlock(&hba_rwlock);
+    if (ret != 0) {
+        pfree_ext(hba);
+        ereport(ERROR,
+            (errcode(ERRCODE_CONFIG_FILE_ERROR),
+                errmsg("get hba rwlock failed when check hba replication, return value:%d", ret)));
+    }
+
+    /* hba_rwlock will be released when ereport ERROR or FATAL. */
+    PG_ENSURE_ERROR_CLEANUP(hba_rwlock_cleanup, (Datum)0);
+    foreach (line, g_instance.libpq_cxt.comm_parsed_hba_lines) {
+        /* 
+         * memory copy here will not copy pointer types like List* and char*, 
+         * the char* type in HbaLine will copy to session memctx by copy_hba_line()
+         */
+        errno_t rc = memcpy_s(hba, sizeof(HbaLine), lfirst(line), sizeof(HbaLine));
+        securec_check(rc, "\0", "\0");
+
         foreach (cell, hba->databases) {
             HbaToken* tok = NULL;
             tok = (HbaToken*)lfirst(cell);
             if (token_is_keyword(tok, "replication") && hba->conntype != ctLocal) {
-                if (hba->auth_method != uaGSS) {
+                if (hba->auth_method != uaGSS && !AM_WAL_HADR_SENDER && !AM_WAL_HADR_CN_SENDER) {
                     hba->auth_method = uaTrust;
                 }
                 ereport(LOG,
@@ -1370,13 +1409,15 @@ static void check_hba_replication(hbaPort* port)
         if (gotRepl) {
             break;
         }
-        hba = NULL;
     }
+
+    copy_hba_line(hba);
+    PG_END_ENSURE_ERROR_CLEANUP(hba_rwlock_cleanup, (Datum)0);
+    (void)pthread_rwlock_unlock(&hba_rwlock);
 
 DIRECT_TRUST:
     /* cannot get invalid method, trust as default. */
-    if (hba == NULL) {
-        hba = (HbaLine*)palloc0(sizeof(HbaLine));
+    if (!gotRepl) {
         hba->auth_method = uaTrust;
     }
     port->hba = hba;
@@ -1411,6 +1452,70 @@ bool IsLoopBackAddr(Port* port)
 #define USER_NULL_MASK 0xFFFFFFFF
 /* Max size of username operator system can return */
 #define SYS_USERNAME_MAX 512
+
+static bool IsSysUsernameSameToDB(uid_t uid, const char* dbUserName)
+{
+    errno_t rc = 0;
+    char sysUser[SYS_USERNAME_MAX + 1] = {0};
+    /* get the actual user name according to the user id */
+    errno = 0;
+    struct passwd pwtmp;
+    struct passwd* pw = NULL;
+    const int pwbufsz = sysconf(_SC_GETPW_R_SIZE_MAX);
+    char* pwbuf = (char*)palloc0(pwbufsz);
+    (void)getpwuid_r(uid, &pwtmp, pwbuf, pwbufsz, &pw);
+
+    /* Here we discard pwret, as if any record in passwd found, pw is always a non-NULL value. */
+    if (pw == NULL) {
+        pfree_ext(pwbuf);
+        ereport(ERROR,
+            (errcode(ERRCODE_INVALID_OPERATION),
+                errmsg("could not look up local user ID %ld: %s",
+                    (long)uid, errno ? gs_strerror(errno) : _("user does not exist"))));
+    }
+
+    /* record the system username */
+    rc = strcpy_s(sysUser, SYS_USERNAME_MAX + 1, pw->pw_name);
+    pfree_ext(pwbuf);
+    securec_check(rc, "\0", "\0");
+    if (strcmp(dbUserName, sysUser) == 0) {
+        return true;
+    } else {
+        return false;
+    }
+}
+
+static UserAuth get_default_auth_method(const char* role)
+{
+    int32 storedMethod;
+    UserAuth defaultAuthMethod = uaSHA256;
+    char encryptString[ENCRYPTED_STRING_LENGTH + 1] = {0};
+    errno_t rc;
+
+    storedMethod = get_password_stored_method(role, encryptString, ENCRYPTED_STRING_LENGTH + 1);
+    switch (storedMethod) {
+        case SHA256_PASSWORD:
+            defaultAuthMethod = uaSHA256;
+            break;
+        case COMBINED_PASSWORD:
+            defaultAuthMethod = uaSHA256;
+            break;
+        case SM3_PASSWORD:
+            defaultAuthMethod = uaSM3;
+            break;
+        case MD5_PASSWORD:
+            defaultAuthMethod = uaMD5;
+            break;
+        default:
+            defaultAuthMethod = uaSHA256;
+            break;
+    }
+
+    rc = memset_s(encryptString, ENCRYPTED_STRING_LENGTH + 1, 0, ENCRYPTED_STRING_LENGTH + 1);
+    securec_check(rc, "\0", "\0");
+    return defaultAuthMethod;
+}
+
 /*
  *	Scan the pre-parsed hba file, looking for a match to the port's connection
  *	request.
@@ -1420,12 +1525,33 @@ static void check_hba(hbaPort* port)
     Oid roleid;
     ListCell* line = NULL;
     HbaLine* hba = NULL;
+    bool isUsernameSame = false;
+    bool isMatched = false;
 
     /* Get the target role's OID.  Note we do not error out for bad role. */
     roleid = get_role_oid(port->user_name, true);
 
-    foreach (line, t_thrd.libpq_cxt.parsed_hba_lines) {
-        hba = (HbaLine*)lfirst(line);
+#ifdef USE_IAM
+    bool isIAM = false;
+    if (roleid != InvalidOid) {
+        isIAM = is_role_iamauth(roleid);
+    }
+#endif
+    hba = (HbaLine*)palloc0(sizeof(HbaLine));
+    int ret = pthread_rwlock_rdlock(&hba_rwlock);
+    if (ret != 0) {
+        pfree_ext(hba);
+        ereport(ERROR,
+            (errcode(ERRCODE_CONFIG_FILE_ERROR),
+                errmsg("get hba rwlock failed when check hba config, return value:%d", ret)));
+    }
+
+    /* hba_rwlock will be released when ereport ERROR or FATAL. */
+    PG_ENSURE_ERROR_CLEANUP(hba_rwlock_cleanup, (Datum)0);
+    foreach (line, g_instance.libpq_cxt.comm_parsed_hba_lines) {
+        /* the value of char* types in HbaLine will be copied to session memctx by copy_hba_line() in the end */
+        errno_t rc = memcpy_s(hba, sizeof(HbaLine), lfirst(line), sizeof(HbaLine));
+        securec_check(rc, "\0", "\0");
         /* Check connection type */
         if (hba->conntype == ctLocal) {
             /*
@@ -1433,17 +1559,15 @@ static void check_hba(hbaPort* port)
              * the installation enviroment.
              */
             if (roleid == INITIAL_USER_ID) {
-
-                char sys_user[SYS_USERNAME_MAX + 1];
-                uid_t uid;
-                gid_t gid;
+                uid_t uid = 0;
+                gid_t gid = 0;
                 /* get the user id of the system, where client in */
                 if (getpeereid(port->sock, &uid, &gid) != 0) {
+                    pfree_ext(hba);
                     /* Provide special error message if getpeereid is a stub */
                     ereport(ERROR,
                         (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
                             errmsg("Could not get user information on this platform")));
-                    return;
                 }
 
                 /*
@@ -1452,30 +1576,9 @@ static void check_hba(hbaPort* port)
                  * like tools. (Usually happed when login with -h localhost
                  * or 127.0.0.1)
                  */
-                if ((long)uid == USER_NULL_MASK)
+                if ((long)uid == USER_NULL_MASK) {
                     continue;
-
-                /* get the actual user name according to the user id */
-                errno = 0;
-                struct passwd pwtmp;
-                struct passwd* pw = NULL;
-                const int pwbufsz = sysconf(_SC_GETPW_R_SIZE_MAX);
-                char* pwbuf = (char*)palloc(pwbufsz);
-                (void)getpwuid_r(uid, &pwtmp, pwbuf, pwbufsz, &pw);
-                /* Here we discard pwret, as if any record in passwd found, pw is always a non-NULL value. */
-                if (pw == NULL) {
-                    pfree_ext(pwbuf);
-                    ereport(ERROR,
-                        (errcode(ERRCODE_INVALID_OPERATION),
-                            errmsg("could not look up local user ID %ld: %s",
-                                (long)uid,
-                                errno ? gs_strerror(errno) : _("user does not exist"))));
-                    return;
                 }
-
-                /* record the system username */
-                securec_check(strncpy_s(sys_user, SYS_USERNAME_MAX + 1, pw->pw_name, SYS_USERNAME_MAX), "\0", "\0");
-
                 /*
                  * If the system username equals to the database username, continue
                  * the authorization without checking the usermap. If not, we should
@@ -1483,18 +1586,13 @@ static void check_hba(hbaPort* port)
                  * needed when login in in the non-installation enviroment under the
                  * same system user group.
                  */
-                if (strcmp(port->user_name, sys_user) != 0)
-                    hba->auth_method = uaSHA256;
-                pfree_ext(pwbuf);
-            } else if (hba->auth_method == uaTrust) {
-                /* For non-initdb user, password is always needed */
-                hba->auth_method = uaSHA256;
-                password_info pass_info;
-                if (get_stored_password(port->user_name, &pass_info)) {
-                    if (isSM3(pass_info.shadow_pass)) {
-                        hba->auth_method = uaSM3;
-                    }			        
+                isUsernameSame= IsSysUsernameSameToDB(uid, port->user_name);
+                if (!isUsernameSame && hba->auth_method == uaTrust) {
+                    hba->auth_method = get_default_auth_method(port->user_name);
                 }
+            } else if (hba->auth_method == uaTrust || hba->auth_method == uaPeer) {
+                /* For non-initdb user, password is always needed */
+                hba->auth_method = get_default_auth_method(port->user_name);
             }
 
             if (!IS_AF_UNIX(port->raddr.addr.ss_family))
@@ -1503,7 +1601,7 @@ static void check_hba(hbaPort* port)
             if (IS_AF_UNIX(port->raddr.addr.ss_family))
                 continue;
 
-                /* Check SSL state */
+            /* Check SSL state */
 #ifdef USE_SSL
             if (port->ssl != NULL) {
                 /* Connection is SSL, match both "host" and "hostssl" */
@@ -1569,7 +1667,7 @@ static void check_hba(hbaPort* port)
                     /* exception 1, just pass */
                 } else if (IsLoopBackAddr(port)) {
                     /* exception 2, for local loop back connections, hba->remote_trust should be false */
-                    hba->auth_method = uaSHA256;
+                    hba->auth_method = get_default_auth_method(port->user_name);
                     hba->remoteTrust = false;
                 } else if (roleid != INITIAL_USER_ID && IS_PGXC_COORDINATOR && is_cluster_internal_connection(port)) {
                     /*
@@ -1579,10 +1677,11 @@ static void check_hba(hbaPort* port)
                      * Nevertheless, this should not be a serious problem, because periodically
                      * local cm_agent connections will soon populate node information in shared memory.
                      */
-                    hba->auth_method = uaSHA256;
+                    hba->auth_method = get_default_auth_method(port->user_name);
                     hba->remoteTrust = false;
                 } else {
                     ConnAuthMethodCorrect = false;
+                    pfree_ext(hba);
                     ereport(FATAL,
                         (errcode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION),
                             errmsg("Forbid remote connection with trust method!")));
@@ -1590,33 +1689,30 @@ static void check_hba(hbaPort* port)
             }
         }
 
-        /*
-         * Change the inner auth method to IAM when using iam role with SHA256 or MD5
-         * to avoid confict.
-         */
-        if (InvalidOid != roleid && is_role_iamauth(roleid) &&
-            (hba->auth_method == uaSHA256 || hba->auth_method == uaMD5)) {
+#ifdef USE_IAM
+        /* Change the inner auth method to IAM when using iam role with SHA256/MD5/SM3 to avoid confict. */
+        if (isIAM && (hba->auth_method == uaSHA256 || hba->auth_method == uaMD5 || hba->auth_method == uaSM3)) {
             hba->auth_method = uaIAM;
         }
-
+#endif
 #if defined(ENABLE_GSS) || defined(ENABLE_SSPI)
-        /*
-         * for non-initial user, krb authentication is not allowed, sha256 req will be processed
-         */
-        if (hba->auth_method == uaGSS && 
-            GetRoleOid(port->user_name) != INITIAL_USER_ID && IsConnFromApp()) {
-            hba->auth_method = uaSHA256;
+        /* For non-initial user, krb authentication is not allowed, sha256 req will be processed. */
+        if (hba->auth_method == uaGSS && roleid != INITIAL_USER_ID && IsConnFromApp()) {
+            hba->auth_method = get_default_auth_method(port->user_name);
         }
 #endif
-
-        port->hba = hba;
-        return;
+        isMatched = true;
+        break;
     }
 
     /* If no matching entry was found, then implicitly reject. */
-    hba = (HbaLine*)palloc0(sizeof(HbaLine));
-    hba->auth_method = uaImplicitReject;
+    if (!isMatched) {
+        hba->auth_method = uaImplicitReject;
+    }
+    copy_hba_line(hba);
     port->hba = hba;
+    PG_END_ENSURE_ERROR_CLEANUP(hba_rwlock_cleanup, (Datum)0);
+    (void)pthread_rwlock_unlock(&hba_rwlock);
 }
 
 /*
@@ -1654,11 +1750,12 @@ bool load_hba(void)
     (void)FreeFile(file);
 
     /* Now parse all the lines */
-    hbacxt = AllocSetContextCreate(t_thrd.top_mem_cxt,
+    hbacxt = AllocSetContextCreate(g_instance.instance_context,
         "hba parser context",
         ALLOCSET_DEFAULT_MINSIZE,
-        ALLOCSET_DEFAULT_MINSIZE,
-        ALLOCSET_DEFAULT_MAXSIZE);
+        ALLOCSET_DEFAULT_INITSIZE,
+        ALLOCSET_DEFAULT_MAXSIZE,
+        SHARED_CONTEXT);
     oldcxt = MemoryContextSwitchTo(hbacxt);
     forboth(line, hba_lines, line_num, hba_line_nums)
     {
@@ -1707,18 +1804,57 @@ bool load_hba(void)
         return false;
     }
 
-    /* Loaded new file successfully, replace the one we use */
-    if (t_thrd.libpq_cxt.parsed_hba_context != NULL)
-        MemoryContextDelete(t_thrd.libpq_cxt.parsed_hba_context);
-    t_thrd.libpq_cxt.parsed_hba_context = hbacxt;
-
-    // copy to communication thread
-    if (t_thrd.proc_cxt.MyProcPid == PostmasterPid) {
+    /* Any ERROR will become PANIC errors when holding rwlock of hba_rwlock. */
+    int ret = pthread_rwlock_wrlock(&hba_rwlock);
+    if (ret == 0) {
+        /* hba_rwlock will be released when ereport ERROR or FATAL. */
+        PG_ENSURE_ERROR_CLEANUP(hba_rwlock_cleanup, (Datum)0);
+        /* Loaded new file successfully, replace the one we use */
+        if (g_instance.libpq_cxt.parsed_hba_context != NULL) {
+            MemoryContextDelete(g_instance.libpq_cxt.parsed_hba_context);
+        }
+        g_instance.libpq_cxt.parsed_hba_context = hbacxt;
         g_instance.libpq_cxt.comm_parsed_hba_lines = new_parsed_lines;
+        PG_END_ENSURE_ERROR_CLEANUP(hba_rwlock_cleanup, (Datum)0);
+        (void)pthread_rwlock_unlock(&hba_rwlock);
+        check_old_hba(false);
+        return true;
+    } else {
+        MemoryContextDelete(hbacxt);
+        ereport(WARNING,
+            (errcode(ERRCODE_CONFIG_FILE_ERROR),
+                errmsg("get hba rwlock failed when load hba config, return value:%d", ret)));
+        return false;
     }
-    t_thrd.libpq_cxt.parsed_hba_lines = new_parsed_lines;
+}
 
-    return true;
+void check_old_hba(bool need_old_hba)
+{
+    struct stat st;
+    char path[MAXPGPATH];
+    int nRet = snprintf_s(path, MAXPGPATH, MAXPGPATH - 1, "%s/pg_hba.conf.old",
+        g_instance.attr.attr_common.data_directory);
+    securec_check_ss_c(nRet, "", "");
+
+    if (stat(path, &st) != 0) {
+        ereport(DEBUG5,
+            (errcode_for_file_access(),
+                errmsg("file does not exists \"%s\"", path)));
+        return;
+    }
+    if (need_old_hba) {
+        if (rename(path, g_instance.attr.attr_common.HbaFileName)) {
+        ereport(LOG,
+            (errcode_for_file_access(),
+                errmsg("failed to rename file \"%s\": %m", path)));
+        }
+    } else {
+        if (unlink(path)) {
+            ereport(LOG,
+                (errcode_for_file_access(),
+                    errmsg("failed to remove file \"%s\": %m", path)));
+        }
+    }
 }
 
 /*
@@ -1910,7 +2046,7 @@ static void parse_ident_usermap(List* line, int line_number, const char* usermap
  *	Scan the (pre-parsed) ident usermap file line by line, looking for a match
  *
  *	See if the user with ident username "auth_user" is allowed to act
- *	as Postgres user "pg_role" according to usermap "usermap_name".
+ *	as openGauss user "pg_role" according to usermap "usermap_name".
  *
  *	Special case: Usermap NULL, equivalent to what was previously called
  *	"sameuser" or "samerole", means don't look in the usermap file.
@@ -2014,7 +2150,7 @@ void hba_getauthmethod(hbaPort* port)
 #ifdef ENABLE_MULTIPLE_NODES
     if (IsDSorHaWalSender() ) {
 #else        
-    if (IsDSorHaWalSender() && is_node_internal_connection(port)) {
+    if (IsDSorHaWalSender() && (is_node_internal_connection(port) || AM_WAL_HADR_SENDER)) {
 #endif        
         check_hba_replication(port);
     } else {
@@ -2054,11 +2190,16 @@ bool is_node_internal_connection(hbaPort* port)
         return true;
     }
 
-    for (int i = 1; i < MAX_REPLNODE_NUM; i++) {
-        if (u_sess->attr.attr_storage.ReplConnInfoArr[i] && *(u_sess->attr.attr_storage.ReplConnInfoArr[i]) != '\0' &&
-            strcasestr(u_sess->attr.attr_storage.ReplConnInfoArr[i], remote_host) != NULL) {
-            ereport(DEBUG2, (errmsg("remote host is:%s in replconninfo %s",
-                remote_host, u_sess->attr.attr_storage.ReplConnInfoArr[1])));
+    for (int i = 1; i < DOUBLE_MAX_REPLNODE_NUM; i++) {
+        char *replconninfo = NULL;
+        if (i >= MAX_REPLNODE_NUM) {
+            replconninfo = u_sess->attr.attr_storage.CrossClusterReplConnInfoArr[i - MAX_REPLNODE_NUM];
+        } else {
+            replconninfo = u_sess->attr.attr_storage.ReplConnInfoArr[i];
+        }
+        if (replconninfo && *replconninfo != '\0' && (strcasestr(replconninfo, remote_host) != NULL ||
+            strcasestr(replconninfo, port->remote_host) != NULL)) {
+            ereport(DEBUG2, (errmsg("remote host is:%s in replconninfo %s", remote_host, replconninfo)));
             return true;
         }
     }
@@ -2150,6 +2291,8 @@ bool is_cluster_internal_IP(sockaddr peer_addr)
     sockaddr_in* pSin = (sockaddr_in*)&peer_addr;
     const int MAX_IP_ADDRESS_LEN = 64;
     char ipstr[MAX_IP_ADDRESS_LEN] = {'\0'};
+    bool isInternalIP = false;
+
     inet_ntop(AF_INET, &pSin->sin_addr, ipstr, MAX_IP_ADDRESS_LEN - 1);
     if (strcmp(ipstr, "127.0.0.1") == 0 || strcmp(ipstr, "localhost") == 0)
         return true;
@@ -2174,22 +2317,32 @@ bool is_cluster_internal_IP(sockaddr peer_addr)
     ListCell* line = NULL;
     HbaLine* hba = NULL;
 
-    (void)pthread_rwlock_rdlock(&hba_rwlock);
+    int ret = pthread_rwlock_rdlock(&hba_rwlock);
+    if (ret != 0) {
+        ereport(LOG,
+            (errcode(ERRCODE_CONFIG_FILE_ERROR),
+                errmsg("get hba rwlock failed when check cluster internal ip, return value:%d", ret)));
+        free(raddr);
+        return false;
+    }
+
+    /* hba_rwlock will be released when ereport ERROR or FATAL. */
+    PG_ENSURE_ERROR_CLEANUP(hba_rwlock_cleanup, (Datum)0);
     foreach (line, g_instance.libpq_cxt.comm_parsed_hba_lines) {
         hba = (HbaLine*)lfirst(line);
-
         /* check connection type */
         if (hba->auth_method == uaTrust || hba->auth_method == uaGSS) {
             if (check_ip(raddr, (struct sockaddr*)&hba->addr, (struct sockaddr*)&hba->mask)) {
-                (void)pthread_rwlock_unlock(&hba_rwlock);
-                free(raddr);
-                return true;
+                isInternalIP = true;
+                break;
             }
         }
     }
+
+    PG_END_ENSURE_ERROR_CLEANUP(hba_rwlock_cleanup, (Datum)0);
     (void)pthread_rwlock_unlock(&hba_rwlock);
     free(raddr);
-    return false;
+    return isInternalIP;
 }
 
 /* Check whether the ip is configured in pg_hba.conf */
@@ -2200,6 +2353,7 @@ bool check_ip_whitelist(hbaPort* port, char* ip, unsigned int ip_len)
     const SockAddr local_addr = port->laddr;
     char remote_host[NI_MAXHOST];
     char local_host[NI_MAXHOST];
+    bool isWhitelistIP = false;
 
     remote_host[0] = '\0';
     local_host[0] = '\0';
@@ -2220,29 +2374,30 @@ bool check_ip_whitelist(hbaPort* port, char* ip, unsigned int ip_len)
         return true;
     }
 
-    int load_hba_cnt = 0;
-    while (!load_hba()) {
-        load_hba_cnt++;
-        pg_usleep(200000L); /* sleep 200ms for reload */
-        if (load_hba_cnt >= 3) {
-            /*
-             * It makes no sense to continue if we fail to load the HBA file,
-             * since there is no way to connect to the database in this case.
-             */
-            ereport(FATAL, (errmsg("could not load pg_hba.conf")));
-        }
-    }
-
     ListCell* line = NULL;
     HbaLine* hba = NULL;
-    foreach (line, t_thrd.libpq_cxt.parsed_hba_lines) {
+    int ret = pthread_rwlock_rdlock(&hba_rwlock);
+    if (ret != 0) {
+        ereport(LOG,
+            (errcode(ERRCODE_CONFIG_FILE_ERROR),
+                errmsg("get hba rwlock failed when check ip whitelist, return value:%d", ret)));
+        return false;
+    }
+
+    /* hba_rwlock will be released when ereport ERROR or FATAL. */
+    PG_ENSURE_ERROR_CLEANUP(hba_rwlock_cleanup, (Datum)0);
+    foreach (line, g_instance.libpq_cxt.comm_parsed_hba_lines) {
         hba = (HbaLine*)lfirst(line);
         if (hba->auth_method != uaReject) {
             if (check_ip(&port->raddr, (struct sockaddr*)&hba->addr, (struct sockaddr*)&hba->mask)) {
-                return true;
+                isWhitelistIP = true;
+                break;
             }
         }
     }
 
-    return false;
+    PG_END_ENSURE_ERROR_CLEANUP(hba_rwlock_cleanup, (Datum)0);
+    (void)pthread_rwlock_unlock(&hba_rwlock);
+    return isWhitelistIP;
 }
+

@@ -1,7 +1,7 @@
 /* -------------------------------------------------------------------------
  *
  * genam.h
- *	  POSTGRES generalized index access method definitions.
+ *	  openGauss generalized index access method definitions.
  *
  *
  * Portions Copyright (c) 2020 Huawei Technologies Co.,Ltd.
@@ -21,8 +21,9 @@
 #include "storage/lock/lock.h"
 #include "utils/relcache.h"
 #include "utils/snapshot.h"
+#include "utils/oidrbtree.h"
 #include "vecexecutor/vectorbatch.h"
-
+#include "access/ustore/knl_utuple.h"
 
 /*
  * Struct for statistics returned by ambuild
@@ -48,6 +49,7 @@ typedef struct IndexVacuumInfo {
     int message_level;             /* ereport level for progress messages */
     double num_heap_tuples;        /* tuples remaining in heap */
     BufferAccessStrategy strategy; /* access strategy for reads */
+    OidRBTree *invisibleParts;     /* used for Ustore GPI */
 } IndexVacuumInfo;
 
 /*
@@ -78,7 +80,7 @@ typedef struct IndexBulkDeleteResult {
 } IndexBulkDeleteResult;
 
 /* Typedef for callback function to determine if a tuple is bulk-deletable */
-typedef bool (*IndexBulkDeleteCallback)(ItemPointer itemptr, void* state, Oid partOid);
+typedef bool (*IndexBulkDeleteCallback)(ItemPointer itemptr, void* state, Oid partOid, int2 bktId);
 
 /* struct definitions appear in relscan.h */
 typedef struct IndexScanDescData* IndexScanDesc;
@@ -89,7 +91,7 @@ struct ScanState;
  * Enumeration specifying the type of uniqueness check to perform in
  * index_insert().
  *
- * UNIQUE_CHECK_YES is the traditional Postgres immediate check, possibly
+ * UNIQUE_CHECK_YES is the traditional openGauss immediate check, possibly
  * blocking to see if a conflicting transaction commits.
  *
  * For deferrable unique constraints, UNIQUE_CHECK_PARTIAL is specified at
@@ -106,11 +108,14 @@ struct ScanState;
  * check for conflicting live tuples (possibly blocking).
  */
 typedef enum IndexUniqueCheck {
-    UNIQUE_CHECK_NO,      /* Don't do any uniqueness checking */
-    UNIQUE_CHECK_YES,     /* Enforce uniqueness at insertion time */
-    UNIQUE_CHECK_PARTIAL, /* Test uniqueness, but no error */
-    UNIQUE_CHECK_EXISTING /* Check if existing tuple is unique */
+    UNIQUE_CHECK_NO,            /* Don't do any uniqueness checking */
+    UNIQUE_CHECK_YES,           /* Enforce uniqueness at insertion time */
+    UNIQUE_CHECK_PARTIAL,       /* Test uniqueness, but no error */
+    UNIQUE_CHECK_EXISTING,      /* Check if existing tuple is unique */
+    UNIQUE_CHECK_UPSERT         /* Test uniqueness, but no error and no insertion when a conflict is found */
 } IndexUniqueCheck;
+
+#define IndexUniqueCheckNoError(unique) ((unique) == UNIQUE_CHECK_PARTIAL || (unique) == UNIQUE_CHECK_UPSERT)
 
 /*
  * generalized index_ interface routines (in indexam.c)
@@ -125,6 +130,7 @@ typedef enum IndexUniqueCheck {
 extern Relation index_open(Oid relationId, LOCKMODE lockmode, int2 bucketId=-1);
 extern void index_close(Relation relation, LOCKMODE lockmode);
 
+extern void index_delete(Relation index_relation, Datum* values, const bool* isnull, ItemPointer heap_t_ctid);
 extern bool index_insert(Relation indexRelation, Datum* values, const bool* isnull, ItemPointer heap_t_ctid,
     Relation heapRelation, IndexUniqueCheck checkUnique);
 
@@ -136,8 +142,15 @@ extern void index_endscan(IndexScanDesc scan);
 extern void index_markpos(IndexScanDesc scan);
 extern void index_restrpos(IndexScanDesc scan);
 extern ItemPointer index_getnext_tid(IndexScanDesc scan, ScanDirection direction);
-extern HeapTuple index_fetch_heap(IndexScanDesc scan);
-extern HeapTuple index_getnext(IndexScanDesc scan, ScanDirection direction);
+extern Tuple IndexFetchTuple(IndexScanDesc scan);
+extern bool IndexFetchSlot(IndexScanDesc scan, TupleTableSlot *slot, bool isUHeap);
+extern Tuple index_getnext(IndexScanDesc scan, ScanDirection direction);
+extern bool IndexFetchUHeap(IndexScanDesc scan, TupleTableSlot *slot);
+extern UHeapTuple UHeapamIndexFetchTuple(IndexScanDesc scan, bool *all_dead);
+extern bool UHeapamIndexFetchTupleInSlot(IndexScanDesc scan, ItemPointer tid, Snapshot snapshot,
+                                        TupleTableSlot *slot, bool *callAgain, bool *allDead);
+extern bool UHeapSysIndexGetnextSlot(SysScanDesc scan, ScanDirection direction, TupleTableSlot *slot);
+extern bool IndexGetnextSlot(IndexScanDesc scan, ScanDirection direction, TupleTableSlot *slot);
 extern int64 index_getbitmap(IndexScanDesc scan, TIDBitmap* bitmap);
 extern int64 index_column_getbitmap(IndexScanDesc scandesc, const void* sort, VectorBatch* tids);
 
@@ -174,15 +187,32 @@ HeapTuple systable_getnext_back(SysScanDesc sysscan);
  * global partition index access method support routines (in genam.c)
  */
 typedef struct GPIScanDescData {
-    HTAB* fakeRelationTable;     /* fake partition relation and partition hash table */
-    Bitmapset* invisiblePartMap; /* cache invisible partition oid in GPI */
-    Relation parentRelation;     /* parent relation of partition */
-    Relation fakePartRelation;   /* fake-relation using partition */
-    Partition partition;         /* partition use to fake partition rel */
-    Oid currPartOid;             /* current partition oid in GPI */
+    HTAB* fakeRelationTable;                /* fake partition relation and partition hash table */
+    OidRBTree* invisiblePartTree;           /* cache invisible partition oid in GPI */
+    OidRBTree* invisiblePartTreeForVacuum;  /* only _bt_check_unique() may use it
+                                             * to determine the index tuple
+                                             * can be marked as dead
+                                             */
+    Relation parentRelation;                /* parent relation of partition */
+    Relation fakePartRelation;              /* fake-relation using partition */
+    Partition partition;                    /* partition use to fake partition rel */
+    Oid currPartOid;                        /* current partition oid in GPI */
 } GPIScanDescData;
 
 typedef GPIScanDescData* GPIScanDesc;
+
+/*
+ * global bucket index access method support routines (in genam.c)
+ */
+typedef struct CBIScanDescData {
+    HTAB* fakeRelationTable;     /* fake bucket relation and bucket hash table */
+    Relation parentRelation;     /* parent relation of bucket */
+    Relation fakeBucketRelation; /* fake-relation using bucket */
+    Partition partition;         /* partition use to fake partition rel */
+    int2 bucketid;               /* current bucket id in GPI */
+    int2 mergingBktId;           /* current bucket id of partition merge process */
+} CBIScanDescData;
+typedef CBIScanDescData* CBIScanDesc;
 
 /* Check input partition oid is same as global-partition-index current work partition oid */
 inline bool GPIScanCheckPartOid(GPIScanDesc gpiScan, Oid currScanPartOid)
@@ -198,5 +228,17 @@ extern void GPIScanEnd(GPIScanDesc gpiScan);
 extern bool GPIGetNextPartRelation(GPIScanDesc gpiScan, MemoryContext cxt, LOCKMODE lmode);
 extern void GPISetCurrPartOid(GPIScanDesc gpiScan, Oid partOid);
 extern Oid GPIGetCurrPartOid(const GPIScanDesc gpiScan);
+extern void cbi_scan_init(CBIScanDesc* cbiScan);
+extern void cbi_scan_end(CBIScanDesc cbiScan);
+extern int2 cbi_get_current_bucketid(const CBIScanDesc cbiScan);
+bool cbi_get_bucket_relation(CBIScanDesc cbiScan, MemoryContext cxt);
+extern void cbi_set_bucketid(CBIScanDesc cbiScan, int2 butcketid);
+inline bool cbi_scan_need_change_bucket(CBIScanDesc cbiscan, int2 bucketid)
+{
+    if (!PointerIsValid(cbiscan)) {
+        return false;
+    }
+    return (cbiscan->bucketid != bucketid);
+}
 
 #endif /* GENAM_H */

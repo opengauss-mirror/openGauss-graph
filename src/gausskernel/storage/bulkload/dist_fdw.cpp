@@ -5,6 +5,7 @@
  *
  * Portions Copyright (c) 2020 Huawei Technologies Co.,Ltd.
  * Copyright (c) 2010-2011, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2021, openGauss Contributors
  *
  * IDENTIFICATION
  *		  src/gausskernel/storage/bulkload/dist_fdw.cpp
@@ -223,8 +224,10 @@ extern void SetFixedAlignment(TupleDesc tupDesc, Relation rel, FixFormatter *for
 extern void VerifyEncoding(int encoding);
 extern void GetDistImportOptions(Oid relOid, DistImportPlanState *planstate, ForeignOptions *fOptions = NULL);
 
+#ifndef ENABLE_LITE_MODE
 static void assignOBSTaskToDataNode(List *urllist, List **totalTask, List *dnNames, DistImportPlanState *planstate,
                                     int64 *fileNum = NULL);
+#endif
 static void assignTaskToDataNodeInSharedMode(List *urllist, List **totalTask, List *dnNames);
 static void assignTaskToDataNodeInNormalMode(List *urllist, List **totalTask, List *dnNames, int dop);
 
@@ -234,6 +237,7 @@ extern BlockNumber getPageCountForFt(void *additionalData);
 
 List *getOBSFileList(List *urllist, bool encrypt, const char *access_key, const char *secret_access_key,
                      bool isAnalyze);
+#ifndef ENABLE_LITE_MODE
 /*
  * In OBS parallel data loading case, we may have # of datanodes not
  * equal to # of objects, as one object can only be assign to one
@@ -241,6 +245,7 @@ List *getOBSFileList(List *urllist, bool encrypt, const char *access_key, const 
  * handlers basing on num_processed
  */
 static void assignOBSFileToDataNode(List *urllist, List **totalTask, List *dnNames);
+#endif
 
 /*
  * Foreign-data wrapper handler function: return a struct with pointers
@@ -428,6 +433,7 @@ static bool distAnalyzeForeignTable(Relation relation, AcquireSampleRowsFunc *fu
     return true;
 }
 
+#ifndef ENABLE_LITE_MODE
 /**
  * @Description: Scheduler file for dist obs foreign table.
  * @in foreignTableId, the given foreign table Oid.
@@ -478,6 +484,7 @@ List *CNSchedulingForDistOBSFt(Oid foreignTableId)
     }
     return totalTask;
 }
+#endif
 
 /**
  * @Description: Build the related scanState information.
@@ -679,6 +686,7 @@ static int distAcquireSampleRows(Relation relation, int logLevel, HeapTuple *sam
         MemoryContextDelete(tupleContext);
         pfree(scanTupleSlot->tts_values);
         pfree(scanTupleSlot->tts_isnull);
+        pfree_ext(scanTupleSlot->tts_lobPointers);
         ForeignScan *fscan = (ForeignScan *)scanState->ss.ps.plan;
         List *workList = (List *)(((DefElem *)linitial(fscan->fdw_private))->arg);
         list_free(workList);
@@ -1057,6 +1065,7 @@ List *assignFileSegmentList(List *segmentlist, List *dnNames)
     return totalTask;
 }
 
+#ifndef ENABLE_LITE_MODE
 /*
  * @Description: get all matched files in obs for each url
  * @IN urllist: obs url list
@@ -1186,6 +1195,7 @@ static void assignOBSTaskToDataNode(List *urllist, List **totalTask, List *dnNam
 
     pfree(obs_file_list);
 }
+#endif
 
 /*
  * @Description: assign task to each data node in shared mode
@@ -1303,9 +1313,13 @@ List *assignTaskToDataNode(List *urllist, ImportMode mode, List *nodeList, int d
     /* check it is obs source */
     const char *first_url = strVal(lfirst(list_head(urllist)));
     if (is_obs_protocol(first_url)) {
+#ifndef ENABLE_LITE_MODE
         assignOBSTaskToDataNode(urllist, &totalTask, dnNames, planstate, fileNum);
         list_free(dnNames);
         return totalTask;
+#else
+        FEATURE_ON_LITE_MODE_NOT_SUPPORTED();
+#endif
     }
 
     if (IS_SHARED_MODE(mode)) {
@@ -1488,6 +1502,7 @@ void InitDistImport(DistImportExecutionState *importstate, Relation rel, const c
 
     /* Set up variables to avoid per-attribute overhead. */
     initStringInfo(&importstate->attribute_buf);
+    initStringInfo(&importstate->sequence_buf);
     initStringInfo(&importstate->line_buf);
     importstate->line_buf_converted = false;
     importstate->raw_buf = (char *)palloc(RAW_BUF_SIZE + 1);
@@ -1833,7 +1848,7 @@ static char *distExportNextFileName(const char *abspath, const char *relname, co
     errno_t rc = EOK;
     uint32 segno = t_thrd.bulk_cxt.distExportNextSegNo++;
     Assert(t_thrd.bulk_cxt.distExportCurrXid != 0);
-    rc = snprintf_s(temp, MAX_PATH_LEN, MAX_PATH_LEN - 1, "%s%s_%lu_%s_%d.%s", abspath, relname,
+    rc = snprintf_s(temp, MAX_PATH_LEN, MAX_PATH_LEN - 1, "%s%s_%lu_%s_%u.%s", abspath, relname,
                     t_thrd.bulk_cxt.distExportCurrXid, t_thrd.bulk_cxt.distExportTimestampStr, segno, suffix);
     securec_check_ss(rc, "\0", "\0");
 

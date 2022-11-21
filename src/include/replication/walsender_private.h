@@ -53,12 +53,17 @@ typedef struct LogCtrlData {
     int64 sleep_count_limit;
     XLogRecPtr prev_flush;
     XLogRecPtr prev_apply;
+    XLogRecPtr local_prev_flush;
+    TimestampTz prev_send_time;
     TimestampTz prev_reply_time;
-    uint64 pre_rate1;
-    uint64 pre_rate2;
+    TimestampTz prev_calculate_time;    /* Controls the flush_rate and apply_rate calculation interval. */
+    uint64 flush_rate;                  /* Recent average flush speed << SHIFT_SPEED. */
+    uint64 apply_rate;                  /* Recent average apply speed << SHIFT_SPEED. */
+    uint64 period_total_flush;          /* Flush amount in a calculation period */
+    uint64 period_total_apply;          /* Apply amount in a calculation period */
+    uint64 local_flush_rate;            /* Local log generation speed << SHIFT_SPEED. */
     int64 prev_RPO;
     int64 current_RPO;
-    bool just_keep_alive;
 } LogCtrlData;
 
 /*
@@ -76,6 +81,8 @@ typedef struct WalSnd {
                                   * reloaded? */
     bool sendKeepalive;          /* do we send keepalives on this connection? */
     bool replSender;             /* is the walsender a normal replication or building */
+    bool is_cross_cluster;       /* is the walsender from another cluster? */
+    bool isTermChanged;          /* is the term changed? used in streaming dr cluster */
 
     ServerMode peer_role;
     DbState peer_state;
@@ -88,6 +95,8 @@ typedef struct WalSnd {
     XLogRecPtr write;
     XLogRecPtr flush;
     XLogRecPtr apply;
+    /* record standby reply message reply.replyFlags */
+    uint32 replyFlags;
 
     /* if valid means all the required replication data already flushed on the standby */
     XLogRecPtr data_flush;
@@ -109,29 +118,18 @@ typedef struct WalSnd {
     Latch latch;
 
     /*
-     * The priority order of the standby managed by this WALSender, as listed
-     * in synchronous_standby_names, or 0 if not-listed. Protected by
-     * SyncRepLock.
+     * The strategy group and priority order of the standby managed by this WALSender,
+     * as listed in synchronous_standby_names, or 0 if not-listed. 
+     * Protected by SyncRepLock.
      */
+    uint8 sync_standby_group;
     int sync_standby_priority;
     int index;
-    XLogRecPtr arch_task_lsn;
-    int archive_obs_subterm;
     LogCtrlData log_ctrl;
-    unsigned int archive_flag;
-    Latch* arch_latch;
-    bool is_start_archive;
-    unsigned int standby_archive_flag;
-    XLogRecPtr archive_target_lsn;
-    XLogRecPtr arch_task_last_lsn;
-    bool arch_finish_result;
 
-    /* 
-     * has_sent_arch_lsn indicates whether the walsnd has sent the archive location,
-     * and last_send_time is used to record the time when the archive location is sent last time.
-     */
-    bool has_sent_arch_lsn;
-    long last_send_lsn_time;
+    slock_t mutex_archive_task_list;
+    List* archive_task_list;
+    unsigned int archive_task_count;
 
     /* 
      * lastCalTime is last time calculating catchupRate, and lastCalWrite
@@ -143,6 +141,9 @@ typedef struct WalSnd {
      * Time needed for synchronous per xlog while catching up.
      */
     double catchupRate;
+    /* Whether the interaction between the active and standby clusters of the streaming disaster recovery switchover is complete */
+    bool isInteractionCompleted;
+    TimestampTz lastRequestTimestamp;
 } WalSnd;
 
 extern THR_LOCAL WalSnd* MyWalSnd;
@@ -160,6 +161,18 @@ typedef struct WalSndCtlData {
      * waitLSN that follows this value. Protected by SyncRepLock.
      */
     XLogRecPtr lsn[NUM_SYNC_REP_WAIT_MODE];
+
+    /*
+    * Paxos replication queue.
+    * Protected by SyncRepLock.
+    */
+    SHM_QUEUE       SyncPaxosQueue;
+
+    /*
+    * Current location of the head of the queue. All waiters should have a
+    * waitLSN that follows this value. Protected by SyncPaxosLock.
+    */
+    XLogRecPtr      paxosLsn;
 
     /*
      * Are any sync standbys defined?  Waiting backends can't reload the
@@ -181,6 +194,8 @@ typedef struct WalSndCtlData {
      * mode.
      */
     bool sync_master_standalone;
+    TimestampTz keep_sync_window_start;
+    bool out_keep_sync_window;
 
     /*
      * The demotion of postmaster  Also indicates that all the walsenders

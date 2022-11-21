@@ -305,5 +305,7 @@ extern Datum pg_timezone_names(PG_FUNCTION_ARGS);
 extern Interval *char_to_interval(char *str, int32 typmod);
 #endif // !FRONTEND_PARSER
 
+
+
 #endif /* DATETIME_H */
 

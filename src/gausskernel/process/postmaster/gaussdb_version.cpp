@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2020 Huawei Technologies Co.,Ltd.
+ * Portions Copyright (c) 2021, openGauss Contributors
  *
  * openGauss is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
@@ -878,8 +879,19 @@ int parse_gaussdb_version_file(gaussdb_version* version_info, const char* filena
     char* gausshome = gs_getenv_r("GAUSSHOME");
     /* first, we will get GAUSSHOME path */
     if (gausshome != NULL) {
-        check_backend_env(gausshome);
-        rc = sprintf_s(filepath, sizeof(filepath), "%s/bin/%s", gausshome, filename);
+        char real_gausshome[PATH_MAX + 1] = {'\0'};
+        if (realpath(gausshome, real_gausshome) == NULL) {
+            ereport(WARNING,
+                (errmodule(MOD_EXECUTOR), errcode(ERRCODE_EXTERNAL_ROUTINE_INVOCATION_EXCEPTION),
+                errmsg("Failed to obtain environment value $GAUSSHOME!"),
+                errdetail("N/A"),
+                errcause("Incorrect environment value."),
+                erraction("Please refer to backend log for more details.")));
+            goto error;
+        }
+        gausshome = NULL;
+        check_backend_env(real_gausshome);
+        rc = sprintf_s(filepath, sizeof(filepath), "%s/bin/%s", real_gausshome, filename);
         if (rc == -1) {
             ereport(WARNING, (errmsg("failed to call secure function.")));
             goto error;
@@ -957,7 +969,8 @@ int parse_gaussdb_version_file(gaussdb_version* version_info, const char* filena
 
     /* deserialization from configuration file */
     header = (version_header*)palloc(sizeof(version_header));
-    if (memcpy_s(header, sizeof(version_header), file_content, sizeof(version_header)) != 0) {
+    if (sizeof(version_header) > (size_t)file_size 
+        || memcpy_s(header, sizeof(version_header), file_content, sizeof(version_header)) != 0) {
         goto error;
     }
 

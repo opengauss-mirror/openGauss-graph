@@ -2,6 +2,7 @@
  * Portions Copyright (c) 2020 Huawei Technologies Co.,Ltd.
  * Portions Copyright (c) 1996-2013, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
+ * Portions Copyright (c) 2021, openGauss Contributors
  *
  * openGauss is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
@@ -39,6 +40,7 @@
 #include "catalog/pg_depend.h"
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_opclass.h"
+#include "catalog/pg_partition_fn.h"
 #include "catalog/pg_type.h"
 #include "catalog/cstore_ctlg.h"
 #include "catalog/toasting.h"
@@ -58,10 +60,6 @@
 #include "access/tupdesc.h"
 
 extern char* get_namespace_name(Oid nspid);
-extern List* ChooseIndexColumnNames(const List* indexElems);
-extern void ComputeIndexAttrs(IndexInfo* indexInfo, Oid* typeOidP, Oid* collationOidP, Oid* classOidP,
-    int16* colOptionP, List* attList, List* exclusionOpNames, Oid relId, const char* accessMethodName, Oid accessMethodId,
-    bool amcanorder, bool isconstraint);
 
 static bool createCUDescTableForPartitionedTable(Relation rel, Datum reloptions);
 static bool createDeltaTableForPartitionedTable(Relation rel, Datum reloptions, CreateStmt* mainTblStmt);
@@ -298,7 +296,6 @@ bool CreateDeltaTable(Relation rel, Datum reloptions, bool isPartition, CreateSt
         NULL,
         REL_CMPRS_NOT_SUPPORT,
         NULL,
-        NULL,
         false);
     Assert(delta_relid != InvalidOid);
 
@@ -474,7 +471,6 @@ bool CreateCUDescTable(Relation rel, Datum reloptions, bool isPartition)
         NULL,
         REL_CMPRS_NOT_SUPPORT,
         NULL,
-        NULL,
         false);
 
     Assert(cudesc_relid != InvalidOid);
@@ -501,6 +497,7 @@ bool CreateCUDescTable(Relation rel, Datum reloptions, bool isPartition)
     indexInfo->ii_ReadyForInserts = true;
     indexInfo->ii_Concurrent = false;
     indexInfo->ii_BrokenHotChain = false;
+    indexInfo->ii_ParallelWorkers = 0;
     indexInfo->ii_PgClassAttrId = Anum_pg_class_relcudescidx;
 
     collationObjectId[0] = InvalidOid;
@@ -539,7 +536,8 @@ bool CreateCUDescTable(Relation rel, Datum reloptions, bool isPartition)
         true,
         false,
         false,
-        &extra);
+        &extra,
+        false);
 
     Assert(OidIsValid(indexOid));
 

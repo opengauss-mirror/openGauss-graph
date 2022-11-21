@@ -24,6 +24,7 @@
 
 #ifdef FRONTEND_PARSER
 #include <setjmp.h>
+#undef ereport
 #define ereport(a, b) fe_rethrow(yyscanner)
 #endif
 
@@ -111,6 +112,11 @@ typedef struct core_yy_extra_type {
     bool is_createstmt;              /* check whether it's a create statement. */
     bool is_hint_str;                /* current identifier is in hint comment string */
     List* parameter_list;            /* placeholder parameter list */
+    bool include_ora_comment;        /* dont igore comment when ture */
+    int func_param_begin;            /* function and procedure param string start pos,exclude left parenthesis */
+    int func_param_end;              /* function and procedure param string end pos,exclude right parenthesis */
+    bool isPlpgsqlKeyWord;
+    const PlpgsqlKeywordValue* plKeywordValue;
 } core_yy_extra_type;
 
 #ifdef FRONTEND_PARSER
@@ -144,6 +150,7 @@ extern void scanner_finish(core_yyscan_t yyscanner);
 extern int core_yylex(core_YYSTYPE* lvalp, YYLTYPE* llocp, core_yyscan_t yyscanner);
 extern int scanner_errposition(int location, core_yyscan_t yyscanner);
 extern void scanner_yyerror(const char* message, core_yyscan_t yyscanner);
+extern void addErrorList(const char* message, int lines);
 
 #endif /* SCANNER_H */
 

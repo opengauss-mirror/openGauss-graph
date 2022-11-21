@@ -12,11 +12,11 @@
  * MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
  * See the Mulan PSL v2 for more details.
  * ---------------------------------------------------------------------------------------
- * 
+ *
  * gscodegen.h
- * 
- * 
- * 
+ *
+ *
+ *
  * IDENTIFICATION
  *        src/include/codegen/gscodegen.h
  *
@@ -32,6 +32,9 @@
 #ifndef __STDC_CONSTANT_MACROS
 #define __STDC_CONSTANT_MACROS
 #endif
+
+#include "pg_config.h"
+
 #ifdef ENABLE_LLVM_COMPILE
 #include "llvm/IR/Verifier.h"
 #include "llvm/ExecutionEngine/MCJIT.h"
@@ -150,13 +153,37 @@
 #define pos_atom_data 0
 #define pos_atom_nullflag 1
 
+#ifdef ENABLE_LLVM_COMPILE
+/* The whole intrinsic methods are listed in include/llvm/IR/IntrinsicEnums.inc */
+#ifdef LLVM_MAJOR_VERSION
+
+#if (LLVM_MAJOR_VERSION - LLVM_MAJOR_VERSION -1 == 1)
+#error LLVM version was defined as empty.
+#else
+#if (LLVM_MAJOR_VERSION == 10)
 const int llvm_prefetch = 217;
 const int llvm_sadd_with_overflow = 229;
 const int llvm_smul_with_overflow = 236;
 const int llvm_ssub_with_overflow = 241;
+#elif (LLVM_MAJOR_VERSION == 11)
+const int llvm_prefetch = 225;
+const int llvm_sadd_with_overflow = 239;
+const int llvm_smul_with_overflow = 247;
+const int llvm_ssub_with_overflow = 252;
+#elif (LLVM_MAJOR_VERSION == 12)
+const int llvm_prefetch = 225;
+const int llvm_sadd_with_overflow = 240;
+const int llvm_smul_with_overflow = 250;
+const int llvm_ssub_with_overflow = 256;
+#else
+#error Un-supported LLVM version.
+#endif
+#endif
 
+#else
+#error LLVM version is not defined.
+#endif
 
-#ifdef ENABLE_LLVM_COMPILE
 /*
  * Declare related LLVM classes to avoid namespace pollution.
  */
@@ -355,6 +382,7 @@ public:
      */
     llvm::PointerType* getPtrType(const char* name);
 
+    llvm::PointerType* getPtrPtrType(const char* name);
     /*
      * @Description : Create a llvm pointer value from 'ptr'. This is used
      *				  to pass pointers between c-code and code-generated IR.
@@ -551,6 +579,11 @@ private:
      */
     void optimizeModule(llvm::Module* module);
 
+    /*
+     * check preload module
+     */
+    bool CheckPreloadModule(llvm::Module* module);
+
     /* Flag used to optimize the module or not */
     bool m_optimizations_enabled;
 
@@ -607,6 +640,7 @@ private:
 #define DEFINE_CG_VOIDTYPE(name) llvm::Type* name = llvmCodeGen->getVoidType()
 #define DEFINE_CG_TYPE(name, typoid) llvm::Type* name = llvmCodeGen->getType(typoid)
 #define DEFINE_CG_PTRTYPE(name, typoid) llvm::Type* name = llvmCodeGen->getPtrType(typoid)
+#define DEFINE_CG_PTRPTRTYPE(name, typoid) llvm::Type* name = llvmCodeGen->getPtrPtrType(typoid)
 #define DEFINE_CG_NINTTYP(name, nbit) llvm::Type* name = llvm::IntegerType::getIntNTy(context, nbit)
 #define DEFINE_CG_ARRTYPE(name, typoid, num) llvm::Type* name = llvm::ArrayType::get(typoid, num)
 

@@ -50,10 +50,10 @@
 #include "pgstat.h"
 #include "pgxc/pgxc.h"
 #include "storage/ipc.h"
-#include "storage/fd.h"
+#include "storage/smgr/fd.h"
 #include "storage/pmsignal.h"
 #include "storage/sinvaladt.h"
-#include "storage/smgr.h"
+#include "storage/smgr/smgr.h"
 #include "tcop/dest.h"
 #include "tcop/tcopprot.h"
 #include "utils/guc.h"
@@ -65,6 +65,8 @@
 #include "utils/syscache.h"
 #include "utils/xml.h"
 #include "executor/executor.h"
+#include "storage/procarray.h"
+#include "communication/commproxy_interface.h"
 
 /* ===================== Static functions to init session ===================== */
 static bool InitSession(knl_session_context* sscxt);
@@ -84,6 +86,7 @@ ThreadPoolWorker::ThreadPoolWorker(uint idx, ThreadPoolGroup* group, pthread_mut
     m_cond = cond;
     m_waitState = STATE_WAIT_UNDEFINED;
     DLInitElem(&m_elem, this);
+    m_thrd = &t_thrd;
 }
 
 ThreadPoolWorker::~ThreadPoolWorker()
@@ -129,13 +132,16 @@ int ThreadPoolWorker::StartUp()
     }
     Backend* bn = CreateBackend();
     m_tid = initialize_worker_thread(THREADPOOL_WORKER, &port, (void*)this);
+    t_thrd.proc_cxt.MyPMChildSlot = 0;
     if (m_tid == InvalidTid) {
-        ReleasePostmasterChildSlot(t_thrd.proc_cxt.MyPMChildSlot);
+        ReleasePostmasterChildSlot(bn->child_slot);
         bn->pid = 0;
+        bn->role = (knl_thread_role)0;
         return STATUS_ERROR;
     }
 
     bn->pid = m_tid;
+    bn->role = THREADPOOL_WORKER;
     Assert(bn->child_slot != 0);
     AddBackend(bn);
 
@@ -145,15 +151,15 @@ int ThreadPoolWorker::StartUp()
 void PreventSignal()
 {
     HOLD_INTERRUPTS();
-    t_thrd.int_cxt.ignoreBackendSignal = true;
     t_thrd.int_cxt.QueryCancelPending = false;
+    t_thrd.int_cxt.ignoreBackendSignal = true;
     disable_sig_alarm(true);
 }
 
 void AllowSignal()
 {
-    /* now we can accept signal. out of this, we rely on signal handle. */
     t_thrd.int_cxt.ignoreBackendSignal = false;
+    /* now we can accept signal. out of this, we rely on signal handle. */
     RESUME_INTERRUPTS();
 }
 
@@ -168,12 +174,19 @@ void ThreadPoolWorker::WaitMission()
     bool isRawSession = false;
 
     Assert(t_thrd.int_cxt.InterruptHoldoffCount == 0);
+    if (unlikely(t_thrd.int_cxt.InterruptHoldoffCount > 0)) {
+        ereport(PANIC,
+                (errmodule(MOD_THREAD_POOL),
+                 errmsg("InterruptHoldoffCount should be zero when get next session.")));
+    }
     /*
      * prevent any signal execep siguit.
      * reset any pending signal and timer.
      * before we serve next session we must keep us clean.
      */
     PreventSignal();
+
+    MemoryContext old = CurrentMemoryContext;
     while (true) {
         /* we should keep the thread clean for next Session. */
         CleanThread();
@@ -196,10 +209,22 @@ void ThreadPoolWorker::WaitMission()
             }
             Assert(m_currentSession != NULL);
             Assert(u_sess != NULL);
+			
+            /*
+             * CommProxy Support
+             *
+             * session attach thread success, we record relation of sock with worker
+             */
+            if (AmIProxyModeSockfd(m_currentSession->proc_cxt.MyProcPort->sock)) {
+                g_comm_controller->SetCommSockActive(m_currentSession->proc_cxt.MyProcPort->sock, m_idx);
+            }
+
+            Assert(CheckMyDatabaseMatch());
+			
             break;
         }
     }
-
+    MemoryContextSwitchTo(old);
     (void)disable_session_sig_alarm();
     /* now we can accept signal. out of this, we rely on signal handle. */
     AllowSignal();
@@ -210,7 +235,7 @@ bool ThreadPoolWorker::WakeUpToWork(knl_session_context* session)
 {
     bool succ = true;
     pthread_mutex_lock(m_mutex);
-    if (likely(m_threadStatus != THREAD_EXIT)) {
+    if (likely(m_threadStatus != THREAD_EXIT && m_threadStatus != THREAD_PENDING)) {
         m_currentSession = session;
         pthread_cond_signal(m_cond);
     } else {
@@ -228,6 +253,21 @@ void ThreadPoolWorker::WakeUpToUpdate(ThreadStatus status)
         pthread_cond_signal(m_cond);
     }
     pthread_mutex_unlock(m_mutex);
+}
+
+bool ThreadPoolWorker::WakeUpToPendingIfFree()
+{
+    bool ans = false;
+    pthread_mutex_lock(m_mutex);
+    if (m_threadStatus != THREAD_EXIT && m_threadStatus != THREAD_PENDING && m_currentSession == NULL) {
+        m_threadStatus = THREAD_PENDING;
+        pthread_cond_signal(m_cond);
+        ans = true;
+    } else {
+        ans = false;
+    }
+    pthread_mutex_unlock(m_mutex);
+    return ans;
 }
 
 /*
@@ -321,6 +361,7 @@ void ThreadPoolWorker::SetSessionInfo()
     thread_proc->roleId = m_currentSession->proc_cxt.MyRoleId;
     Assert(thread_proc->pid == t_thrd.proc_cxt.MyProcPid);
     thread_proc->sessionid = m_currentSession->session_id;
+    thread_proc->globalSessionId = m_currentSession->globalSessionId;
     thread_proc->workingVersionNum = m_currentSession->proc_cxt.MyProcPort->SessionVersionNum;
     m_currentSession->attachPid = thread_proc->pid;
 
@@ -333,6 +374,9 @@ void ThreadPoolWorker::SetSessionInfo()
 
 void ThreadPoolWorker::WaitNextSession()
 {
+    if (EnableLocalSysCache()) {
+        g_instance.global_sysdbcache.GSCMemThresholdCheck();
+    }
     /* Return worker to pool unless we can get a task right now. */
     ThreadPoolListener* lsn = m_group->GetListener();
     Assert(lsn != NULL);
@@ -341,6 +385,14 @@ void ThreadPoolWorker::WaitNextSession()
         /* Wait if the thread was turned into pending mode. */
         if (unlikely(m_threadStatus == THREAD_PENDING)) {
             Pending();
+            /* pending thread must don't have session on it */
+            if (m_currentSession != NULL) {
+                u_sess = m_currentSession;
+                ereport(FATAL,
+                        (errmodule(MOD_THREAD_POOL),
+                         errmsg("pending thread should not have session %lu on it",
+                                 m_currentSession->session_id)));
+            }
         } else if (unlikely(m_threadStatus == THREAD_EXIT)) {
             ShutDownIfNecessary();
         } else if (m_currentSession != NULL) {
@@ -364,6 +416,12 @@ void ThreadPoolWorker::WaitNextSession()
             m_group->GetListener()->RemoveWorkerFromList(this);
             pg_atomic_fetch_sub_u32((volatile uint32*)&m_group->m_idleWorkerNum, 1);
             pgstat_report_waitstatus(oldStatus);
+        } else {
+            u_sess = t_thrd.fake_session;
+            ereport(DEBUG2,
+                    (errmodule(MOD_THREAD_POOL),
+                     errmsg("TryFeedWorker remove a session:%lu from m_readySessionList into worker, status %d",
+                            m_currentSession->session_id, m_threadStatus)));
         }
     }
 }
@@ -399,9 +457,9 @@ void ThreadPoolWorker::ShutDownIfNecessary()
     /* there is time window which the cancle signal has arrived but ignored by prevent signal called before,
      * so we rebuild the signal status here in case that happens. */
     if (unlikely(m_currentSession != NULL && m_currentSession->status == KNL_SESS_CLOSE)) {
-        ereport(LOG, (errmodule(MOD_THREAD_POOL),
-                      errmsg("Cancle signal has arrived but ignored by prevent signal called before, rebuild it.")));
         t_thrd.int_cxt.ClientConnectionLost = true;
+        ereport(ERROR, (errmodule(MOD_THREAD_POOL),
+                        errmsg("Interrupt signal has been received, but ignored by preventSignal, rebuild it.")));
     }
 }
 
@@ -444,6 +502,7 @@ void ThreadPoolWorker::CleanThread()
     thread_proc->databaseId = InvalidOid;
     thread_proc->roleId = InvalidOid;
     thread_proc->sessionid = t_thrd.fake_session->session_id;
+    thread_proc->globalSessionId = t_thrd.fake_session->globalSessionId;
     thread_proc->workingVersionNum = pg_atomic_read_u32(&WorkingGrandVersionNum);
 
     if (m_currentSession != NULL) {
@@ -453,15 +512,21 @@ void ThreadPoolWorker::CleanThread()
 
 void ThreadPoolWorker::DetachSessionFromThread()
 {
+    /* session attach thread success, we record relation of sock with worker */
+    if (AmIProxyModeSockfd(m_currentSession->proc_cxt.MyProcPort->sock)) {
+        g_comm_controller->SetCommSockIdle(m_currentSession->proc_cxt.MyProcPort->sock);
+    }
+
     /* If some error occur at session initialization, we need to close it. */
     if (m_currentSession->status == KNL_SESS_UNINIT) {
         m_currentSession->status = KNL_SESS_CLOSERAW;
+        /* cache may be in wrong stat, rebuild is ok */
+        ReBuildLSC();
         CleanUpSession(false);
         m_currentSession = NULL;
         u_sess = NULL;
         return;
     }
-
     m_currentSession->status = KNL_SESS_DETACH;
     if (t_thrd.pgxact != NULL && m_currentSession->proc_cxt.Isredisworker) {
         LWLockAcquire(ProcArrayLock, LW_EXCLUSIVE);
@@ -520,7 +585,12 @@ bool ThreadPoolWorker::AttachSessionToThread()
     switch (m_currentSession->status) {
         case KNL_SESS_UNINIT: {
             if (InitSession(m_currentSession)) {
+                /* Registering backend_version */
+                if (t_thrd.proc && contain_backend_version(t_thrd.proc->workingVersionNum)) {
+                    register_backend_version(t_thrd.proc->workingVersionNum);
+                }
                 m_currentSession->status = KNL_SESS_ATTACH;
+                Assert(CheckMyDatabaseMatch());
             } else {
                 m_currentSession->status = KNL_SESS_CLOSE;
                 /* clean up mess. */
@@ -533,8 +603,27 @@ bool ThreadPoolWorker::AttachSessionToThread()
         } break;
 
         case KNL_SESS_DETACH: {
+#ifdef ENABLE_LITE_MODE
+            char thr_name[16];
+            int rcs = 0;
+            Port *port = m_currentSession->proc_cxt.MyProcPort;
+
+            if (t_thrd.role == WORKER) {
+                rcs = snprintf_truncated_s(thr_name, sizeof(thr_name), "w:%s", port->user_name);
+                securec_check_ss(rcs, "\0", "\0");
+                (void)pthread_setname_np(gs_thread_self(), thr_name);
+            } else if (t_thrd.role == THREADPOOL_WORKER) {
+                rcs = snprintf_truncated_s(thr_name, sizeof(thr_name), "tw:%s", port->user_name);
+                securec_check_ss(rcs, "\0", "\0");
+                (void)pthread_setname_np(gs_thread_self(), thr_name);
+            }
+#endif
             pgstat_initialize_session();
             pgstat_couple_decouple_session(true);
+             /* Postgres init thread syscache. */
+            t_thrd.proc_cxt.PostInit->InitLoadLocalSysCache(u_sess->proc_cxt.MyDatabaseId, 
+                u_sess->proc_cxt.MyProcPort->database_name);
+            Assert(CheckMyDatabaseMatch());
             m_currentSession->status = KNL_SESS_ATTACH;
         } break;
 
@@ -550,6 +639,11 @@ bool ThreadPoolWorker::AttachSessionToThread()
             CleanUpSession(false);
             m_currentSession = NULL;
             u_sess = NULL;
+#ifdef ENABLE_LITE_MODE
+            if (EnableLocalSysCache()) {
+                t_thrd.lsc_cxt.lsc->LocalSysDBCacheReSet();
+            }
+#endif
         } break;
 
         default:
@@ -597,6 +691,7 @@ void ThreadPoolWorker::CleanUpSession(bool threadexit)
 
         if (!threadexit) {
             CleanUpSessionWithLock();
+            DecreaseUserCount(m_currentSession->proc_cxt.MyRoleId);
         }
 
         /* Close Session. */
@@ -625,18 +720,14 @@ void ThreadPoolWorker::CleanUpSession(bool threadexit)
     }
 
     /* clear pgstat slot */
+    pgstat_release_session_memory_entry();
     pgstat_deinitialize_session();
     pgstat_beshutdown_session(m_currentSession->session_ctr_index);
     localeconv_deinitialize_session();
 
     /* clean gpc refcount and plancache in shared memory */
-    if (!t_thrd.proc_cxt.proc_exit_inprogress) {
-        if (ENABLE_DN_GPC)
-            CleanSessGPCPtr(m_currentSession);
-        if (u_sess->pcache_cxt.unnamed_stmt_psrc && u_sess->pcache_cxt.unnamed_stmt_psrc->gpc.status.InShareTable())
-            u_sess->pcache_cxt.unnamed_stmt_psrc->gpc.status.SubRefCount();
-        CNGPCCleanUpSession();
-    }
+    if (ENABLE_DN_GPC)
+        CleanSessGPCPtr(m_currentSession);
 
     /*
      * clear invalid msg slot
@@ -673,7 +764,14 @@ void ThreadPoolWorker::AddBackend(Backend* bn)
 static void init_session_share_memory()
 {
     TableSpaceUsageManager::Init();
+#ifndef ENABLE_MULTIPLE_NODES
+    ReplicationOriginShmemInit();
+#endif
 }
+
+#ifndef ENABLE_MULTIPLE_NODES
+extern void InitBSqlPluginHookIfNeeded();
+#endif
 
 static bool InitSession(knl_session_context* session)
 {
@@ -700,7 +798,7 @@ static bool InitSession(knl_session_context* session)
 
     /* Read in remaining GUC variables */
     read_nondefault_variables();
-    
+
     /* now safe to ereport to client */
     t_thrd.postgres_cxt.whereToSendOutput = DestRemote;
 
@@ -743,11 +841,19 @@ static bool InitSession(knl_session_context* session)
     InitFileAccess();
     smgrinit();
 
-    /* Postgres init. */
+    /* openGauss init. */
     char* dbname = session->proc_cxt.MyProcPort->database_name;
     char* username = session->proc_cxt.MyProcPort->user_name;
     t_thrd.proc_cxt.PostInit->SetDatabaseAndUser(dbname, InvalidOid, username);
     t_thrd.proc_cxt.PostInit->InitSession();
+
+#ifndef ENABLE_MULTIPLE_NODES
+    if (u_sess->proc_cxt.MyDatabaseId != InvalidOid && DB_IS_CMPT(B_FORMAT) && u_sess->attr.attr_sql.b_sql_plugin) {
+        InitBSqlPluginHookIfNeeded();
+    }
+#endif
+
+    Assert(CheckMyDatabaseMatch());
 
     SetProcessingMode(NormalProcessing);
 
@@ -817,6 +923,9 @@ static void ResetSignalHandle()
     (void)gspqsignal(SIGALRM, handle_sig_alarm);
     (void)gspqsignal(SIGQUIT, quickdie); /* hard crash time */
     (void)gspqsignal(SIGTERM, die);      /* cancel current query and exit */
+    gs_signal_setmask(&t_thrd.libpq_cxt.UnBlockSig, NULL);
+    /* not necessary, unblock for sure */
+    gs_signal_unblock_sigusr2();
 }
 
 static void SessionSetBackendOptions()

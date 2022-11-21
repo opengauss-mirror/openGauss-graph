@@ -68,6 +68,10 @@ void statement_init_metric_context()
 {
     StatementStatContext *reusedHandle = NULL;
 
+    /* won't assign handle when statement flush thread not started */
+    if (g_instance.pid_cxt.StatementPID == 0) {
+        return;
+    }
     CHECK_STMT_TRACK_ENABLED();
 
     /* create context under TopMemoryContext */
@@ -83,27 +87,39 @@ void statement_init_metric_context()
         statement_commit_metirc_context();
     }
 
+    HOLD_INTERRUPTS();
     (void)syscalllockAcquire(&u_sess->statement_cxt.list_protect);
 
-    /* 1, check free list: free detail stat; reuse entry in free list */
-    if (u_sess->statement_cxt.free_count > 0) {
-        reusedHandle = (StatementStatContext*)u_sess->statement_cxt.toFreeStatementList;
-        u_sess->statement_cxt.curStatementMetrics = reusedHandle;
-        u_sess->statement_cxt.toFreeStatementList = reusedHandle->next;
-        u_sess->statement_cxt.free_count--;
-    } else {
-        /* 2, no free slot int free list, allocate new one */
-        if (u_sess->statement_cxt.allocatedCxtCnt < u_sess->attr.attr_common.track_stmt_session_slot) {
-            MemoryContext oldcontext = MemoryContextSwitchTo(u_sess->statement_cxt.stmt_stat_cxt);
+    PG_TRY();
+    {
+        /* 1, check free list: free detail stat; reuse entry in free list */
+        if (u_sess->statement_cxt.free_count > 0) {
+            reusedHandle = (StatementStatContext*)u_sess->statement_cxt.toFreeStatementList;
+            u_sess->statement_cxt.curStatementMetrics = reusedHandle;
+            u_sess->statement_cxt.toFreeStatementList = reusedHandle->next;
+            u_sess->statement_cxt.free_count--;
+        } else {
+            /* 2, no free slot int free list, allocate new one */
+            if (u_sess->statement_cxt.allocatedCxtCnt < u_sess->attr.attr_common.track_stmt_session_slot) {
+                MemoryContext oldcontext = MemoryContextSwitchTo(u_sess->statement_cxt.stmt_stat_cxt);
 
-            u_sess->statement_cxt.curStatementMetrics = palloc0_noexcept(sizeof(StatementStatContext));
-            if (u_sess->statement_cxt.curStatementMetrics != NULL) {
-                u_sess->statement_cxt.allocatedCxtCnt++;
+                u_sess->statement_cxt.curStatementMetrics = palloc0_noexcept(sizeof(StatementStatContext));
+                if (u_sess->statement_cxt.curStatementMetrics != NULL) {
+                    u_sess->statement_cxt.allocatedCxtCnt++;
+                }
+                (void)MemoryContextSwitchTo(oldcontext);
             }
-            (void)MemoryContextSwitchTo(oldcontext);
         }
     }
+    PG_CATCH();
+    {
+        (void)syscalllockRelease(&u_sess->statement_cxt.list_protect);
+        RESUME_INTERRUPTS();
+        PG_RE_THROW();
+    }
+    PG_END_TRY();
     (void)syscalllockRelease(&u_sess->statement_cxt.list_protect);
+    RESUME_INTERRUPTS();
 
     ereport(DEBUG1, (errmodule(MOD_INSTR), errmsg("[Statement] init - free list length: %d, suspend list length: %d",
         u_sess->statement_cxt.free_count, u_sess->statement_cxt.suspend_count)));
@@ -121,6 +137,9 @@ void statement_init_metric_context()
         }
 
         instr_stmt_report_stat_at_handle_init();
+        if (IsConnFromCoord()) {
+            instr_stmt_dynamic_change_level();
+        }
     }
 }
 
@@ -156,7 +175,7 @@ static void print_stmt_basic_debug_log(int log_level)
         (errmodule(MOD_INSTR), errmsg("\t unique query id: %lu", CURRENT_STMT_METRIC_HANDLE->unique_query_id)));
     ereport(log_level, (errmodule(MOD_INSTR), errmsg("\t unique query: %s", CURRENT_STMT_METRIC_HANDLE->query)));
     ereport(log_level, (errmodule(MOD_INSTR),
-        errmsg("\t slow query threshold: %d", CURRENT_STMT_METRIC_HANDLE->slow_query_threshold)));
+        errmsg("\t slow query threshold: %ld", CURRENT_STMT_METRIC_HANDLE->slow_query_threshold)));
     ereport(log_level, (errmodule(MOD_INSTR), errmsg("\t thread id: %lu", CURRENT_STMT_METRIC_HANDLE->tid)));
     ereport(log_level, (errmodule(MOD_INSTR), errmsg("\t transaction id: %lu", CURRENT_STMT_METRIC_HANDLE->txn_id)));
     ereport(log_level, (errmodule(MOD_INSTR),
@@ -322,9 +341,16 @@ void statement_commit_metirc_context()
 
     (void)syscalllockAcquire(&u_sess->statement_cxt.list_protect);
 
-    /* ignore record to persist (to statement_history) if unique sql id = 0 */
+    /*
+     * Rules to persist handle to statement_history
+     * - ignore record to persist (to statement_history) if unique sql id = 0
+     * - dynamic tracked sql(dynamic_track_level >= L0)
+     * - full sql(statement_level[0] >= L0)
+     * - slow sql(statement_leve[1] >= L0 && duration >= log_min_duration_statement && log_min_duration_statement > 0)
+     */
     if (CURRENT_STMT_METRIC_HANDLE->unique_query_id != 0 &&
-        (u_sess->statement_cxt.statement_level[0] >= STMT_TRACK_L0 ||
+        (CURRENT_STMT_METRIC_HANDLE->dynamic_track_level >= STMT_TRACK_L0 ||
+        u_sess->statement_cxt.statement_level[0] >= STMT_TRACK_L0 ||
         (u_sess->statement_cxt.statement_level[1] >= STMT_TRACK_L0 &&
         (CURRENT_STMT_METRIC_HANDLE->finish_time - CURRENT_STMT_METRIC_HANDLE->start_time) >=
         CURRENT_STMT_METRIC_HANDLE->slow_query_threshold &&

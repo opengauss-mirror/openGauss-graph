@@ -1,4 +1,4 @@
-/* -------------------------------------------------------------------------
+    /* -------------------------------------------------------------------------
  *
  * parsenodes.h
  *	  definitions for parse tree nodes
@@ -33,6 +33,8 @@
 #endif
 #include "tcop/dest.h"
 #include "nodes/parsenodes_common.h"
+// #include "utils/palloc.h"
+// #include "tcop/dest.h"
 
 /*
  * Relids
@@ -87,7 +89,7 @@ typedef uint32 AclMode; /* a bitmask of privilege bits */
 #define ACL_WRITE (1 << 14)       /* for pg_directory */
 #define N_ACL_RIGHTS 15           /* 1 plus the last 1<<x */
 #define ACL_NO_RIGHTS 0
-/* Currently, SELECT ... FOR UPDATE/FOR SHARE requires UPDATE privileges */
+/* Currently, SELECT ... FOR [KEY] UPDATE/FOR SHARE requires UPDATE privileges */
 #define ACL_SELECT_FOR_UPDATE ACL_UPDATE
 
 /* grantable rights for DDL operations */
@@ -204,11 +206,13 @@ typedef enum RTEKind {
     RTE_JOIN,     /* join */
     RTE_FUNCTION, /* function in FROM */
     RTE_VALUES,   /* VALUES (<exprlist>), (<exprlist>), ... */
-    RTE_CTE       /* common table expr (WITH list element) */
+    RTE_CTE,       /* common table expr (WITH list element) */
 #ifdef PGXC
-    ,
-    RTE_REMOTE_DUMMY /* RTEs created by remote plan reduction */
+    RTE_REMOTE_DUMMY, /* RTEs created by remote plan reduction */
 #endif               /* PGXC */
+    RTE_RESULT       /* RTE represents an empty FROM clause; such
+                      * RTEs are added by the planner, they're not
+                      * present during parsing or rewriting */
 } RTEKind;
 
 typedef struct RangeTblEntry {
@@ -230,22 +234,31 @@ typedef struct RangeTblEntry {
     /*
      * Fields valid for a plain relation RTE (else zero):
      */
-    Oid relid;               /* OID of the relation */
-    Oid partitionOid;        /*
-                              * OID of a partition if relation is partitioned table.
-                              * Select * from table_name partition (partition_name);
-                              * or select * from table_name partition for (partition_key_value_list)
-                              */
-    bool isContainPartition; /* select from caluse whether contains partition
-                              * if contains partition isContainPartition=true,
-                              * otherwise isContainPartition=false
-                              */
+    Oid relid;                  /* OID of the relation */
+    Oid partitionOid;           /*
+                                 * OID of a partition if relation is partitioned table.
+                                 * Select * from table_name partition (partition_name);
+                                 * or select * from table_name partition for (partition_key_value_list)
+                                 */
+    bool isContainPartition;    /* select from caluse whether contains partition
+                                 * if contains partition isContainPartition=true,
+                                 * otherwise isContainPartition=false
+                                 */
+    Oid subpartitionOid;        /*
+                                 * OID of a subpartition if relation is partitioned table.
+                                 * Select * from table_name subpartition (subpartition_name);
+                                 */
+    bool isContainSubPartition; /* select from caluse whether contains subpartition
+                                 * if contains subpartition isContainSubPartition=true,
+                                 * otherwise isContainSubPartition=false
+                                 */
     Oid refSynOid;           /* OID of synonym object if relation is referenced by some synonym object. */
     List* partid_list;
 
     char relkind;                   /* relation kind (see pg_class.relkind) */
     bool isResultRel;       /* used in target of SELECT INTO or similar */
     TableSampleClause* tablesample; /* sampling method and parameters */
+    TimeCapsuleClause* timecapsule; /* user-specified time capsule point */
 
     bool ispartrel; /* is it a partitioned table */
 
@@ -297,9 +310,15 @@ typedef struct RangeTblEntry {
     char* ctename;          /* name of the WITH list item */
     Index ctelevelsup;      /* number of query levels up */
     bool self_reference;    /* is this a recursive self-reference? */
+    bool cterecursive;      /* is this a recursive cte */
     List* ctecoltypes;      /* OID list of column type OIDs */
     List* ctecoltypmods;    /* integer list of column typmods */
     List* ctecolcollations; /* OID list of column collation OIDs */
+    bool  swConverted;      /* indicate the current CTE rangetable entry is converted
+                               from StartWith ... Connect By clause */
+    List *origin_index;     /* rewrite rtes of cte for startwith */
+    bool swAborted;         /* RTE has been replaced by CTE */
+    bool swSubExist;         /* under subquery contains startwith */
     char locator_type;      /*      keep subplan/cte's locator type */
 
     /*
@@ -321,6 +340,7 @@ typedef struct RangeTblEntry {
     Bitmapset* insertedCols;    /* columns needing INSERT permission */
     Bitmapset* updatedCols;     /* columns needing UPDATE permission */
     RelOrientation orientation; /* column oriented or row oriented */
+    bool is_ustore;             /* is a ustore rel */
 
     char* mainRelName;
     char* mainRelNameSpace;
@@ -337,12 +357,18 @@ typedef struct RangeTblEntry {
     /* For hash buckets */
     bool relhasbucket; /* the rel has underlying buckets, get from pg_class */
     bool isbucket;	  /* the sql only want some buckets from the rel */
+    int  bucketmapsize;
     List* buckets;	  /* the bucket id wanted */
 
     bool isexcluded; /* the rel is the EXCLUDED relation for UPSERT */
     /* For sublink in targetlist pull up */
     bool sublink_pull_up;       /* mark the subquery is sublink pulled up */
     Bitmapset *extraUpdatedCols; /* generated columns being updated */
+    bool pulled_from_subquery; /* mark whether it is pulled-up from subquery to the current level, for upsert remote
+                                  query deparse */
+#ifdef GS_GRAPH    
+    bool isVLE;
+#endif /* GS_GRAPH */
 } RangeTblEntry;
 
 /*
@@ -443,23 +469,47 @@ typedef struct WindowClause {
 
 /*
  * RowMarkClause -
- *	   parser output representation of FOR UPDATE/SHARE clauses
+ *	   parser output representation of FOR [KEY] UPDATE/SHARE clauses
  *
  * Query.rowMarks contains a separate RowMarkClause node for each relation
- * identified as a FOR UPDATE/SHARE target.  If FOR UPDATE/SHARE is applied
- * to a subquery, we generate RowMarkClauses for all normal and subquery rels
- * in the subquery, but they are marked pushedDown = true to distinguish them
- * from clauses that were explicitly written at this query level.  Also,
- * Query.hasForUpdate tells whether there were explicit FOR UPDATE/SHARE
- * clauses in the current query level.
+ * identified as a FOR [KEY] UPDATE/SHARE target.  If one of these clauses
+ * is applied to a subquery, we generate RowMarkClauses for all normal and
+ * subquery rels in the subquery, but they are marked pushedDown = true to
+ * distinguish them from clauses that were explicitly written at this query
+ * level.  Also, Query.hasForUpdate tells whether there were explicit FOR
+ * UPDATE/SHARE/KEY SHARE clauses in the current query level
  */
 typedef struct RowMarkClause {
     NodeTag type;
     Index rti;       /* range table index of target relation */
-    bool forUpdate;  /* true = FOR UPDATE, false = FOR SHARE */
+    bool forUpdate;  /* for compatibility, we reserve this filed but don't use it */
     bool noWait;     /* NOWAIT option */
+    int waitSec;      /* WAIT time Sec */
     bool pushedDown; /* pushed down from higher query level? */
+    LockClauseStrength strength;
 } RowMarkClause;
+
+/*
+ * - Brief: data structure in parse state to save StartWith clause in current subquery
+ *          level, normally a StartWithTargetRelInfo indicates a RangeVar(rte-rel) e.g.
+ *          baserel, subselect where we add StartWith transform needed information to
+ *          construct a start-with clause
+ */
+typedef struct StartWithTargetRelInfo {
+    NodeTag type;
+
+    /* fields to describe original relation info */
+    char *relname;
+    char *aliasname;
+    char *ctename;
+    List *columns;
+    Node *tblstmt;
+
+	/* fields to record origin RTE related info */
+    RTEKind rtekind;
+    RangeTblEntry *rte;
+    RangeTblRef* rtr;
+} StartWithTargetRelInfo;
 
 /* Convenience macro to get the output tlist of a CTE's query */
 #define GetCTETargetList(cte)                                                                        \
@@ -561,6 +611,7 @@ typedef enum GrantObjectType {
     ACL_OBJECT_FDW,            /* foreign-data wrapper */
     ACL_OBJECT_FOREIGN_SERVER, /* foreign server */
     ACL_OBJECT_FUNCTION,       /* function */
+    ACL_OBJECT_PACKAGE,        /* package */
     ACL_OBJECT_LANGUAGE,       /* procedural language */
     ACL_OBJECT_LARGEOBJECT,    /* largeobject */
     ACL_OBJECT_NAMESPACE,      /* namespace */
@@ -625,6 +676,23 @@ typedef struct GrantRoleStmt {
 } GrantRoleStmt;
 
 /* ----------------------
+ * Grant/Revoke Database Privilege Statement
+ * ----------------------
+ */
+typedef struct GrantDbStmt {
+    NodeTag type;
+    bool is_grant;       /* true = GRANT, false = REVOKE */
+    bool admin_opt;      /* with admin option */
+    List* privileges;    /* list of DbPriv nodes */
+    List* grantees;      /* list of PrivGrantee nodes */
+} GrantDbStmt;
+
+typedef struct DbPriv {
+    NodeTag type;
+    char* db_priv_name;    /* string name of sys privilege */
+} DbPriv;
+
+/* ----------------------
  *	Alter Default Privileges Statement
  * ----------------------
  */
@@ -652,27 +720,6 @@ typedef struct ShutdownStmt {
     NodeTag type;
     char* mode;
 } ShutdownStmt;
-
-typedef struct ListPartitionDefState {
-    NodeTag type;
-    char* partitionName;  /* name of list partition */
-    List* boundary;       /* the boundary of a list partition */
-    char* tablespacename; /* table space to use, or NULL */
-} ListPartitionDefState;
-
-typedef struct HashPartitionDefState {
-    NodeTag type;
-    char* partitionName;  /* name of hash partition */
-    List* boundary;       /* the boundary of a hash partition */
-    char* tablespacename; /* table space to use, or NULL */
-} HashPartitionDefState;
-
-typedef struct RangePartitionindexDefState {
-    NodeTag type;
-    char* name;
-    char* tablespace;
-} RangePartitionindexDefState;
-
 
 /* ----------
  * Definitions for constraints in CreateStmt
@@ -704,10 +751,6 @@ typedef struct RangePartitionindexDefState {
  * Constraint node.
  * ----------
  */
-
-#define CSTORE_SUPPORT_CONSTRAINT(type) \
-    ((type) == CONSTR_NULL || (type) == CONSTR_NOTNULL || (type) == CONSTR_DEFAULT || \
-     (type) == CONSTR_CLUSTER || (type) == CONSTR_PRIMARY || (type) == CONSTR_UNIQUE)
 
 #define GetConstraintType(type)                \
     ({                                         \
@@ -1020,15 +1063,6 @@ typedef struct CreateRoleStmt {
     List* options;          /* List of DefElem nodes */
 } CreateRoleStmt;
 
-typedef struct DropRoleStmt {
-    NodeTag type;
-    List* roles;              /* List of roles to remove */
-    bool missing_ok;          /* skip error if a role is missing? */
-    bool is_user;             /* drop user or role */
-    bool inherit_from_parent; /* whether user is inherited from parent user */
-    DropBehavior behavior;    /* CASCADE or RESTRICT */
-} DropRoleStmt;
-
 /* ----------------------
  *		{Create|Alter} SEQUENCE Statement
  * ----------------------
@@ -1044,6 +1078,7 @@ typedef struct CreateSeqStmt {
 #endif
     int64 uuid;            /* UUID of the sequence, mark unique sequence globally */
     bool canCreateTempSeq; /* create sequence when "create table (like )" */
+    bool is_large;
 } CreateSeqStmt;
 
 typedef struct AlterSeqStmt {
@@ -1054,6 +1089,7 @@ typedef struct AlterSeqStmt {
 #ifdef PGXC
     bool is_serial; /* Indicates if this sequence is part of SERIAL process */
 #endif
+    bool is_large; /* Indicates if this is a large or normal sequence */
 } AlterSeqStmt;
 
 /* ----------------------
@@ -1154,6 +1190,7 @@ typedef struct TruncateStmt {
     List* relations;       /* relations (RangeVars) to be truncated */
     bool restart_seqs;     /* restart owned sequences? */
     DropBehavior behavior; /* RESTRICT or CASCADE behavior */
+    bool purge;
 } TruncateStmt;
 
 /* ----------------------
@@ -1244,13 +1281,14 @@ typedef struct IndexStmt {
     List* partIndexOldNodes;    /* partition relfilenode of existing storage, if any */
     List* partIndexOldPSortOid; /* partition psort oid, if any */
     Node* partClause;           /* partition index define */
-
+    bool* partIndexUsable;      /* is partition index usable */
     /* @hdfs
      * is a partitioned index? The foreign table dose not index. The isPartitioned
      * value is false when relation is a foreign table.
      */
     bool isPartitioned;
     bool isGlobal;                            /* is GLOBAL partition index */
+    bool crossbucket;                         /* is crossbucket index */
     bool unique;                              /* is index unique? */
     bool primary;                             /* is index a primary key? */
     bool isconstraint;                        /* is it for a pkey/unique constraint? */
@@ -1274,6 +1312,10 @@ typedef struct IndexStmt {
 
     /* adaptive memory assigned for the stmt */
     AdaptMem memUsage;
+#ifdef GS_GRAPH
+    bool transformed;	/* true when transformIndexStmt is finished */
+    bool if_not_exists;	/* just do nothing if index already exists? */
+#endif
 } IndexStmt;
 
 typedef struct AlterFunctionStmt {
@@ -1281,17 +1323,6 @@ typedef struct AlterFunctionStmt {
     FuncWithArgs* func; /* name and args of function */
     List* actions;      /* list of DefElem */
 } AlterFunctionStmt;
-
-/* ----------------------
- *		DO Statement
- *
- * DoStmt is the raw parser output, InlineCodeBlock is the execution-time API
- * ----------------------
- */
-typedef struct DoStmt {
-    NodeTag type;
-    List* args; /* List of DefElem nodes */
-} DoStmt;
 
 typedef struct InlineCodeBlock {
     NodeTag type;
@@ -1391,6 +1422,16 @@ typedef struct CompositeTypeStmt {
 } CompositeTypeStmt;
 
 /* ----------------------
+ *		Create Type Statement, table of types
+ * ----------------------
+ */
+typedef struct TableOfTypeStmt {
+    NodeTag type;
+    List* typname;         /* the table of type to be quoted */
+    TypeName* reftypname;  /* the name of the type being referenced */
+} TableOfTypeStmt;
+
+/* ----------------------
  *		Create Type Statement, enum types
  * ----------------------
  */
@@ -1428,9 +1469,43 @@ typedef struct AlterEnumStmt {
  *		Load Statement
  * ----------------------
  */
+
+typedef enum LOAD_DATA_TYPE {
+    LOAD_DATA_APPEND,
+    LOAD_DATA_TRUNCATE,
+    LOAD_DATA_REPLACE,
+    LOAD_DATA_INSERT,
+    LOAD_DATA_UNKNOWN
+} LOAD_DATA_TYPE;
+
+typedef struct LoadWhenExpr {
+    NodeTag type;
+    int whentype; /* 0 poition 1 field name */
+    int start;
+    int end;
+    char *val;
+    const char *attname;
+    int attnum;
+    char *oper;
+    int operid;
+} LoadWhenExpr;
+
 typedef struct LoadStmt {
     NodeTag type;
     char* filename; /* file to load */
+
+    List *pre_load_options;
+
+    bool is_load_data;
+    bool is_only_special_filed;
+
+    // load data options
+    List *load_options;
+
+    // relation options
+    LOAD_DATA_TYPE load_type;
+    RangeVar *relation;
+    List *rel_options;
 } LoadStmt;
 
 /* ----------------------
@@ -1586,6 +1661,9 @@ typedef struct VacuumStmt {
 
     Relation onepartrel; /* for tracing the opened relation */
     Partition onepart;   /* for tracing the opened partition */
+    Relation parentpartrel; /* for tracing the opened parent relation of a subpartition */
+    Partition parentpart;   /* for tracing the opened parent partition of a subpartition */
+    bool issubpartition;
     List* partList;
 #ifdef PGXC
     void* HDFSDnWorkFlow; /* @hdfs HDFSDnWorkFlow stores analyze operation related information */
@@ -1649,7 +1727,7 @@ typedef struct VacuumStmt {
  */
 typedef struct BarrierStmt {
     NodeTag type;
-    const char* id; /* User supplied barrier id, if any */
+    char* id; /* User supplied barrier id, if any */
 } BarrierStmt;
 
 /*
@@ -1697,10 +1775,12 @@ typedef struct DropNodeStmt {
 typedef struct CreateGroupStmt {
     NodeTag type;
     char* group_name;
+    char* group_parent;
     char* src_group_name;
     List* nodes;
     List* buckets;
-    bool vcgroup;
+    int   bucketcnt;
+    bool  vcgroup;
 } CreateGroupStmt;
 
 /*
@@ -1887,6 +1967,13 @@ typedef struct DropMaskingPolicyStmt
     List        *policy_names;
 } DropMaskingPolicyStmt;
 
+typedef struct AlterSchemaStmt {
+    NodeTag type;
+    char *schemaname; /* the name of the schema to create */
+    char *authid;      /* the owner of the created schema */
+    bool hasBlockChain;  /* whether this schema has blockchain */
+} AlterSchemaStmt;
+
 /*
  * ----------------------
  *      Create Resource Pool statement
@@ -1916,6 +2003,16 @@ typedef struct DropResourcePoolStmt {
     bool missing_ok;
     char* pool_name;
 } DropResourcePoolStmt;
+
+typedef struct AlterGlobalConfigStmt {
+    NodeTag type;
+    List* options;
+} AlterGlobalConfigStmt;
+
+typedef struct DropGlobalConfigStmt {
+    NodeTag type;
+    List* options;
+} DropGlobalConfigStmt;
 
 /*
  * ----------------------
@@ -1999,32 +2096,6 @@ typedef struct ExplainStmt {
 } ExplainStmt;
 
 /* ----------------------
- *		CREATE TABLE AS Statement (a/k/a SELECT INTO)
- *
- * A query written as CREATE TABLE AS will produce this node type natively.
- * A query written as SELECT ... INTO will be transformed to this form during
- * parse analysis.
- * A query written as CREATE MATERIALIZED view will produce this node type,
- * during parse analysis, since it needs all the same data.
- *
- * The "query" field is handled similarly to EXPLAIN, though note that it
- * can be a SELECT or an EXECUTE, but not other DML statements.
- * ----------------------
- */
-typedef struct CreateTableAsStmt {
-    NodeTag type;
-    Node* query;         /* the query (see comments above) */
-    IntoClause* into;    /* destination table */
-    ObjectType  relkind; /* type of object */
-    bool is_select_into; /* it was written as SELECT INTO */
-#ifdef PGXC
-    Oid groupid;
-    void* parserSetup;
-    void* parserSetupArg;
-#endif
-} CreateTableAsStmt;
-
-/* ----------------------
  *     REFRESH MATERIALIZED VIEW Statement
  * ----------------------
  */
@@ -2064,6 +2135,8 @@ typedef struct LockStmt {
     List* relations; /* relations to lock */
     int mode;        /* lock mode */
     bool nowait;     /* no wait mode */
+    bool cancelable; /* send term to lock holder */
+    int waitSec;      /* WAIT time Sec */
 } LockStmt;
 
 /* ----------------------
@@ -2221,5 +2294,6 @@ typedef struct DropDirectoryStmt {
     bool missing_ok;     /* skip error if db is missing? */
 
 } DropDirectoryStmt;
+
 #endif /* PARSENODES_H */
 

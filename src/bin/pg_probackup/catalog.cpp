@@ -1142,8 +1142,14 @@ walk_files_collect_timelines(InstanceConfig *instance)
         {
             TimeLineHistoryEntry *tln;
             bool is_valid_tli = flase;
+            int ret;
 
-            sscanf_s(file->name, "%08X.history", &tli);
+            ret = sscanf_s(file->name, "%08X.history", &tli);
+            if (ret != 1) {
+                elog(LOG, "format filename \"%s\" wrong", file->name);
+                break;
+            }
+            
             timelines = read_timeline_history(arclog_path, tli, true);
 
             is_valid_tli = !tlinfo || tlinfo->tli != tli;
@@ -1426,8 +1432,9 @@ void anchor_lsn_keep_segments_timelines(InstanceConfig *instance, parray *timeli
                 * covered by other larger interval.
                 */
 
-                GetXLogFileName(begin_segno_str, tlinfo->tli, interval->begin_segno, instance->xlog_seg_size);
-                GetXLogFileName(end_segno_str, tlinfo->tli, interval->end_segno, instance->xlog_seg_size);
+                GetXLogFileName(begin_segno_str, MAXFNAMELEN, tlinfo->tli, interval->begin_segno,
+                    instance->xlog_seg_size);
+                GetXLogFileName(end_segno_str, MAXFNAMELEN, tlinfo->tli, interval->end_segno, instance->xlog_seg_size);
 
                 elog(LOG, "Timeline %i to stay reachable from timeline %i "
                                 "protect from purge WAL interval between "
@@ -1481,8 +1488,8 @@ void anchor_lsn_keep_segments_timelines(InstanceConfig *instance, parray *timeli
             else
                 interval->end_segno = segno;
 
-            GetXLogFileName(begin_segno_str, tlinfo->tli, interval->begin_segno, instance->xlog_seg_size);
-            GetXLogFileName(end_segno_str, tlinfo->tli, interval->end_segno, instance->xlog_seg_size);
+            GetXLogFileName(begin_segno_str, MAXFNAMELEN, tlinfo->tli, interval->begin_segno, instance->xlog_seg_size);
+            GetXLogFileName(end_segno_str, MAXFNAMELEN, tlinfo->tli, interval->end_segno, instance->xlog_seg_size);
 
             elog(LOG, "Archive backup %s to stay consistent "
                             "protect from purge WAL interval "
@@ -1921,13 +1928,17 @@ write_backup(pgBackup *backup, bool strict)
     securec_check_ss_c(nRet, "\0", "\0");
     canonicalize_path(path_temp);
     fp = fopen(path_temp, PG_BINARY_W);
-    if (fp == NULL)
+    if (fp == NULL) {
         elog(ERROR, "Cannot open control file \"%s\": %s",
             path_temp, strerror(errno));
+        return;
+    }
 
-    if (chmod(path_temp, FILE_PERMISSION) == -1)
+    if (chmod(path_temp, FILE_PERMISSION) == -1) {
         elog(ERROR, "Cannot change mode of \"%s\": %s", path_temp,
          strerror(errno));
+        return;
+    }
 
     setvbuf(fp, buf, _IOFBF, sizeof(buf));
 
@@ -1966,6 +1977,19 @@ void flush_and_close_file(pgBackup *backup, bool sync, FILE *out, char *control_
     if (fclose(out) != 0)
         elog(ERROR, "Cannot close file list \"%s\": %s",
          control_path_temp, strerror(errno));
+}
+
+inline int WriteCompressOption(pgFile *file, char *line, int remainLen, int len)
+{
+    if (file->is_datafile && file->compressedFile) {
+        auto nRet =
+            snprintf_s(line + len, remainLen - len, remainLen - len - 1,
+                       ",\"compressedFile\":\"%d\",\"compressedChunkSize\":\"%d\",\"compressedAlgorithm\":\"%d\"", 1,
+                       file->compressedChunkSize, file->compressedAlgorithm);
+        securec_check_ss_c(nRet, "\0", "\0");
+        return nRet;
+    }
+    return 0;
 }
 
 /*
@@ -2061,6 +2085,8 @@ write_backup_filelist(pgBackup *backup, parray *files, const char *root,
             nRet = snprintf_s(line+len, remainLen - len,remainLen - len - 1,",\"segno\":\"%d\"", file->segno);
             securec_check_ss_c(nRet, "\0", "\0");
             len += nRet;
+            /* persistence compress option */
+            len += WriteCompressOption(file, line, remainLen, len);
         }
 
         if (file->linked)

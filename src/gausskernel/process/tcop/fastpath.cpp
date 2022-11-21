@@ -33,6 +33,7 @@
 #include "utils/lsyscache.h"
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
+#include "catalog/pg_proc_fn.h"
 
 /*
  * Formerly, this code attempted to cache the function and type info
@@ -214,8 +215,11 @@ static void fetch_fp_info(Oid func_id, struct fp_info* fip)
 
     fip->nmspace = pp->pronamespace;
     fip->rettype = pp->prorettype;
+
+    oidvector* proargs = ProcedureGetArgTypes(func_htp);
+
     errno_t errorno = EOK;
-    errorno = memcpy_s(fip->argtypes, pp->pronargs * sizeof(Oid), pp->proargtypes.values, pp->pronargs * sizeof(Oid));
+    errorno = memcpy_s(fip->argtypes, pp->pronargs * sizeof(Oid), proargs->values, pp->pronargs * sizeof(Oid));
     securec_check(errorno, "", "");
     errorno = strcpy_s(fip->fname, NAMEDATALEN, NameStr(pp->proname));
     securec_check(errorno, "", "");
@@ -263,7 +267,7 @@ int HandleFunctionRequest(StringInfo msgBuf)
     struct fp_info* fip = NULL;
     bool callit = false;
     bool was_logged = false;
-    char msec_str[32];
+    char msec_str[PRINTF_DST_MAX];
     errno_t errorno = EOK;
     errorno = memset_s(&my_fp, sizeof(struct fp_info), 0, sizeof(struct fp_info));
     securec_check(errorno, "\0", "\0");

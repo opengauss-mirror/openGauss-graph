@@ -5,6 +5,7 @@
  *
  * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
+ * Portions Copyright (c) 2021, openGauss Contributors
  *
  *
  * IDENTIFICATION
@@ -38,7 +39,7 @@
 #include "parser/parser.h"
 #include "utils/int8.h"
 #include "utils/sortsupport.h"
-#include "executor/nodeSort.h"
+#include "executor/node/nodeSort.h"
 #include "pgxc/groupmgr.h"
 
 #define JUDGE_INPUT_VALID(X, Y) ((NULL == (X)) || (NULL == (Y)))
@@ -183,6 +184,19 @@ bytea* cstring_to_bytea_with_len(const char* s, int len)
     return result;
 }
 
+BpChar* cstring_to_bpchar_with_len(const char* s, int len)
+{
+    BpChar *result = (BpChar *) palloc0(len + VARHDRSZ);
+
+    SET_VARSIZE(result, len + VARHDRSZ);
+    if (len > 0) {
+        int rc = memcpy_s(VARDATA(result), len, s, len);
+        securec_check(rc, "\0", "\0");
+    }
+
+    return result;
+}
+
 /*
  * text_to_cstring
  *
@@ -199,6 +213,7 @@ char* text_to_cstring(const text* t)
         ereport(ERROR,
             (errcode(ERRCODE_UNEXPECTED_NULL_VALUE), errmsg("invalid null pointer input for text_to_cstring()")));
     }
+    FUNC_CHECK_HUGE_POINTER(false, t, "text_to_cstring()");
 
     /* must cast away the const, unfortunately */
     text* tunpacked = pg_detoast_datum_packed((struct varlena*)t);
@@ -231,6 +246,9 @@ char* text_to_cstring(const text* t)
 void text_to_cstring_buffer(const text* src, char* dst, size_t dst_len)
 {
     /* must cast away the const, unfortunately */
+
+    FUNC_CHECK_HUGE_POINTER((src == NULL), src, "text_to_cstring_buffer()");
+
     text* srcunpacked = pg_detoast_datum_packed((struct varlena*)src);
     size_t src_len = VARSIZE_ANY_EXHDR(srcunpacked);
 
@@ -464,8 +482,8 @@ Datum rawout(PG_FUNCTION_ARGS)
 
     resultlen = datalen << 1;
 
-    if (resultlen < (int)(MaxAllocSize - VARHDRSZ)) {
-        ans = (text*)palloc(VARHDRSZ + resultlen);
+    if (resultlen < (int)(MaxAllocSize - VARHDRSZ) * 2) {
+        ans = (text*)palloc_huge(CurrentMemoryContext, VARHDRSZ + resultlen);
         ans_len = hex_encode(VARDATA(data), datalen, VARDATA(ans));
         /* Make this FATAL 'cause we've trodden on memory ... */
         if (ans_len > resultlen)
@@ -485,6 +503,8 @@ Datum rawout(PG_FUNCTION_ARGS)
 Datum rawtotext(PG_FUNCTION_ARGS)
 {
     Datum arg1 = PG_GETARG_DATUM(0);
+
+    FUNC_CHECK_HUGE_POINTER(PG_ARGISNULL(0), DatumGetPointer(arg1), "rawtotext()");
     Datum cstring_result;
     Datum result;
 
@@ -499,6 +519,8 @@ Datum rawtotext(PG_FUNCTION_ARGS)
 Datum texttoraw(PG_FUNCTION_ARGS)
 {
     Datum arg1 = PG_GETARG_DATUM(0);
+
+    FUNC_CHECK_HUGE_POINTER(PG_ARGISNULL(0), DatumGetPointer(arg1), "rawtotext()");
     Datum result;
     Datum cstring_arg1;
 
@@ -522,11 +544,11 @@ Datum bytearecv(PG_FUNCTION_ARGS)
     /* Because of the hex encoding when output a blob, the output size of blob
        will be twice(as func hex_enc_len). And the max palloc size is 1GB, so
        we only input blobs less than 500M */
-    if ((long)nbytes* 2 + VARHDRSZ > (long)(MaxAllocSize)) {
+    if ((long)nbytes* 2 + VARHDRSZ > (long)(MaxAllocSize) * 2) {
         ereport(ERROR, (errcode(ERRCODE_OUT_OF_MEMORY),
-                        errmsg("blob/bytea size:%d, only can recevie blob/bytea less than 500M ", nbytes)));
+                        errmsg("blob/bytea size:%d, only can recevie blob/bytea less than 1000M ", nbytes)));
     }
-    result = (bytea*)palloc(nbytes + VARHDRSZ);
+    result = (bytea*)palloc_huge(CurrentMemoryContext, nbytes + VARHDRSZ);
     SET_VARSIZE(result, nbytes + VARHDRSZ);
     pq_copymsgbytes(buf, VARDATA(result), nbytes);
     PG_RETURN_BYTEA_P(result);
@@ -603,7 +625,6 @@ Datum bytea_string_agg_finalfn(PG_FUNCTION_ARGS)
 Datum textin(PG_FUNCTION_ARGS)
 {
     char* inputText = PG_GETARG_CSTRING(0);
-
     PG_RETURN_TEXT_P(cstring_to_text(inputText));
 }
 
@@ -613,7 +634,13 @@ Datum textin(PG_FUNCTION_ARGS)
 Datum textout(PG_FUNCTION_ARGS)
 {
     Datum txt = PG_GETARG_DATUM(0);
-
+    if (VARATT_IS_HUGE_TOAST_POINTER(DatumGetPointer(txt))) {
+        int len = strlen("<CLOB>") + 1;
+        char *res = (char *)palloc(len);
+        errno_t rc = strcpy_s(res, len, "<CLOB>");
+        securec_check_c(rc, "\0", "\0");
+        PG_RETURN_CSTRING(res);
+    }
     PG_RETURN_CSTRING(TextDatumGetCString(txt));
 }
 
@@ -697,6 +724,22 @@ Datum unknownsend(PG_FUNCTION_ARGS)
     PG_RETURN_BYTEA_P(pq_endtypsend(&buf));
 }
 
+static Datum text_length_huge(Datum str)
+{
+    if (pg_database_encoding_max_length() == 1) {
+        PG_RETURN_INT64(toast_raw_datum_size(str) - VARHDRSZ);
+    } else {
+        int64 result = 0;
+        text* t = DatumGetTextPP(str);
+        result = calculate_huge_length(t);
+
+        if ((Pointer)(t) != (Pointer)(str))
+            pfree_ext(t);
+
+        PG_RETURN_INT64(result);
+    }
+}
+
 /* ========== PUBLIC ROUTINES ========== */
 
 /*
@@ -706,10 +749,14 @@ Datum unknownsend(PG_FUNCTION_ARGS)
  */
 Datum textlen(PG_FUNCTION_ARGS)
 {
-    Datum str = PG_GETARG_DATUM(0);
+    Datum str = fetch_real_lob_if_need(PG_GETARG_DATUM(0));
 
-    /* try to avoid decompressing argument */
-    PG_RETURN_INT32(text_length(str));
+    if (VARATT_IS_HUGE_TOAST_POINTER((varlena *)DatumGetTextPP(str))) {
+        return text_length_huge(str);
+    } else {
+        /* try to avoid decompressing argument */
+        PG_RETURN_INT32(text_length(str));
+    }
 }
 
 /*
@@ -747,6 +794,8 @@ Datum textoctetlen(PG_FUNCTION_ARGS)
 {
     Datum str = PG_GETARG_DATUM(0);
 
+    FUNC_CHECK_HUGE_POINTER(PG_ARGISNULL(0), DatumGetPointer(str), "textoctetlen()");
+
     /* We need not detoast the input at all */
     PG_RETURN_INT32(toast_raw_datum_size(str) - VARHDRSZ);
 }
@@ -767,18 +816,28 @@ Datum textcat(PG_FUNCTION_ARGS)
     text* t1 = NULL;
     text* t2 = NULL;
 
-    if (PG_ARGISNULL(0) && PG_ARGISNULL(1))
-        PG_RETURN_NULL();
-    else if (PG_ARGISNULL(0)) {
-        t2 = PG_GETARG_TEXT_PP(1);
-        PG_RETURN_TEXT_P(t2);
-    } else if (PG_ARGISNULL(1)) {
-        t1 = PG_GETARG_TEXT_PP(0);
-        PG_RETURN_TEXT_P(t1);
+    if (u_sess->attr.attr_sql.sql_compatibility == A_FORMAT) {
+        if (PG_ARGISNULL(0) && PG_ARGISNULL(1))
+            PG_RETURN_NULL();
+        else if (PG_ARGISNULL(0)) {
+            t2 = PG_GETARG_TEXT_PP(1);
+            PG_RETURN_TEXT_P(t2);
+        } else if (PG_ARGISNULL(1)) {
+            t1 = PG_GETARG_TEXT_PP(0);
+            PG_RETURN_TEXT_P(t1);
+        } else {
+            t1 = PG_GETARG_TEXT_PP(0);
+            t2 = PG_GETARG_TEXT_PP(1);
+            PG_RETURN_TEXT_P(text_catenate(t1, t2));
+        }
     } else {
-        t1 = PG_GETARG_TEXT_PP(0);
-        t2 = PG_GETARG_TEXT_PP(1);
-        PG_RETURN_TEXT_P(text_catenate(t1, t2));
+        if (!PG_ARGISNULL(0) && !PG_ARGISNULL(1)) {
+            t1 = PG_GETARG_TEXT_PP(0);
+            t2 = PG_GETARG_TEXT_PP(1);
+            PG_RETURN_TEXT_P(text_catenate(t1, t2));
+        } else {
+            PG_RETURN_NULL();
+        }
     }
 }
 
@@ -791,12 +850,27 @@ Datum textcat(PG_FUNCTION_ARGS)
 static text* text_catenate(text* t1, text* t2)
 {
     text* result = NULL;
-    int len1, len2, len;
+    int64 len1, len2, len;
     char* ptr = NULL;
     int rc = 0;
 
-    len1 = VARSIZE_ANY_EXHDR(t1);
-    len2 = VARSIZE_ANY_EXHDR(t2);
+    if (VARATT_IS_HUGE_TOAST_POINTER(t1)) {
+        struct varatt_lob_external large_toast_pointer;
+
+        VARATT_EXTERNAL_GET_HUGE_POINTER(large_toast_pointer, t1);
+        len1 = large_toast_pointer.va_rawsize;
+    } else {
+        len1 = VARSIZE_ANY_EXHDR(t1);
+    }
+
+    if (VARATT_IS_HUGE_TOAST_POINTER(t2)) {
+        struct varatt_lob_external large_toast_pointer;
+
+        VARATT_EXTERNAL_GET_HUGE_POINTER(large_toast_pointer, t2);
+        len2 = large_toast_pointer.va_rawsize;
+    } else {
+        len2 = VARSIZE_ANY_EXHDR(t2);
+    }
 
     /* paranoia ... probably should throw error instead? */
     if (len1 < 0)
@@ -805,25 +879,34 @@ static text* text_catenate(text* t1, text* t2)
         len2 = 0;
 
     len = len1 + len2 + VARHDRSZ;
-    result = (text*)palloc(len);
+    if (len > MAX_TOAST_CHUNK_SIZE + VARHDRSZ) {
+#ifdef ENABLE_MULTIPLE_NODES
+        ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+            errmsg("Un-support clob/blob type more than 1GB for distributed system")));
+#endif
+        Oid toastOid = get_toast_oid();
+        result = text_catenate_huge(t1, t2, toastOid);
+    } else {
+        result = (text*)palloc(len);
 
-    /* Set size of result string... */
-    SET_VARSIZE(result, len);
+        /* Set size of result string... */
+        SET_VARSIZE(result, len);
 
-    /* Fill data field of result string... */
-    ptr = VARDATA(result);
-    if (len1 > 0) {
-        rc = memcpy_s(ptr, len1, VARDATA_ANY(t1), len1);
-        securec_check(rc, "\0", "\0");
-    }
-    if (len2 > 0) {
-        rc = memcpy_s(ptr + len1, len2, VARDATA_ANY(t2), len2);
-        securec_check(rc, "\0", "\0");
+        /* Fill data field of result string... */
+        ptr = VARDATA(result);
+        if (len1 > 0) {
+            rc = memcpy_s(ptr, len1, VARDATA_ANY(t1), len1);
+            securec_check(rc, "\0", "\0");
+        }
+        if (len2 > 0) {
+            rc = memcpy_s(ptr + len1, len2, VARDATA_ANY(t2), len2);
+            securec_check(rc, "\0", "\0");
+        }
     }
 
     return result;
 }
-void text_to_bktmap(text* gbucket, uint2* bktmap, int len)
+void text_to_bktmap(text* gbucket, uint2* bktmap, int *bktlen)
 {
     int s_idx = 0;
     int dest_idx = 0;
@@ -832,16 +915,16 @@ void text_to_bktmap(text* gbucket, uint2* bktmap, int len)
     char dest_str[MAX_NODE_DIG + 1] = {0};
     char* s = text_to_cstring(gbucket);
     int len_text = text_length((Datum)gbucket);
-#ifdef ENABLE_MULTIPLE_NODES
-    CheckBucketMapLenValid();
-#endif
     while (s_idx < len_text && s[s_idx] != '\0' && res_idx < BUCKETDATALEN) {
         if (s[s_idx] == ',') {
             dest_str[dest_idx] = '\0';
             bucket_nid = atoi(dest_str);
             if (bucket_nid > MAX_DATANODE_NUM || bucket_nid < 0)
                 ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED), errmsg("Node id out of range")));
-            bktmap[res_idx++] = bucket_nid;
+            if (bktmap) {
+                bktmap[res_idx] = bucket_nid;
+            }
+            res_idx++;
             dest_idx = 0;
         } else {
             if (dest_idx >= MAX_NODE_DIG)
@@ -852,9 +935,14 @@ void text_to_bktmap(text* gbucket, uint2* bktmap, int len)
     }
     if (dest_idx > 0 && res_idx < BUCKETDATALEN) {
         dest_str[dest_idx] = '\0';
-        bktmap[res_idx++] = atoi(dest_str);
-        dest_idx = 0;
+        if (bktmap) {
+            bktmap[res_idx] = atoi(dest_str);
+        }
+        *bktlen = ++res_idx;
+    } else {
+        ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED), errmsg("bucket map string is invalid")));
     }
+    
     pfree_ext(s);
 }
 /*
@@ -1187,6 +1275,8 @@ Datum text_substr_orclcompat(PG_FUNCTION_ARGS)
     mblen_converter fun_mblen;
     fun_mblen = *pg_wchar_table[GetDatabaseEncoding()].mblen;
 
+    FUNC_CHECK_HUGE_POINTER(PG_ARGISNULL(0), DatumGetPointer(str), "text_substr()");
+
     is_compress = (VARATT_IS_COMPRESSED(DatumGetPointer(str)) || VARATT_IS_EXTERNAL(DatumGetPointer(str)));
     // orclcompat is true, withlen is true
     baseIdx = 6 + (int)is_compress + (eml - 1) * 8;
@@ -1214,6 +1304,8 @@ Datum text_substr_no_len_orclcompat(PG_FUNCTION_ARGS)
     mblen_converter fun_mblen;
     fun_mblen = *pg_wchar_table[GetDatabaseEncoding()].mblen;
 
+    FUNC_CHECK_HUGE_POINTER(PG_ARGISNULL(0), DatumGetPointer(str), "text_substr()");
+
     is_compress = (VARATT_IS_COMPRESSED(DatumGetPointer(str)) || VARATT_IS_EXTERNAL(DatumGetPointer(str)));
     // orclcompat is true, withlen is false
     baseIdx = 4 + (int)is_compress + (eml - 1) * 8;
@@ -1237,6 +1329,8 @@ Datum textoverlay(PG_FUNCTION_ARGS)
 {
     text* t1 = PG_GETARG_TEXT_PP(0);
     text* t2 = PG_GETARG_TEXT_PP(1);
+
+    FUNC_CHECK_HUGE_POINTER(false, t1, "textoverlay()");
     int sp = PG_GETARG_INT32(2); /* substring start position */
     int sl = PG_GETARG_INT32(3); /* substring length */
 
@@ -1247,6 +1341,7 @@ Datum textoverlay_no_len(PG_FUNCTION_ARGS)
 {
     text* t1 = PG_GETARG_TEXT_PP(0);
     text* t2 = PG_GETARG_TEXT_PP(1);
+    FUNC_CHECK_HUGE_POINTER(false, t1, "textoverlay()");
     int sp = PG_GETARG_INT32(2); /* substring start position */
     int sl;
 
@@ -1290,6 +1385,7 @@ Datum textpos(PG_FUNCTION_ARGS)
 {
     text* str = PG_GETARG_TEXT_PP(0);
     text* search_str = PG_GETARG_TEXT_PP(1);
+    FUNC_CHECK_HUGE_POINTER(PG_ARGISNULL(0), str, "textpos()");
 
     PG_RETURN_INT32((int32)text_position(str, search_str));
 }
@@ -1770,6 +1866,11 @@ Datum texteq(PG_FUNCTION_ARGS)
 {
     Datum arg1 = PG_GETARG_DATUM(0);
     Datum arg2 = PG_GETARG_DATUM(1);
+
+    if (VARATT_IS_HUGE_TOAST_POINTER(DatumGetPointer(arg1)) || VARATT_IS_HUGE_TOAST_POINTER(DatumGetPointer(arg2))) {
+        ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                errmsg("texteq could not support more than 1GB clob/blob data")));
+    }
     bool result = false;
     Size len1, len2;
 
@@ -1801,6 +1902,10 @@ Datum textne(PG_FUNCTION_ARGS)
 {
     Datum arg1 = PG_GETARG_DATUM(0);
     Datum arg2 = PG_GETARG_DATUM(1);
+    if (VARATT_IS_HUGE_TOAST_POINTER(DatumGetPointer(arg1)) || VARATT_IS_HUGE_TOAST_POINTER(DatumGetPointer(arg2))) {
+        ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                errmsg("textne could not support more than 1GB clob/blob data")));
+    }
     bool result = false;
     Size len1, len2;
 
@@ -1907,6 +2012,7 @@ Datum text_lt(PG_FUNCTION_ARGS)
 {
     text* arg1 = PG_GETARG_TEXT_PP(0);
     text* arg2 = PG_GETARG_TEXT_PP(1);
+    FUNC_CHECK_HUGE_POINTER(false, arg1, "text_lt()");
     bool result = false;
 
     result = (text_cmp(arg1, arg2, PG_GET_COLLATION()) < 0);
@@ -1921,6 +2027,8 @@ Datum text_le(PG_FUNCTION_ARGS)
 {
     text* arg1 = PG_GETARG_TEXT_PP(0);
     text* arg2 = PG_GETARG_TEXT_PP(1);
+    FUNC_CHECK_HUGE_POINTER(false, arg1, "text_le()");
+
     bool result = false;
 
     result = (text_cmp(arg1, arg2, PG_GET_COLLATION()) <= 0);
@@ -1935,6 +2043,8 @@ Datum text_gt(PG_FUNCTION_ARGS)
 {
     text* arg1 = PG_GETARG_TEXT_PP(0);
     text* arg2 = PG_GETARG_TEXT_PP(1);
+    FUNC_CHECK_HUGE_POINTER(false, arg1, "text_gt()");
+
     bool result = false;
 
     result = (text_cmp(arg1, arg2, PG_GET_COLLATION()) > 0);
@@ -1949,6 +2059,8 @@ Datum text_ge(PG_FUNCTION_ARGS)
 {
     text* arg1 = PG_GETARG_TEXT_PP(0);
     text* arg2 = PG_GETARG_TEXT_PP(1);
+    FUNC_CHECK_HUGE_POINTER(false, arg1, "text_ge()");
+
     bool result = false;
 
     result = (text_cmp(arg1, arg2, PG_GET_COLLATION()) >= 0);
@@ -1963,6 +2075,8 @@ Datum bttextcmp(PG_FUNCTION_ARGS)
 {
     text* arg1 = PG_GETARG_TEXT_PP(0);
     text* arg2 = PG_GETARG_TEXT_PP(1);
+    FUNC_CHECK_HUGE_POINTER(false, arg1, "bttextcmp()");
+
     int32 result;
 
     result = text_cmp(arg1, arg2, PG_GET_COLLATION());
@@ -2667,6 +2781,7 @@ Datum text_larger(PG_FUNCTION_ARGS)
 {
     text* arg1 = PG_GETARG_TEXT_PP(0);
     text* arg2 = PG_GETARG_TEXT_PP(1);
+    FUNC_CHECK_HUGE_POINTER(false, arg1, "text_larger()");
     text* result = NULL;
 
     result = ((text_cmp(arg1, arg2, PG_GET_COLLATION()) > 0) ? arg1 : arg2);
@@ -2678,6 +2793,7 @@ Datum text_smaller(PG_FUNCTION_ARGS)
 {
     text* arg1 = PG_GETARG_TEXT_PP(0);
     text* arg2 = PG_GETARG_TEXT_PP(1);
+    FUNC_CHECK_HUGE_POINTER(false, arg1, "text_smaller()");
     text* result = NULL;
 
     result = ((text_cmp(arg1, arg2, PG_GET_COLLATION()) < 0) ? arg1 : arg2);
@@ -2715,6 +2831,8 @@ Datum text_pattern_lt(PG_FUNCTION_ARGS)
 {
     text* arg1 = PG_GETARG_TEXT_PP(0);
     text* arg2 = PG_GETARG_TEXT_PP(1);
+
+    FUNC_CHECK_HUGE_POINTER(false, arg1, "text_pattern()");
     int result;
 
     result = internal_text_pattern_compare(arg1, arg2);
@@ -2729,6 +2847,8 @@ Datum text_pattern_le(PG_FUNCTION_ARGS)
 {
     text* arg1 = PG_GETARG_TEXT_PP(0);
     text* arg2 = PG_GETARG_TEXT_PP(1);
+
+    FUNC_CHECK_HUGE_POINTER(false, arg1, "text_pattern()");
     int result;
 
     result = internal_text_pattern_compare(arg1, arg2);
@@ -2743,6 +2863,8 @@ Datum text_pattern_ge(PG_FUNCTION_ARGS)
 {
     text* arg1 = PG_GETARG_TEXT_PP(0);
     text* arg2 = PG_GETARG_TEXT_PP(1);
+    FUNC_CHECK_HUGE_POINTER(false, arg1, "text_pattern()");
+
     int result;
 
     result = internal_text_pattern_compare(arg1, arg2);
@@ -2757,6 +2879,8 @@ Datum text_pattern_gt(PG_FUNCTION_ARGS)
 {
     text* arg1 = PG_GETARG_TEXT_PP(0);
     text* arg2 = PG_GETARG_TEXT_PP(1);
+    FUNC_CHECK_HUGE_POINTER(false, arg1, "text_pattern()");
+
     int result;
 
     result = internal_text_pattern_compare(arg1, arg2);
@@ -2771,6 +2895,8 @@ Datum bttext_pattern_cmp(PG_FUNCTION_ARGS)
 {
     text* arg1 = PG_GETARG_TEXT_PP(0);
     text* arg2 = PG_GETARG_TEXT_PP(1);
+    FUNC_CHECK_HUGE_POINTER(false, arg1, "btext_pattern()");
+
     int result;
 
     result = internal_text_pattern_compare(arg1, arg2);
@@ -2790,6 +2916,8 @@ Datum bttext_pattern_cmp(PG_FUNCTION_ARGS)
 Datum byteaoctetlen(PG_FUNCTION_ARGS)
 {
     Datum str = PG_GETARG_DATUM(0);
+
+    FUNC_CHECK_HUGE_POINTER(PG_ARGISNULL(0), PG_GETARG_TEXT_PP(0), "byteaoctetlen()");
 
     /* We need not detoast the input at all */
     PG_RETURN_INT32(toast_raw_datum_size(str) - VARHDRSZ);
@@ -2823,8 +2951,23 @@ static bytea* bytea_catenate(bytea* t1, bytea* t2)
     char* ptr = NULL;
     int rc = 0;
 
-    len1 = VARSIZE_ANY_EXHDR(t1);
-    len2 = VARSIZE_ANY_EXHDR(t2);
+    if (VARATT_IS_HUGE_TOAST_POINTER(t1)) {
+        struct varatt_lob_external large_toast_pointer;
+
+        VARATT_EXTERNAL_GET_HUGE_POINTER(large_toast_pointer, t1);
+        len1 = large_toast_pointer.va_rawsize;
+    } else {
+        len1 = VARSIZE_ANY_EXHDR(t1);
+    }
+
+    if (VARATT_IS_HUGE_TOAST_POINTER(t2)) {
+        struct varatt_lob_external large_toast_pointer;
+
+        VARATT_EXTERNAL_GET_HUGE_POINTER(large_toast_pointer, t2);
+        len2 = large_toast_pointer.va_rawsize;
+    } else {
+        len2 = VARSIZE_ANY_EXHDR(t2);
+    }
 
     /* paranoia ... probably should throw error instead? */
     if (len1 < 0)
@@ -2833,20 +2976,30 @@ static bytea* bytea_catenate(bytea* t1, bytea* t2)
         len2 = 0;
 
     len = len1 + len2 + VARHDRSZ;
-    result = (bytea*)palloc(len);
 
-    /* Set size of result string... */
-    SET_VARSIZE(result, len);
+    if (len > MAX_TOAST_CHUNK_SIZE + VARHDRSZ) {
+#ifdef ENABLE_MULTIPLE_NODES
+        ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+            errmsg("Un-support clob/blob type more than 1GB for distributed system")));
+#endif
+        Oid toastOid = get_toast_oid();
+        result = text_catenate_huge(t1, t2, toastOid);
+    } else {
+        result = (bytea*)palloc(len);
 
-    /* Fill data field of result string... */
-    ptr = VARDATA(result);
-    if (len1 > 0) {
-        rc = memcpy_s(ptr, len1, VARDATA_ANY(t1), len1);
-        securec_check(rc, "\0", "\0");
-    }
-    if (len2 > 0) {
-        rc = memcpy_s(ptr + len1, len2, VARDATA_ANY(t2), len2);
-        securec_check(rc, "\0", "\0");
+        /* Set size of result string... */
+        SET_VARSIZE(result, len);
+
+        /* Fill data field of result string... */
+        ptr = VARDATA(result);
+        if (len1 > 0) {
+            rc = memcpy_s(ptr, len1, VARDATA_ANY(t1), len1);
+            securec_check(rc, "\0", "\0");
+        }
+        if (len2 > 0) {
+            rc = memcpy_s(ptr + len1, len2, VARDATA_ANY(t2), len2);
+            securec_check(rc, "\0", "\0");
+        }
     }
     return result;
 }
@@ -3572,7 +3725,6 @@ Datum byteaeq(PG_FUNCTION_ARGS)
     Datum arg2 = PG_GETARG_DATUM(1);
     bool result = false;
     Size len1, len2;
-
     /*
      * We can use a fast path for unequal lengths, which might save us from
      * having to detoast one or both values.
@@ -3601,6 +3753,8 @@ Datum byteane(PG_FUNCTION_ARGS)
     bool result = false;
     Size len1, len2;
 
+    FUNC_CHECK_HUGE_POINTER(PG_ARGISNULL(0), DatumGetPointer(arg1), "byteane()");
+
     /*
      * We can use a fast path for unequal lengths, which might save us from
      * having to detoast one or both values.
@@ -3626,6 +3780,8 @@ Datum bytealt(PG_FUNCTION_ARGS)
 {
     bytea* arg1 = PG_GETARG_BYTEA_PP(0);
     bytea* arg2 = PG_GETARG_BYTEA_PP(1);
+
+    FUNC_CHECK_HUGE_POINTER(false, arg1, "bytealt()");
     int len1, len2;
     int cmp;
 
@@ -3647,6 +3803,8 @@ Datum byteale(PG_FUNCTION_ARGS)
     int len1, len2;
     int cmp;
 
+    FUNC_CHECK_HUGE_POINTER(false, arg1, "bytealt()");
+
     len1 = VARSIZE_ANY_EXHDR(arg1);
     len2 = VARSIZE_ANY_EXHDR(arg2);
 
@@ -3664,6 +3822,7 @@ Datum byteagt(PG_FUNCTION_ARGS)
     bytea* arg2 = PG_GETARG_BYTEA_PP(1);
     int len1, len2;
     int cmp;
+    FUNC_CHECK_HUGE_POINTER(false, arg1, "byteagt()");
 
     len1 = VARSIZE_ANY_EXHDR(arg1);
     len2 = VARSIZE_ANY_EXHDR(arg2);
@@ -3682,6 +3841,7 @@ Datum byteage(PG_FUNCTION_ARGS)
     bytea* arg2 = PG_GETARG_BYTEA_PP(1);
     int len1, len2;
     int cmp;
+    FUNC_CHECK_HUGE_POINTER(false, arg1, "bytealt()");
 
     len1 = VARSIZE_ANY_EXHDR(arg1);
     len2 = VARSIZE_ANY_EXHDR(arg2);
@@ -3698,6 +3858,7 @@ Datum byteacmp(PG_FUNCTION_ARGS)
 {
     bytea* arg1 = PG_GETARG_BYTEA_PP(0);
     bytea* arg2 = PG_GETARG_BYTEA_PP(1);
+    FUNC_CHECK_HUGE_POINTER(false, arg1, "byteacmp()");
     int len1, len2;
     int cmp;
 
@@ -3736,6 +3897,8 @@ Datum raweq(PG_FUNCTION_ARGS)
     int len1, len2;
     bool result = false;
 
+    FUNC_CHECK_HUGE_POINTER(PG_ARGISNULL(0), arg1, "raweq()");
+
     len1 = VARSIZE_ANY_EXHDR(arg1);
     len2 = VARSIZE_ANY_EXHDR(arg2);
 
@@ -3757,6 +3920,7 @@ Datum rawne(PG_FUNCTION_ARGS)
     bytea* arg2 = PG_GETARG_BYTEA_PP(1);
     int len1, len2;
     bool result = false;
+    FUNC_CHECK_HUGE_POINTER(false, arg1, "rawne()");
 
     len1 = VARSIZE_ANY_EXHDR(arg1);
     len2 = VARSIZE_ANY_EXHDR(arg2);
@@ -3779,6 +3943,7 @@ Datum rawlt(PG_FUNCTION_ARGS)
     bytea* arg2 = PG_GETARG_BYTEA_PP(1);
     int len1, len2;
     int cmp;
+    FUNC_CHECK_HUGE_POINTER(false, arg1, "rawlt()");
 
     len1 = VARSIZE_ANY_EXHDR(arg1);
     len2 = VARSIZE_ANY_EXHDR(arg2);
@@ -3797,6 +3962,7 @@ Datum rawle(PG_FUNCTION_ARGS)
     bytea* arg2 = PG_GETARG_BYTEA_PP(1);
     int len1, len2;
     int cmp;
+    FUNC_CHECK_HUGE_POINTER(false, arg1, "rawle()");
 
     len1 = VARSIZE_ANY_EXHDR(arg1);
     len2 = VARSIZE_ANY_EXHDR(arg2);
@@ -3815,6 +3981,7 @@ Datum rawgt(PG_FUNCTION_ARGS)
     bytea* arg2 = PG_GETARG_BYTEA_PP(1);
     int len1, len2;
     int cmp;
+    FUNC_CHECK_HUGE_POINTER(false, arg1, "rawgt()");
 
     len1 = VARSIZE_ANY_EXHDR(arg1);
     len2 = VARSIZE_ANY_EXHDR(arg2);
@@ -3833,6 +4000,7 @@ Datum rawge(PG_FUNCTION_ARGS)
     bytea* arg2 = PG_GETARG_BYTEA_PP(1);
     int len1, len2;
     int cmp;
+    FUNC_CHECK_HUGE_POINTER(false, arg1, "rawge()");
 
     len1 = VARSIZE_ANY_EXHDR(arg1);
     len2 = VARSIZE_ANY_EXHDR(arg2);
@@ -3851,6 +4019,7 @@ Datum rawcmp(PG_FUNCTION_ARGS)
     bytea* arg2 = PG_GETARG_BYTEA_PP(1);
     int len1, len2;
     int cmp;
+    FUNC_CHECK_HUGE_POINTER(false, arg1, "rawcmp()");
 
     len1 = VARSIZE_ANY_EXHDR(arg1);
     len2 = VARSIZE_ANY_EXHDR(arg2);
@@ -3914,6 +4083,33 @@ static void appendStringInfoText(StringInfo str, const text* t)
 }
 
 /*
+ * replace_text_with_two_args
+ * replace all occurrences of 'old_sub_str' in 'orig_str'
+ * with '' to form 'new_str'
+ *
+ * the effect is equivalent to
+ *
+ * delete all occurrences of 'old_sub_str' in 'orig_str'
+ * to form 'new_str'
+ *
+ * returns 'orig_str' if 'old_sub_str' == '' or 'orig_str' == ''
+ * otherwise returns 'new_str'
+ */
+Datum replace_text_with_two_args(PG_FUNCTION_ARGS)
+{
+    if (PG_ARGISNULL(0))
+        PG_RETURN_NULL();
+
+    if (PG_ARGISNULL(1))
+        PG_RETURN_TEXT_P(PG_GETARG_TEXT_PP(0));
+
+    return DirectFunctionCall3(replace_text,
+        PG_GETARG_DATUM(0),
+        PG_GETARG_DATUM(1),
+        CStringGetTextDatum("\0"));
+}
+
+/*
  * replace_text
  * replace all occurrences of 'old_sub_str' in 'orig_str'
  * with 'new_sub_str' to form 'new_str'
@@ -3947,6 +4143,12 @@ Datum replace_text(PG_FUNCTION_ARGS)
 
     if (!PG_ARGISNULL(2))
         to_sub_text = PG_GETARG_TEXT_PP(2);
+
+    if (VARATT_IS_HUGE_TOAST_POINTER(src_text) || VARATT_IS_HUGE_TOAST_POINTER(from_sub_text)) {
+        ereport(ERROR,
+            (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                errmsg("replace() arguments cannot exceed 1GB")));
+    }
 
     text_position_setup(src_text, from_sub_text, &state);
 
@@ -4131,8 +4333,9 @@ static void appendStringInfoRegexpSubstr(
  *
  * Note: to avoid having to include regex.h in builtins.h, we declare
  * the regexp argument as void *, but really it's regex_t *.
+ * occur : the n-th matched occurrence, start from 1.
  */
-text* replace_text_regexp(text* src_text, void* regexp, text* replace_text, bool glob)
+text* replace_text_regexp(text* src_text, void* regexp, text* replace_text, int position, int occur)
 {
     text* ret_text = NULL;
     regex_t* re = (regex_t*)regexp;
@@ -4141,8 +4344,10 @@ text* replace_text_regexp(text* src_text, void* regexp, text* replace_text, bool
     regmatch_t pmatch[REGEXP_REPLACE_BACKREF_CNT];
     pg_wchar* data = NULL;
     size_t data_len;
-    int search_start;
+    int search_start = position - 1;
     int data_pos;
+    int count = 0;
+    int replace_len;
     char* start_ptr = NULL;
     bool have_escape = false;
 
@@ -4151,7 +4356,9 @@ text* replace_text_regexp(text* src_text, void* regexp, text* replace_text, bool
     /* Convert data string to wide characters. */
     data = (pg_wchar*)palloc((src_text_len + 1) * sizeof(pg_wchar));
     data_len = pg_mb2wchar_with_len(VARDATA_ANY(src_text), data, src_text_len);
-
+    if ((unsigned int)(position) > data_len) {
+        return src_text;
+    }
     /* Check whether replace_text has escape char. */
     if (replace_text != NULL)
         have_escape = check_replace_text_has_escape_char(replace_text);
@@ -4160,7 +4367,6 @@ text* replace_text_regexp(text* src_text, void* regexp, text* replace_text, bool
     start_ptr = (char*)VARDATA_ANY(src_text);
     data_pos = 0;
 
-    search_start = 0;
     while ((unsigned int)(search_start) <= data_len) {
         int regexec_result;
 
@@ -4204,24 +4410,27 @@ text* replace_text_regexp(text* src_text, void* regexp, text* replace_text, bool
             data_pos = pmatch[0].rm_so;
         }
 
-        /*
-         * Copy the replace_text. Process back references when the
-         * replace_text has escape characters.
-         */
-        if (replace_text != NULL && have_escape)
-            appendStringInfoRegexpSubstr(&buf, replace_text, pmatch, start_ptr, data_pos);
-        else if (replace_text != NULL)
-            appendStringInfoText(&buf, replace_text);
+        count++;
+
+        replace_len = charlen_to_bytelen(start_ptr, pmatch[0].rm_eo - data_pos);
+
+        if (occur == 0 || count == occur) {
+            /*
+             * Copy the replace_text. Process back references when the
+             * replace_text has escape characters.
+             */
+            if (replace_text != NULL && have_escape)
+                appendStringInfoRegexpSubstr(&buf, replace_text, pmatch, start_ptr, data_pos);
+            else if (replace_text != NULL)
+                appendStringInfoText(&buf, replace_text);
+        } else {
+            /* not the n-th matched occurrence */
+            appendBinaryStringInfo(&buf, start_ptr, replace_len);
+        }
 
         /* Advance start_ptr and data_pos over the matched text. */
-        start_ptr += charlen_to_bytelen(start_ptr, pmatch[0].rm_eo - data_pos);
+        start_ptr += replace_len;
         data_pos = pmatch[0].rm_eo;
-
-        /*
-         * When global option is off, replace the first instance only.
-         */
-        if (!glob)
-            break;
 
         /*
          * Advance search position.	Normally we start the next search at the
@@ -5596,6 +5805,15 @@ Datum interval_list_agg_noarg2_transfn(PG_FUNCTION_ARGS)
     PG_RETURN_POINTER(state);
 }
 
+static void check_huge_toast_pointer(Datum value, Oid valtype)
+{
+    if ((valtype == TEXTOID || valtype == CLOBOID || valtype == BLOBOID) &&
+        VARATT_IS_HUGE_TOAST_POINTER(DatumGetPointer(value))) {
+        ereport(ERROR,
+            (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("concat could not support more than 1GB clob/blob data")));
+    }
+}
+
 /*
  * Implementation of both concat() and concat_ws().
  *
@@ -5656,6 +5874,7 @@ static text* concat_internal(const char* sepstr, int seplen, int argidx, Functio
 
             /* call the appropriate type output function, append the result */
             valtype = get_fn_expr_argtype(fcinfo->flinfo, i);
+            check_huge_toast_pointer(value, valtype);
             if (!OidIsValid(valtype))
                 ereport(ERROR, (errcode(ERRCODE_INDETERMINATE_DATATYPE),
                         errmsg("could not determine data type of concat() input")));
@@ -5711,6 +5930,10 @@ Datum text_concat_ws(PG_FUNCTION_ARGS)
 Datum text_left(PG_FUNCTION_ARGS)
 {
     text* str = PG_GETARG_TEXT_PP(0);
+    if (VARATT_IS_HUGE_TOAST_POINTER((varlena *)str)) {
+        ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                errmsg("text_left could not support more than 1GB clob/blob data")));
+    }
     const char* p = VARDATA_ANY(str);
     int len = VARSIZE_ANY_EXHDR(str);
     int n = PG_GETARG_INT32(1);
@@ -5744,6 +5967,10 @@ Datum text_left(PG_FUNCTION_ARGS)
 Datum text_right(PG_FUNCTION_ARGS)
 {
     text* str = PG_GETARG_TEXT_PP(0);
+    if (VARATT_IS_HUGE_TOAST_POINTER((varlena *)str)) {
+        ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                errmsg("text_right could not support more than 1GB clob/blob data")));
+    }
     const char* p = VARDATA_ANY(str);
     int len = VARSIZE_ANY_EXHDR(str);
     int n = PG_GETARG_INT32(1);
@@ -5777,6 +6004,10 @@ Datum text_right(PG_FUNCTION_ARGS)
 Datum text_reverse(PG_FUNCTION_ARGS)
 {
     text* str = PG_GETARG_TEXT_PP(0);
+    if (VARATT_IS_HUGE_TOAST_POINTER((varlena *)str)) {
+        ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                errmsg("text_reverse could not support more than 1GB clob/blob data")));
+    }
     const char* p = VARDATA_ANY(str);
     int len = VARSIZE_ANY_EXHDR(str);
     const char* endp = p + len;

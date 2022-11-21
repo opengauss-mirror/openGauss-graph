@@ -34,7 +34,7 @@
 #define AttributeRelation_Rowtype_Id  75
 
 #define IsAttributeRelation(rel) (RelationGetRelid(rel) == AttributeRelationId)
-#define IsAttributeCache(cache) ((cache)->cc_reloid == AttributeRelationId)
+#define IsAttributeCache(reloid) ((reloid) == AttributeRelationId)
 
 CATALOG(pg_attribute,1249) BKI_BOOTSTRAP BKI_WITHOUT_OIDS BKI_ROWTYPE_OID(75) BKI_SCHEMA_MACRO
 {
@@ -45,7 +45,7 @@ CATALOG(pg_attribute,1249) BKI_BOOTSTRAP BKI_WITHOUT_OIDS BKI_ROWTYPE_OID(75) BK
 	 * atttypid is the OID of the instance in Catalog Class pg_type that
 	 * defines the data type of this attribute (e.g. int4).  Information in
 	 * that instance is redundant with the attlen, attbyval, and attalign
-	 * attributes of this instance, so they had better match or Postgres will
+	 * attributes of this instance, so they had better match or openGauss will
 	 * fail.
 	 */
 	Oid			atttypid;
@@ -233,5 +233,20 @@ typedef FormData_pg_attribute *Form_pg_attribute;
  */
 #define ATTRIBUTE_IDENTITY_ALWAYS 'a'
 #define ATTRIBUTE_GENERATED_STORED 's'
+
+#ifdef GS_GRAPH
+/* graph */
+DATA(insert ( 8110 id 8102 -1 8 1 0 -1 -1 FLOAT8PASSBYVAL p d f f f t 0 0 0 _null_ _null_ _null_ _null_ 0));
+DATA(insert ( 8110 properties 3802 -1 -1 2 0 -1 -1 f x i f f f t 0 0 0 _null_ _null_ _null_ _null_ 0));
+DATA(insert ( 8110 tid 27 -1 6 3 0 -1 -1 f p s f f f t 0 0 0 _null_ _null_ _null_ _null_ 0));
+DATA(insert ( 8120 id 8102 -1 8 1 0 -1 -1 FLOAT8PASSBYVAL p d f f f t 0 0 0 _null_ _null_ _null_ _null_ 0));
+DATA(insert ( 8120 start 8102 -1 8 2 0 -1 -1 FLOAT8PASSBYVAL p d f f f t 0 0 0 _null_ _null_ _null_ _null_ 0));
+DATA(insert ( 8120 end 8102 -1 8 3 0 -1 -1 FLOAT8PASSBYVAL p d f f f t 0 0 0 _null_ _null_ _null_ _null_ 0));
+DATA(insert ( 8120 properties 3802 -1 -1 4 0 -1 -1 f x i f f f t 0 0 0 _null_ _null_ _null_ _null_ 0));
+DATA(insert ( 8120 tid 27 -1 6 5 0 -1 -1 f p s f f f t 0 0 0 _null_ _null_ _null_ _null_ 0));
+DATA(insert ( 8130 vertices 8111 -1 -1 1 1 -1 -1 f x i f f f t 0 0 0 _null_ _null_ _null_ _null_ 0));
+DATA(insert ( 8130 edges 8121 -1 -1 2 1 -1 -1 f x i f f f t 0 0 0 _null_ _null_ _null_ _null_ 0));
+#endif /* GS_GRAPH */
+
 #endif   /* PG_ATTRIBUTE_H */
 
