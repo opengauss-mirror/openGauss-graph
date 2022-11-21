@@ -1,3 +1,5 @@
+create database pl_test_pkg_func DBCOMPATIBILITY 'pg';
+\c pl_test_pkg_func;
 create schema package_schema;
 set current_schema= package_schema;
 --test package function defination
@@ -77,7 +79,6 @@ begin
 	 return 0;
 end;
 /
-ERROR:  Package function does not support function overload which has the same type argument.
 create or replace procedure package_func_overload(col int, col2 out varchar)
 package
 as
@@ -103,7 +104,6 @@ DECLARE
 	para3  bigint = 2;
 	para4  varchar;
 BEGIN
-   package_func_overload(1, 1);
    package_func_overload(1, para1);
    package_func_overload(1, para2);
    package_func_overload(1, para3);
@@ -210,7 +210,6 @@ begin
 	 return 0;
 end;
 /
-ERROR:  Package function does not support function overload which has the same type argument.
 --none package function overload
 create or replace function package_func_overload_4(col int, col2 out int)
 returns integer as $$
@@ -337,7 +336,6 @@ BEGIN
 	return 1;
 END;
 $$ language plpgsql;
-ERROR:  Package function does not support function overload which has the same type argument.
 select  test_proc_define('hello', 'world', 'NO BIND');
  test_proc_define 
 ------------------
@@ -729,7 +727,7 @@ end;
 /
 INFO:  buffer: 123
 drop schema package_schema cascade;
-NOTICE:  drop cascades to 18 other objects
+NOTICE:  drop cascades to 20 other objects
 DETAIL:  drop cascades to function package_schema.get_sal(character varying)
 drop cascades to function package_schema.get_sal(integer)
 drop cascades to function package_schema.test_package_function(integer)
@@ -740,6 +738,7 @@ drop cascades to function package_schema.package_func_overload(integer)
 drop cascades to function package_schema.package_func_overload_1(integer,character varying)
 drop cascades to function package_schema.package_func_overload_2(integer,bigint)
 drop cascades to function package_schema.package_func_overload_3(integer)
+drop cascades to function package_schema.package_func_overload_3(integer,integer)
 drop cascades to function package_schema.package_func_overload_4(integer)
 drop cascades to function package_schema.package_func_overload_4(integer,integer)
 drop cascades to function package_schema.test_para1(integer)
@@ -748,6 +747,7 @@ drop cascades to function package_schema.read_file(integer,integer)
 drop cascades to function package_schema.read_file(integer,integer,integer)
 drop cascades to function package_schema.read_file1(integer)
 drop cascades to function package_schema.test_proc_define(character varying,character varying,character varying)
+drop cascades to function package_schema.test_proc_define(character varying,character varying)
 drop schema package_nps cascade;
 NOTICE:  drop cascades to 15 other objects
 DETAIL:  drop cascades to function read_file(integer,integer,integer)
@@ -765,3 +765,84 @@ drop cascades to function test_default_out()
 drop cascades to function test_default_out(integer,integer,integer)
 drop cascades to function test_para2(text)
 drop cascades to function test_para2(text,character varying)
+\c regression;
+drop schema if exists s1;
+NOTICE:  schema "s1" does not exist, skipping
+drop schema if exists s2;
+NOTICE:  schema "s2" does not exist, skipping
+create schema s1;
+create schema s2;
+set current_schema to s1;
+create function package_func_overload_1(col int)
+returns integer as $$
+declare
+begin
+    return 0;
+end;
+$$ language plpgsql;
+set current_schema to s2;
+create function package_func_overload_1(col int)
+returns integer as $$
+declare
+begin
+    return 0;
+end;
+$$ language plpgsql;
+reset current_schema;
+drop schema s1 cascade;
+NOTICE:  drop cascades to function s1.package_func_overload_1(integer)
+drop schema s2 cascade;
+NOTICE:  drop cascades to function s2.package_func_overload_1(integer)
+create schema s;
+set current_schema to s;
+CREATE OR REPLACE PACKAGE p1 IS
+PROCEDURE testpro1(var3 int);
+PROCEDURE testpro1(var2 char);
+END p1;
+/
+create function testpro1(col int)
+returns integer as $$
+declare
+begin
+     return 0;
+end;
+$$ language plpgsql;
+reset current_schema;
+drop schema s cascade;
+NOTICE:  drop cascades to 4 other objects
+--?DETAIL:  drop cascades to package .*
+drop cascades to function s.testpro1(integer)
+drop cascades to function s.testpro1(character)
+drop cascades to function s.testpro1(integer)
+drop package if exists pkg112;
+NOTICE:  package pkg112() does not exist, skipping
+create or replace package pkg112 
+as
+type ty1 is table of integer index by integer;
+procedure p1(v1 in ty1,v2 out ty1,v3 inout ty1,v4 int);
+procedure p1(v2 out ty1,v3 inout ty1,v4 int);
+procedure p4();
+pv1 ty1;
+end pkg112;
+/
+set behavior_compat_options='proc_outparam_override';
+drop package if exists pkg112;
+NOTICE:  drop cascades to 3 other objects
+DETAIL:  drop cascades to function public.p1(_int4[],_int4[],integer)
+drop cascades to function public.p1(_int4[],integer)
+drop cascades to function public.p4()
+create or replace package pkg112 
+as
+type ty1 is table of integer index by integer;
+procedure p1(v1 in ty1,v2 out ty1,v3 inout ty1,v4 int);
+procedure p1(v2 out ty1,v3 inout ty1,v4 int);
+procedure p4();
+pv1 ty1;
+end pkg112;
+/
+drop package if exists pkg112;
+NOTICE:  drop cascades to 3 other objects
+DETAIL:  drop cascades to function public.p1(_int4[],_int4[],integer)
+drop cascades to function public.p1(_int4[],integer)
+drop cascades to function public.p4()
+set behavior_compat_options='';

@@ -1,7 +1,7 @@
 /* -------------------------------------------------------------------------
  *
  * transam.h
- *	  postgres transaction access method support code
+ *	  openGauss transaction access method support code
  *
  *
  * Portions Copyright (c) 2020 Huawei Technologies Co.,Ltd.
@@ -82,6 +82,11 @@
 /* compare two XIDs already known to be normal; this is a macro for speed */
 #define NormalTransactionIdFollows(id1, id2) \
     (AssertMacro(TransactionIdIsNormal(id1) && TransactionIdIsNormal(id2)), (int32)((id1) - (id2)) > 0)
+
+/* Extract xid from a value comprised of epoch and xid  */
+#define GetXidFromEpochXid(epochxid)                    \
+        ((uint32) (epochxid) & 0XFFFFFFFF)
+
 /* ----------
  *		Object ID (OID) zero is InvalidOid.
  *
@@ -155,6 +160,11 @@ typedef struct VariableCacheData {
     pg_atomic_uint64 nextCommitSeqNo;
     TransactionId latestCompletedXid; /* newest XID that has committed or
                                        * aborted */
+
+    CommitSeqNo xlogMaxCSN; /* latest CSN read in the xlog */
+    CommitSeqNo* max_csn_array; /* Record the xlogMaxCSN of all nodes. */
+    bool* main_standby_array;   /* Record whether node is main standby or not */
+
     /*
      * These fields only set in startup to normal
      */
@@ -163,6 +173,8 @@ typedef struct VariableCacheData {
     TransactionId recentLocalXmin;           /* the lastest xmin in local node */
     pg_atomic_uint64 recentGlobalXmin;       /* the lastest xmin in global  */
     pg_atomic_uint64 standbyXmin;            /* the  xmin for read snapshot on standby */
+    pg_atomic_uint64 standbyRedoCleanupXmin; /* the xmin for standby redo cleanup xlog */
+    pg_atomic_uint64 standbyRedoCleanupXminLsn; /* the lsn for standby redo cleanup xlog */
     pg_atomic_uint32 CriticalCacheBuildLock; /* lock of create relcache init file */
 
     pg_atomic_uint64 cutoff_csn_min;
@@ -186,6 +198,8 @@ extern bool TransactionStartedDuringRecovery(void);
  */
 extern bool TransactionIdDidCommit(TransactionId transactionId);
 extern bool TransactionIdDidAbort(TransactionId transactionId);
+extern bool UHeapTransactionIdDidCommit(TransactionId transactionId);
+extern bool UHeapTransactionIdDidAbort(TransactionId transactionId);
 
 #define COMMITSEQNO_INPROGRESS UINT64CONST(0x0)
 #define COMMITSEQNO_ABORTED UINT64CONST(0x1)
@@ -196,12 +210,13 @@ extern bool TransactionIdDidAbort(TransactionId transactionId);
 #define COMMITSEQNO_SUBTRANS_BIT (UINT64CONST(1) << 63)
 
 #define MAX_COMMITSEQNO UINT64CONST((UINT64CONST(1) << 60) - 1) /* First four bits reserved */
+#define COMMITSEQNO_RESERVE_MASK (~MAX_COMMITSEQNO)
 
 #define COMMITSEQNO_IS_INPROGRESS(csn) (((csn)&MAX_COMMITSEQNO) == COMMITSEQNO_INPROGRESS)
 #define COMMITSEQNO_IS_ABORTED(csn) ((csn) == COMMITSEQNO_ABORTED)
 #define COMMITSEQNO_IS_FROZEN(csn) ((csn) == COMMITSEQNO_FROZEN)
 #define COMMITSEQNO_IS_COMMITTED(csn) \
-    (((csn)&MAX_COMMITSEQNO) >= COMMITSEQNO_FROZEN && !COMMITSEQNO_IS_SUBTRANS(csn) && !COMMITSEQNO_IS_COMMITTING(csn))
+    (((csn)&MAX_COMMITSEQNO) >= COMMITSEQNO_FROZEN && !((csn)&COMMITSEQNO_RESERVE_MASK))
 #define COMMITSEQNO_IS_COMMITTING(csn) (((csn)&COMMITSEQNO_COMMIT_INPROGRESS) == COMMITSEQNO_COMMIT_INPROGRESS)
 
 #define COMMITSEQNO_IS_SUBTRANS(csn) (((csn)&COMMITSEQNO_SUBTRANS_BIT) == COMMITSEQNO_SUBTRANS_BIT)
@@ -212,9 +227,8 @@ extern bool TransactionIdDidAbort(TransactionId transactionId);
 typedef enum { XID_COMMITTED, XID_ABORTED, XID_INPROGRESS } TransactionIdStatus;
 
 extern void SetLatestFetchState(TransactionId transactionId, CommitSeqNo result);
-extern CommitSeqNo TransactionIdGetCommitSeqNo(TransactionId xid, bool isCommit, bool isMvcc, bool isNest);
-extern CommitSeqNo TransactionIdGetCommitSeqNoNCache(
-    TransactionId transactionId, bool isCommit, bool isMvcc, bool isNest);
+extern CommitSeqNo TransactionIdGetCommitSeqNo(TransactionId xid, bool isCommit, bool isMvcc, bool isNest,
+    Snapshot snapshot);
 extern void TransactionIdAbort(TransactionId transactionId);
 extern void TransactionIdCommitTree(TransactionId xid, int nxids, TransactionId* xids, uint64 csn);
 extern bool TransactionIdIsKnownCompleted(TransactionId transactionId);
@@ -224,7 +238,6 @@ extern TransactionId TransactionIdLatest(TransactionId mainxid, int nxids, const
 extern XLogRecPtr TransactionIdGetCommitLSN(TransactionId xid);
 extern bool LatestFetchTransactionIdDidAbort(TransactionId transactionId);
 extern bool LatestFetchCSNDidAbort(TransactionId transactionId);
-extern bool TransactionIdLogicallyPrecedes(TransactionId id1, TransactionId id2);
 
 /* in transam/varsup.c */
 #ifdef PGXC /* PGXC_DATANODE */
@@ -241,5 +254,4 @@ extern bool ForceTransactionIdLimitUpdate(void);
 extern Oid GetNewObjectId(bool IsToastRel = false);
 extern TransactionId SubTransGetTopParentXidFromProcs(TransactionId xid);
 extern TransactionIdStatus TransactionIdGetStatus(TransactionId transactionId);
-
 #endif /* TRAMSAM_H */

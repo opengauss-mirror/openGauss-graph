@@ -26,7 +26,7 @@
 #include "miscadmin.h"
 #include "postmaster/alarmchecker.h"
 #include "postmaster/syslogger.h"
-#include "storage/fd.h"
+#include "storage/smgr/fd.h"
 #include "storage/checksum.h"
 #include "replication/basebackup.h"
 #include "utils/builtins.h"
@@ -101,6 +101,7 @@ bytea* read_binary_file(const char* filename, int64 seek_offset, int64 bytes_to_
     const int MAX_RETRY_LIMIT = 60;
     int retryCnt = 0;
     errno_t rc = 0;
+    UndoFileType undoFileType = UNDO_INVALID;
 
     if (bytes_to_read < 0) {
         if (seek_offset < 0)
@@ -130,7 +131,7 @@ bytea* read_binary_file(const char* filename, int64 seek_offset, int64 bytes_to_
             ereport(ERROR, (errcode_for_file_access(), errmsg("could not open file \"%s\" for reading: %m", filename)));
     }
 
-    isNeedCheck = is_row_data_file(filename, &segNo);
+    isNeedCheck = is_row_data_file(filename, &segNo, &undoFileType);
     ereport(DEBUG1, (errmsg("read_binary_file, filename is %s, isNeedCheck is %d", filename, isNeedCheck)));
 
     buf = (bytea*)palloc((Size)bytes_to_read + VARHDRSZ);
@@ -147,11 +148,13 @@ recheck:
                 errmsg("could not read file \"%s\": %m", filename)));
     }
 
-    if (g_instance.attr.attr_storage.enableIncrementalCheckpoint && isNeedCheck && need_check) {
+    if (ENABLE_INCRE_CKPT && isNeedCheck && need_check) {
         uint32 check_loc = 0;
         BlockNumber blkno = 0;
         uint16 checksum = 0;
         PageHeader phdr = NULL;
+        uint32 segSize;
+        GET_SEG_SIZE(undoFileType, segSize);
 
         if (seek_offset < 0) {
             struct stat fst;
@@ -178,9 +181,9 @@ recheck:
         }
 
         for (check_loc = 0; check_loc < nbytes; check_loc += BLCKSZ) {
-            blkno = offset / BLCKSZ + check_loc / BLCKSZ + (segNo * ((BlockNumber)RELSEG_SIZE));
+            blkno = offset / BLCKSZ + check_loc / BLCKSZ + (segNo * segSize);
             phdr = PageHeader((char*)VARDATA(buf) + check_loc);
-            if (PageIsNew(phdr)) {
+            if (!CheckPageZeroCases(phdr)) {
                 continue;
             }
             checksum = pg_checksum_page((char*)VARDATA(buf) + check_loc, blkno);
@@ -312,6 +315,129 @@ Datum pg_read_binary_file_all(PG_FUNCTION_ARGS)
     filename = convert_and_check_filename(filename_t);
 
     PG_RETURN_BYTEA_P(read_binary_file(filename, 0, -1, false));
+}
+struct CompressAddressItemState {
+    uint32 blkno;
+    int segmentNo;
+    ReadBlockChunksStruct rbStruct;
+    FILE *pcaFile;
+};
+
+static void ReadBinaryFileBlocksFirstCall(PG_FUNCTION_ARGS, int32 startBlockNum, int32 blockCount)
+{
+    char* path = convert_and_check_filename(PG_GETARG_TEXT_PP(0));
+    int segmentNo = 0;
+    UndoFileType undoFileType = UNDO_INVALID;
+    if (!is_row_data_file(path, &segmentNo, &undoFileType)) {
+        ereport(ERROR, (errcode(ERRCODE_INSUFFICIENT_RESOURCES), errmsg("%s is not a relation file.", path)));
+    }
+    /* create a function context for cross-call persistence */
+    FuncCallContext* fctx = SRF_FIRSTCALL_INIT();
+
+    /* switch to memory context appropriate for multiple function calls */
+    MemoryContext mctx = MemoryContextSwitchTo(fctx->multi_call_memory_ctx);
+
+    /* initialize file scanning code */
+    CompressAddressItemState* itemState = (CompressAddressItemState*)palloc(sizeof(CompressAddressItemState));
+
+    /* save mmap to inter_call_data->pcMap */
+    char pcaFilePath[MAXPGPATH];
+    errno_t rc = snprintf_s(pcaFilePath, MAXPGPATH, MAXPGPATH - 1, PCA_SUFFIX, path);
+    securec_check_ss(rc, "\0", "\0");
+    FILE* pcaFile = AllocateFile((const char*)pcaFilePath, "rb");
+    if (pcaFile == NULL) {
+        ereport(ERROR, (errcode_for_file_access(), errmsg("could not open file \"%s\": %m", pcaFilePath)));
+    }
+    PageCompressHeader* map = pc_mmap(fileno(pcaFile), ReadChunkSize(pcaFile, pcaFilePath, MAXPGPATH), true);
+    if (map == MAP_FAILED) {
+        ereport(ERROR, (errcode(ERRCODE_INSUFFICIENT_RESOURCES), errmsg("Failed to mmap %s: %m", pcaFilePath)));
+    }
+    if ((BlockNumber)startBlockNum + (BlockNumber)blockCount > map->nblocks) {
+        auto blockNum = map->nblocks;
+        ReleaseMap(map, pcaFilePath);
+        ereport(ERROR,
+            (ERRCODE_INVALID_PARAMETER_VALUE,
+                errmsg("invalid blocknum \"%d\" and block count \"%d\", the max blocknum is \"%u\"",
+                    startBlockNum,
+                    blockCount,
+                    blockNum)));
+    }
+    /* construct ReadBlockChunksStruct */
+    char* pcdFilePath = (char*)palloc0(MAXPGPATH);
+    rc = snprintf_s(pcdFilePath, MAXPGPATH, MAXPGPATH - 1, PCD_SUFFIX, path);
+    securec_check_ss(rc, "\0", "\0");
+    FILE* fp = AllocateFile(pcdFilePath, "rb");
+    if (fp == NULL) {
+        ereport(ERROR, (errcode_for_file_access(), errmsg("could not open file \"%s\": %m", pcdFilePath)));
+    }
+    itemState->pcaFile = pcaFile;
+    itemState->rbStruct.header = map;
+    itemState->rbStruct.fp = fp;
+    itemState->rbStruct.segmentNo = segmentNo;
+    itemState->rbStruct.fileName = pcdFilePath;
+
+    /*
+     * build tupdesc for result tuples. This must match this function's
+     * pg_proc entry!
+     */
+    TupleDesc tupdesc = CreateTemplateTupleDesc(4, false, TAM_HEAP);
+    TupleDescInitEntry(tupdesc, (AttrNumber)1, "path", TEXTOID, -1, 0);
+    TupleDescInitEntry(tupdesc, (AttrNumber)2, "blocknum", INT4OID, -1, 0);
+    TupleDescInitEntry(tupdesc, (AttrNumber)3, "len", INT4OID, -1, 0);
+    TupleDescInitEntry(tupdesc, (AttrNumber)4, "data", BYTEAOID, -1, 0);
+    fctx->tuple_desc = BlessTupleDesc(tupdesc);
+
+    itemState->blkno = startBlockNum;
+    fctx->max_calls = blockCount;
+    fctx->user_fctx = itemState;
+
+    MemoryContextSwitchTo(mctx);
+}
+
+Datum pg_read_binary_file_blocks(PG_FUNCTION_ARGS)
+{
+    int32 startBlockNum = PG_GETARG_INT32(1);
+    int32 blockCount = PG_GETARG_INT32(2);
+
+    if (startBlockNum < 0 || blockCount <= 0 || startBlockNum + blockCount > RELSEG_SIZE) {
+        ereport(ERROR, (ERRCODE_INVALID_PARAMETER_VALUE,
+                        errmsg("invalid blocknum \"%d\" or block count \"%d\"", startBlockNum, blockCount)));
+    }
+
+    /* stuff done only on the first call of the function */
+    if (SRF_IS_FIRSTCALL()) {
+        ReadBinaryFileBlocksFirstCall(fcinfo, startBlockNum, blockCount);
+    }
+
+    /* stuff done on every call of the function */
+    FuncCallContext *fctx = SRF_PERCALL_SETUP();
+    CompressAddressItemState *itemState = (CompressAddressItemState *)fctx->user_fctx;
+
+    if (fctx->call_cntr < fctx->max_calls) {
+        bytea *buf = (bytea *)palloc(BLCKSZ + VARHDRSZ);
+        size_t len = ReadAllChunkOfBlock(VARDATA(buf), BLCKSZ, itemState->blkno, itemState->rbStruct);
+        SET_VARSIZE(buf, len + VARHDRSZ);
+        Datum values[4];
+        values[0] = PG_GETARG_DATUM(0);
+        values[1] = Int32GetDatum(itemState->blkno);
+        values[2] = Int32GetDatum(len);
+        values[3] = PointerGetDatum(buf);
+
+        /* Build and return the result tuple. */
+        bool nulls[4];
+        securec_check(memset_s(nulls, sizeof(nulls), 0, sizeof(nulls)), "\0", "\0");
+        HeapTuple tuple = heap_form_tuple(fctx->tuple_desc, (Datum*)values, (bool*)nulls);
+        Datum result = HeapTupleGetDatum(tuple);
+        itemState->blkno++;
+        SRF_RETURN_NEXT(fctx, result);
+    } else {
+        if (itemState->rbStruct.header != NULL) {
+            pc_munmap(itemState->rbStruct.header);
+        }
+        FreeFile(itemState->pcaFile);
+        FreeFile(itemState->rbStruct.fp);
+        SRF_RETURN_DONE(fctx);
+    }
 }
 
 /*

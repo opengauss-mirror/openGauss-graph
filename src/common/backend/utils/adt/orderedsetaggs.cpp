@@ -19,11 +19,12 @@
 #include "catalog/pg_type.h"
 #include "miscadmin.h"
 #include "nodes/nodeFuncs.h"
-#include "executor/nodeAgg.h"
+#include "executor/node/nodeAgg.h"
 #include "utils/array.h"
 #include "utils/lsyscache.h"
 #include "utils/timestamp.h"
 #include "utils/tuplesort.h"
+
 
 const char* PERCENTILE_FLOAT8 = "percentile_float8";
 const char* PERCENTILE_INTERVAL = "percentile_interval";
@@ -387,4 +388,422 @@ Datum mode_final(PG_FUNCTION_ARGS)
     } else {
         PG_RETURN_DATUM(mode_val);
     }
+}
+
+static void Merge(TdigestData *td);
+
+/*
+ *    add one point to TdigestData
+ */
+
+void TdAdd(TdigestData *td, double mean, int64 count)
+{
+    CentroidPoint cp;
+    
+    if ((td->merged_nodes + td->unmerged_nodes) == td->cap) {
+        Merge(td);
+    }
+    
+    cp.count = count;
+    cp.mean = mean;
+    td->nodes[td->merged_nodes + td->unmerged_nodes] = cp;
+    td->unmerged_nodes++;
+    td->unmerged_count += count;
+}
+
+/*
+ *    comepare points when sort
+ */
+
+static int CompareNodes(const void *firstNode, const void *secondNode)
+{
+    CentroidPoint *firstCp = (CentroidPoint *)(firstNode);
+    CentroidPoint *secondCp = (CentroidPoint *)(secondNode);
+    if (firstCp->mean < secondCp->mean) {
+        return -1;
+    } else if (firstCp->mean > secondCp->mean) {
+        return 1;
+    } else {
+        return 0;
+    }
+}
+
+/*
+ *    merge the points
+ */
+
+static void MergeAct(TdigestData *td, int num)
+{
+    int i = 1;
+    int cur = 0;
+    double denom = 0;
+    double normalizer = 0;
+    int64 CountSoFar = 0;
+    double TotalCount = 0;
+    TotalCount = td->merged_count + td->unmerged_count;
+    denom = 2 * M_PI * TotalCount * log(TotalCount);
+    normalizer = td->compression / denom;
+    
+    while (i < num) {
+        double ProposedCount = td->nodes[cur].count + td->nodes[i].count;
+        double z = ProposedCount * normalizer;
+        double q0 = (double)CountSoFar / TotalCount;
+        double q2 = ((double)CountSoFar + ProposedCount) / TotalCount;
+        bool ShouldAdd = (z <= (q0 * (1 - q0))) && (z <= (q2 * (1 - q2)));
+        if (ShouldAdd) {
+            // add nodes[i] to nodes[cur]
+            td->nodes[cur].count += td->nodes[i].count;
+            double delta = td->nodes[i].mean - td->nodes[cur].mean;
+            double WeightedDelta = (delta * (double)td->nodes[i].count) / (double)td->nodes[cur].count;
+            td->nodes[cur].mean += WeightedDelta;
+        } else {
+            // don't add nodes[i] to nodes[cur] and move nodes[i] to nodes[cur+1]
+            CountSoFar += td->nodes[cur].count;
+            cur++;
+            td->nodes[cur] = td->nodes[i];
+        }
+        if (cur != i) {
+            // empty nodes[i]
+            CentroidPoint cp;
+            cp.count = 0;
+            cp.mean = 0;
+            td->nodes[i] = cp;
+        }
+        i++;
+    }
+    td->merged_nodes = cur + 1;
+    td->merged_count = TotalCount;
+}
+
+static void Merge(TdigestData *td)
+{
+    int num = 0;
+
+    if (td->unmerged_nodes == 0) {
+        return;
+    }
+    // 1. sort all point
+    num = td->merged_nodes + td->unmerged_nodes;
+    qsort((void *)(td->nodes), num, sizeof(CentroidPoint), &CompareNodes);
+    // 2. Go through all the points and merge
+    MergeAct(td, num);
+    // 3. set unmerged_nodes to 0
+    td->unmerged_nodes = 0;
+    td->unmerged_count = 0;
+}
+
+/*
+ *    Calculate the percentile_of_value from all the points
+ */
+
+double CalQuantile(TdigestData *td, double val, int index, CentroidPoint *cp, double CountVal)
+{
+    if (val == cp->mean) {
+        // 1.current point. If have the same number, take the middle numberTake the middle number
+        double CountAtValue = cp->count;
+        while (index < td->merged_nodes && td->nodes[index].mean == cp->mean) {
+            CountAtValue += td->nodes[index].count;
+            index++;
+        }
+        double res = (CountVal + (CountAtValue / 2)) / td->merged_count;
+        return res;
+    } else if (val > cp->mean) {
+        // 2.biggest
+        return 1;
+    } else if (index == 0) {
+        // 3.minimum
+        return 0;
+    }
+    // 4.Interpolation calculation
+    CentroidPoint *cpr = cp;
+    CentroidPoint *cpl = cp - 1;
+    CountVal -= ((double)cpl->count / 2);
+    
+    double m = (cpr->mean - cpl->mean) / ((double)cpl->count / 2 + (double)cpr->count / 2);
+    double x = (val - cpl->mean) / m;
+    double res = (CountVal + x) / td->merged_count;
+    return res;
+}
+
+double TdQuantileOf(TdigestData *td, double val)
+{
+    double CountVal = 0;
+    int i = 0;
+    CentroidPoint *cp = NULL;
+    double res = 0;
+   
+    Merge(td);
+    if (td->merged_nodes == 0) {
+        return NAN;
+    }
+     
+    // find a value greater than val
+    while (i < td->merged_nodes) {
+        cp = &td->nodes[i];
+        if (cp->mean >= val) {
+            break;
+        }
+        CountVal += cp->count;
+        i++;
+    }
+    i++;
+    // compute result
+    res =  CalQuantile(td, val, i, cp, CountVal);
+    return res;
+}
+
+/*
+ *    Calculate the value_of_percentile from all the points
+ */
+double CalValue(TdigestData *td, CentroidPoint *cp, double goal, double count, int index)
+{
+    double minright = 0.000000001;
+    double minleft = -0.000000001;
+
+    // 1.current point
+    double DeltaK = goal - count - ((double)cp->count / 2);
+    if (!(DeltaK > minright || DeltaK < minleft)) {
+        return cp->mean;
+    }
+    // 2.biggest or minimum
+    bool right = DeltaK > 0;
+    if ((right && ((index + 1) == td->merged_nodes)) ||
+        (!right && (index == 0))) {
+        return cp->mean;
+    }
+    // 3.Interpolation calculation
+    CentroidPoint *cpl;
+    CentroidPoint *cpr;
+    if (right) {
+        cpl = cp;
+        cpr = &td->nodes[index + 1];
+        count += ((double)cpl->count / 2);
+    } else {
+        cpl = &td->nodes[index - 1];
+        cpr = cp;
+        count -= ((double)cpl->count / 2);
+    }
+    
+    double x = goal - count;
+    double m = (cpr->mean - cpl->mean) / ((double)cpl->count / 2 + (double)cpr->count / 2);
+    return m * x + cpl->mean;
+}
+
+double TdValueAt(TdigestData *td, double q)
+{
+    int i = 0;
+    double k = 0;
+    double goal = 0;
+    CentroidPoint *cp = NULL;
+    double res = 0;
+
+    Merge(td);
+    if (td->merged_nodes == 0) {
+        return NAN;
+    }
+    // find a count greater than cur_count
+    goal = q * td->merged_count;
+    while (i < td->merged_nodes) {
+        cp = &td->nodes[i];
+        if (k + cp->count > goal) {
+            break;
+        }
+        k += cp->count;
+        i++;
+    }
+    // compute result
+    res = CalValue(td, cp, goal, k, i);
+    return res;
+}
+
+/*
+ * Inputs:   param 0-3
+ *	param0:  Store results.
+ *	param1:  scan data from dn and store param 1 in param 0
+ *	param2:  value to calcute
+ *	param3:  comperssion
+ * Outputs:  param0
+ *	param0:  Store results.
+ */
+
+Datum tdigest_merge(PG_FUNCTION_ARGS)
+{
+#ifdef ENABLE_MULTIPLE_NODES
+    if (PG_ARGISNULL(0)) {
+        if (PG_ARGISNULL(2))
+            ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("percentile cannot be NULL")));
+        if (PG_ARGISNULL(1))
+            PG_RETURN_NULL();
+
+        /* This is the first non-null input. */
+        double newval = PG_GETARG_FLOAT8(1);
+        double compression = PG_GETARG_FLOAT8(3);
+        if (compression <= 0 || compression > 500) {
+            compression = 300;
+        }
+        int compressNum = 6;
+        int compressAdd = 10;
+        Size memsize = sizeof(TdigestData) +
+            (((compressNum * (int)(compression)) + compressAdd) * sizeof(CentroidPoint));
+        TdigestData *res = (TdigestData *)(palloc0(memsize));
+        if (!res) {
+            ereport(ERROR, (errmodule(MOD_OPT_AGG), errcode(ERRCODE_OUT_OF_MEMORY),
+                errmsg("Failed to apply for memory"), errdetail("N/A"),
+                errcause("palloc failed"),
+                erraction("Check memory")));
+            PG_RETURN_NULL();
+        }
+        SET_VARSIZE(res, memsize);
+        res->compression = compression;
+        res->cap = (memsize - sizeof(TdigestData)) / sizeof(CentroidPoint);
+
+        res->valuetoc = PG_GETARG_FLOAT8(2);
+
+        TdAdd(res, newval, 1);
+        PG_RETURN_POINTER(res);
+    } else {
+        TdigestData* oldres = (TdigestData*)PG_DETOAST_DATUM(PG_GETARG_DATUM(0));
+        /* Leave res unchanged if new input is null. */
+        if (PG_ARGISNULL(1)) {
+            PG_RETURN_POINTER(oldres);
+        }
+        /* OK to do the addition. */
+        TdAdd(oldres, PG_GETARG_FLOAT8(1), 1);
+        PG_RETURN_POINTER(oldres);
+    }
+#else
+    ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("Distributed support only")));
+    PG_RETURN_NULL();
+#endif
+}
+
+/*
+ * Inputs:   param 0-1
+ *	param0:  Store results.
+ *	param1:  TdigestData from dn and merge param 1 in param 0
+ * Outputs:   param 0
+ *	param0:  Store results.
+ */
+
+Datum tdigest_merge_to_one(PG_FUNCTION_ARGS)
+{
+    if (PG_ARGISNULL(0)) {
+        if (PG_ARGISNULL(1))
+            PG_RETURN_NULL();
+        // get data from first dn
+        TdigestData* newval = (TdigestData*)PG_DETOAST_DATUM(PG_GETARG_DATUM(1));
+        PG_RETURN_POINTER(newval);
+    } else {
+        // get data from next dn
+        TdigestData* oldres = (TdigestData*)PG_DETOAST_DATUM(PG_GETARG_DATUM(0));
+        if (PG_ARGISNULL(1)) {
+            PG_RETURN_POINTER(oldres);
+        }
+        TdigestData* newval = (TdigestData*)PG_DETOAST_DATUM(PG_GETARG_DATUM(1));
+        // merge data from dn to param 0
+        Merge(oldres);
+        Merge(newval);
+        int i = 0;
+        while (i < newval->merged_nodes) {
+            CentroidPoint *cp = &newval->nodes[i];
+            TdAdd(oldres, cp->mean, cp->count);
+            i++;
+        }
+        PG_RETURN_POINTER(oldres);
+    }
+}
+
+/*
+ * Final function for percentile_of_value
+ */
+ 
+Datum calculate_quantile_of(PG_FUNCTION_ARGS)
+{
+    if (PG_ARGISNULL(0))
+        PG_RETURN_NULL();
+    // get final TdigestData
+    TdigestData* newval = (TdigestData*)PG_DETOAST_DATUM(PG_GETARG_DATUM(0));
+    double value = newval->valuetoc;
+    // start calculate percentile
+    double res = TdQuantileOf(newval, value);
+    PG_RETURN_FLOAT8(res);
+}
+
+/*
+ * Inputs:   param 0-3
+ *	param0:  Store results.
+ *	param1:  scan data from dn and store param 1 in param 0
+ *	param2:  value to calcute
+ *	param3:  comperssion
+ * Outputs:   param 0
+ *	param0:  Store results.
+ */
+ 
+Datum tdigest_mergep(PG_FUNCTION_ARGS)
+{
+#ifdef ENABLE_MULTIPLE_NODES
+    if (PG_ARGISNULL(0)) {
+        if (PG_ARGISNULL(2))
+            ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("percentile cannot be NULL")));
+        if (PG_GETARG_FLOAT8(2) < 0 || PG_GETARG_FLOAT8(2) > 1 || isnan(PG_GETARG_FLOAT8(2)))
+            ereport(ERROR,
+                (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                    errmsg("percentile value %g is not between 0 and 1", PG_GETARG_FLOAT8(2))));
+        if (PG_ARGISNULL(1))
+            PG_RETURN_NULL();
+
+        double newval = PG_GETARG_FLOAT8(1);
+        double compression = PG_GETARG_FLOAT8(3);
+        if (compression <= 0 || compression > 500) {
+            compression = 300;
+        }
+        int compressNum = 6;
+        int compressAdd = 10;
+        Size memsize = sizeof(TdigestData) +
+            (((compressNum * (int)(compression)) + compressAdd) * sizeof(CentroidPoint));
+        TdigestData *res = (TdigestData *)(palloc0(memsize));
+        if (!res) {
+            ereport(ERROR, (errmodule(MOD_OPT_AGG), errcode(ERRCODE_OUT_OF_MEMORY),
+                errmsg("Failed to apply for memory"), errdetail("N/A"),
+                errcause("palloc failed"),
+                erraction("Check memory")));
+            PG_RETURN_NULL();
+        }
+        SET_VARSIZE(res, memsize);
+        res->compression = compression;
+        res->cap = (memsize - sizeof(TdigestData)) / sizeof(CentroidPoint);
+        
+        res->valuetoc = PG_GETARG_FLOAT8(2);
+        /* add one point */
+        TdAdd(res, newval, 1);
+        PG_RETURN_POINTER(res);
+    } else {
+        TdigestData* oldres = (TdigestData*)PG_DETOAST_DATUM(PG_GETARG_DATUM(0));
+        /* Leave res unchanged if new input is null. */
+        if (PG_ARGISNULL(1)) {
+            PG_RETURN_POINTER(oldres);
+        }
+        /* add one point */
+        TdAdd(oldres, PG_GETARG_FLOAT8(1), 1);
+        PG_RETURN_POINTER(oldres);
+    }
+#else
+    ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("Distributed support only")));
+    PG_RETURN_NULL();
+#endif
+}
+
+/*
+ * Final function for value_of_percentile
+ */
+ 
+Datum calculate_value_at(PG_FUNCTION_ARGS)
+{
+    if (PG_ARGISNULL(0))
+        PG_RETURN_NULL();
+    TdigestData* newval = (TdigestData*)PG_DETOAST_DATUM(PG_GETARG_DATUM(0));
+    double percentile = newval->valuetoc;
+    // start calculate value
+    double res = TdValueAt(newval, percentile);
+    PG_RETURN_FLOAT8(res);
 }

@@ -1,0 +1,45 @@
+set graph_path=test;
+SPARQL SELECT ?X	
+WHERE
+{
+  ?X rdf:type <GraduateStudent> .
+  ?X <takesCourse> <http://www.Department0.University0.edu/GraduateCourse0> .
+};
+                            ?X                             
+-----------------------------------------------------------
+ http://www.Department0.University0.edu/GraduateStudent44
+ http://www.Department0.University0.edu/GraduateStudent101
+ http://www.Department0.University0.edu/GraduateStudent124
+(3 rows)
+
+DROP GRAPH test CASCADE;
+NOTICE:  drop cascades to 29 other objects
+DETAIL:  drop cascades to sequence test.gs_label_seq
+drop cascades to vlabel gs_vertex
+drop cascades to elabel gs_edge
+drop cascades to vlabel publication
+drop cascades to elabel publicationauthor
+drop cascades to vlabel assistantprofessor
+drop cascades to elabel doctoraldegreefrom
+drop cascades to elabel mastersdegreefrom
+drop cascades to elabel teacherof
+drop cascades to elabel undergraduatedegreefrom
+drop cascades to elabel worksfor
+drop cascades to vlabel associateprofessor
+drop cascades to vlabel course
+drop cascades to vlabel fullprofessor
+drop cascades to elabel headof
+drop cascades to vlabel graduatecourse
+drop cascades to vlabel graduatestudent
+drop cascades to vlabel researchassistant
+drop cascades to elabel advisor
+drop cascades to elabel memberof
+drop cascades to elabel takescourse
+drop cascades to vlabel teachingassistant
+drop cascades to elabel teachingassistantof
+drop cascades to vlabel lecturer
+drop cascades to vlabel researchgroup
+drop cascades to elabel suborganizationof
+drop cascades to vlabel undergraduatestudent
+drop cascades to vlabel department
+drop cascades to vlabel university

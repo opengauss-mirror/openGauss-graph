@@ -4,6 +4,7 @@
  *	  Lightweight lock manager
  *
  *
+ * Portions Copyright (c) 2021, openGauss Contributors
  * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
@@ -43,6 +44,7 @@ const struct LWLOCK_PARTITION_DESC LWLockPartInfo[] = {
     {"CSNLOG_PART", 512, 1, 512},
     {"LOG2_LOCKTABLE_PART", 4, 4, 16}, /* lock table partition range is 2^4 to 2^16 */
     {"TWOPHASE_PART", 1, 1, 64},
+    {"FASTPATH_PART", 20, 20, 10000}
 };
 
 /*
@@ -71,11 +73,9 @@ const struct LWLOCK_PARTITION_DESC LWLockPartInfo[] = {
 #define NUM_INSTANCE_REALTIME_PARTITIONS 32
 
 /* CSN log partitions */
-#define MAX_NUM_CSNLOG_PARTITIONS (LWLockPartInfo[CSNLOG_PART].maxNumPartition)
 #define NUM_CSNLOG_PARTITIONS (g_instance.attr.attr_storage.num_internal_lock_partitions[CSNLOG_PART])
 
-/* Clog partitions */
-#define MAX_NUM_CLOG_PARTITIONS (LWLockPartInfo[CLOG_PART].maxNumPartition)
+/* CLOG log paritions */
 #define NUM_CLOG_PARTITIONS (g_instance.attr.attr_storage.num_internal_lock_partitions[CLOG_PART])
 
 /* Twophase State partitions */
@@ -83,8 +83,7 @@ const struct LWLOCK_PARTITION_DESC LWLockPartInfo[] = {
 
 /* Number of partitions the shared lock tables are divided into */
 #define LOG2_NUM_LOCK_PARTITIONS (g_instance.attr.attr_storage.num_internal_lock_partitions[LOG2_LOCKTABLE_PART])
-
-#define NUM_LOCK_PARTITIONS (1 << LOG2_NUM_LOCK_PARTITIONS)
+#define NUM_LOCK_PARTITIONS (1 << ((uint32)LOG2_NUM_LOCK_PARTITIONS))
 
 /* Number of partitions the shared predicate lock tables are divided into */
 #define LOG2_NUM_PREDICATELOCK_PARTITIONS 4
@@ -108,8 +107,12 @@ const struct LWLOCK_PARTITION_DESC LWLockPartInfo[] = {
 /* Number of partions the ngroup info hash table */
 #define NUM_NGROUP_INFO_PARTITIONS  256
 
+#ifndef ENABLE_LITE_MODE
 /* Number of partions the io state hashtable */
 #define NUM_IO_STAT_PARTITIONS 128
+#else
+#define NUM_IO_STAT_PARTITIONS 2
+#endif
 
 /* Number of partitions the xid => procid hashtable */
 #define NUM_PROCXACT_PARTITIONS  128
@@ -125,9 +128,20 @@ const struct LWLOCK_PARTITION_DESC LWLockPartInfo[] = {
 /* Number of partions of the segment head buffer */
 #define NUM_SEGMENT_HEAD_PARTITIONS 128
 
+/* Number of partions the session roleid hashtable */
+#define NUM_SESSION_ROLEID_PARTITIONS 128
+
 #ifdef WIN32
-#define NUM_INDIVIDUAL_LWLOCKS           113
+#define NUM_INDIVIDUAL_LWLOCKS           116 /* num should be same as lwlockname.txt */
 #endif
+
+/* Number of partitions the global package runtime state hashtable */
+#ifndef ENABLE_LITE_MODE
+#define NUM_GPRC_PARTITIONS 128
+#else
+#define NUM_GPRC_PARTITIONS 2
+#endif
+
 /* 
  * WARNING---Please keep the order of LWLockTrunkOffset and BuiltinTrancheIds consistent!!! 
 */
@@ -167,10 +181,11 @@ const struct LWLOCK_PARTITION_DESC LWLockPartInfo[] = {
 /* segment head */
 #define FirstSegmentHeadLock (FirstStartBlockMappingLock + NUM_STARTBLOCK_PARTITIONS)
 #define FirstTwoPhaseStateLock (FirstSegmentHeadLock + NUM_SEGMENT_HEAD_PARTITIONS)
-
+/* session roleid */
+#define FirstSessRoleIdLock (FirstTwoPhaseStateLock + NUM_TWOPHASE_PARTITIONS)
+#define FirstGPRCMappingLock (FirstSessRoleIdLock + NUM_SESSION_ROLEID_PARTITIONS)
 /* must be last: */
-#define NumFixedLWLocks (FirstTwoPhaseStateLock + NUM_TWOPHASE_PARTITIONS)
-
+#define NumFixedLWLocks (FirstSessRoleIdLock + NUM_SESSION_ROLEID_PARTITIONS)
 /*
  * WARNING----Please keep BuiltinTrancheIds and BuiltinTrancheNames consistent!!!
  *
@@ -218,10 +233,13 @@ enum BuiltinTrancheIds
     LWTRANCHE_OLDSERXID_SLRU_CTL,
     LWTRANCHE_WAL_INSERT,
     LWTRANCHE_DOUBLE_WRITE,
-    LWTRANCHE_DW_SINGLE_POS,
-    LWTRANCHE_DW_SINGLE_WRITE,
+    LWTRANCHE_DW_SINGLE_FIRST,   /* single flush dw file, first version pos lock */
+    LWTRANCHE_DW_SINGLE_SECOND,   /* single flush dw file, second version pos lock */
+    LWTRANCHE_DW_SINGLE_SECOND_BUFTAG,  /* single flush dw file, second version buffer tag page lock */
     LWTRANCHE_REDO_POINT_QUEUE,
     LWTRANCHE_PRUNE_DIRTY_QUEUE,
+    LWTRANCHE_UNLINK_REL_TBL,
+    LWTRANCHE_UNLINK_REL_FORK_TBL,
     LWTRANCHE_ACCOUNT_TABLE,
     LWTRANCHE_EXTEND, // For general 3rd plugin
     LWTRANCHE_MPFL,
@@ -235,6 +253,13 @@ enum BuiltinTrancheIds
     LWTRANCHE_WAL_INIT_SEGMENT,
     LWTRANCHE_SEGHEAD_PARTITION,
     LWTRANCHE_TWOPHASE_STATE,
+    LWTRANCHE_ROLEID_PARTITION,
+    LWTRANCHE_PGWR_SYNC_QUEUE,
+    LWTRANCHE_BARRIER_TBL,
+    LWTRANCHE_PAGE_REPAIR,
+    LWTRANCHE_FILE_REPAIR,
+    LWTRANCHE_REPLICATION_ORIGIN,
+    LWTRANCHE_AUDIT_INDEX_WAIT,
     /*
      * Each trancheId above should have a corresponding item in BuiltinTrancheNames;
      */

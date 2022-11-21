@@ -22,12 +22,22 @@
 #include "knl/knl_variable.h"
 
 #include "access/tableam.h"
-#include "executor/execdebug.h"
-#include "executor/nodeNestloop.h"
-#include "executor/execStream.h"
+#include "executor/exec/execdebug.h"
+#include "executor/node/nodeNestloop.h"
+#include "executor/exec/execStream.h"
 #include "utils/memutils.h"
-#include "executor/nodeHashjoin.h"
+#include "executor/node/nodeHashjoin.h"
 
+#ifdef GS_GRAPH
+#include "executor/nodeModifyGraph.h"
+#include "executor/tuptable.h"
+typedef struct NestLoopContext
+{
+	dlist_node	list;
+	TupleTableSlot *outer_tupleslot;
+	HeapTuple	outer_tuple;
+} NestLoopContext;
+#endif
 static void MaterialAll(PlanState* node)
 {
     if (IsA(node, MaterialState)) {
@@ -133,6 +143,9 @@ TupleTableSlot* ExecNestLoop(NestLoopState* node)
     }
 
     for (;;) {
+#ifdef GS_GRAPH
+        CommandId	svCid = InvalidCommandId;
+#endif        
         /*
          * If we don't have an outer tuple, get the next one and reset the
          * inner scan.
@@ -202,6 +215,15 @@ TupleTableSlot* ExecNestLoop(NestLoopState* node)
          */
         ENL1_printf("getting new inner tuple");
 
+#ifdef GS_GRAPH
+        if (node->js.jointype == JOIN_CYPHER_MERGE ||
+			node->js.jointype == JOIN_CYPHER_DELETE)
+		{
+			svCid = inner_plan->state->es_snapshot->curcid;
+			inner_plan->state->es_snapshot->curcid = node->nl_graphwrite_cid;
+		}
+#endif        
+
         /*
          * If inner plan is mergejoin, which does not cache data,
          * but will early free the left and right tree's caching memory.
@@ -216,13 +238,24 @@ TupleTableSlot* ExecNestLoop(NestLoopState* node)
         inner_plan->state->es_skip_early_free = orig_value;
         econtext->ecxt_innertuple = inner_tuple_slot;
 
+#ifdef GS_GRAPH
+        if (svCid != InvalidCommandId)
+			inner_plan->state->es_snapshot->curcid = svCid;
+#endif
+
         if (TupIsNull(inner_tuple_slot)) {
             ENL1_printf("no inner tuple, need new outer tuple");
 
             node->nl_NeedNewOuter = true;
 
+#ifdef GS_GRAPH
+            if (!node->nl_MatchedOuter && (node->js.jointype == JOIN_LEFT || node->js.jointype == JOIN_CYPHER_MERGE ||
+				                            node->js.jointype == JOIN_CYPHER_DELETE || node->js.jointype == JOIN_ANTI ||
+                                              node->js.jointype == JOIN_LEFT_ANTI_FULL)) {
+#else
             if (!node->nl_MatchedOuter && (node->js.jointype == JOIN_LEFT || node->js.jointype == JOIN_ANTI ||
                                               node->js.jointype == JOIN_LEFT_ANTI_FULL)) {
+#endif
                 /*
                  * We are doing an outer join and there were no join matches
                  * for this outer tuple.  Generate a fake join tuple with
@@ -285,6 +318,11 @@ TupleTableSlot* ExecNestLoop(NestLoopState* node)
             if (node->js.jointype == JOIN_SEMI)
                 node->nl_NeedNewOuter = true;
 
+#ifdef GS_GRAPH
+            if (node->js.single_match)
+				node->nl_NeedNewOuter = true;
+#endif
+
             if (otherqual == NIL || ExecQual(otherqual, econtext, false)) {
                 /*
                  * qualification was satisfied so we project and return the
@@ -337,6 +375,9 @@ NestLoopState* ExecInitNestLoop(NestLoop* node, EState* estate, int eflags)
      * create state structure
      */
     NestLoopState* nlstate = makeNode(NestLoopState);
+#ifdef GS_GRAPH
+    CommandId	svCid = InvalidCommandId;
+#endif
     nlstate->js.ps.plan = (Plan*)node;
     nlstate->js.ps.state = estate;
     nlstate->nl_MaterialAll = node->materialAll;
@@ -371,6 +412,23 @@ NestLoopState* ExecInitNestLoop(NestLoop* node, EState* estate, int eflags)
         eflags |= EXEC_FLAG_REWIND;
     else
         eflags &= ~EXEC_FLAG_REWIND;
+
+#ifdef GS_GRAPH
+    if (node->join.jointype == JOIN_CYPHER_MERGE ||
+		node->join.jointype == JOIN_CYPHER_DELETE)
+	{
+		/*
+		 * Modify the CID to see the graph pattern created by MERGE CREATE
+		 * or to not see it deleted by DELETE.
+		 */
+		nlstate->nl_graphwrite_cid =
+						estate->es_snapshot->curcid + MODIFY_CID_NLJOIN_MATCH;
+
+		svCid = estate->es_snapshot->curcid;
+		estate->es_snapshot->curcid = nlstate->nl_graphwrite_cid;
+	}
+#endif
+
     innerPlanState(nlstate) = ExecInitNode(innerPlan(node), estate, eflags);
 
     /*
@@ -378,12 +436,27 @@ NestLoopState* ExecInitNestLoop(NestLoop* node, EState* estate, int eflags)
      */
     ExecInitResultTupleSlot(estate, &nlstate->js.ps);
 
+#ifdef GS_GRAPH
+    /*
+	 * detect whether we need only consider the first matching inner tuple
+	 */
+	nlstate->js.single_match = (node->join.inner_unique ||
+								node->join.jointype == JOIN_SEMI);
+#endif
+
     switch (node->join.jointype) {
         case JOIN_INNER:
         case JOIN_SEMI:
+#ifdef GS_GRAPH
+        case JOIN_VLE:
+#endif        
             break;
         case JOIN_LEFT:
         case JOIN_ANTI:
+#ifdef GS_GRAPH
+        case JOIN_CYPHER_MERGE:
+		case JOIN_CYPHER_DELETE:
+#endif
         case JOIN_LEFT_ANTI_FULL:
             nlstate->nl_NullInnerTupleSlot = ExecInitNullTupleSlot(estate, ExecGetResultType(innerPlanState(nlstate)));
             break;
@@ -401,6 +474,11 @@ NestLoopState* ExecInitNestLoop(NestLoop* node, EState* estate, int eflags)
     ExecAssignResultTypeFromTL(&nlstate->js.ps, TAM_HEAP);
 
     ExecAssignProjectionInfo(&nlstate->js.ps, NULL);
+
+#ifdef GS_GRAPH
+    dlist_init(&nlstate->ctxs_head);
+	nlstate->prev_ctx_node = &nlstate->ctxs_head.head;
+#endif
 
     /*
      * finally, wipe the current outer tuple clean.
@@ -433,6 +511,20 @@ void ExecEndNestLoop(NestLoopState* node)
      * clean out the tuple table
      */
     (void)ExecClearTuple(node->js.ps.ps_ResultTupleSlot);
+
+#ifdef GS_GRAPH
+    dlist_mutable_iter iter;
+    dlist_foreach_modify(iter, &node->ctxs_head)
+	{
+		NestLoopContext *ctx;
+
+		dlist_delete(iter.cur);
+
+		ctx = dlist_container(NestLoopContext, list, iter.cur);
+		pfree(ctx);
+	}
+	node->prev_ctx_node = &node->ctxs_head.head;
+#endif
 
     /*
      * close down subplans
@@ -478,3 +570,161 @@ void ExecReScanNestLoop(NestLoopState* node)
     node->nl_NeedNewOuter = true;
     node->nl_MatchedOuter = false;
 }
+#ifdef GS_GRAPH
+void ExecNextNestLoopContext(NestLoopState *node)
+{
+	ExprContext *econtext = node->js.ps.ps_ExprContext;
+	dlist_node *ctx_node;
+	NestLoopContext *ctx;
+	TupleTableSlot *slot;
+
+	/*
+	 * This nested loop is supposed to be for vertex-edge join to get vertices
+	 * for graphpath results, and that means it is the top most (and only)
+	 * innerPlan of NestLoopVLE. Since it is already executed at this point,
+	 * its chgParam is already NULL. So, we don't need to manage chgParam.
+	 */
+	Assert(node->js.ps.chgParam == NULL);
+	Assert(node->js.jointype == JOIN_INNER);
+
+	/* get the current context */
+	if (dlist_has_next(&node->ctxs_head, node->prev_ctx_node))
+	{
+		ctx_node = dlist_next_node(&node->ctxs_head, node->prev_ctx_node);
+		ctx = dlist_container(NestLoopContext, list, ctx_node);
+	}
+	else
+	{
+		ctx = (NestLoopContext*)palloc(sizeof(*ctx));
+		ctx_node = &ctx->list;
+
+		dlist_push_tail(&node->ctxs_head, ctx_node);
+	}
+
+	slot = econtext->ecxt_outertuple;
+	if (TTS_IS_HEAPTUPLE(slot))
+	{
+		HeapTupleTableSlot *heapTupleTableSlot = (HeapTupleTableSlot *) slot;
+
+		/*
+		 * If tts_tuple is the same with the stored one, remove it from the
+		 * slot to keep this copy from ExecStoreTuple()/ExecClearTuple() in
+		 * the next nested loop.
+		 *
+		 * This can happen when there is a matched result with the tuple.
+		 */
+		if (heapTupleTableSlot->tuple == ctx->outer_tuple)
+		{
+			slot->tts_isempty |= TTS_FLAG_EMPTY;
+			slot->tts_nvalid = 0;
+			ItemPointerSetInvalid(&heapTupleTableSlot->tuple->t_self);
+		}
+	}
+	else
+	{
+		/*
+		 * Keep the latest outer tuple slot to 1) set ecxt_outertuple to it
+		 * later when continuing the current nested loop after the end of the
+		 * next nested loop, and 2) use the original slot rather than a
+		 * temporary slot that requires extra resources.
+		 * We get the slot through ecxt_outertuple instead of
+		 * outerPlanState(node)->ps_ResultTupleSlot because
+		 * outerPlanState(node) can be AppendState.
+		 */
+		ctx->outer_tupleslot = slot;
+		/*
+		 * We need to copy and store the current outer tuple here because;
+		 * 1) there might be a chance to unpin the underlying buffer that the
+		 *    slot relies on while doing ExecStoreTuple() in the next nested
+		 *    loop, and
+		 * 2) when continuing the current nested loop later, the inner plan
+		 *    needs the right outer variables that are in the slot.
+		 * The tuple has to be stored in CurrentMemoryContext.
+		 */
+		ctx->outer_tuple = ExecCopySlotHeapTuple(slot);
+	}
+	/*
+	 * We don't need to care about the inner plan and nl_NeedNewOuter because
+	 * the next execution of the current nested loop must execute the inner
+	 * plan.
+	 */
+
+	/* make the current context previous context */
+	node->prev_ctx_node = ctx_node;
+
+	/*
+	 * We don't have to restore the current outer tuple slot because it will be
+	 * filled with values of the first scan result of the outer plan.
+	 */
+
+	ExecNextContext(outerPlanState(node));
+	ExecNextContext(innerPlanState(node));
+
+	node->nl_NeedNewOuter = true;
+}
+
+void ExecPrevNestLoopContext(NestLoopState *node)
+{
+	NestLoop   *nl = (NestLoop *) node->js.ps.plan;
+	ExprContext *econtext = node->js.ps.ps_ExprContext;
+	dlist_node *ctx_node;
+	NestLoopContext *ctx;
+	TupleTableSlot *slot;
+	ListCell   *lc;
+
+	/*
+	 * We don't have to store the current outer tuple slot because of the same
+	 * reason above.
+	 */
+
+	/* if chgParam is not NULL, free it now */
+	if (node->js.ps.chgParam != NULL)
+	{
+		bms_free(node->js.ps.chgParam);
+		node->js.ps.chgParam = NULL;
+	}
+
+	/* make the previous context current context */
+	ctx_node = node->prev_ctx_node;
+	Assert(ctx_node != &node->ctxs_head.head);
+
+	if (dlist_has_prev(&node->ctxs_head, ctx_node))
+		node->prev_ctx_node = dlist_prev_node(&node->ctxs_head, ctx_node);
+	else
+		node->prev_ctx_node = &node->ctxs_head.head;
+
+	ctx = dlist_container(NestLoopContext, list, ctx_node);
+	slot = ctx->outer_tupleslot;
+	econtext->ecxt_outertuple = slot;
+	/*
+	 * Pass true to shouldFree here because the tuple must be freed when
+	 * ExecStoreTuple(), ExecClearTuple(), or ExecResetTupleTable() is called.
+	 */
+	ExecForceStoreHeapTuple(ctx->outer_tuple, slot, true);
+	/* restore outer variables */
+	foreach(lc, nl->nestParams)
+	{
+		NestLoopParam *nlp = (NestLoopParam *) lfirst(lc);
+		int			paramno = nlp->paramno;
+		ParamExecData *prm;
+
+		prm = &(econtext->ecxt_param_exec_vals[paramno]);
+		/* Param value should be an OUTER_VAR var */
+		Assert(IsA(nlp->paramval, Var));
+		Assert(nlp->paramval->varno == OUTER_VAR);
+		Assert(nlp->paramval->varattno > 0);
+		prm->value = slot_getattr(slot,
+								  nlp->paramval->varattno,
+								  &(prm->isnull));
+	}
+
+	ExecPrevContext(outerPlanState(node));
+	ExecPrevContext(innerPlanState(node));
+
+	/*
+	 * The next execution of the current nested loop must execute the inner
+	 * plan.
+	 */
+	node->nl_NeedNewOuter = false;
+}
+#endif

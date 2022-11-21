@@ -38,7 +38,7 @@
 #include "catalog/pg_proc.h"
 #include "catalog/pg_type.h"
 #include "executor/executor.h"
-#include "executor/nodeWindowAgg.h"
+#include "executor/node/nodeWindowAgg.h"
 #include "miscadmin.h"
 #include "nodes/nodeFuncs.h"
 #include "optimizer/clauses.h"
@@ -126,6 +126,7 @@ static void advance_windowaggregate(
         ExprState* arg_state = (ExprState*)lfirst(arg);
 
         fcinfo->arg[i] = ExecEvalExpr(arg_state, econtext, &fcinfo->argnull[i], NULL);
+        fcinfo->argTypes[i] = arg_state->resultType;
         i++;
     }
 
@@ -176,6 +177,7 @@ static void advance_windowaggregate(
         *fcinfo, &(peraggstate->transfn), num_arguments + 1, perfuncstate->winCollation, (Node*)winstate, NULL);
     fcinfo->arg[0] = peraggstate->transValue;
     fcinfo->argnull[0] = peraggstate->transValueIsNull;
+    fcinfo->argTypes[0] = InvalidOid;
     new_val = FunctionCallInvoke(fcinfo);
     /*
      * If pass-by-ref datatype, must copy the new value into aggcontext and
@@ -216,6 +218,7 @@ static void finalize_windowaggregate(WindowAggState* winstate, WindowStatePerFun
         InitFunctionCallInfoData(fcinfo, &(peraggstate->finalfn), 1, perfuncstate->winCollation, (Node*)winstate, NULL);
         fcinfo.arg[0] = peraggstate->transValue;
         fcinfo.argnull[0] = peraggstate->transValueIsNull;
+        fcinfo.argTypes[0] = InvalidOid;
         if (fcinfo.flinfo->fn_strict && peraggstate->transValueIsNull) {
             /* don't call a strict function with NULL inputs */
             *result = (Datum)0;
@@ -776,7 +779,8 @@ static void update_frameheadpos(WindowObject winobj, TupleTableSlot* slot)
     if (winstate->framehead_valid)
         return; /* already known for current row */
 
-    if (frame_options & FRAMEOPTION_START_UNBOUNDED_PRECEDING) {
+    bool isFrameHead = frame_options & FRAMEOPTION_START_UNBOUNDED_PRECEDING;
+    if (isFrameHead) {
         /* In UNBOUNDED PRECEDING mode, frame head is always row 0 */
         winstate->frameheadpos = 0;
         winstate->framehead_valid = true;

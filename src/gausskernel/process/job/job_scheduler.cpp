@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2020 Huawei Technologies Co.,Ltd.
+ * Portions Copyright (c) 2021, openGauss Contributors
  *
  * openGauss is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
@@ -136,15 +137,16 @@ NON_EXEC_STATIC void JobScheduleMain()
 
     SetProcessingMode(InitProcessing);
 
-    if (IS_PGXC_COORDINATOR && IsPostmasterEnvironment) {
+    bool isExit = IS_PGXC_COORDINATOR && IsPostmasterEnvironment;
+    if (isExit) {
         /*
          * If we exit, first try and clean connections and send to
          * pooler thread does NOT exist any more, PoolerLock of LWlock is used instead.
          *
          * PoolManagerDisconnect() which is called by PGXCNodeCleanAndRelease()
-         * is the last call to pooler in the postgres thread, and PoolerLock is
+         * is the last call to pooler in the openGauss thread, and PoolerLock is
          * used in PoolManagerDisconnect(), but it is called after ProcKill()
-         * when postgres thread exits.
+         * when openGauss thread exits.
          * ProcKill() releases any of its held LW locks. So Assert(!(proc == NULL ...))
          * will fail in LWLockAcquire() which is called by PoolManagerDisconnect().
          *
@@ -195,7 +197,7 @@ NON_EXEC_STATIC void JobScheduleMain()
     InitProcess();
 #endif
 
-    /* Initialize POSTGRES with DEFAULT_DATABASE, since it cannot be dropped */
+    /* Initialize openGauss with DEFAULT_DATABASE, since it cannot be dropped */
     t_thrd.proc_cxt.PostInit->SetDatabaseAndUser(dbname, InvalidOid, username);
     t_thrd.proc_cxt.PostInit->InitJobScheduler();
 
@@ -256,6 +258,8 @@ NON_EXEC_STATIC void JobScheduleMain()
         /* since not using PG_TRY, must reset error stack by hand */
         t_thrd.log_cxt.error_context_stack = NULL;
 
+        t_thrd.log_cxt.call_stack = NULL;
+
         /* Prevents interrupts while cleaning up */
         HOLD_INTERRUPTS();
 
@@ -269,6 +273,9 @@ NON_EXEC_STATIC void JobScheduleMain()
 
         /* Abort the current transaction in order to recover */
         AbortCurrentTransaction();
+
+        /* release resource held by lsc */
+        AtEOXact_SysDBCache(false);
 
         elog(LOG, "Job scheduler encounter abnormal, detail error msg: %s.", edata->message);
 
@@ -324,7 +331,8 @@ NON_EXEC_STATIC void JobScheduleMain()
      * Create a resource owner to keep track of our resources (currently only
      * buffer pins).
      */
-    t_thrd.utils_cxt.CurrentResourceOwner = ResourceOwnerCreate(NULL, "Job Scheduler", MEMORY_CONTEXT_EXECUTOR);
+    t_thrd.utils_cxt.CurrentResourceOwner = ResourceOwnerCreate(NULL, "Job Scheduler",
+        THREAD_GET_MEM_CXT_GROUP(MEMORY_CONTEXT_EXECUTOR));
 
     /* Get classified list of node Oids for syschronise th job status info. */
     exec_init_poolhandles();
@@ -657,6 +665,38 @@ static inline bool IsExecuteOnCurrentNode(const char* executeNodeName)
 }
 
 /*
+ * @brief SkipSchedulerJob
+ *  Skip process DBE_SCHEDULER jobs, contains various checks.
+ *  1. whether the job is enabled
+ *  2. whether the job is expired(end_date < current timestamp OR end_date is NULL)
+ * @param values    pg_job attr values
+ * @param nulls     pg_job attr nulls
+ * @return true     skip current job
+ * @return false    do not skip current job
+ */
+static bool SkipSchedulerJob(Datum *values, bool *nulls, Timestamp curtime)
+{
+    Assert(values != NULL);
+    Assert(nulls != NULL);
+    /* do not handle non-scheduler jobs */
+    if (nulls[Anum_pg_job_job_name]) {
+        return false;
+    }
+
+    /* expired job, need to drop even it is disabled */
+    if (DatumGetBool(DirectFunctionCall2(timestamp_ge, curtime, values[Anum_pg_job_end_date - 1]))) {
+        return false;
+    }
+
+    /* disabled jobs */
+    if (!nulls[Anum_pg_job_enable - 1] && !DatumGetBool(values[Anum_pg_job_enable - 1])) {
+        return true; /* skip here to avoid further overhead */
+    }
+
+    return false;
+}
+
+/*
  * Description: Find expire jobs and insert to job queue for execute.
  *
  * Returns: void
@@ -687,6 +727,11 @@ static void ScanExpireJobs()
         int64 jobID = pg_job->job_id;
 
         get_job_values(jobID, tuple, pg_job_tbl, values, nulls);
+
+        /* dbms schedule creates a job but dont enable it */
+        if (SkipSchedulerJob(values, nulls, curtime)) {
+            continue;
+        }
 
         /* handle cases - ALL_NODE/ALL_CN/ALL_DN/CCN specific node */
         if (!IsExecuteOnCurrentNode(pg_job->node_name.data)) {

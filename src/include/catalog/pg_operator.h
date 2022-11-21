@@ -278,10 +278,20 @@ typedef FormData_pg_operator *Form_pg_operator;
 #define RECORD_EQ_OP 2988
 #define RECORD_LT_OP 2990
 #define RECORD_GT_OP 2991
+
+#define OID_GRAPHID_EQ_OP 8187
+#define OID_VERTEX_EQ_OP 8236
+#define OID_VERTEX_NE_OP 8237
+#define OID_VERTEX_LT_OP 8238
+#define OID_VERTEX_GT_OP 8239
+#define OID_VERTEX_LE_OP 8240
+#define OID_VERTEX_GE_OP 8241
+
 extern void OperatorCreate(const char *operatorName, Oid operatorNamespace, Oid leftTypeId, Oid rightTypeId, Oid procedureId,
     List *commutatorName, List *negatorName, Oid restrictionId, Oid joinId, bool canMerge, bool canHash);
 
 extern Oid OperatorGet(const char *operatorName, Oid operatorNamespace, Oid leftObjectId, Oid rightObjectId, bool *defined);
+
 
 #endif   /* PG_OPERATOR_H */
 

@@ -20,9 +20,10 @@ ifneq "$(MAKECMDGOALS)" "clean"
   endif
 endif
 OBJS= analyze.o gram.o hint_gram.o keywords.o kwlookup.o parser.o \
-      parse_agg.o parse_clause.o parse_coerce.o parse_collate.o parse_cte.o \
+      parse_agg.o parse_clause.o parse_startwith.o parse_coerce.o parse_collate.o parse_cte.o \
       parse_expr.o parse_func.o parse_hint.o parse_merge.o parse_node.o parse_oper.o parse_param.o \
-      parse_relation.o parse_target.o parse_type.o parse_utilcmd.o scansup.o parse_compatibility.o
+      parse_relation.o parse_target.o parse_type.o parse_utilcmd.o scansup.o parse_compatibility.o \
+	  parse_graph.o parse_cypher_expr.o parse_shortestpath.o parse_sparql_expr.o \
 
 FLEXFLAGS = -CF -b -p -p
 

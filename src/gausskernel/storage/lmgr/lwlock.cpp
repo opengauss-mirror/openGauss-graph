@@ -75,6 +75,7 @@
 #include "access/csnlog.h"
 #include "access/multixact.h"
 #include "access/subtrans.h"
+#include "access/ustore/undo/knl_uundoapi.h"
 #include "commands/async.h"
 #include "commands/copy.h"
 #include "lib/ilist.h"
@@ -95,6 +96,10 @@
 #include "instruments/instr_event.h"
 #include "instruments/instr_statement.h"
 #include "tsan_annotation.h"
+
+#ifndef MAX
+#define MAX(A, B) ((B) > (A) ? (B) : (A))
+#endif
 
 #define LW_FLAG_HAS_WAITERS ((uint32)1 << 30)
 #define LW_FLAG_RELEASE_OK ((uint32)1 << 29)
@@ -139,7 +144,7 @@ static const char *BuiltinTrancheNames[] = {
     "UniqueSQLMappingLock",
     "InstrUserLockId",
     "GPCMappingLock",
-    "UspagrpMappingLock",
+    "UspagrpMappingLock", 
     "ProcXactMappingLock",
     "ASPMappingLock",
     "GlobalSeqLock",
@@ -162,10 +167,13 @@ static const char *BuiltinTrancheNames[] = {
     "OldSerXid SLRU Ctl",
     "WALInsertLock",
     "DoubleWriteLock",
-    "DWSingleFlushPosLock",
-    "DWSingleFlushWriteLock",
+    "DWSingleFlushFirstLock",
+    "DWSingleFlushSecondLock",
+    "DWSingleFlushSecondBufTagLock",
     "RestartPointQueueLock",
     "PruneDirtyQueueLock",
+    "UnlinkRelHashTblLock",
+    "UnlinkRelForkHashTblLock",
     "LWTRANCHE_ACCOUNT_TABLE",
     "GeneralExtendedLock",
     "MPFLLOCK",
@@ -178,13 +186,18 @@ static const char *BuiltinTrancheNames[] = {
     "WALBufferInitWait",
     "WALInitSegment",
     "SegmentHeadPartitionLock",
-    "TwoPhaseStatePartLock"
+    "TwoPhaseStatePartLock",
+    "RoleIdPartLock",
+    "PgwrSyncQueueLock",
+    "BarrierHashTblLock",
+    "PageRepairHashTblLock",
+    "FileRepairHashTblLock",
+    "ReplicationOriginSlotLock",
+    "AuditIndextblLock"
 };
 
 static void RegisterLWLockTranches(void);
 static void InitializeLWLocks(int numLocks);
-extern void LWLockReportWaitStart(LWLock *);
-extern void LWLockReportWaitEnd(void);
 
 #ifdef LWLOCK_STATS
 typedef struct lwlock_stats_key {
@@ -330,13 +343,18 @@ static lwlock_stats *get_lwlock_stats_entry(LWLock *lock)
 }
 #endif /* LWLOCK_STATS */
 
-const int NUM_DW_SINGLE_FLUSH_LOCK = 161; /* one page correspond to one lock */
 /*
  * Compute number of LWLocks to allocate.
  */
 int NumLWLocks(void)
 {
     int numLocks;
+    uint32 maxConn = g_instance.attr.attr_network.MaxConnections;
+    uint32 maxThreadNum = 0;
+    if (ENABLE_THREAD_POOL) {
+        maxThreadNum = g_threadPoolControler->GetThreadNum();
+    }
+    uint32 numLockFactor = 4;
 
     /*
      * Possibly this logic should be spread out among the affected modules,
@@ -348,7 +366,10 @@ int NumLWLocks(void)
     numLocks = (int)NumFixedLWLocks;
 
     /* bufmgr.c needs two for each shared buffer */
-    numLocks += 2 * g_instance.attr.attr_storage.NBuffers;
+    numLocks += 2 * TOTAL_BUFFER_NUM;
+
+    /* each zone owns undo space lock */
+    numLocks += MAX(maxConn, maxThreadNum) * numLockFactor * UNDO_ZONE_LOCK;
 
     /* cucache_mgr.cpp CU Cache calculates its own requirements */
     numLocks += DataCacheMgrNumLocks();
@@ -358,7 +379,7 @@ int NumLWLocks(void)
 
     /* proc.c needs one for each backend or auxiliary process. For prepared xacts,
      * backendLock is actually not allocated. */
-    numLocks += (2 * GLOBAL_ALL_PROCS - g_instance.attr.attr_storage.max_prepared_xacts);
+    numLocks += (2 * GLOBAL_ALL_PROCS - g_instance.attr.attr_storage.max_prepared_xacts * NUM_TWOPHASE_PARTITIONS);
 
     /* clog.c needs one per CLOG buffer */
     numLocks += CLOGShmemBuffers();
@@ -382,20 +403,31 @@ int NumLWLocks(void)
     numLocks += g_instance.attr.attr_storage.max_replication_slots;
 
     /* double write.c needs flush lock */
-    numLocks += 1;                              /* batch flush lock */
-    numLocks += NUM_DW_SINGLE_FLUSH_LOCK + 1;  /* single flush write lock and the get pos lock */
+    numLocks += 1;   /* dw batch flush lock */
+    numLocks += 3;  /* dw single flush pos lock (two version) + second version buftag page lock */
 
     /* for materialized view */
     numLocks += 1;
 
+    /* for WALFlushWait lock, WALBufferInitWait lock and WALInitSegment lock */
+    numLocks += 3;
+    
     /* for recovery state queue */
     numLocks += 1;
 
     /* for prune dirty queue */
     numLocks += 1;
 
-    /* for WALFlushWait lock, WALBufferInitWait lock and WALInitSegment lock */
-    numLocks += 3;
+    /* for unlink rel hashtbl, one is for all fork relation hashtable, one is for one fork relation hash table */
+    numLocks += 2;
+
+    /* for incre ckpt sync request queue lock */
+    numLocks +=1;
+    /* for page repair hash table and file repair hash table */
+    numLocks += 2;
+
+    /* for barrier preparse hashtbl */
+    numLocks += 1;
 
     /*
      * Add any requested by loadable modules; for backwards-compatibility
@@ -584,14 +616,17 @@ static void InitializeLWLocks(int numLocks)
         LWLockInitialize(&lock->lock, LWTRANCHE_START_BLOCK_MAPPING);
     }
 
-    for (id = 0; id < NUM_TWOPHASE_PARTITIONS; id++, lock++) {
-        LWLockInitialize(&lock->lock, LWTRANCHE_TWOPHASE_STATE);
-    }
-
     for (id = 0; id < NUM_SEGMENT_HEAD_PARTITIONS; id++, lock++) {
         LWLockInitialize(&lock->lock, LWTRANCHE_SEGHEAD_PARTITION);
     }
 
+    for (id = 0; id < NUM_TWOPHASE_PARTITIONS; id++, lock++) {
+        LWLockInitialize(&lock->lock, LWTRANCHE_TWOPHASE_STATE);
+    }
+    
+    for (id = 0; id < NUM_SESSION_ROLEID_PARTITIONS; id++, lock++) {
+        LWLockInitialize(&lock->lock, LWTRANCHE_ROLEID_PARTITION);
+    }
     Assert((lock - t_thrd.shemem_ptr_cxt.mainLWLockArray) == NumFixedLWLocks);
 
     for (id = NumFixedLWLocks; id < numLocks; id++, lock++) {
@@ -1281,6 +1316,8 @@ bool LWLockAcquire(LWLock *lock, LWLockMode mode, bool need_update_lockid)
             break; /* got the lock */
         }
 
+        instr_stmt_report_lock(LWLOCK_WAIT_START, mode, NULL, lock->tranche);
+        pgstat_report_waitevent(PG_WAIT_LWLOCK | lock->tranche);
         /*
          * Ok, at this point we couldn't grab the lock on the first try. We
          * cannot simply queue ourselves to the end of the list and wait to be
@@ -1300,6 +1337,8 @@ bool LWLockAcquire(LWLock *lock, LWLockMode mode, bool need_update_lockid)
             LOG_LWDEBUG("LWLockAcquire", lock, "acquired, undoing queue");
 
             LWLockDequeueSelf(lock, mode);
+            pgstat_report_waitevent(WAIT_EVENT_END);
+            instr_stmt_report_lock(LWLOCK_WAIT_END);
             break;
         }
 
@@ -1324,8 +1363,6 @@ bool LWLockAcquire(LWLock *lock, LWLockMode mode, bool need_update_lockid)
 #ifdef LWLOCK_STATS
         lwstats->block_count++;
 #endif
-        instr_stmt_report_lock(LWLOCK_WAIT_START, mode, NULL, lock->tranche);
-        LWLockReportWaitStart(lock);
         TRACE_POSTGRESQL_LWLOCK_WAIT_START(T_NAME(lock), mode);
         for (;;) {
             /* "false" means cannot accept cancel/die interrupt here. */
@@ -1352,7 +1389,7 @@ bool LWLockAcquire(LWLock *lock, LWLockMode mode, bool need_update_lockid)
         }
 #endif
         TRACE_POSTGRESQL_LWLOCK_WAIT_DONE(T_NAME(lock), mode);
-        LWLockReportWaitEnd();
+        pgstat_report_waitevent(WAIT_EVENT_END);
         instr_stmt_report_lock(LWLOCK_WAIT_END);
 
         LOG_LWDEBUG("LWLockAcquire", lock, "awakened");
@@ -1464,8 +1501,11 @@ bool LWLockAcquireOrWait(LWLock *lock, LWLockMode mode)
 
     mustwait = LWLockAttemptLock(lock, mode);
     if (mustwait) {
-        LWLockQueueSelf(lock, LW_WAIT_UNTIL_FREE);
+        instr_stmt_report_lock(LWLOCK_WAIT_START, mode, NULL, lock->tranche);
+        pgstat_report_waitevent(PG_WAIT_LWLOCK | lock->tranche);
+        TRACE_POSTGRESQL_LWLOCK_WAIT_START(T_NAME(lock), mode);
 
+        LWLockQueueSelf(lock, LW_WAIT_UNTIL_FREE);
         mustwait = LWLockAttemptLock(lock, mode);
         if (mustwait) {
             /*
@@ -1477,10 +1517,6 @@ bool LWLockAcquireOrWait(LWLock *lock, LWLockMode mode)
 #ifdef LWLOCK_STATS
             lwstats->block_count++;
 #endif
-            instr_stmt_report_lock(LWLOCK_WAIT_START, mode, NULL, lock->tranche);
-            LWLockReportWaitStart(lock);
-            TRACE_POSTGRESQL_LWLOCK_WAIT_START(T_NAME(lock), mode);
-
             remember_lwlock_acquire(lock);
 
             for (;;) {
@@ -1504,10 +1540,6 @@ bool LWLockAcquireOrWait(LWLock *lock, LWLockMode mode)
                 Assert(nwaiters < MAX_BACKENDS);
             }
 #endif
-            TRACE_POSTGRESQL_LWLOCK_WAIT_DONE(T_NAME(lock), mode);
-            LWLockReportWaitEnd();
-            instr_stmt_report_lock(LWLOCK_WAIT_END);
-
             LOG_LWDEBUG("LWLockAcquireOrWait", lock, "awakened");
         } else {
             LOG_LWDEBUG("LWLockAcquireOrWait", lock, "acquired, undoing queue");
@@ -1520,6 +1552,9 @@ bool LWLockAcquireOrWait(LWLock *lock, LWLockMode mode)
              */
             LWLockDequeueSelf(lock, mode);
         }
+        TRACE_POSTGRESQL_LWLOCK_WAIT_DONE(T_NAME(lock), mode);
+        pgstat_report_waitevent(WAIT_EVENT_END);
+        instr_stmt_report_lock(LWLOCK_WAIT_END);
     }
 
     /*
@@ -1832,9 +1867,19 @@ void LWLockReleaseClearVar(LWLock *lock, uint64 *valptr, uint64 val)
  */
 void LWLockReleaseAll(void)
 {
-    while (t_thrd.storage_cxt.num_held_lwlocks > 0) {
+    int index = t_thrd.storage_cxt.num_held_lwlocks - 1;
+    while (index >= 0) {
+        // SwitchoverLockHolder never release switchover lock in LWLockReleaseAll
+        if (t_thrd.storage_cxt.isSwitchoverLockHolder && (g_instance.archive_obs_cxt.in_switchover ||
+                g_instance.streaming_dr_cxt.isInSwitchover) &&
+                (t_thrd.storage_cxt.held_lwlocks[index].lock == HadrSwitchoverLock)) {
+            index--;
+            continue;
+        }
         HOLD_INTERRUPTS(); /* match the upcoming RESUME_INTERRUPTS */
-        LWLockRelease(t_thrd.storage_cxt.held_lwlocks[t_thrd.storage_cxt.num_held_lwlocks - 1].lock);
+
+        LWLockRelease(t_thrd.storage_cxt.held_lwlocks[index].lock);
+        index--;
     }
 }
 
@@ -2144,3 +2189,4 @@ void CheckLWLockPartNumRange(void)
         }
     }
 }
+

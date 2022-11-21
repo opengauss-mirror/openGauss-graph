@@ -7,6 +7,7 @@
  *
  * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
+ * Portions Copyright (c) 2021, openGauss Contributors
  *
  *
  * IDENTIFICATION
@@ -34,13 +35,18 @@
 #include "catalog/pg_directory.h"
 #include "catalog/pg_job.h"
 #include "catalog/pg_job_proc.h"
+#include "catalog/gs_job_argument.h"
+#include "catalog/gs_job_attribute.h"
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_obsscaninfo.h"
 #include "catalog/pg_pltemplate.h"
 #include "catalog/pg_db_role_setting.h"
+#include "catalog/pg_recyclebin.h"
+#include "catalog/pg_replication_origin.h"
 #include "catalog/pg_shdepend.h"
 #include "catalog/pg_shdescription.h"
 #include "catalog/pg_shseclabel.h"
+#include "catalog/pg_subscription.h"
 #include "catalog/pg_tablespace.h"
 #include "catalog/pg_auth_history.h"
 #include "catalog/pg_user_status.h"
@@ -50,6 +56,7 @@
 #include "catalog/pgxc_group.h"
 #include "catalog/pg_extension_data_source.h"
 #include "catalog/pg_proc.h"
+#include "catalog/pg_snapshot.h"
 #include "commands/tablespace.h"
 #include "commands/directory.h"
 #include "cstore.h"
@@ -59,8 +66,10 @@
 #include "catalog/pg_workload_group.h"
 #include "catalog/pg_app_workloadgroup_mapping.h"
 #include "miscadmin.h"
-#include "storage/fd.h"
+#include "storage/smgr/fd.h"
+#include "storage/smgr/segment.h"
 #include "utils/fmgroids.h"
+#include "utils/lsyscache.h"
 #include "utils/rel.h"
 #include "utils/rel_gs.h"
 #include "utils/snapmgr.h"
@@ -196,7 +205,6 @@ char* relpathbackend(RelFileNode rnode, BackendId backend, ForkNumber forknum)
     char* path = NULL;
 
     // Column store
-    //  Future: fix this function.
     if (IsValidColForkNum(forknum)) {
         path = (char*)palloc0(MAXPGPATH * sizeof(char));
 
@@ -210,7 +218,7 @@ char* relpathbackend(RelFileNode rnode, BackendId backend, ForkNumber forknum)
         if (rnode.spcNode == GLOBALTABLESPACE_OID) {
             /* Shared system relations live in {datadir}/global */
             Assert(rnode.dbNode == 0);
-            Assert(rnode.bucketNode == InvalidBktId);
+            Assert(IsHeapFileNode(rnode));
             Assert(backend == InvalidBackendId);
             pathlen = 7 + OIDCHARS + 1 + FORKNAMECHARS + 1;
             path = (char*)palloc(pathlen);
@@ -225,29 +233,26 @@ char* relpathbackend(RelFileNode rnode, BackendId backend, ForkNumber forknum)
             if (backend == InvalidBackendId) {
                 pathlen = 5 + OIDCHARS + 1 + OIDCHARS + 1 + OIDCHARS + 1 + FORKNAMECHARS + 1 + OIDCHARS + 2;
                 path = (char*)palloc(pathlen);
-                if (rnode.bucketNode == DIR_BUCKET_ID) {
-                    rc = snprintf_s(path, pathlen, pathlen - 1, "base/%u/%u/",
-                        rnode.dbNode, rnode.relNode);
-                } else if (forknum != MAIN_FORKNUM) {
-                    if (rnode.bucketNode == InvalidBktId) {
+                if (forknum != MAIN_FORKNUM) {
+                    if (!IsBucketFileNode(rnode)) {
                         rc = snprintf_s(path, pathlen, pathlen - 1, "base/%u/%u_%s",
                             rnode.dbNode, rnode.relNode, forkNames[forknum]);
                     } else {
-                        rc = snprintf_s(path, pathlen, pathlen - 1, "base/%u/%u/%u_b%d_%s",
-                            rnode.dbNode, rnode.relNode, rnode.relNode, rnode.bucketNode, forkNames[forknum]);
+                        rc = snprintf_s(path, pathlen, pathlen - 1, "base/%u/%u_b%d_%s",
+                            rnode.dbNode, rnode.relNode, rnode.bucketNode, forkNames[forknum]);
                     }
                 } else {
-                    if (rnode.bucketNode == InvalidBktId) {
+                    if (!IsBucketFileNode(rnode)) {
                         rc = snprintf_s(path, pathlen, pathlen - 1, "base/%u/%u", rnode.dbNode, rnode.relNode);
                     } else {
-                        rc = snprintf_s(path, pathlen, pathlen - 1, "base/%u/%u/%u_b%d",
-                            rnode.dbNode, rnode.relNode, rnode.relNode, rnode.bucketNode);
+                        rc = snprintf_s(path, pathlen, pathlen - 1, "base/%u/%u_b%d",
+                            rnode.dbNode, rnode.relNode, rnode.bucketNode);
                     }
                 }
                 securec_check_ss(rc, "\0", "\0");
             } else {
                 /* OIDCHARS will suffice for an integer, too */
-                Assert(rnode.bucketNode == InvalidBktId);
+                Assert(!IsBucketFileNode(rnode));
                 pathlen = 5 + OIDCHARS + 2 + OIDCHARS + 1 + OIDCHARS + 1 + FORKNAMECHARS + 1;
                 path = (char*)palloc(pathlen);
                 if (forknum != MAIN_FORKNUM) {
@@ -269,22 +274,18 @@ char* relpathbackend(RelFileNode rnode, BackendId backend, ForkNumber forknum)
                 OIDCHARS + 1 + OIDCHARS + 1 + OIDCHARS + 2 + OIDCHARS + 1 + FORKNAMECHARS + 1;
                 path = (char*)palloc(pathlen);
 #ifdef PGXC
-                if (rnode.bucketNode == DIR_BUCKET_ID) {
-                    rc = snprintf_s(path, pathlen, pathlen - 1, "pg_tblspc/%u/%s_%s/%u/%u/",
-                        rnode.spcNode, TABLESPACE_VERSION_DIRECTORY, g_instance.attr.attr_common.PGXCNodeName,
-                        rnode.dbNode, rnode.relNode);
-                } else if (forknum != MAIN_FORKNUM) {
-                    if (rnode.bucketNode == InvalidBktId) {
+                if (forknum != MAIN_FORKNUM) {
+                    if (!IsBucketFileNode(rnode)) {
                         rc = snprintf_s(path, pathlen, pathlen - 1, "pg_tblspc/%u/%s_%s/%u/%u_%s",
                             rnode.spcNode, TABLESPACE_VERSION_DIRECTORY, g_instance.attr.attr_common.PGXCNodeName,
                             rnode.dbNode, rnode.relNode, forkNames[forknum]);
                     } else {
-                        rc = snprintf_s(path, pathlen, pathlen - 1, "pg_tblspc/%u/%s_%s/%u/%u/%u_b%d_%s",
+                        rc = snprintf_s(path, pathlen, pathlen - 1, "pg_tblspc/%u/%s_%s/%u/%u_b%d_%s",
                             rnode.spcNode, TABLESPACE_VERSION_DIRECTORY, g_instance.attr.attr_common.PGXCNodeName,
-                            rnode.dbNode, rnode.relNode, rnode.relNode, rnode.bucketNode, forkNames[forknum]);
+                            rnode.dbNode, rnode.relNode, rnode.bucketNode, forkNames[forknum]);
                     }
                 } else {
-                    if (rnode.bucketNode == InvalidBktId) {
+                    if (!IsBucketFileNode(rnode)) {
                         rc = snprintf_s(path,
                             pathlen,
                             pathlen - 1,
@@ -298,12 +299,11 @@ char* relpathbackend(RelFileNode rnode, BackendId backend, ForkNumber forknum)
                         rc = snprintf_s(path,
                             pathlen,
                             pathlen - 1,
-                            "pg_tblspc/%u/%s_%s/%u/%u/%u_b%d",
+                            "pg_tblspc/%u/%s_%s/%u/%u_b%d",
                             rnode.spcNode,
                             TABLESPACE_VERSION_DIRECTORY,
                             g_instance.attr.attr_common.PGXCNodeName,
                             rnode.dbNode,
-                            rnode.relNode,
                             rnode.relNode,
                             rnode.bucketNode);
                     }
@@ -401,10 +401,6 @@ char* relpathbackend(RelFileNode rnode, BackendId backend, ForkNumber forknum)
  *  dbNode/relNode
  *  dbNode/relNode.1 (segno = 1)
  *  dbNode/relNode_forkName 
- * Hashbucket Table Path(e.g. bucketNode = 0):
- *  dbNode/relNode/relNode_b0
- *  dbNode/relNode/relNode_b0_fsm
- *  dbNode/relNode/relNode_b0_bcm
  * Tmp Table Path:
  *  dbNode/tbackendId_relNode
  *  dbNode/tbackendId_relNode_forkName
@@ -444,32 +440,11 @@ static void relpath_parse_rnode(char *path, RelFileNodeForkNum &filenode)
             filenode.segno = ('\0' == *tmptoken) ? 0 : (BlockNumber)atooid(tmptoken);
         } else {
             /* 
-             *   Normal Table Path:
-             *      dbNode/relNode_forkName 
-             *   Hashbucket Table Path(e.g. bucketNode = 0):
-             *      dbNode/relNode/relNode_b0
-             *      dbNode/relNode/relNode_b0_fsm
-             *      dbNode/relNode/relNode_b0_bcm
+             *   dbNode/relNode_forkName 
              */
-            filenode.rnode.node.relNode = atooid(token); /* relNode or relNode/relNode */
+            filenode.rnode.node.relNode = atooid(token); /* relNode */
             filenode.rnode.node.bucketNode = InvalidBktId;
-            /* avoid _bcm */
-            if ('b' == *tmptoken && 'c' != *(tmptoken + 1)) {
-                tmptoken = tmptoken + 1;
-                filenode.rnode.node.bucketNode = (int2)atooid(tmptoken);
-                token = strtok_r(NULL, "_", &tmptoken);
-                if ('\0' == *tmptoken) {
-                    filenode.forknumber = MAIN_FORKNUM;
-                    token = strtok_r(token, ".", &tmptoken);
-                    if ('\0' != *tmptoken) {
-                        filenode.segno = (BlockNumber)atooid(tmptoken);
-                    }
-                } else {
-                    filenode.forknumber = forkname_to_number(tmptoken, NULL);
-                }
-            } else {
-                filenode.forknumber = forkname_to_number(tmptoken, &filenode.segno);
-            }
+            filenode.forknumber = forkname_to_number(tmptoken, &filenode.segno);
         }
     } else {
         tmptoken = tmptoken + 1; /* skip 't' */
@@ -516,6 +491,7 @@ RelFileNodeForkNum relpath_to_filenode(char* path)
     securec_check(rc, "\0", "\0");
     filenode.rnode.node.spcNode = DEFAULTTABLESPACE_OID;
     filenode.rnode.node.bucketNode = InvalidBktId;
+    filenode.rnode.node.opt = 0;
     filenode.rnode.backend = InvalidBackendId;
 
     if (0 == strncmp(token, "global", 7)) {
@@ -539,10 +515,6 @@ RelFileNodeForkNum relpath_to_filenode(char* path)
         *   Normal Table Path:
         *      base/dbNode/relNode
         *      base/dbNode/relNode_forkName 
-        *   Hashbucket Table Path(e.g. bucketNode = 0):
-        *      base/dbNode/relNode/relNode_b0
-        *      base/dbNode/relNode/relNode_b0_fsm
-        *      base/dbNode/relNode/relNode_b0_bcm
         *   Tmp Table Path:
         *      base/dbNode/tbackendId_relNode
         *      base/dbNode/tbackendId_relNode_forkName
@@ -554,10 +526,6 @@ RelFileNodeForkNum relpath_to_filenode(char* path)
          *   Normal Table Path:
          *      pg_tblspc/spcNode/version_dir/dbNode/relNode
          *      pg_tblspc/spcNode/version_dir/dbNode/relNode_forkName
-         *   Hashbucket Table Path(e.g. bucketNode = 0):
-         *      pg_tblspc/spcNode/version_dir/dbNode/relNode/relNode_b0
-         *      pg_tblspc/spcNode/version_dir/dbNode/relNode/relNode_b0_fsm
-         *      pg_tblspc/spcNode/version_dir/dbNode/relNode/relNode_b0_bcm
          *   Tmp Table File Path:
          *      pg_tblspc/spcNode/version_dir/dbNode/tbackendId_relNode
          *      pg_tblspc/spcNode/version_dir/dbNode/tbackendId_relNode_forkName
@@ -567,7 +535,10 @@ RelFileNodeForkNum relpath_to_filenode(char* path)
 
         /* check tablespace version directory */
         token = strtok_r(NULL, "/", &tmptoken);
-        Assert(token != NULL);
+        if (NULL == token) {
+            pfree(parsepath);
+            ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("invalid relation file path %s.", path)));
+        }
 
         char tblspcversiondir[MAXPGPATH];
         int errorno = snprintf_s(tblspcversiondir,
@@ -674,7 +645,15 @@ bool IsSystemClass(Form_pg_class reltuple)
 {
     Oid relnamespace = reltuple->relnamespace;
 
-    return IsSystemNamespace(relnamespace) || IsToastNamespace(relnamespace);
+    return IsSystemNamespace(relnamespace) || IsToastNamespace(relnamespace) || IsPackageSchemaOid(relnamespace);
+}
+
+bool IsSysSchema(Oid namespaceId)
+{
+    if (namespaceId == PG_PUBLIC_NAMESPACE) {
+        return false;
+    }
+    return namespaceId < FirstNormalObjectId;
 }
 
 /*
@@ -858,7 +837,8 @@ bool IsSharedRelation(Oid relationId)
         relationId == GsGlobalConfigRelationId ||
 #endif
         relationId == DbRoleSettingRelationId || relationId == PgJobRelationId || relationId == PgJobProcRelationId ||
-        relationId == DataSourceRelationId || relationId == GSObsScanInfoRelationId)
+        relationId == DataSourceRelationId || relationId == GSObsScanInfoRelationId ||
+        relationId == SubscriptionRelationId || relationId == ReplicationOriginRelationId)
         return true;
     /* These are their indexes (see indexing.h) */
     if (relationId == AuthIdRolnameIndexId || relationId == AuthIdOidIndexId || relationId == AuthMemRoleMemIndexId ||
@@ -882,7 +862,10 @@ bool IsSharedRelation(Oid relationId)
         relationId == DbRoleSettingDatidRolidIndexId ||
         /* Add job system table indexs */
         relationId == PgJobOidIndexId || relationId == PgJobIdIndexId || relationId == PgJobProcOidIndexId ||
-        relationId == PgJobProcIdIndexId || relationId == DataSourceOidIndexId || relationId == DataSourceNameIndexId)
+        relationId == PgJobProcIdIndexId || relationId == DataSourceOidIndexId ||
+        relationId == DataSourceNameIndexId || relationId == SubscriptionObjectIndexId ||
+        relationId == SubscriptionNameIndexId || relationId == ReplicationOriginIdentIndex ||
+        relationId == ReplicationOriginNameIndex)
         return true;
     /* These are their toast tables and toast indexes (see toasting.h) */
     if (relationId == PgShdescriptionToastTable || relationId == PgShdescriptionToastIndex ||
@@ -974,23 +957,29 @@ Oid GetNewOidWithIndex(Relation relation, Oid indexId, AttrNumber oidcolumn)
     Oid newOid;
     SysScanDesc scan;
     ScanKeyData key;
+    Snapshot snapshot;
+    SnapshotData snapshotDirty;
     bool collides = false;
+    bool isToastRel = IsToastNamespace(RelationGetNamespace(relation));
+
+    InitDirtySnapshot(snapshotDirty);
+
+    /*
+     * See notes in GetNewOid about using SnapshotAny.
+     * Exception: SnapshotDirty is used for upgrading non-TOAST catalog rels, because the time qual used
+     * for catalogs is SnapshotNow, rather than MVCC or SnapshotToast.
+     */
+    snapshot = (u_sess->attr.attr_common.IsInplaceUpgrade && !isToastRel) ? &snapshotDirty : SnapshotAny;
 
     /* Generate new OIDs until we find one not in the table */
     do {
         CHECK_FOR_INTERRUPTS();
 
-        /*
-         * See comments in GetNewObjectId.
-         * In the future, we might turn to SnapshotToast when getting new
-         * chunk_id for toast datum to prevent wrap around.
-         */
-        newOid = GetNewObjectId(IsToastNamespace(RelationGetNamespace(relation)));
+        newOid = GetNewObjectId(isToastRel);
 
         ScanKeyInit(&key, oidcolumn, BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(newOid));
 
-        /* see notes above about using SnapshotAny */
-        scan = systable_beginscan(relation, indexId, true, SnapshotAny, 1, &key);
+        scan = systable_beginscan(relation, indexId, true, snapshot, 1, &key);
 
         collides = HeapTupleIsValid(systable_getnext(scan));
 
@@ -1041,8 +1030,9 @@ Oid GetNewRelFileNode(Oid reltablespace, Relation pg_class, char relpersistence)
 
     /* This logic should match RelationInitPhysicalAddr */
     rnode.node.spcNode = ConvertToRelfilenodeTblspcOid(reltablespace);
-    rnode.node.dbNode = (rnode.node.spcNode == GLOBALTABLESPACE_OID) ? InvalidOid : u_sess->proc_cxt.MyDatabaseId;
+    rnode.node.dbNode = (rnode.node.spcNode == GLOBALTABLESPACE_OID) ? InvalidOid : GetMyDatabaseId();
     rnode.node.bucketNode = InvalidBktId;
+
     /*
      * The relpath will vary based on the backend ID, so we must initialize
      * that properly here to make sure that any collisions based on filename
@@ -1080,10 +1070,71 @@ Oid GetNewRelFileNode(Oid reltablespace, Relation pg_class, char relpersistence)
              */
             collides = false;
         }
+        HTAB* relfilenode_hashtbl = g_instance.bgwriter_cxt.unlink_rel_hashtbl;
+        bool found = false;
+        LWLockAcquire(g_instance.bgwriter_cxt.rel_hashtbl_lock, LW_SHARED);
+        if (hash_search(relfilenode_hashtbl, &rnode, HASH_FIND, &found) !=  NULL) {
+            collides = true;
+        }
+        LWLockRelease(g_instance.bgwriter_cxt.rel_hashtbl_lock);
 
         pfree(rpath);
         rpath = NULL;
     } while (collides);
 
     return rnode.node.relNode;
+}
+
+bool IsPackageSchemaOid(Oid relnamespace)
+{
+    const char* packageSchemaList[] = {
+        "dbe_lob",
+        "dbe_random",
+        "dbe_output",
+        "dbe_raw",
+        "dbe_task",
+        "dbe_scheduler",
+        "dbe_sql",
+        "dbe_file",
+        "pkg_service",
+        "pkg_util",
+        "dbe_match",
+        "dbe_perf",
+        "dbe_session"
+    };
+    int schemaNum = 10;
+    char* schemaName = get_namespace_name(relnamespace);
+    if (schemaName == NULL) {
+        return false;
+    }
+    for (int i = 0; i < schemaNum; ++i) {
+        if (strcmp(schemaName, packageSchemaList[i]) == 0) {
+            pfree_ext(schemaName);
+            return true;
+        }
+    }
+    return false;
+}
+
+bool IsPackageSchemaName(const char* schemaName)
+{
+    const char* packageSchemaList[] = {
+        "dbe_lob",
+        "dbe_random",
+        "dbe_output",
+        "dbe_raw",
+        "dbe_task",
+        "dbe_scheduler",
+        "dbe_sql",
+        "dbe_file",
+        "pkg_service",
+        "pkg_util"
+    };
+    int schemaNum = 10;
+    for (int i = 0; i < schemaNum; ++i) {
+        if (strcmp(schemaName, packageSchemaList[i]) == 0) {
+            return true;
+        }
+    }
+    return false;
 }

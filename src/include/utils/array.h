@@ -1,7 +1,7 @@
 /* -------------------------------------------------------------------------
  *
  * array.h
- *	  Declarations for Postgres arrays.
+ *	  Declarations for openGauss arrays.
  *
  * A standard varlena array has the following internal structure:
  *	  <vl_len_>		- standard varlena header word
@@ -56,8 +56,11 @@
 #ifndef ARRAY_H
 #define ARRAY_H
 
+#include "access/tupmacs.h"
 #include "fmgr.h"
+#include "utils/expandeddatum.h"
 
+#define EA_MAGIC 689375833		/* ID for debugging crosschecks */
 /*
  * Arrays are varlena objects, so must meet the varlena convention that
  * the first int32 of the object contains the total object size in bytes.
@@ -73,6 +76,73 @@ typedef struct {
     Oid elemtype;     /* element type OID */
 } ArrayType;
 
+#define PG_GETARG_ANY_ARRAY(n)	DatumGetAnyArray(PG_GETARG_DATUM(n))
+
+typedef struct ExpandedArrayHeader
+{
+	/* Standard header for expanded objects */
+	ExpandedObjectHeader hdr;
+
+	/* Magic value identifying an expanded array (for debugging only) */
+	int			ea_magic;
+
+	/* Dimensionality info (always valid) */
+	int			ndims;			/* # of dimensions */
+	int		   *dims;			/* array dimensions */
+	int		   *lbound;			/* index lower bounds for each dimension */
+
+	/* Element type info (always valid) */
+	Oid			element_type;	/* element type OID */
+	int16		typlen;			/* needed info about element datatype */
+	bool		typbyval;
+	char		typalign;
+
+	/*
+	 * If we have a Datum-array representation of the array, it's kept here;
+	 * else dvalues/dnulls are NULL.  The dvalues and dnulls arrays are always
+	 * palloc'd within the object private context, but may change size from
+	 * time to time.  For pass-by-ref element types, dvalues entries might
+	 * point either into the fstartptr..fendptr area, or to separately
+	 * palloc'd chunks.  Elements should always be fully detoasted, as they
+	 * are in the standard flat representation.
+	 *
+	 * Even when dvalues is valid, dnulls can be NULL if there are no null
+	 * elements.
+	 */
+	Datum	   *dvalues;		/* array of Datums */
+	bool	   *dnulls;			/* array of is-null flags for Datums */
+	int			dvalueslen;		/* allocated length of above arrays */
+	int			nelems;			/* number of valid entries in above arrays */
+
+	/*
+	 * flat_size is the current space requirement for the flat equivalent of
+	 * the expanded array, if known; otherwise it's 0.  We store this to make
+	 * consecutive calls of get_flat_size cheap.
+	 */
+	Size		flat_size;
+
+	/*
+	 * fvalue points to the flat representation if it is valid, else it is
+	 * NULL.  If we have or ever had a flat representation then
+	 * fstartptr/fendptr point to the start and end+1 of its data area; this
+	 * is so that we can tell which Datum pointers point into the flat
+	 * representation rather than being pointers to separately palloc'd data.
+	 */
+	ArrayType  *fvalue;			/* must be a fully detoasted array */
+	char	   *fstartptr;		/* start of its data area */
+	char	   *fendptr;		/* end+1 of its data area */
+} ExpandedArrayHeader;
+
+// /*
+//  * Functions that can handle either a "flat" varlena array or an expanded
+//  * array use this union to work with their input.
+//  */
+typedef union AnyArrayType
+{
+	ArrayType	flt;
+	ExpandedArrayHeader xpn;
+} AnyArrayType;
+
 /*
  * working state for accumArrayResult() and friends
  */
@@ -86,6 +156,9 @@ typedef struct ArrayBuildState {
     int16 typlen;           /* needed info about datatype */
     bool typbyval;
     char typalign;
+#ifdef GS_GRAPH
+	bool private_cxt;	/* use private memory context */
+#endif
 } ArrayBuildState;
 
 /*
@@ -121,7 +194,6 @@ typedef struct ArrayIteratorData* ArrayIterator;
 #define PG_GETARG_ARRAYTYPE_P(n) DatumGetArrayTypeP(PG_GETARG_DATUM(n))
 #define PG_GETARG_ARRAYTYPE_P_COPY(n) DatumGetArrayTypePCopy(PG_GETARG_DATUM(n))
 #define PG_RETURN_ARRAYTYPE_P(x) PG_RETURN_POINTER(x)
-
 /*
  * Access macros for array header fields.
  *
@@ -147,6 +219,25 @@ typedef struct ArrayIteratorData* ArrayIterator;
     (ARR_HASNULL(a) ? (bits8*)(((char*)(a)) + sizeof(ArrayType) + 2 * sizeof(int) * ARR_NDIM(a)) : (bits8*)NULL)
 
 /*
+ * Macros for working with AnyArrayType inputs.  Beware multiple references!
+ */
+#define AARR_NDIM(a) \
+	(VARATT_IS_EXPANDED_HEADER(a) ? (a)->xpn.ndims : ARR_NDIM(&(a)->flt))
+#define AARR_HASNULL(a) \
+	(VARATT_IS_EXPANDED_HEADER(a) ? \
+	 ((a)->xpn.dvalues != NULL ? (a)->xpn.dnulls != NULL : ARR_HASNULL((a)->xpn.fvalue)) : \
+	 ARR_HASNULL(&(a)->flt))
+#define AARR_ELEMTYPE(a) \
+	(VARATT_IS_EXPANDED_HEADER(a) ? (a)->xpn.element_type : ARR_ELEMTYPE(&(a)->flt))
+#define AARR_DIMS(a) \
+	(VARATT_IS_EXPANDED_HEADER(a) ? (a)->xpn.dims : ARR_DIMS(&(a)->flt))
+#define AARR_LBOUND(a) \
+	(VARATT_IS_EXPANDED_HEADER(a) ? (a)->xpn.lbound : ARR_LBOUND(&(a)->flt))
+
+/* fmgr macros for AnyArrayType (ie, get either varlena or expanded form) */
+#define PG_GETARG_ANY_ARRAY(n)	DatumGetAnyArray(PG_GETARG_DATUM(n))
+
+/*
  * The total array header size (in bytes) for an array with the specified
  * number of dimensions and total number of items.
  */
@@ -160,7 +251,8 @@ typedef struct ArrayIteratorData* ArrayIterator;
  * Returns a pointer to the actual array data.
  */
 #define ARR_DATA_PTR(a) (((char*)(a)) + ARR_DATA_OFFSET(a))
-
+/* multiset functions number of args */
+#define MULTISET_ARGS_NUM 2
 /*
  * prototypes for functions defined in arrayfuncs.c
  */
@@ -185,6 +277,14 @@ extern Datum array_lower(PG_FUNCTION_ARGS);
 extern Datum array_upper(PG_FUNCTION_ARGS);
 extern Datum array_extend(PG_FUNCTION_ARGS);
 extern Datum array_length(PG_FUNCTION_ARGS);
+extern Datum array_exists(PG_FUNCTION_ARGS);
+extern Datum array_next(PG_FUNCTION_ARGS);
+extern Datum array_varchar_next(PG_FUNCTION_ARGS);
+extern Datum array_prior(PG_FUNCTION_ARGS);
+extern Datum array_trim(PG_FUNCTION_ARGS);
+extern Datum array_delete(PG_FUNCTION_ARGS);
+extern Datum array_deleteidx(PG_FUNCTION_ARGS);
+extern Datum array_extendnull(PG_FUNCTION_ARGS);
 extern Datum array_larger(PG_FUNCTION_ARGS);
 extern Datum array_smaller(PG_FUNCTION_ARGS);
 extern Datum generate_subscripts(PG_FUNCTION_ARGS);
@@ -192,6 +292,11 @@ extern Datum generate_subscripts_nodir(PG_FUNCTION_ARGS);
 extern Datum array_fill(PG_FUNCTION_ARGS);
 extern Datum array_fill_with_lower_bounds(PG_FUNCTION_ARGS);
 extern Datum array_unnest(PG_FUNCTION_ARGS);
+extern Datum array_cat_distinct(PG_FUNCTION_ARGS);
+extern Datum array_intersect(PG_FUNCTION_ARGS);
+extern Datum array_intersect_distinct(PG_FUNCTION_ARGS);
+extern Datum array_except(PG_FUNCTION_ARGS);
+extern Datum array_except_distinct(PG_FUNCTION_ARGS);
 
 extern Datum array_ref(ArrayType* array, int nSubscripts, const int* indx, int arraytyplen, int elmlen, bool elmbyval,
     char elmalign, bool* isNull);
@@ -256,5 +361,99 @@ extern Datum array_agg_finalfn(PG_FUNCTION_ARGS);
  */
 extern Datum array_typanalyze(PG_FUNCTION_ARGS);
 extern float8* check_float8_array(ArrayType* transarray, const char* caller, int n);
+extern AnyArrayType *DatumGetAnyArray(Datum d);
+
+typedef struct array_iter
+{
+	/* datumptr being NULL or not tells if we have flat or expanded array */
+
+	/* Fields used when we have an expanded array */
+	Datum	   *datumptr;		/* Pointer to Datum array */
+	bool	   *isnullptr;		/* Pointer to isnull array */
+
+	/* Fields used when we have a flat array */
+	char	   *dataptr;		/* Current spot in the data area */
+	bits8	   *bitmapptr;		/* Current byte of the nulls bitmap, or NULL */
+	int			bitmask;		/* mask for current bit in nulls bitmap */
+} array_iter;
+
+
+static inline void
+array_iter_setup(array_iter *it, AnyArrayType *a)
+{
+	if (VARATT_IS_EXPANDED_HEADER(a))
+	{
+		if (a->xpn.dvalues)
+		{
+			it->datumptr = a->xpn.dvalues;
+			it->isnullptr = a->xpn.dnulls;
+			/* we must fill all fields to prevent compiler warnings */
+			it->dataptr = NULL;
+			it->bitmapptr = NULL;
+		}
+		else
+		{
+			/* Work with flat array embedded in the expanded datum */
+			it->datumptr = NULL;
+			it->isnullptr = NULL;
+			it->dataptr = ARR_DATA_PTR(a->xpn.fvalue);
+			it->bitmapptr = ARR_NULLBITMAP(a->xpn.fvalue);
+		}
+	}
+	else
+	{
+		it->datumptr = NULL;
+		it->isnullptr = NULL;
+		it->dataptr = ARR_DATA_PTR(&a->flt);
+		it->bitmapptr = ARR_NULLBITMAP(&a->flt);
+	}
+	it->bitmask = 1;
+}
+
+static inline Datum
+array_iter_next(array_iter *it, bool *isnull, int i,
+				int elmlen, bool elmbyval, char elmalign)
+{
+	Datum		ret;
+
+	if (it->datumptr)
+	{
+		ret = it->datumptr[i];
+		*isnull = it->isnullptr ? it->isnullptr[i] : false;
+	}
+	else
+	{
+		if (it->bitmapptr && (*(it->bitmapptr) & it->bitmask) == 0)
+		{
+			*isnull = true;
+			ret = (Datum) 0;
+		}
+		else
+		{
+			*isnull = false;
+			ret = fetch_att(it->dataptr, elmbyval, elmlen);
+			it->dataptr = att_addlength_pointer(it->dataptr, elmlen,
+												it->dataptr);
+			it->dataptr = (char *) att_align_nominal(it->dataptr, elmalign);
+		}
+		it->bitmask <<= 1;
+		if (it->bitmask == 0x100)
+		{
+			if (it->bitmapptr)
+				it->bitmapptr++;
+			it->bitmask = 1;
+		}
+	}
+
+	return ret;
+}
+
+#ifdef GS_GRAPH
+extern ArrayBuildState *initArrayResult(Oid element_type, MemoryContext rcontext, bool subcontext);
+extern Datum array_get_element(Datum arraydatum, int nSubscripts, int *indx,
+	int arraytyplen, int elmlen, bool elmbyval, char elmalign, bool *isNull);
+extern void deconstruct_expanded_array(ExpandedArrayHeader *eah);
+extern Datum makeArrayResultForVLE(ArrayBuildState* astate, MemoryContext rcontext);
+#endif
 
 #endif /* ARRAY_H */

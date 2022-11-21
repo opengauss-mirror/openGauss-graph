@@ -2,8 +2,8 @@
 \! gs_ktool -g
 \! gs_ktool -g
 
-CREATE CLIENT MASTER KEY MyCMK WITH ( KEY_STORE = gs_ktool , KEY_PATH = "gs_ktool/1" , ALGORITHM = AES_256_CBC);
-CREATE COLUMN ENCRYPTION KEY MyCEK WITH VALUES (CLIENT_MASTER_KEY = MyCMK, ALGORITHM = AEAD_AES_256_CBC_HMAC_SHA256);
+CREATE CLIENT MASTER KEY MyCMK WITH ( KEY_STORE = gs_ktool , KEY_PATH = "gs_ktool/1" , ALGORITHM = SM4);
+CREATE COLUMN ENCRYPTION KEY MyCEK WITH VALUES (CLIENT_MASTER_KEY = MyCMK, ALGORITHM = SM4_SM3);
 CREATE CLIENT MASTER KEY MyCMK1 WITH ( KEY_STORE = gs_ktool , KEY_PATH = "gs_ktool/2" , ALGORITHM = AES_256_CBC);
 CREATE COLUMN ENCRYPTION KEY MyCEK1 WITH VALUES (CLIENT_MASTER_KEY = MyCMK1, ALGORITHM = AEAD_AES_256_CBC_HMAC_SHA256);
 CREATE TABLE IF NOT EXISTS tr1(i1 INT ENCRYPTED WITH (COLUMN_ENCRYPTION_KEY = MyCEK, ENCRYPTION_TYPE = DETERMINISTIC) , i2 INT);
@@ -38,6 +38,13 @@ CREATE TABLE creditcard_info2 (id_number    int, name text encrypted with (colum
 insert into creditcard_info  select * from creditcard_info1 ;
 insert into creditcard_info1  select * from creditcard_info ;
 insert into creditcard_info1  select * from creditcard_info2 ;
+
+-- error
+INSERT INTO creditcard_info1(id_number, name, credit_card) SELECT id_number, name, credit_card FROM creditcard_info2;
+INSERT INTO creditcard_info1(id_number, credit_card) SELECT id_number, credit_card FROM creditcard_info2;
+
+-- succeed
+INSERT INTO creditcard_info1(id_number, name) SELECT id_number, name FROM creditcard_info2;
 
 drop table creditcard_info;
 drop table creditcard_info1;

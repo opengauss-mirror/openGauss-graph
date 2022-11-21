@@ -22,6 +22,7 @@
  *
  * -------------------------------------------------------------------------
  */
+#include "parser/parse_func.h"
 #include "postgres.h"
 #include "access/htup.h"
 #include "access/heapam.h"
@@ -31,10 +32,12 @@
 #include "catalog/pg_proc.h"
 #include "commands/user.h"
 #include "gs_policy_object_types.h"
+#include "gs_policy_plugin.h"
 #include "utils/syscache.h"
 #include "utils/lsyscache.h"
 #include "utils/builtins.h"
 #include "utils/acl.h"
+#include "catalog/objectaddress.h"
 
 /*
  * get_relation_schema
@@ -541,6 +544,19 @@ typedef struct ObjectTypeInfo
     const char* object_name;
 } ObjectTypeInfo;
 
+typedef struct CmdCursorInfo {
+    CmdType cmd_type;
+    const char *object_name;
+} CmdCursorInfo;
+
+static CmdCursorInfo cmd_cursorinfo[] = {
+    {CMD_SELECT, "FOR SELECT FROM"},
+    {CMD_INSERT, "FOR INSERT TO"},
+    {CMD_UPDATE, "FOR UPDATE FROM"},
+    {CMD_DELETE, "FOR DELETE FROM"},
+    {CMD_UNKNOWN, NULL}
+};
+
 static OperInfo oper_infos[] = {
     {"create", T_CREATE},
     {"alter", T_ALTER},
@@ -557,7 +573,7 @@ static OperInfo oper_infos[] = {
     {"login_success", T_LOGIN_SUCCESS},
     {"login_failure", T_LOGIN_FAILURE},
     {"copy", T_COPY},
-    {"open", T_OPEN},
+    {"cursor", T_CURSOR},
     {"fetch", T_FETCH},
     {"close", T_CLOSE},
     {"all", T_ALL},
@@ -617,6 +633,20 @@ static ObjectTypeInfo object_type_infos[] =
     {O_CURSOR, "CURSOR"},
     {O_UNKNOWN, NULL}
 };
+
+/*
+ * get_cursorinfo
+ *    return cursor operation object
+ */
+const char *get_cursorinfo(CmdType type)
+{
+    for (int i = 0; cmd_cursorinfo[i].object_name != NULL; ++i) {
+        if (cmd_cursorinfo[i].cmd_type == type) {
+            return cmd_cursorinfo[i].object_name;
+        }
+    }
+    return "UNKNOWN";
+}
 
 /*
  * get_privilege_type
@@ -709,4 +739,239 @@ int gs_policy_base_cmp(const void *key1, const void *key2)
     if (l->m_type < r->m_type) return -1;
     if (r->m_type < l->m_type) return 1;
     return strcasecmp(l->m_label_name.c_str(), r->m_label_name.c_str());
+}
+
+/* get function param types */
+bool get_function_parameters(HeapTuple tuple, func_types* types, int* default_params)
+{
+    if (types == NULL) {
+        return false;
+    }
+    Form_pg_proc func_rel = (Form_pg_proc) GETSTRUCT(tuple);
+    if (default_params != NULL) {
+        *default_params = func_rel->pronargdefaults;
+    }
+    bool isNull = false;
+    Datum pro_all_arg_types = SysCacheGetAttr(PROCOID, tuple, Anum_pg_proc_proallargtypes, &isNull);
+    Oid* pro_arg_types = NULL;
+    if (!isNull) {
+        ArrayType  *arr = DatumGetArrayTypeP(pro_all_arg_types);
+        Assert(ARR_DIMS(arr)[0] >= func_rel->pronargs);
+        pro_arg_types = (Oid*)ARR_DATA_PTR(arr);
+    } else {
+        pro_arg_types = func_rel->proargtypes.values;
+    }
+    Oid type;
+    for (int i = 0; i < func_rel->pronargs; ++i) {
+        type = pro_arg_types[i];
+        types->push_back(type);
+    }
+    return !types->empty();
+}
+
+bool verify_proc_params(const func_params* func_params, const func_types* proc_types)
+{
+    if (!func_params || func_params->empty())
+        return true;
+    if (!proc_types || proc_types->empty()) {
+        return false;
+    }
+    /* it is used to represent function's parameters in pg_proc */
+    func_types::const_iterator it = proc_types->begin();
+
+    ++it;
+    /* fit is useed to represent user's input parameters when create masking policy */
+    func_params::const_iterator fit = func_params->begin(), feit = func_params->end();
+    int datatype_length = 2; /* data type length */
+    for (; fit != feit; ++fit, ++it) {
+        if (it == proc_types->end()) {
+            return false;
+        }
+        switch (*it) {
+            case BPCHAROID:
+            case VARCHAROID:
+            case NVARCHAR2OID:
+            case TEXTOID:
+            {
+                if (strncasecmp(fit->c_str(), "s:", datatype_length) != 0) {
+                    return false;
+                }
+            }
+            break;
+            case INT8OID:
+            case INT4OID:
+            case INT2OID:
+            case INT1OID:
+            {
+                if (strncasecmp(fit->c_str(), "i:", datatype_length) != 0) {
+                    return false;
+                }
+            }
+            break;
+            case FLOAT4OID:
+            case FLOAT8OID:
+            case NUMERICOID:
+            {
+                if (strncasecmp(fit->c_str(), "f:", datatype_length) != 0) {
+                    return false;
+                }
+            }
+            break;
+            default:
+                return false;
+        }
+    }
+    return true;
+}
+
+void load_function_label(const Query *query, bool audit_exist)
+{
+    if (audit_exist && query->rtable != NIL) {
+        ListCell *lc = NULL;
+        foreach (lc, query->rtable) {
+            RangeTblEntry *rte = (RangeTblEntry *)lfirst(lc);
+            if (rte->rtekind == RTE_REMOTE_DUMMY) {
+                continue;
+            } else if (rte && rte->rtekind == RTE_FUNCTION && rte->funcexpr) {
+                FuncExpr *fe = (FuncExpr *)rte->funcexpr;
+                PolicyLabelItem func_label;
+                get_function_name(fe->funcid, &func_label);
+                set_result_set_function(func_label);
+            }
+        }
+    }
+}
+
+/*
+ * ListCell could be RangeVar nodes, FuncWithArgs nodes,
+ * or plain names (as Value strings) according to objtype
+ */
+void gen_policy_labelitem(PolicyLabelItem &item, const ListCell *rel, int objtype)
+{
+    if (rel == NULL) {
+        return;
+    }
+
+    switch (objtype) {
+        case O_VIEW:
+        case O_TABLE: {
+            Oid relid = RangeVarGetRelid((RangeVar *)rel, NoLock, false);
+            if (!OidIsValid(relid)) {
+                return;
+            }
+
+            item = PolicyLabelItem(0, relid, objtype, "");
+            break;
+        }
+        case O_FUNCTION: {
+            FuncWithArgs *func = (FuncWithArgs *)(rel);
+            Oid funcid = LookupFuncNameTypeNames(func->funcname, func->funcargs, false);
+            if (!OidIsValid(funcid)) {
+                return;
+            }
+            item = PolicyLabelItem(0, funcid, objtype, "");
+            break;
+        }
+        case O_SCHEMA: {
+            char *nspname = strVal(rel);
+            item = PolicyLabelItem(nspname, NULL, NULL, objtype);
+            break;
+        }
+        default:
+            break;
+    }
+
+    return;
+}
+
+void gen_policy_label_for_commentstmt(PolicyLabelItem &item, const CommentStmt *commentstmt)
+{
+    ObjectAddress address;
+    Relation relation;
+    address = get_object_address(commentstmt->objtype, commentstmt->objname, commentstmt->objargs, &relation,
+        ShareUpdateExclusiveLock, false);
+    switch (commentstmt->objtype) {
+        case OBJECT_COLUMN: {
+            item = PolicyLabelItem(0, address.objectId, O_COLUMN, strVal(lfirst(list_tail(commentstmt->objname))));
+            break;
+        }
+        case OBJECT_TABLE: {
+            item = PolicyLabelItem(0, address.objectId, O_TABLE, "");
+            break;
+        }
+        case OBJECT_FUNCTION: {
+            item = PolicyLabelItem(0, address.objectId, O_FUNCTION, "");
+            break;
+        }
+        case OBJECT_SCHEMA: {
+            item = PolicyLabelItem(address.objectId, 0, O_SCHEMA, "");
+        }
+        default:
+            break;
+    }
+    if (relation != NULL) {
+        relation_close(relation, NoLock);
+    }
+}
+
+int get_objtype(int object_type)
+{
+    int objtype = O_UNKNOWN;
+    switch (object_type) {
+        case OBJECT_ROLE:
+            objtype = O_ROLE;
+            break;
+        case OBJECT_USER:
+            objtype = O_USER;
+            break;
+        case OBJECT_SCHEMA:
+            objtype = O_SCHEMA;
+            break;
+        case OBJECT_SEQUENCE:
+            objtype = O_SEQUENCE;
+            break;
+        case OBJECT_DATABASE:
+            objtype = O_DATABASE;
+            break;
+        case OBJECT_FOREIGN_SERVER:
+            objtype = O_SERVER;
+            break;
+        case OBJECT_FOREIGN_TABLE:
+        case OBJECT_STREAM:
+        case OBJECT_TABLE:
+            objtype = (object_type == OBJECT_TABLE) ? O_TABLE : O_FOREIGNTABLE;
+            break;
+        case OBJECT_COLUMN:
+            objtype = O_COLUMN;
+            break;
+        case OBJECT_FUNCTION:
+            objtype = O_FUNCTION;
+            break;
+        case OBJECT_CONTQUERY:
+        case OBJECT_VIEW:
+            objtype = O_VIEW;
+            break;
+        case OBJECT_INDEX:
+            objtype = O_INDEX;
+            break;
+        case OBJECT_TABLESPACE:
+            objtype = O_TABLESPACE;
+            break;
+        default:
+            break;
+    }
+    return objtype;
+}
+
+CmdType get_rte_commandtype(RangeTblEntry *rte)
+{
+    if (rte->selectedCols) {
+        return CMD_SELECT;
+    } else if (rte->insertedCols) {
+        return CMD_INSERT;
+    } else if (rte->updatedCols) {
+        return CMD_UPDATE;
+    } else {
+        return CMD_UNKNOWN;
+    }
 }

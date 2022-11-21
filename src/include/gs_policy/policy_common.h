@@ -23,6 +23,7 @@
 #ifndef _GS_POLICY_COMMON_H
 #define _GS_POLICY_COMMON_H
 #include "nodes/parsenodes.h"
+#include "nodes/plannodes.h"
 
 #include "postgres.h"
 #include "gs_set.h"
@@ -72,16 +73,12 @@ extern void drop_policy_label(DropPolicyLabelStmt *stmt);
 extern bool VerifyLabelHasColumn(RangeVar *rel, GsPolicyFQDN *fqdn,
     const gs_stl::gs_set<gs_stl::gs_string> *labels);
 
-typedef bool(*ValidateBehaviourPtr)(const char *func_name);
+typedef bool(*ValidateBehaviourPtr)(const char *func_name, const char* func_parameters,
+                                    bool* invalid_params, bool is_audit);
 extern PGDLLIMPORT ValidateBehaviourPtr validate_masking_behaviour_hook;
 
 typedef bool (*LoadLabelsPtr)(bool);
 extern PGDLLIMPORT LoadLabelsPtr load_labels_hook;
-
-typedef bool (*IsLabelsHasBoundObjectPtr)(const GsPolicyFQDN*,
-                                       const gs_stl::gs_set<gs_stl::gs_string>*,
-                                       bool (*CheckLabelBoundPolicy)(bool, const gs_stl::gs_string));
-extern PGDLLIMPORT IsLabelsHasBoundObjectPtr check_labels_has_object_hook;
 
 typedef void (*RelationBuildPtr)(Relation);
 extern PGDLLIMPORT RelationBuildPtr RelationBuildRlsPolicies_hook;
@@ -90,9 +87,6 @@ typedef void(*GetRlsPoliciesPtr)(const Query *query, const RangeTblEntry *rte,
                                  const Relation relation, List *&rlsQuals, List *&withCheckOptions,
                                  int rtIndex, bool &hasRowSecurity, bool &hasSubLink);
 extern PGDLLIMPORT GetRlsPoliciesPtr get_rls_policies_hook;
-
-typedef bool (*GetLabelTablesPtr)(const gs_stl::gs_string&, policy_label_tables_set&);
-extern PGDLLIMPORT GetLabelTablesPtr get_label_tables_hook;
 
 typedef void (*ReseThreadValuesPtr)();
 extern THR_LOCAL PGDLLIMPORT ReseThreadValuesPtr reset_policy_thr_hook;
@@ -105,6 +99,12 @@ extern PGDLLIMPORT LoadPoliciesPtr load_security_policies_hook;
 
 typedef void (*LightUnifiedAuditExecutorPtr)(const Query *query);
 extern THR_LOCAL PGDLLIMPORT LightUnifiedAuditExecutorPtr light_unified_audit_executor_hook;
+
+/* hooks for sqlbypass */
+typedef void (*OpFusionUnifiedAuditExecutorPtr)(const PlannedStmt *plannedStmt);
+extern PGDLLIMPORT OpFusionUnifiedAuditExecutorPtr opfusion_unified_audit_executor_hook;
+typedef void (*OpFusionUnifiedAuditFlushLogsPtr)(AuditResult audit_result);
+extern PGDLLIMPORT OpFusionUnifiedAuditFlushLogsPtr opfusion_unified_audit_flush_logs_hook;
 
 typedef bool (*LoadPolicyAccessPtr)(bool);
 extern PGDLLIMPORT LoadPolicyAccessPtr load_policy_access_hook;

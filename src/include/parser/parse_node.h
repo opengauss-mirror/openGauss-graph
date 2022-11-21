@@ -6,6 +6,7 @@
  *
  * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
+ * Portions Copyright (c) 2021, openGauss Contributors
  *
  * src/include/parser/parse_node.h
  *
@@ -88,6 +89,10 @@ typedef Node* (*PreParseColumnRefHook)(ParseState* pstate, ColumnRef* cref);
 typedef Node* (*PostParseColumnRefHook)(ParseState* pstate, ColumnRef* cref, Node* var);
 typedef Node* (*ParseParamRefHook)(ParseState* pstate, ParamRef* pref);
 typedef Node* (*CoerceParamHook)(ParseState* pstate, Param* param, Oid targetTypeId, int32 targetTypeMod, int location);
+typedef Node* (*CreateProcOperatorHook)(ParseState* pstate, Node* left, Node* right, Oid* ltypeid, Oid* rtypeid);
+typedef void (*CreateProcInsertrHook)(ParseState* pstate, int param_no, Oid param_new_type, Oid relid,
+                const char* col_name);
+typedef void* (*GetFuncinfoFromStateHelper)(void* param);
 
 /*
  * State information used during parse analysis
@@ -150,6 +155,8 @@ struct ParseState {
                                             node's fromlist) */
     List* p_relnamespace;                /* current namespace for relations */
     List* p_varnamespace;                /* current namespace for columns */
+    List* p_namespace;	                 /* currently-referenceable RTEs (List of
+								          * ParseNamespaceItem) */
     bool  p_lateral_active;              /* p_lateral_only items visible? */
     List* p_ctenamespace;                /* current namespace for common table exprs */
     List* p_future_ctes;                 /* common table exprs not yet in namespace */
@@ -160,16 +167,36 @@ struct ParseState {
     int p_next_resno;                    /* next targetlist resno to assign */
     List* p_locking_clause;              /* raw FOR UPDATE/FOR SHARE info */
     Node* p_value_substitute;            /* what to replace VALUE with, if any */
+
+    /* Flags telling about things found in the query: */
     bool p_hasAggs;
     bool p_hasWindowFuncs;
+    bool p_hasTargetSRFs;
     bool p_hasSubLinks;
     bool p_hasModifyingCTE;
+    bool p_hasGraphwriteClause;
     bool p_is_insert;
     bool p_locked_from_parent;
     bool p_resolve_unknowns; /* resolve unknown-type SELECT outputs as type text */
     bool p_hasSynonyms;
     Relation p_target_relation;
     RangeTblEntry* p_target_rangetblentry;
+    bool p_is_case_when;
+
+#ifdef GS_GRAPH
+    Node	   *p_last_srf;		/* graph add most recent set-returning func/op found */
+#endif /* GS_GRAPH */
+
+    /*
+     * used for start with...connect by rewrite
+     */
+    bool p_addStartInfo;
+    List *p_start_info;
+    int sw_subquery_idx; /* given unname-subquery unique name when sw rewrite */
+    SelectStmt *p_sw_selectstmt;
+    List *sw_fromClause;
+    WithClause *origin_with;
+    bool p_hasStartWith;
 
     /*
      * Optional hook functions for parser callbacks.  These are null unless
@@ -177,10 +204,17 @@ struct ParseState {
      */
     PreParseColumnRefHook p_pre_columnref_hook;
     PostParseColumnRefHook p_post_columnref_hook;
+    PreParseColumnRefHook p_bind_variable_columnref_hook;
+    PreParseColumnRefHook p_bind_describe_hook;
     ParseParamRefHook p_paramref_hook;
     CoerceParamHook p_coerce_param_hook;
+    CreateProcOperatorHook p_create_proc_operator_hook;
+    CreateProcInsertrHook p_create_proc_insert_hook;
     void* p_ref_hook_state; /* common passthrough link for above */
+    void* p_cl_hook_state; /* cl related state - SQLFunctionParseInfoPtr  */
     List* p_target_list;
+    void* p_bind_hook_state;
+    void* p_describeco_hook_state;
 
     /*
      * star flag info
@@ -225,15 +259,40 @@ struct ParseState {
                         * in SelectStmt.
                         */
 
+    bool use_level; /* When selecting a column with the same name in an RTE list, whether to consider the
+                     * priority of RTE.
+                     * The priority refers to the index of RTE in the list. The smaller the index value, the
+                     * higher the priority.
+                     */
+
     PlusJoinRTEInfo* p_plusjoin_rte_info; /* The RTE info while processing "(+)" */
+
+    /*
+	 * Additional information for Cypher queries
+	 */
+    char	   *p_lc_varname;
+	bool		p_is_match_quals;
+	bool		p_is_fp_processed;
+	List	   *p_node_info_list;		/* final shape of named nodes */
+	Node	   *p_vle_initial_vid;		/* initial vid for VLE */
+	RangeTblEntry *p_vle_initial_rte;	/* RTE of initial vid for VLE */
+	List	   *p_elem_quals;			/* quals of elements */
+	List	   *p_future_vertices;		/* vertices to be resolved */
+	Node	   *p_resolved_qual;		/* qual of resolved future vertices */
+	bool		p_is_optional_match;
+	uint32		p_nr_modify_clause;
+	List	   *p_target_labels;		/* relation Oid's of target labels */
+	char	   *p_delete_edges_resname;
 };
 
 /* An element of p_relnamespace or p_varnamespace */
 typedef struct ParseNamespaceItem
 {
-   RangeTblEntry *p_rte;       /* The relation's rangetable entry */
-   bool        p_lateral_only; /* Is only visible to LATERAL expressions? */
-   bool        p_lateral_ok;   /* If so, does join type allow use? */
+    RangeTblEntry *p_rte;       /* The relation's rangetable entry */
+    bool		p_rel_visible;	/* Relation name is visible? */
+    bool		p_cols_visible; /* Column names visible as unqualified refs? */
+    bool        p_lateral_only; /* Is only visible to LATERAL expressions? */
+    bool        p_lateral_ok;   /* If so, does join type allow use? */
 } ParseNamespaceItem;
 
 /* Support for parser_errposition_callback function */
@@ -244,6 +303,22 @@ typedef struct ParseCallbackState {
     ErrorContextCallback errcontext;
 #endif
 } ParseCallbackState;
+
+#ifdef GS_GRAPH
+/* ----------------------
+ *		Alter EVENT TRIGGER Statement
+ * ----------------------
+ */
+typedef struct AlterEventTrigStmt
+{
+	NodeTag		type;
+	char	   *trigname;		/* TRIGGER's name */
+	char		tgenabled;		/* trigger's firing configuration WRT
+								 * session_replication_role */
+} AlterEventTrigStmt;
+
+#endif
+
 
 extern ParseState* make_parsestate(ParseState* parentParseState);
 extern void free_parsestate(ParseState* pstate);

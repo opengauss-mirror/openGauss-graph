@@ -91,17 +91,17 @@ FROM (SELECT $$a$$ || x AS b,
       FROM generate_series(1,2) x,
            generate_series(4,5) y) q;
 
+-- Enforce use of COMMIT instead of 2PC for temporary objects
 CREATE TEMP TABLE rows AS
 SELECT x, 'txt' || x as y
 FROM generate_series(1,3) AS x;
 
 SELECT row_to_json(q,true)
-FROM rows q;
+FROM rows q order by x;
 
 SELECT row_to_json(row((select array_agg(x) as d from generate_series(5,10) x)),false);
 
 --json_agg
-
 SELECT json_agg(q)
   FROM ( SELECT $$a$$ || x AS b, y AS c,
                ARRAY[ROW(x.*,ARRAY[1,2,3]),
@@ -126,9 +126,7 @@ FROM (SELECT '-Infinity'::float8 AS "float8field") q;
 SELECT row_to_json(q)
 FROM (SELECT '{"a":1,"b": [2,3,4,"d","e","f"],"c":{"p":1,"q":2}}'::json AS "jsonfield") q;
 
-
 -- json extraction functions
-
 CREATE TEMP TABLE test_json (
        json_type text,
        test_json json

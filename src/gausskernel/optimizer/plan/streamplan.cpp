@@ -21,13 +21,17 @@
 #include "optimizer/cost.h"
 #include "optimizer/pathnode.h"
 #include "optimizer/tlist.h"
+#include "optimizer/randomplan.h"
+#include "parser/parse_hint.h"
 #include "parser/parsetree.h"
 #include "pgxc/groupmgr.h"
 #include "pgxc/poolmgr.h"
 #include "pgxc/poolutils.h"
+#include "pgxc/nodemgr.h"
 #include "utils/syscache.h"
 #include "instruments/instr_statement.h"
- 
+#include "replication/walreceiver.h"
+
 /* only operator with qual supporting can use hashfilter */
 static int g_support_hashfilter_types[] = {
     T_SeqScan,
@@ -317,7 +321,7 @@ void stream_join_plan(PlannerInfo* root, Plan* join_plan, JoinPath* join_path)
         join_plan->exec_nodes = ng_get_default_computing_group_exec_node();
     } else {
         join_plan->exec_type = EXEC_ON_DATANODES;
-        join_plan->exec_nodes = stream_merge_exec_nodes(outer_plan, inner_plan);
+        join_plan->exec_nodes = stream_merge_exec_nodes(outer_plan, inner_plan, ENABLE_PRED_PUSH(root));
     }
 
     if (IsA(join_plan, HashJoin)) {
@@ -679,7 +683,7 @@ void pushdown_execnodes(Plan* plan, ExecNodes* exec_nodes, bool add_node, bool o
 
         Assert(IsA(ru_plan, RecursiveUnion));
 
-        pushdown_execnodes((Plan*)ru_plan, exec_nodes, add_node);
+        pushdown_execnodes((Plan*)ru_plan, exec_nodes, add_node, only_nodelist);
 
         plan->exec_nodes = exec_nodes;
     } else if (IsA(plan, Stream) || IsA(plan, VecStream)) {
@@ -704,7 +708,7 @@ void pushdown_execnodes(Plan* plan, ExecNodes* exec_nodes, bool add_node, bool o
             }
             plan->exec_nodes = exec_nodes;
             streamPlan->consumer_nodes = exec_nodes;
-            pushdown_execnodes(plan->lefttree, exec_nodes, add_node);
+            pushdown_execnodes(plan->lefttree, exec_nodes, add_node, only_nodelist);
         }
     } else if (is_replicated_plan(plan) || add_node) {
         if (IsA(plan, Append) || IsA(plan, VecAppend)) {
@@ -712,7 +716,7 @@ void pushdown_execnodes(Plan* plan, ExecNodes* exec_nodes, bool add_node, bool o
             ListCell* cell = NULL;
 
             foreach (cell, ((Append*)plan)->appendplans) {
-                pushdown_execnodes((Plan*)lfirst(cell), exec_nodes, add_node);
+                pushdown_execnodes((Plan*)lfirst(cell), exec_nodes, add_node, only_nodelist);
             }
         } else if (IsA(plan, MergeAppend)) {
             /*
@@ -721,7 +725,7 @@ void pushdown_execnodes(Plan* plan, ExecNodes* exec_nodes, bool add_node, bool o
             ListCell* cell = NULL;
 
             foreach (cell, ((MergeAppend*)plan)->mergeplans) {
-                pushdown_execnodes((Plan*)lfirst(cell), exec_nodes, add_node);
+                pushdown_execnodes((Plan*)lfirst(cell), exec_nodes, add_node, only_nodelist);
             }
         } else if (IsA(plan, ModifyTable)) {
             /*
@@ -730,10 +734,10 @@ void pushdown_execnodes(Plan* plan, ExecNodes* exec_nodes, bool add_node, bool o
             ListCell* cell = NULL;
 
             foreach (cell, ((ModifyTable*)plan)->plans) {
-                pushdown_execnodes((Plan*)lfirst(cell), exec_nodes, add_node);
+                pushdown_execnodes((Plan*)lfirst(cell), exec_nodes, add_node, only_nodelist);
             }
         } else if (IsA(plan, SubqueryScan) || IsA(plan, VecSubqueryScan)) {
-            pushdown_execnodes(((SubqueryScan*)plan)->subplan, exec_nodes, add_node);
+            pushdown_execnodes(((SubqueryScan*)plan)->subplan, exec_nodes, add_node, only_nodelist);
         } else if (IsA(plan, Material)) {
             if (((Material*)plan)->materialize_all) {
                 if (plan->exec_nodes == NULL) {
@@ -771,20 +775,20 @@ void pushdown_execnodes(Plan* plan, ExecNodes* exec_nodes, bool add_node, bool o
                             plan->lefttree->exec_nodes->nodeList = desired_nodelist;
                         plan->lefttree->exec_nodes->nodeList =
                             list_make1_int(pickup_random_datanode_from_plan(plan->lefttree));
-                        pushdown_execnodes(plan->lefttree, plan->lefttree->exec_nodes);
+                        pushdown_execnodes(plan->lefttree, plan->lefttree->exec_nodes, false, only_nodelist);
                         plan->lefttree = make_stream_plan(NULL, plan->lefttree, NIL, 0.0);
                     } else if (src_surplus_nodelist != NIL) {
                         /* If we should spread to less datanode, just prune the datanode */
-                        pushdown_execnodes(plan->lefttree, plan->lefttree->exec_nodes);
+                        pushdown_execnodes(plan->lefttree, plan->lefttree->exec_nodes, false, only_nodelist);
                     }
                     list_free_ext(src_surplus_nodelist);
                     list_free_ext(des_surplus_nodelist);
                 }
             }
-            pushdown_execnodes(plan->lefttree, exec_nodes, add_node);
+            pushdown_execnodes(plan->lefttree, exec_nodes, add_node, only_nodelist);
         } else {
-            pushdown_execnodes(plan->lefttree, exec_nodes, add_node);
-            pushdown_execnodes(plan->righttree, exec_nodes, add_node);
+            pushdown_execnodes(plan->lefttree, exec_nodes, add_node, only_nodelist);
+            pushdown_execnodes(plan->righttree, exec_nodes, add_node, only_nodelist);
         }
 
         if (plan->exec_nodes == NULL || !only_nodelist) {
@@ -828,6 +832,12 @@ Path* create_stream_path(PlannerInfo* root, RelOptInfo* rel, StreamType type, Li
         pathnode->path.dop = smp_desc->consumerDop;
     else
         pathnode->path.dop = 1;
+
+    if (type == STREAM_GATHER) {
+        pathnode->path.exec_type = EXEC_ON_COORDS;
+    } else {
+        pathnode->path.exec_type = EXEC_ON_DATANODES;
+    }
 
     switch (type) {
         case STREAM_BROADCAST:
@@ -889,6 +899,132 @@ Path* create_stream_path(PlannerInfo* root, RelOptInfo* rel, StreamType type, Li
 }
 
 /*
+ * pre check condition of Query tree before create gather paths
+ */
+bool PreCheckGatherParse(PlannerInfo* root, RelOptInfo* rel)
+{
+    bool support = true;
+
+    /* not support any aggregates */
+    if (root->parse->hasAggs || root->hasHavingQual ||
+        root->parse->groupClause != NIL || root->parse->groupingSets != NIL) {
+        return false;
+    }
+
+    /* not support sort or limit */
+    if (root->parse->sortClause != NIL || root->parse->limitCount ||
+        root->parse->limitOffset) {
+        return false;
+    }
+
+    /* not support subquery */
+    if (root->parse->hasSubLinks || root->is_correlated || root->parent_root != NULL) {
+        return false;
+    }
+
+    /* not support cte and recursive */
+    if (root->parse->hasModifyingCTE || root->parse->cteList != NIL) {
+        return false;
+    }
+
+    if (root->parse->hasDistinctOn || root->parse->hasForUpdate ||
+        root->parse->hasWindowFuncs || root->parse->distinctClause != NIL) {
+        return false;
+    }
+
+    /* not support any modified tables */
+    if (root->parse->upsertClause != NULL || root->parse->resultRelation != 0) {
+        return false;
+    }
+
+    return support;
+}
+
+bool PreCheckGatherOthers(PlannerInfo* root, RelOptInfo* rel, bool isJoin)
+{
+    bool support = true;
+
+    if (root->hasRecursion || root->is_under_recursive_cte) {
+        return false;
+    }
+
+    /* unsupport tables */
+    if (rel->orientation != REL_ROW_ORIENTED && !isJoin) {
+        return false;
+    }
+
+    /* not support union all or parameterized path */
+    if (check_param_clause((Node*)rel->baserestrictinfo) ||
+        root->append_rel_list != NIL) {
+        return false;
+    }
+
+    /* not support random plan */
+    if (u_sess->attr.attr_sql.plan_mode_seed != OPTIMIZE_PLAN) {
+        return false;
+    }
+
+    return support;
+}
+
+/*
+ * Create Gather Paths based on subpath
+ */
+void CreateGatherPaths(PlannerInfo* root, RelOptInfo* rel, bool isJoin)
+{
+    /* Create gather path on plain rel pathlist. */
+    ListCell* lc = NULL;
+    List* pathlist = rel->pathlist;
+
+    if (!PreCheckGatherParse(root, rel) || !PreCheckGatherOthers(root, rel, isJoin)) {
+        return;
+    }
+
+    foreach(lc, pathlist) {
+        Path* path = (Path*)lfirst(lc);
+
+        /* only add gather for path which execute on datanodes */
+        if (EXEC_CONTAIN_COORDINATOR(path->exec_type) || path->param_info) {
+            continue;
+        }
+
+        /* just return if node group exist. */
+        if (!ng_is_same_group(&path->distribution, ng_get_installation_group_distribution())) {
+            continue;
+        }
+
+        if (path->dop > 1 || path->pathtype == T_SubqueryScan) {
+            continue;
+        }
+
+        if (isJoin) {
+            /* Stream walker to check stream */
+            ContainStreamContext context;
+            context.outer_relids = NULL;
+            context.upper_params = NULL;
+            context.only_check_stream = true;
+            context.under_materialize_all = false;
+            context.has_stream = false;
+            context.has_parameterized_path = false;
+            context.has_cstore_index_delta = false;
+            stream_path_walker(path, &context);
+            /* not support any of subpaths contains stream */
+            if (context.has_stream) {
+                continue;
+            }
+        }
+        add_path(root, rel, create_stream_path(root, rel, STREAM_GATHER, NIL, NIL, path, 1.0));
+    }
+
+    /* do not set_chepeast on join paths here */
+    if (isJoin) {
+        return;
+    }
+    set_cheapest(rel);
+}
+
+
+/*
  * Check if node is modifyTable for DFS table.
  * Example:
  * ->  Append
@@ -922,6 +1058,57 @@ bool IsModifyTableForDfsTable(Plan* AppendNode)
     return false;
 }
 
+void disaster_read_array_init()
+{
+    Snapshot snapshot = GetActiveSnapshot();
+    if (snapshot == NULL) {
+        snapshot = GetTransactionSnapshot();
+    }
+
+    LWLockAcquire(MaxCSNArrayLock, LW_SHARED);
+    CommitSeqNo *maxcsn = t_thrd.xact_cxt.ShmemVariableCache->max_csn_array;
+    bool *mainstandby = t_thrd.xact_cxt.ShmemVariableCache->main_standby_array;
+    if (maxcsn == NULL) {
+        ereport(ERROR, (errmsg("max_csn_array is NULL")));
+    }
+    if (mainstandby == NULL) {
+        ereport(ERROR, (errmsg("main_standby_array is NULL")));
+    }
+    
+    int slice_num = u_sess->pgxc_cxt.NumDataNodes;
+    int slice_internal_num = u_sess->pgxc_cxt.standby_num + 1;
+
+    for (int i = 0; i < slice_num; i++) {
+        int j = 0;
+        for (; j < slice_internal_num; j++) {
+            int nodeIdx = i + j * slice_num;
+            bool set = false;
+            if (snapshot->snapshotcsn <= maxcsn[nodeIdx] + 1) {
+                u_sess->pgxc_cxt.disasterReadArray[i] = nodeIdx;
+                set = true;
+                ereport(LOG, (errmsg("select [%d, %d] node index %d, nodeid, %d, csn %lu, %s", 
+                    i, j,
+                    nodeIdx,
+                    u_sess->pgxc_cxt.poolHandle->dn_conn_oids[nodeIdx],
+                    maxcsn[nodeIdx],
+                    mainstandby[nodeIdx] ? "Main Standby" : "Cascade Standby")));
+            } else {
+                ereport(LOG, (errmsg("nodeid %d, snapshotcsn = %lu, max_csn_array = %lu",
+                                     u_sess->pgxc_cxt.poolHandle->dn_conn_oids[nodeIdx],
+                                     snapshot->snapshotcsn,
+                                     maxcsn[nodeIdx])));
+            }
+            if (set && !mainstandby[nodeIdx]) {
+                break;
+            }
+        }
+        if (j == (u_sess->pgxc_cxt.standby_num + 1))
+            ereport(LOG, (errmsg("current slice datanode is all invalid")));
+    }
+    LWLockRelease(MaxCSNArrayLock);
+    u_sess->pgxc_cxt.DisasterReadArrayInit = true;
+}
+
 NodeDefinition* get_all_datanodes_def()
 {
     Oid* dn_node_arr = NULL;
@@ -930,27 +1117,45 @@ NodeDefinition* get_all_datanodes_def()
     NodeDefinition* nodeDefArray = NULL;
     int rc = 0;
 
-    PgxcNodeGetOids(NULL, &dn_node_arr, NULL, &dn_node_num, false);
+    if (IS_DISASTER_RECOVER_MODE) {
+        PgxcNodeGetOidsForInit(NULL, &dn_node_arr, NULL, &dn_node_num, NULL, false);
+    } else {
+        PgxcNodeGetOids(NULL, &dn_node_arr, NULL, &dn_node_num, false);
+    }
 
-    if (u_sess->pgxc_cxt.NumDataNodes != dn_node_num) {
+    int dnNum = Max(u_sess->pgxc_cxt.NumTotalDataNodes, u_sess->pgxc_cxt.NumDataNodes);
+    if (dnNum != dn_node_num) {
         ResetSessionExecutorInfo(true);
         if (dn_node_arr != NULL) {
             pfree_ext(dn_node_arr);
             dn_node_arr = NULL;
         }
-        PgxcNodeGetOids(NULL, &dn_node_arr, NULL, &dn_node_num, false);
-
-        if (u_sess->pgxc_cxt.NumDataNodes != dn_node_num)
+        if (IS_DISASTER_RECOVER_MODE) {
+            PgxcNodeGetOidsForInit(NULL, &dn_node_arr, NULL, &dn_node_num, NULL, false);
+        } else {
+            PgxcNodeGetOids(NULL, &dn_node_arr, NULL, &dn_node_num, false);
+        }
+        if (dnNum != dn_node_num)
             ereport(ERROR,
                 (errmodule(MOD_OPT),
                     errcode(ERRCODE_OPTIMIZER_INCONSISTENT_STATE),
                     errmsg("total datanodes maybe be changed")));
     }
 
+    if (IS_CN_DISASTER_RECOVER_MODE) {
+        disaster_read_array_init();
+    }
+
     nodeDefArray = (NodeDefinition*)palloc(sizeof(NodeDefinition) * u_sess->pgxc_cxt.NumDataNodes);
-    for (i = 0; i < dn_node_num; i++) {
-        Oid current_primary_oid = PgxcNodeGetPrimaryDNFromMatric(dn_node_arr[i]);
-        NodeDefinition* res = PgxcNodeGetDefinition(current_primary_oid);
+    NodeDefinition* res = NULL;
+    for (i = 0; i < u_sess->pgxc_cxt.NumDataNodes; i++) {
+        if (!IS_DISASTER_RECOVER_MODE) {
+            Oid current_primary_oid = PgxcNodeGetPrimaryDNFromMatric(dn_node_arr[i]);
+            res = PgxcNodeGetDefinition(current_primary_oid);
+        } else {
+            int index = u_sess->pgxc_cxt.disasterReadArray[i];
+            res = PgxcNodeGetDefinition(dn_node_arr[index == -1 ? i : index]);
+        }
 
         rc = memcpy_s(&nodeDefArray[i], sizeof(NodeDefinition), res, sizeof(NodeDefinition));
         securec_check(rc, "\0", "\0");
@@ -1364,7 +1569,7 @@ Plan* create_local_redistribute(PlannerInfo* root, Plan* lefttree, List* redistr
  *
  * Return the bucketmap by execnode
  */
-uint2* get_bucketmap_by_execnode(ExecNodes* exec_node, PlannedStmt* plannedstmt)
+uint2* get_bucketmap_by_execnode(ExecNodes* exec_node, PlannedStmt* plannedstmt, int *bucketCnt)
 {
     if (exec_node == NULL) {
         return NULL;
@@ -1381,16 +1586,17 @@ uint2* get_bucketmap_by_execnode(ExecNodes* exec_node, PlannedStmt* plannedstmt)
      */
     int bucketMapIdx = exec_node->bucketmapIdx;
     uint2* bucketMap = NULL;
-#ifdef ENABLE_MULTIPLE_NODES
-    CheckBucketMapLenValid();
-#endif
-    if (bucketMapIdx == BUCKETMAP_DEFAULT_INDEX) {
-        bucketMap = (uint2*)palloc0(BUCKETDATALEN * sizeof(uint2));
-        for (int i = 0; i < BUCKETDATALEN; i++) {
+
+    if (((uint32)bucketMapIdx & BUCKETMAP_DEFAULT_INDEX_BIT) == (uint32)BUCKETMAP_DEFAULT_INDEX_BIT) {
+        *bucketCnt = bucketMapIdx & ~(BUCKETMAP_DEFAULT_INDEX_BIT);
+        bucketMap = (uint2*)palloc0(*bucketCnt * sizeof(uint2));
+        Assert(*bucketCnt <= BUCKETDATALEN);
+        for (int i = 0; i < *bucketCnt; i++) {
             bucketMap[i] = static_cast<uint2>(i % nodeLen);
         }
     } else {
-        bucketMap = plannedstmt->bucketMap[bucketMapIdx];
+        bucketMap =  plannedstmt->bucketMap[bucketMapIdx];
+        *bucketCnt = plannedstmt->bucketCnt[bucketMapIdx];
     }
     return bucketMap;
 }
@@ -1446,11 +1652,6 @@ uint2* GetGlobalStreamBucketMap(PlannedStmt* planned_stmt)
     Oid* members = NULL;
 
     groupoid = get_pgxc_class_groupoid(relationId);
-
-#ifdef ENABLE_MULTIPLE_NODES
-    CheckBucketMapLenValid();
-#endif
-
     if (groupoid != InvalidOid) {
         nmembers = get_pgxc_groupmembers(groupoid, &members);
         if (nmembers != 0) {

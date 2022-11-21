@@ -62,7 +62,6 @@ create table fkt (a int primary key, b int references pkt, c int);
 create table up_neg_11(c1 int, c2 int) partition by range(c1)(partition p1 values less than(10), partition p2 values less than(maxvalue));
 create unique index index_up_neg_11 on up_neg_11(c2);
 
-
 -- procedure test
 CREATE SCHEMA upsert_test_procedure;
 

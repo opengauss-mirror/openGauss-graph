@@ -74,7 +74,17 @@ struct XidCache {
  * rather than the main lock table.  This eases contention on the lock
  * manager LWLocks.  See storage/lmgr/README for additional details.
  */
-#define FP_LOCK_SLOTS_PER_BACKEND 20
+#define FP_LOCK_SLOTS_PER_BACKEND ((uint32)g_instance.attr.attr_storage.num_internal_lock_partitions[FASTPATH_PART])
+#define FP_LOCK_SLOTS_PER_LOCKBIT 20
+#define FP_LOCKBIT_NUM (((FP_LOCK_SLOTS_PER_BACKEND - 1) / FP_LOCK_SLOTS_PER_LOCKBIT) + 1)
+#define FAST_PATH_SET_LOCKBITS_ZERO(proc)                       \
+    do {                                                        \
+        for (uint32 _idx = 0; _idx < FP_LOCKBIT_NUM; _idx++) {  \
+            (proc)->fpLockBits[_idx] = 0;                       \
+        }                                                       \
+    } while (0)
+
+
 
 typedef struct FastPathTag {
     uint32 dbid;
@@ -128,6 +138,7 @@ struct PGPROC {
      */
     ThreadId sessMemorySessionid;
     uint64 sessionid; /* if not zero, session id in thread pool*/
+    GlobalSessionId globalSessionId;
     int logictid;     /*logic thread id*/
     TransactionId gtt_session_frozenxid;    /* session level global temp table relfrozenxid */
 
@@ -173,6 +184,10 @@ struct PGPROC {
     int syncRepState;       /* wait state for sync rep */
     bool syncRepInCompleteQueue; /* waiting in complete queue */
     SHM_QUEUE syncRepLinks; /* list link if process is in syncrep queue */
+
+    XLogRecPtr waitPaxosLSN;    /* waiting for this LSN or higher on paxos callback */
+    int syncPaxosState;  /* wait state for sync paxos, reuse syncRepState defines */
+    SHM_QUEUE syncPaxosLinks;  /* list link if process is in syncpaxos queue */
 
     DataQueuePtr waitDataSyncPoint; /* waiting for this data sync point */
     int dataSyncRepState;           /* wait state for data sync rep */
@@ -236,8 +251,8 @@ struct PGPROC {
     LWLock* backendLock; /* protects the fields below */
 
     /* Lock manager data, recording fast-path locks taken by this backend. */
-    uint64 fpLockBits;                              /* lock modes held for each fast-path slot */
-    FastPathTag fpRelId[FP_LOCK_SLOTS_PER_BACKEND]; /* slots for rel oids */
+    uint64 *fpLockBits;                             /* lock modes held for each fast-path slot */
+    FastPathTag *fpRelId;                           /* slots for rel oids */
     bool fpVXIDLock;                                /* are we holding a fast-path VXID lock? */
     LocalTransactionId fpLocalTransactionId;        /* lxid for fast-path VXID
                                                      * lock */
@@ -256,7 +271,16 @@ struct PGPROC {
 
     char *dw_unaligned_buf;
     char *dw_buf;
+    volatile bool flush_new_dw;
     volatile int32 dw_pos;
+
+    /*
+     * Support for lock groups.  Use LockHashPartitionLockByProc on the group
+     * leader to get the LWLock protecting these fields.
+     */
+    PGPROC     *lockGroupLeader;    /* lock group leader, if I'm a member */
+    dlist_head  lockGroupMembers;   /* list of members, if I'm a leader */
+    dlist_node  lockGroupLink;  /* my member link, if I'm a member */
 
     /*
      * All PROCLOCK objects for locks held or awaited by this backend are
@@ -291,6 +315,7 @@ typedef struct PGXACT {
                              * vacuum must not remove tuples deleted by
                              * xid >= xmin ! */
     CommitSeqNo csn_min;    /* local csn min */
+    CommitSeqNo csn_dr;
     TransactionId next_xid; /* xid sent down from CN */
     int nxids;              /* use int replace uint8, avoid overflow when sub xids >= 256 */
     uint8 vacuumFlags;      /* vacuum-related flags, see above */
@@ -323,12 +348,16 @@ typedef struct PROC_HDR {
     uint32		allNonPreparedProcCount;
     /* Head of list of free PGPROC structures */
     PGPROC* freeProcs;
+    /* Head of list of external's free PGPROC structures */
+    PGPROC* externalFreeProcs;
     /* Head of list of autovacuum's free PGPROC structures */
     PGPROC* autovacFreeProcs;
     /* Head of list of cm agent's free PGPROC structures */
     PGPROC* cmAgentFreeProcs;
     /* Head of list of pg_job's free PGPROC structures */
     PGPROC* pgjobfreeProcs;
+	/* Head of list of bgworker free PGPROC structures */
+    PGPROC* bgworkerFreeProcs;
     /* First pgproc waiting for group XID clear */
     pg_atomic_uint32 procArrayGroupFirst;
     /* First pgproc waiting for group transaction status update */
@@ -339,8 +368,12 @@ typedef struct PROC_HDR {
     Latch* walwriterauxiliaryLatch;
     /* Checkpointer process's latch */
     Latch* checkpointerLatch;
+    /* pagewriter main process's latch */
+    Latch* pgwrMainThreadLatch;
     /* BCMWriter process's latch */
     Latch* cbmwriterLatch;
+    volatile Latch* ShareStoragexlogCopyerLatch;
+    volatile Latch* BarrierPreParseLatch;
     /* Current shared estimate of appropriate spins_per_delay value */
     int spins_per_delay;
     /* The proc of the Startup process, since not in ProcArray */
@@ -363,26 +396,38 @@ typedef struct PROC_HDR {
  *
  * PGXC needs another slot for the pool manager process
  */
-const int MAX_PAGE_WRITER_THREAD_NUM = 8;
-const int MAX_BG_WRITER_THREAD_NUM = 8;
+const int MAX_PAGE_WRITER_THREAD_NUM = 16;
+
+#ifndef ENABLE_LITE_MODE
 const int MAX_COMPACTION_THREAD_NUM = 100;
+#else
+const int MAX_COMPACTION_THREAD_NUM = 10;
+#endif
 
 /* number of multi auxiliary threads. */
 #define NUM_MULTI_AUX_PROC \
     (MAX_PAGE_WRITER_THREAD_NUM + \
      MAX_RECOVERY_THREAD_NUM + \
-     MAX_BG_WRITER_THREAD_NUM + \
      g_instance.shmem_cxt.ThreadPoolGroupNum + \
-     MAX_COMPACTION_THREAD_NUM)
+     MAX_COMPACTION_THREAD_NUM \
+    )
 
 #define NUM_AUXILIARY_PROCS (NUM_SINGLE_AUX_PROC + NUM_MULTI_AUX_PROC) 
 
 /* max number of CMA's connections */
 #define NUM_CMAGENT_PROCS (10)
+/* buffer length of information when no free proc available for cm_agent */
+#define CONNINFOLEN (64)
+
+/* max number of DCF call back threads */
+#define NUM_DCF_CALLBACK_PROCS \
+        (g_instance.attr.attr_storage.dcf_attr.enable_dcf ? \
+        g_instance.attr.attr_storage.dcf_attr.dcf_max_workers : 0)
 
 #define GLOBAL_ALL_PROCS \
     (g_instance.shmem_cxt.MaxBackends + \
-     NUM_CMAGENT_PROCS + NUM_AUXILIARY_PROCS + g_instance.attr.attr_storage.max_prepared_xacts)
+     NUM_CMAGENT_PROCS + NUM_AUXILIARY_PROCS + NUM_DCF_CALLBACK_PROCS + \
+     (g_instance.attr.attr_storage.max_prepared_xacts * NUM_TWOPHASE_PARTITIONS))
 
 #define GLOBAL_MAX_SESSION_NUM (2 * g_instance.shmem_cxt.MaxBackends)
 #define GLOBAL_RESERVE_SESSION_NUM (g_instance.shmem_cxt.MaxReserveBackendId)
@@ -392,6 +437,8 @@ const int MAX_COMPACTION_THREAD_NUM = 100;
 #define MAX_SESSION_TIMEOUT 24 * 60 * 60 /* max session timeout value. */
 
 #define BackendStatusArray_size (MAX_BACKEND_SLOT + NUM_AUXILIARY_PROCS)
+
+#define GSC_MAX_BACKEND_SLOT (g_instance.shmem_cxt.MaxBackends + MAX_SESSION_SLOT_COUNT)
 
 extern AlarmCheckResult ConnectionOverloadChecker(Alarm* alarm, AlarmAdditionalParam* additionalParam);
 
@@ -415,7 +462,7 @@ extern int GetUsedConnectionCount(void);
 extern int GetUsedInnerToolConnCount(void);
 
 extern void ProcQueueInit(PROC_QUEUE* queue);
-extern int ProcSleep(LOCALLOCK* locallock, LockMethod lockMethodTable, bool allow_con_update);
+extern int ProcSleep(LOCALLOCK* locallock, LockMethod lockMethodTable, bool allow_con_update, int waitSec);
 extern PGPROC* ProcWakeup(PGPROC* proc, int waitStatus);
 extern void ProcLockWakeup(LockMethod lockMethodTable, LOCK* lock, const PROCLOCK* proclock = NULL);
 extern void ProcBlockerUpdate(PGPROC *waiterProc, PROCLOCK *blockerProcLock, const char* lockMode, bool isLockHolder);
@@ -433,6 +480,8 @@ extern bool enable_session_sig_alarm(int delayms);
 extern bool disable_session_sig_alarm(void);
 
 extern bool disable_sig_alarm(bool is_statement_timeout);
+extern bool pause_sig_alarm(bool is_statement_timeout);
+extern bool resume_sig_alarm(bool is_statement_timeout);
 extern void handle_sig_alarm(SIGNAL_ARGS);
 
 extern bool enable_standby_sig_alarm(TimestampTz now, TimestampTz fin_time, bool deadlock_only);
@@ -443,6 +492,24 @@ extern ThreadId getThreadIdFromLogicThreadId(int logictid);
 extern int getLogicThreadIdFromThreadId(ThreadId tid);
 
 extern bool IsRedistributionWorkerProcess(void);
+extern void PgStatCMAThreadStatus();
 
 void CancelBlockedRedistWorker(LOCK* lock, LOCKMODE lockmode);
+
+extern void BecomeLockGroupLeader(void);
+extern void BecomeLockGroupMember(PGPROC *leader);
+
+static inline bool TransactionIdOlderThanAllUndo(TransactionId xid)
+{
+    uint64 cutoff = pg_atomic_read_u64(&g_instance.undo_cxt.oldestXidInUndo);
+    return xid < cutoff;
+}
+static inline bool TransactionIdOlderThanFrozenXid(TransactionId xid)
+{
+    uint64 cutoff = pg_atomic_read_u64(&g_instance.undo_cxt.oldestFrozenXid);
+    return xid < cutoff;
+}
+
+extern int GetThreadPoolStreamProcNum(void);
+
 #endif /* PROC_H */

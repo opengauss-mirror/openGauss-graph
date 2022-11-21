@@ -51,10 +51,11 @@
 #include "storage/procarray.h"
 #include "gstrace/gstrace_infra.h"
 #include "gstrace/access_gstrace.h"
+#include "replication/walreceiver.h"
 
 /*
  * Defines for CSNLOG page sizes.  A page is the same BLCKSZ as is used
- * everywhere else in Postgres.
+ * everywhere else in openGauss.
  *
  * Note: because TransactionIds are 32 bits and wrap around at 0xFFFFFFFF,
  * CSNLOG page numbering also wraps around at 0xFFFFFFFF/CSNLOG_XACTS_PER_PAGE,
@@ -117,9 +118,6 @@ void CSNLogSetCommitSeqNo(TransactionId xid, int nsubxids, TransactionId *subxid
 
     /* for standby node, don't set invalid or abort csn mark. */
     if ((t_thrd.xact_cxt.useLocalSnapshot ||
-#ifdef ENABLE_MULTIPLE_NODES
-         RecoveryInProgress() ||
-#endif
          g_instance.attr.attr_storage.IsRoachStandbyCluster) &&
         csn <= COMMITSEQNO_ABORTED) {
         return;
@@ -156,6 +154,9 @@ void CSNLogSetCommitSeqNo(TransactionId xid, int nsubxids, TransactionId *subxid
         offset = i;
         pageno = TransactionIdToCSNPage(subxids[offset]);
         xid = InvalidTransactionId;
+    }
+    if (IS_DISASTER_RECOVER_MODE && COMMITSEQNO_IS_COMMITTED(csn)) {
+        UpdateXLogMaxCSN(csn);
     }
 }
 
@@ -458,6 +459,30 @@ CommitSeqNo CSNLogGetNestCommitSeqNo(TransactionId xid)
 }
 
 /**
+ * @Description: Interrogate the CSN of a transaction in the CSN log recursively.
+ * @in xid -  the transaction id
+ * @return -  return the csn of the top parent of the input transaction
+ */
+CommitSeqNo CSNLogGetDRCommitSeqNo(TransactionId xid)
+{
+    CommitSeqNo csn = InvalidCommitSeqNo;
+    PG_TRY();
+    {
+        csn = CSNLogGetCommitSeqNo(xid);
+    }
+    PG_CATCH();
+    {
+        if (t_thrd.xact_cxt.slru_errcause == SLRU_OPEN_FAILED) {
+            csn = InvalidCommitSeqNo;
+        } else {
+            PG_RE_THROW();
+        }
+    }
+    PG_END_TRY();
+    return csn;
+}
+
+/**
  * @Description: Determine the CSN of a transaction, walking the
  * subtransaction tree if needed
  * @in xid -  the transaction id
@@ -488,52 +513,6 @@ static CommitSeqNo RecursiveGetCommitSeqNo(TransactionId xid)
     }
 
     return csn;
-}
-
-/**
- * @Description: Find the next xid that is in progress
- * @in xid -  the start xid of the search scope
- * @in end -  the end xid of the search scope
- * @return -  return the next xid that is in progress in scope
- */
-TransactionId CSNLogGetNextInProgressXid(TransactionId xid, TransactionId end)
-{
-    int64 pageno;
-    Assert(TransactionIdIsValid(u_sess->utils_cxt.TransactionXmin));
-
-    if (TransactionIdPrecedes(xid, u_sess->utils_cxt.TransactionXmin))
-        xid = u_sess->utils_cxt.TransactionXmin;
-
-    for (;;) {
-        int slotno;
-        int entryno;
-
-        if (!TransactionIdPrecedes(xid, end)) {
-            goto end;
-        }
-
-        pageno = TransactionIdToCSNPage(xid);
-        slotno = SimpleLruReadPage_ReadOnly(CsnlogCtl(pageno), pageno, xid);
-
-        for (entryno = TransactionIdToCSNPgIndex(xid); entryno < (int)CSNLOG_XACTS_PER_PAGE; entryno++) {
-            CommitSeqNo csn;
-
-            if (!TransactionIdPrecedes(xid, end)) {
-                CSN_LWLOCK_RELEASE(pageno);
-                goto end;
-            }
-            csn = *(CommitSeqNo *)(CsnlogCtl(pageno)->shared->page_buffer[slotno] + entryno * sizeof(CommitSeqNo));
-            if (COMMITSEQNO_IS_INPROGRESS(csn) || COMMITSEQNO_IS_COMMITTING(csn)) {
-                CSN_LWLOCK_RELEASE(pageno);
-                goto end;
-            }
-            TransactionIdAdvance(xid);
-        }
-        CSN_LWLOCK_RELEASE(pageno);
-    }
-
-end:
-    return xid;
 }
 
 /**
@@ -570,6 +549,10 @@ void CSNLOGShmemInit(void)
     int i;
     int rc = 0;
     char name[SLRU_MAX_NAME_LENGTH];
+
+    MemoryContext old = MemoryContextSwitchTo(THREAD_GET_MEM_CXT_GROUP(MEMORY_CONTEXT_DEFAULT));
+    t_thrd.shemem_ptr_cxt.CsnlogCtlPtr = (SlruCtlData*)palloc0(NUM_CSNLOG_PARTITIONS * sizeof(SlruCtlData));
+    (void)MemoryContextSwitchTo(old);
 
     for (i = 0; i < NUM_CSNLOG_PARTITIONS; i++) {
         rc = sprintf_s(name, SLRU_MAX_NAME_LENGTH, "%s%d", "CSNLOG Ctl", i);
@@ -632,26 +615,12 @@ static int ZeroCSNLOGPage(int64 pageno)
  * @in oldestActiveXID -  the oldest active transaction id
  * @return -  no return
  */
-void StartupCSNLOG(bool isUpgrade)
+void StartupCSNLOG()
 {
-    if (isUpgrade) {
-        /* for shutdown condition, we just rezero the next page of next_id */
-        int64 endPage = TransactionIdToCSNPage(t_thrd.xact_cxt.ShmemVariableCache->nextXid);
-
-        CSN_LWLOCK_ACQUIRE(endPage, LW_EXCLUSIVE);
-        (void)ZeroCSNLOGPage(endPage);
-        CSN_LWLOCK_RELEASE(endPage);
-
-        t_thrd.xact_cxt.ShmemVariableCache->lastExtendCSNLogpage = endPage;
-        elog(LOG, "startup csnlog at xid:%lu, pageno:%ld", t_thrd.xact_cxt.ShmemVariableCache->nextXid,
-             t_thrd.xact_cxt.ShmemVariableCache->lastExtendCSNLogpage);
-    } else {
-        /* for non-shutdown condition, we jsut set the last extend page */
-        int64 lastExtendPage = TransactionIdToCSNPage(t_thrd.xact_cxt.ShmemVariableCache->nextXid - 1);
-        t_thrd.xact_cxt.ShmemVariableCache->lastExtendCSNLogpage = lastExtendPage;
-        elog(LOG, "startup csnlog without extend at xid:%lu, pageno:%ld",
-             t_thrd.xact_cxt.ShmemVariableCache->nextXid - 1, t_thrd.xact_cxt.ShmemVariableCache->lastExtendCSNLogpage);
-    }
+    int64 lastExtendPage = TransactionIdToCSNPage(t_thrd.xact_cxt.ShmemVariableCache->nextXid - 1);
+    t_thrd.xact_cxt.ShmemVariableCache->lastExtendCSNLogpage = lastExtendPage;
+    elog(LOG, "startup csnlog without extend at xid:%lu, pageno:%ld",
+        t_thrd.xact_cxt.ShmemVariableCache->nextXid - 1, t_thrd.xact_cxt.ShmemVariableCache->lastExtendCSNLogpage);
     t_thrd.xact_cxt.ShmemVariableCache->startExtendCSNLogpage = 0;
 }
 
@@ -678,55 +647,6 @@ void ShutdownCSNLOG(void)
 }
 
 /**
- * @Description: This must be called ONCE at the end of startup/recovery.
- * @return -  no return
- */
-void TrimCSNLOG(void)
-{
-    TransactionId xid = t_thrd.xact_cxt.ShmemVariableCache->nextXid;
-    int64 pageno = TransactionIdToCSNPage(xid);
-
-    CSN_LWLOCK_ACQUIRE(pageno, LW_EXCLUSIVE);
-
-    /*
-     * Re-Initialize our idea of the latest page number.
-     */
-    CsnlogCtl(pageno)->shared->latest_page_number = pageno;
-
-    /*
-     * Zero out the remainder of the current clog page.  Under normal
-     * circumstances it should be zeroes already, but it seems at least
-     * theoretically possible that XLOG replay will have settled on a nextXID
-     * value that is less than the last XID actually used and marked by the
-     * previous database lifecycle (since subtransaction commit writes clog
-     * but makes no WAL entry).  Let's just be safe. (We need not worry about
-     * pages beyond the current one, since those will be zeroed when first
-     * used.  For the same reason, there is no need to do anything when
-     * nextXid is exactly at a page boundary; and it's likely that the
-     * "current" page doesn't exist yet in that case.)
-     */
-    if (TransactionIdToCSNPgIndex(xid) != 0) {
-        int entryno = TransactionIdToCSNPgIndex(xid);
-        int byteno = entryno * sizeof(CommitSeqNo);
-        int slotno;
-        errno_t rc = EOK;
-        char *byteptr = NULL;
-
-        slotno = SimpleLruReadPage(CsnlogCtl(pageno), pageno, false, xid);
-
-        byteptr = CsnlogCtl(pageno)->shared->page_buffer[slotno] + byteno;
-
-        /* Zero the rest of the page */
-        rc = memset_s(byteptr, BLCKSZ - byteno, 0, BLCKSZ - byteno);
-        securec_check(rc, "\0", "\0");
-
-        CsnlogCtl(pageno)->shared->page_dirty[slotno] = true;
-    }
-
-    CSN_LWLOCK_RELEASE(pageno);
-}
-
-/**
  * @Description: Perform a checkpoint --- either during shutdown, or on-the-fly
  * @return -  no return
  */
@@ -738,7 +658,7 @@ void CheckPointCSNLOG(void)
 
     for (i = 0; i < NUM_CSNLOG_PARTITIONS; i++) {
         flush_num = SimpleLruFlush(CsnlogCtl(i), true);
-        g_instance.ckpt_cxt_ctl->ckpt_csnlog_flush_num += flush_num;
+        g_instance.ckpt_cxt_ctl->ckpt_view.ckpt_csnlog_flush_num += flush_num;
     }
     TRACE_POSTGRESQL_CSNLOG_CHECKPOINT_DONE(true);
 }
@@ -876,7 +796,11 @@ void ExtendCSNLOG(TransactionId newestXact)
 void TruncateCSNLOG(TransactionId oldestXact)
 {
     int64 cutoffPage;
-
+    TransactionId CatalogXmin = GetReplicationSlotCatalogXmin();
+    if (CatalogXmin >= FirstNormalTransactionId) {
+        oldestXact = Min(oldestXact, CatalogXmin);
+    }
+    u_sess->utils_cxt.RecentDataXmin = oldestXact;
     /*
      * The cutoff point is the start of the segment containing oldestXact. We
      * pass the *page* containing oldestXact to SimpleLruTruncate.

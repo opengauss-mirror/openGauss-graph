@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2020 Huawei Technologies Co.,Ltd.
+ * Portions Copyright (c) 2021, openGauss Contributors
  *
  * openGauss is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
@@ -26,7 +27,7 @@
 #define VECNODES_H_
 
 #include "access/dfs/dfs_am.h"
-#include "executor/execStream.h"
+#include "executor/exec/execStream.h"
 #include "nodes/execnodes.h"
 #include "access/cstore_am.h"
 #include "pgxc/execRemote.h"
@@ -173,6 +174,8 @@ typedef struct VecToRowState {
     bool* m_ttsisnull;             // indicator if one column value is null
 
     int part_id;
+    List* subpartitions;
+    List* subPartLengthList;
     DevectorizeFun* devectorizeFunRuntime;
 
 } VecToRowState;
@@ -182,6 +185,7 @@ typedef struct RowToVecState {
 
     bool m_fNoMoreRows;            // does it has more rows to output
     VectorBatch* m_pCurrentBatch;  // current active batch in outputing
+    bool m_batchMode;
 } RowToVecState;
 
 typedef struct VecResultState : public ResultState {
@@ -259,6 +263,7 @@ typedef struct TsStoreScanState : ScanState {
     bool has_sort;
     int limit;                       // If is limit n
     AttrNumber sort_by_time_colidx;  // If is sort by tstime limit n
+
 #ifdef ENABLE_MULTIPLE_NODES
     TagRows* tag_rows;
 #endif

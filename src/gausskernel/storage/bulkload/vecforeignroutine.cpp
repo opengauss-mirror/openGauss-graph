@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2020 Huawei Technologies Co.,Ltd.
+ * Portions Copyright (c) 2021, openGauss Contributors
  *
  * openGauss is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
@@ -74,6 +75,7 @@ bool TrySaveImportError(DistImportExecutionState *importState, ForeignScanState 
 
 bool TrySaveImportError(CopyState cstate)
 {
+    cstate->errorrows++;
     if ((ERRCODE_TO_CATEGORY((unsigned int)geterrcode()) == ERRCODE_DATA_EXCEPTION) && DoAcceptOneError(cstate)) {
         FormAndSaveImportError(cstate, cstate->err_table, cstate->copy_beginTime, cstate->logger);
         // clear error state
@@ -122,7 +124,9 @@ VectorBatch *distExecVecImport(VecForeignScanState *node)
 
     MemoryContextReset(scanMcxt);
     oldMemoryContext = MemoryContextSwitchTo(scanMcxt);
+#ifndef ENABLE_LITE_MODE
     SetObsMemoryContext(((CopyState)importState)->copycontext);
+#endif
     for (batch->m_rows = 0; batch->m_rows < BatchMaxSize; batch->m_rows++) {
 retry:
         PG_TRY();

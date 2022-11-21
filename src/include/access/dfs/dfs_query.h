@@ -26,7 +26,11 @@
 #ifndef DFS_QUERY_H
 #define DFS_QUERY_H
 
+#include "pg_config.h"
+
+#ifndef ENABLE_LITE_MODE
 #include "orc/Exceptions.hh"
+#endif
 #include "access/dfs/dfs_am.h"
 #include "catalog/pg_collation.h"
 #include "nodes/execnodes.h"
@@ -577,7 +581,7 @@ BlockNumber getPageCountForFt(void *additionalData);
                         errmsg(msg, RelationGetRelationName(relation))));                \
     else                                                                                 \
         ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmodule(MOD_DFS),      \
-                        errmsg("could not open relation with OID %u", foreignTableId))); \
+                        errmsg("could not open relation with OID  %u", foreignTableId))); \
 } while (0)
 
 #endif /* DFS_QUERY_H */

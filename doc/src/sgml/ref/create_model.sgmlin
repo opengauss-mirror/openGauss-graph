@@ -1,0 +1,110 @@
+<refentry id="SQL-CREATE_MODEL">
+<refmeta>
+<refentrytitle>CREATE MODEL</refentrytitle>
+<manvolnum>7</manvolnum>
+<refmiscinfo>SQL - Language Statements</refmiscinfo>
+</refmeta>
+<refnamediv>
+<refname>CREATE MODEL</refname>
+<refpurpose>Create a new machine learning model</refpurpose>
+</refnamediv>
+<refsynopsisdiv>
+<synopsis>
+
+CREATE MODEL model_name USING algorithm_name 
+[FEATURES { {expression [ [ AS ] output_name ]} [, ...] }]
+[TARGET { {expression [ [ AS ] output_name ]} [, ...] }]
+FROM { table_name | select_query }
+WITH hyperparameter_name = { hyperparameter_value | DEFAULT } [, ...] }
+
+where:
+  * algorithm_name is one of the architectures currently supported: 
+      * logistic_regression: Compute a logistic regression using Gradient Descent
+      * linear_regression: Compute a linear regression using Gradient Descent
+      * svm_classification: Compute a support vector machine classifier  using Gradient Descent
+      * kmeans: Compute an unsupervised clustering 
+      * pca: Compute a principal component analysis result using Gradient Descent
+      * multiclass: Compute a classification result for multiple types of data
+      * xgboost_regression_logistic: Compute logistic regression using XGBoost
+      * xgboost_binary_logistic: Compute logistic regression for binary classification using XGBoost
+      * xgboost_regression_squarederror: Compute regression with squarred loss
+      * xgboost_regression_gamma: Compute gamma regression with log-link using XGBoost
+  * select_query is a standard SELECT query
+  
+For supervised machine learning algorithms, FEATURES and TARGET clauses are mandatory. For unsupervised machine learning algorithms, FEATURES
+is optional, and TARGET cannot be specified.
+
+
+###########################
+###     Model usage     ###
+###########################
+
+The models created can be used in SELECT and UPDATE statements as expresions. The syntax is the following: 
+  PREDICT BY model_name FEATURES (expression [, ...]) [ [ AS ] output_name ]
+
+For example:  
+  SELECT id, PREDICT BY m (FEATURES f1, f2) AS prediction FROM t;
+  UPDATE t SET x=PREDICT BY m(features f1, f2);
+
+
+###########################
+###   Hyperparameters   ###
+###########################
+
+# Hyperparameter list for 'logistic_regression', 'linear_regression' and 'svm_classification':
+  * batch_size: Number of tuples 
+  * decay: Decay factor
+  * lambda (Only svm classifier): Lambda parameter of support vector machines
+  * learning_rate: Learning rate of the algorithm
+  * max_iterations: Maximum number of iterations until convergence
+  * max_seconds: Maximum number of seconds doing the optimization
+  * optimizer: Select optimzier between: gd (gradient descent) or ngd (normalized gradient descent)
+  * tolerance: System stops when the percentage of changes between two iterations is below this percentage
+  * seed: Seed value for random
+  * kernel: Name of kernel for svm classification, valid values are 'linear'(default), 'gaussian' and 'polynomial'
+  * components: Number of output dimensions for kernels different than linear, default is MAX(2*features, 128)
+  * gamma: Gamma parameter for gaussian kernel, default value is 0.5
+  * degree: Degree parameter for polynomial kernel in the range 2 to 9, default is 2
+  * coef0: Coef0 parameter for polynomial kernel and value is greater or equal than zero, default is 1.0
+  * verbose: 0 (no output), 1 (more output)
+
+# Hyperparameter list for 'kmeans':
+  * batch_size: Number of tuples in each processing batch
+  * distance_function: Distance function between clusters and centroids. Valid values are 'L1', 'L2', 'L2_Squared' and 'Linf'  
+  * max_iterations: Maximum iterations until convergence
+  * num_centroids: Number of centroids 'k' parameter for K-means
+  * num_features: Dimensionality of the point. Tuples that contain points that do not match the dimension are ignored.
+  * seed: Seed value for random
+  * tolerance: System stops when the percentage of changes between two iterations is below this percentage
+  * seeding_function: Algorithm used for initial seeds: 'Random++' or 'Kmeans||'
+  * verbose:  0 (no output), 1 (less output), or 2 (full output)
+  
+# Hyperparameter list for 'xgboost_regression_logistic', 'xgboost_binary_logistic', 'xgboost_regression_gamma' and 'xgboost_regression_squarederror':
+  * n_iter: Maximum iterations until convergence
+  * batch_size: Number of tuples in each processing batch
+  * booster: Which booster to use, e.g., gbtree, gblinear or dart (default: gbtree)
+  * tree_method: The tree construction algorithm used in XGBoost. Choices: auto, exact, approx, hist, gpu_hist (gpu_hist only supported with GPU)
+  * eval_metric: Evaluation metric for validation data, default is 'rmse'
+  * seed: Seed value for random
+  * nthread: Number of parallel threads used to run XGBoost
+  * max_depth: Maximum depth of a tree (default 6) (valid only for tree boosters)
+  * gamma: Minimum loss reduction required to make a further partition on a leaf node of the tree
+  * eta: Step size shrinkage used in update to prevents overfitting (default 0.3)
+  * min_child_weight: Minimum sum of instance weight (hessian) needed in a child (default 1)
+  * verbosity: Verbosity of printing messages: 0 (silent), 1 (warning), 2 (info), 3 (debug)
+
+# Hyperparameter list for 'pca':
+  * max_iterations: Maximum iterations until convergence
+  * batch_size: Number of tuples in each processing batch
+  * max_seconds: Maximum number of seconds doing the optimization
+  * number_components: Number of components to keep and value is greater or equal than 1, default 1
+  * tolerance: System stops when the percentage of changes between two iterations is below this percentage, default is 0.0005
+  * seed: Seed value for random
+  * verbose: 0 (no output), 1 (more output)
+
+# Hyperparameter list for 'multiclass':
+  * classifier: name of gradient descent binary classifier, currently supports 'svm_classification' and 'logistic_regression'
+  * and all hyperparameters of the selected binary classifier
+</synopsis>
+</refsynopsisdiv>
+</refentry>

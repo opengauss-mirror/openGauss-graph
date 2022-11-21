@@ -5,6 +5,7 @@
  *
  * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
+ * Portions Copyright (c) 2021, openGauss Contributors
  *
  *
  * IDENTIFICATION
@@ -66,6 +67,13 @@ ParseState* make_parsestate(ParseState* parentParseState)
         pstate->p_paramref_hook = parentParseState->p_paramref_hook;
         pstate->p_coerce_param_hook = parentParseState->p_coerce_param_hook;
         pstate->p_ref_hook_state = parentParseState->p_ref_hook_state;
+        pstate->p_create_proc_operator_hook = parentParseState->p_create_proc_operator_hook;
+        pstate->p_create_proc_insert_hook = parentParseState->p_create_proc_insert_hook;
+        pstate->p_cl_hook_state = parentParseState->p_cl_hook_state;
+        pstate->p_bind_variable_columnref_hook = parentParseState->p_bind_variable_columnref_hook;
+        pstate->p_bind_hook_state = parentParseState->p_bind_hook_state;
+        pstate->p_bind_describe_hook = parentParseState->p_bind_describe_hook;
+        pstate->p_describeco_hook_state = parentParseState->p_describeco_hook_state;
     }
 
     return pstate;
@@ -301,6 +309,7 @@ ArrayRef* transformArraySubscripts(ParseState* pstate, Node* arrayBase, Oid arra
     List* lowerIndexpr = NIL;
     ListCell* idx = NULL;
     ArrayRef* aref = NULL;
+    bool isIndexByVarchar = false;
 
     /*
      * Caller may or may not have bothered to determine elementType.  Note
@@ -355,9 +364,20 @@ ArrayRef* transformArraySubscripts(ParseState* pstate, Node* arrayBase, Oid arra
             lowerIndexpr = lappend(lowerIndexpr, subexpr);
         }
         subexpr = transformExpr(pstate, ai->uidx);
-        /* If it's not int4 already, try to coerce */
-        subexpr = coerce_to_target_type(
-            pstate, subexpr, exprType(subexpr), INT4OID, -1, COERCION_ASSIGNMENT, COERCE_IMPLICIT_CAST, -1);
+        if (get_typecategory(arrayType) == TYPCATEGORY_TABLEOF_VARCHAR) {
+            isIndexByVarchar = true;
+        }
+        if ((nodeTag(arrayBase) == T_Param && ((Param*)arrayBase)->tableOfIndexType == VARCHAROID)
+            || isIndexByVarchar) {
+            /* subcript type is varchar */
+            subexpr = coerce_to_target_type(pstate, subexpr, exprType(subexpr),
+                ((Param*)arrayBase)->tableOfIndexType, -1, COERCION_ASSIGNMENT, COERCE_IMPLICIT_CAST, -1);
+        } else {
+             /* If it's not int4 already, try to coerce */
+            subexpr = coerce_to_target_type(
+                pstate, subexpr, exprType(subexpr), INT4OID, -1, COERCION_ASSIGNMENT, COERCE_IMPLICIT_CAST, -1);
+        }
+       
         if (subexpr == NULL) {
             ereport(ERROR,
                 (errcode(ERRCODE_DATATYPE_MISMATCH),
@@ -488,6 +508,7 @@ Const* make_const(ParseState* pstate, Value* value, int location)
             val = CStringGetDatum(strVal(value));
 
             typid = UNKNOWNOID; /* will be coerced later */
+            // typid = CSTRINGOID;
             typelen = -2;       /* cstring-style varwidth type */
             typebyval = false;
             break;

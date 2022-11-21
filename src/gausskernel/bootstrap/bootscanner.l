@@ -32,13 +32,12 @@
 #include "parser/scansup.h"
 #include "rewrite/prs2lock.h"
 #include "storage/buf/block.h"
-#include "storage/fd.h"
+#include "storage/smgr/fd.h"
 #include "storage/item/itemptr.h"
 #include "storage/off.h"
 #include "utils/rel.h"
 
 /* Not needed now that this file is compiled as part of bootparse. */
-/* #include "bootparse.h" */
 
 
 /* Avoid exit() on fatal scanner errors (a bit ugly -- see yy_fatal_error) */
@@ -65,6 +64,10 @@ sid		\"([^\"])*\"
 arrayid [A-Za-z0-9_]+\[{D}*\]
 
 %%
+
+asc			{ return(ASC); }
+
+desc			{ return(DESC); }
 
 open			{ return(OPEN); }
 

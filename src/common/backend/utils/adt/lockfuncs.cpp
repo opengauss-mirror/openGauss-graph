@@ -27,6 +27,7 @@
 #include "pgxc/pgxc.h"
 #include "pgxc/pgxcnode.h"
 #include "pgxc/nodemgr.h"
+#include "pgxc/poolutils.h"
 #include "executor/spi.h"
 #include "tcop/utility.h"
 #endif
@@ -36,6 +37,7 @@
 #include "access/heapam.h"
 #include "utils/syscache.h"
 #include "utils/snapmgr.h"
+#include "pgstat.h"
 
 #define NUM_LOCKTAG_ID 17
 /* This must match enum LockTagType! */
@@ -50,7 +52,10 @@ const char* const LockTagTypeNames[] = {"relation",
     "object",
     "cstore_freespace",
     "userlock",
-    "advisory"};
+    "advisory",
+    "filenode",
+    "subtransactionid",
+    "tuple_uid"};
 
 /* This must match enum PredicateLockTargetType (predicate_internals.h) */
 static const char* const PredicateLockTagTypeNames[] = {"relation", "page", "tuple"};
@@ -74,9 +79,8 @@ typedef enum { WAIT, DONT_WAIT } TryType;
 static bool pgxc_advisory_lock(int64 key64, int32 key1, int32 key2, bool iskeybig, LOCKMODE lockmode,
     LockLevel locklevel, TryType locktry, Name databaseName = NULL);
 #endif
-
 /* Number of columns in pg_locks output */
-#define NUM_LOCK_STATUS_COLUMNS 18
+#define NUM_LOCK_STATUS_COLUMNS 19
 
 /*
  * VXIDGetDatum - Construct a text representation of a VXID
@@ -192,6 +196,7 @@ Datum pg_lock_status(PG_FUNCTION_ARGS)
         TupleDescInitEntry(tupdesc, (AttrNumber)16, "granted", BOOLOID, -1, 0);
         TupleDescInitEntry(tupdesc, (AttrNumber)17, "fastpath", BOOLOID, -1, 0);
         TupleDescInitEntry(tupdesc, (AttrNumber)18, "locktag", TEXTOID, -1, 0);
+        TupleDescInitEntry(tupdesc, (AttrNumber)19, "global_sessionid", TEXTOID, -1, 0);
 
         funcctx->tuple_desc = BlessTupleDesc(tupdesc);
 
@@ -299,6 +304,18 @@ Datum pg_lock_status(PG_FUNCTION_ARGS)
                 nulls[9] = true;
                 nulls[10] = true;
                 break;
+            case LOCKTAG_RELFILENODE:
+                values[1] = ObjectIdGetDatum(instance->locktag.locktag_field1);
+                values[2] = ObjectIdGetDatum(instance->locktag.locktag_field2);
+                values[3] = ObjectIdGetDatum(instance->locktag.locktag_field3);
+                nulls[4] = true;
+                nulls[5] = true;
+                nulls[6] = true;
+                nulls[7] = true;
+                nulls[8] = true;
+                nulls[9] = true;
+                nulls[10] = true;
+                break;
             case LOCKTAG_RELATION_EXTEND:
                 values[1] = ObjectIdGetDatum(instance->locktag.locktag_field1);
                 values[2] = ObjectIdGetDatum(instance->locktag.locktag_field2);
@@ -331,6 +348,20 @@ Datum pg_lock_status(PG_FUNCTION_ARGS)
                 values[5] = UInt16GetDatum(instance->locktag.locktag_field5);
                 nulls[6] = true;
                 nulls[7] = true;
+                nulls[8] = true;
+                nulls[9] = true;
+                nulls[10] = true;
+                break;
+            case LOCKTAG_UID:
+                values[1] = ObjectIdGetDatum(instance->locktag.locktag_field1);
+                values[2] = ObjectIdGetDatum(instance->locktag.locktag_field2);
+                nulls[3] = true;
+                nulls[4] = true;
+                nulls[5] = true;
+                nulls[6] = true;
+                values[7] = TransactionIdGetDatum((uint64)instance->locktag.locktag_field3 << 32 |
+                                                  ((uint64)instance->locktag.locktag_field4));
+
                 nulls[8] = true;
                 nulls[9] = true;
                 nulls[10] = true;
@@ -392,6 +423,9 @@ Datum pg_lock_status(PG_FUNCTION_ARGS)
         values[15] = BoolGetDatum(granted);
         values[16] = BoolGetDatum(instance->fastpath);
         GetLocktagInfo(instance, values);
+        char* gId = GetGlobalSessionStr(instance->globalSessionId);
+        values[18] = CStringGetTextDatum(gId);
+        pfree(gId);
         tuple = heap_form_tuple(funcctx->tuple_desc, values, nulls);
         result = HeapTupleGetDatum(tuple);
         SRF_RETURN_NEXT(funcctx, result);
@@ -466,6 +500,7 @@ Datum pg_lock_status(PG_FUNCTION_ARGS)
         blocklocktag = LockPredTagToString(predTag);
         values[NUM_LOCKTAG_ID] = CStringGetTextDatum(blocklocktag);
         pfree_ext(blocklocktag);
+        nulls[18] = true;
         tuple = heap_form_tuple(funcctx->tuple_desc, values, nulls);
         result = HeapTupleGetDatum(tuple);
         SRF_RETURN_NEXT(funcctx, result);
@@ -614,6 +649,16 @@ static bool pgxc_advisory_lock(int64 key64, int32 key1, int32 key2, bool iskeybi
     else
         SET_LOCKTAG_INT32_DB(locktag, databaseOid, key1, key2);
 
+    /*
+     * Before get cn/dn oids, we should refresh NumCoords/NumDataNodes and co_handles/dn_handles in u_sess in case of
+     * can not process SIGUSR1 of "pgxc_pool_reload" command immediately.
+     */
+#ifdef ENABLE_MULTIPLE_NODES
+        if (IsGotPoolReload()) {
+            processPoolerReload();
+            ResetGotPoolReload(false);
+        }
+#endif
     PgxcNodeGetOids(&coOids, &dnOids, &numcoords, &numdnodes, false);
 
     /* Skip everything XC specific if there's only one Coordinator running */
@@ -1291,6 +1336,7 @@ Datum pgxc_lock_for_backup(PG_FUNCTION_ARGS)
      *    is denied.
      */
     /* Connect to SPI manager to check any prepared transactions */
+    SPI_STACK_LOG("connect", NULL, NULL);
     if (SPI_connect() < 0) {
         ereport(ERROR,
             (errcode(ERRCODE_CONNECTION_EXCEPTION), errmsg("internal error while locking the cluster for backup")));
@@ -1299,6 +1345,7 @@ Datum pgxc_lock_for_backup(PG_FUNCTION_ARGS)
     /* Are there any prepared transactions that have not yet been committed? */
     SPI_execute("select gid from pg_catalog.pg_prepared_xacts limit 1", true, 0);
     prepared_xact_count = SPI_processed;
+    SPI_STACK_LOG("finish", NULL, NULL);
     SPI_finish();
 
     if (prepared_xact_count > 0) {
@@ -1400,6 +1447,7 @@ Datum pgxc_lock_for_sp_database(PG_FUNCTION_ARGS)
      */
 
     /* Connect to SPI manager to check any prepared transactions */
+    SPI_STACK_LOG("connect", NULL, NULL);
     if (SPI_connect() < 0) {
         ereport(ERROR,
             (errcode(ERRCODE_CONNECTION_EXCEPTION), errmsg("internal error while locking the cluster for backup")));
@@ -1408,6 +1456,7 @@ Datum pgxc_lock_for_sp_database(PG_FUNCTION_ARGS)
     /* Are there any prepared transactions that have not yet been committed? */
     SPI_execute("select gid from pg_catalog.pg_prepared_xacts limit 1", true, 0);
     prepared_xact_count = SPI_processed;
+    SPI_STACK_LOG("finish", NULL, NULL);
     SPI_finish();
 
     if (prepared_xact_count > 0) {
@@ -1424,6 +1473,23 @@ Datum pgxc_lock_for_sp_database(PG_FUNCTION_ARGS)
         NameGetDatum(databaseName));
 
     PG_RETURN_BOOL(true);
+}
+
+bool pg_try_advisory_lock_for_redis(Relation rel)
+{
+    LOCKMODE lockmode = u_sess->attr.attr_sql.enable_cluster_resize ? ExclusiveLock : ShareLock;
+    LockLevel locklevel = u_sess->attr.attr_sql.enable_cluster_resize ? SESSION_LOCK : TRANSACTION_LOCK;
+    TryType locktry = u_sess->attr.attr_sql.enable_cluster_resize ? WAIT : DONT_WAIT;
+    bool result = pgxc_advisory_lock(0, 65534, RelationGetRelCnOid(rel), false, lockmode, locklevel, locktry, NULL);
+    if (u_sess->attr.attr_sql.enable_cluster_resize && result) {
+        return true;
+    } else if (result) {
+        LOCKTAG tag;
+        SET_LOCKTAG_INT32_DB(tag, u_sess->proc_cxt.MyDatabaseId, 65534, RelationGetRelCnOid(rel));
+        (void)LockRelease(&tag, ShareLock, false);
+        return true;
+    }
+    return false;
 }
 
 /*

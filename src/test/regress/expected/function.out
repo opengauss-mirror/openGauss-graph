@@ -1,3 +1,5 @@
+create database pl_test_funcion DBCOMPATIBILITY 'pg';
+\c pl_test_funcion;
 create schema distribute_function;
 set current_schema = distribute_function;
 create table function_table_01(f1 int, f2 float, f3 text);
@@ -911,7 +913,7 @@ create table sche1.pg_class(id int);
 set search_path=sche1;
 insert into pg_class values(1);
 ERROR:  null value in column "relnamespace" violates not-null constraint
-DETAIL:  Failing row contains (1, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null).
+DETAIL:  Failing row contains (1, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null).
 select * from sche1.pg_class;
  id 
 ----
@@ -922,7 +924,7 @@ set search_path=sche1, pg_catalog;
 WARNING:  It is invalid to set pg_temp or pg_catalog behind other schemas in search path explicitly. The priority order is pg_temp, pg_catalog and other schemas.
 insert into pg_class values(1);
 ERROR:  null value in column "relnamespace" violates not-null constraint
-DETAIL:  Failing row contains (1, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null).
+DETAIL:  Failing row contains (1, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null).
 select * from sche1.pg_class;
  id 
 ----
@@ -945,7 +947,7 @@ end;
 $$ LANGUAGE plpgsql;
 select sche1.fun_001();
 ERROR:  null value in column "relnamespace" violates not-null constraint
-DETAIL:  Failing row contains (1, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null).
+DETAIL:  Failing row contains (1, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null).
 CONTEXT:  SQL statement "insert into pg_class values(1)"
 PL/pgSQL function fun_001() line 4 at SQL statement
 referenced column: fun_001
@@ -958,7 +960,7 @@ set search_path=sche1, pg_catalog;
 WARNING:  It is invalid to set pg_temp or pg_catalog behind other schemas in search path explicitly. The priority order is pg_temp, pg_catalog and other schemas.
 select sche1.fun_001();
 ERROR:  null value in column "relnamespace" violates not-null constraint
-DETAIL:  Failing row contains (1, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null).
+DETAIL:  Failing row contains (1, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null).
 CONTEXT:  SQL statement "insert into pg_class values(1)"
 PL/pgSQL function fun_001() line 4 at SQL statement
 referenced column: fun_001
@@ -1479,7 +1481,8 @@ begin
 end;
 /
 call sche1.pro();
-ERROR:  relation "test" already exists
+ERROR:  relation "test" already exists in schema "sche1"
+DETAIL:  creating new table with existing name in the same schema
 CONTEXT:  SQL statement "create table test as select * from sche_t1"
 PL/pgSQL function sche1.subpro() line 3 at SQL statement
 SQL statement "CALL subpro()"
@@ -1609,3 +1612,5 @@ DROP FUNCTION func_increment_sql_1;
 DROP FUNCTION func_increment_sql_2;
 DROP FUNCTION fun_test_1;
 DROP FUNCTION fun_test_2;
+\c regression;
+drop database IF EXISTS pl_test_funcion;

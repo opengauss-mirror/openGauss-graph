@@ -8,6 +8,7 @@
  * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  * Portions Copyright (c) 2020 Huawei Technologies Co.,Ltd.
+ * Portions Copyright (c) 2021, openGauss Contributors
  *
  * src/include/catalog/pg_operator.h
  *
@@ -1760,6 +1761,115 @@ DATA(insert OID = 4378 (  "="	   PGNSP PGUID b f f 4303 4303	16 4378 4379 hll_ha
 DESCR("hyper log log equal hashval op");
 DATA(insert OID = 4379 (  "<>"	   PGNSP PGUID b f f 4303 4303	16 4379 4378 hll_hashval_ne neqsel neqjoinsel ));
 DESCR("hyper log log not equal hashval op");
+
+DATA(insert OID = 6000 ("="        PGNSP PGUID b f f    34    34    16 6000    6001 int16eq eqsel eqjoinsel));
+DESCR("int16 equal");
+
+DATA(insert OID = 6001 ("<>"       PGNSP PGUID b f f    34    34    16 6001    6000 int16ne neqsel neqjoinsel));
+DESCR("int16 not equal");
+
+DATA(insert OID = 6002 ("<"        PGNSP PGUID b f f    34    34    16 6004    6005 int16lt scalarltsel scalarltjoinsel));
+DESCR("int16 less than");
+
+DATA(insert OID = 6003 ("<="       PGNSP PGUID b f f    34    34    16 6005    6004 int16le scalarltsel scalarltjoinsel));
+DESCR("int16 less or equal");
+
+DATA(insert OID = 6004 (">"        PGNSP PGUID b f f    34    34    16 6002    6003 int16gt scalargtsel scalargtjoinsel));
+DESCR("int16 greater");
+
+DATA(insert OID = 6005 (">="       PGNSP PGUID b f f    34    34    16 6003    6002 int16ge scalargtsel scalargtjoinsel));
+DESCR("int16 greater or equal");
+
+DATA(insert OID = 6006 ("+"        PGNSP PGUID b f f    34    34    34 6006    0 int16pl - -));
+DESCR("int16 plus");
+
+DATA(insert OID = 6007 ("-"        PGNSP PGUID b f f    34    34    34 0       0 int16mi - -));
+DESCR("int16 minus");
+
+DATA(insert OID = 6008 ("*"        PGNSP PGUID b f f    34    34    34 6008    0 int16mul - -));
+DESCR("int16 multiply");
+
+DATA(insert OID = 6009 ("/"        PGNSP PGUID b f f    34    34    701 0       0 int16div - -));
+DESCR("int16 divide");
+
+
+/* graphid operators */
+DATA(insert OID = 8187 (  "="	   PGNSP PGUID b t t 8102 8102 16 8187 8188 graphid_eq eqsel eqjoinsel ));
+DESCR("equal");
+#define OID_GRAPHID_EQ_OP 8187
+DATA(insert OID = 8188 (  "<>"	   PGNSP PGUID b f f 8102 8102 16 8188 8187 graphid_ne neqsel neqjoinsel ));
+DESCR("not equal");
+DATA(insert OID = 8189 (  "<"	   PGNSP PGUID b f f 8102 8102 16 8190 8192 graphid_lt scalarltsel scalarltjoinsel ));
+DESCR("less than");
+DATA(insert OID = 8190 (  ">"	   PGNSP PGUID b f f 8102 8102 16 8189 8191 graphid_gt scalargtsel scalargtjoinsel ));
+DESCR("greater than");
+DATA(insert OID = 8191 (  "<="	   PGNSP PGUID b f f 8102 8102 16 8192 8190 graphid_le scalarltsel scalarltjoinsel ));
+DESCR("less than or equal");
+DATA(insert OID = 8192 (  ">="	   PGNSP PGUID b f f 8102 8102 16 8191 8189 graphid_ge scalargtsel scalargtjoinsel ));
+DESCR("greater than or equal");
+/* vertex operators */
+DATA(insert OID = 8236 (  "="	   PGNSP PGUID b t t 8112 8112 16 8236 8237 vertex_eq eqsel eqjoinsel ));
+DESCR("equal");
+#define OID_VERTEX_EQ_OP 8236
+DATA(insert OID = 8237 (  "<>"	   PGNSP PGUID b f f 8112 8112 16 8237 8236 vertex_ne neqsel neqjoinsel ));
+DESCR("not equal");
+#define OID_VERTEX_NE_OP 8237
+DATA(insert OID = 8238 (  "<"	   PGNSP PGUID b f f 8112 8112 16 8239 8241 vertex_lt scalarltsel scalarltjoinsel ));
+DESCR("less than");
+#define OID_VERTEX_LT_OP 8238
+DATA(insert OID = 8239 (  ">"	   PGNSP PGUID b f f 8112 8112 16 8238 8240 vertex_gt scalargtsel scalargtjoinsel ));
+DESCR("greater than");
+#define OID_VERTEX_GT_OP 8239
+DATA(insert OID = 8240 (  "<="	   PGNSP PGUID b f f 8112 8112 16 8241 8239 vertex_le scalarltsel scalarltjoinsel ));
+DESCR("less than or equal");
+#define OID_VERTEX_LE_OP 8240
+DATA(insert OID = 8241 (  ">="	   PGNSP PGUID b f f 8112 8112 16 8240 8238 vertex_ge scalargtsel scalargtjoinsel ));
+DESCR("greater than or equal");
+#define OID_VERTEX_GE_OP 8241
+/* edge operators */
+DATA(insert OID = 8248 (  "="	   PGNSP PGUID b t t 8122 8122 16 8248 8249 edge_eq eqsel eqjoinsel ));
+DESCR("equal");
+DATA(insert OID = 8249 (  "<>"	   PGNSP PGUID b f f 8122 8122 16 8249 8248 edge_ne neqsel neqjoinsel ));
+DESCR("not equal");
+DATA(insert OID = 8250 (  "<"	   PGNSP PGUID b f f 8122 8122 16 8251 8253 edge_lt scalarltsel scalarltjoinsel ));
+DESCR("less than");
+DATA(insert OID = 8251 (  ">"	   PGNSP PGUID b f f 8122 8122 16 8250 8252 edge_gt scalargtsel scalargtjoinsel ));
+DESCR("greater than");
+DATA(insert OID = 8252 (  "<="	   PGNSP PGUID b f f 8122 8122 16 8253 8251 edge_le scalarltsel scalarltjoinsel ));
+DESCR("less than or equal");
+DATA(insert OID = 8253 (  ">="	   PGNSP PGUID b f f 8122 8122 16 8252 8250 edge_ge scalargtsel scalargtjoinsel ));
+DESCR("greater than or equal");
+/* rowid operators */
+DATA(insert OID = 8261 (  "="	   PGNSP PGUID b t f 8162 8162 16 8261 8262 rowid_eq eqsel eqjoinsel ));
+DESCR("equal");
+DATA(insert OID = 8262 (  "<>"	   PGNSP PGUID b f f 8162 8162 16 8262 8261 rowid_ne neqsel neqjoinsel ));
+DESCR("not equal");
+DATA(insert OID = 8263 (  "<"	   PGNSP PGUID b f f 8162 8162 16 8264 8266 rowid_lt scalarltsel scalarltjoinsel ));
+DESCR("less than");
+DATA(insert OID = 8264 (  ">"	   PGNSP PGUID b f f 8162 8162 16 8263 8265 rowid_gt scalargtsel scalargtjoinsel ));
+DESCR("greater than");
+DATA(insert OID = 8265 (  "<="	   PGNSP PGUID b f f 8162 8162 16 8266 8264 rowid_le scalarltsel scalarltjoinsel ));
+DESCR("less than or equal");
+DATA(insert OID = 8266 (  ">="	   PGNSP PGUID b f f 8162 8162 16 8265 8263 rowid_ge scalargtsel scalargtjoinsel ));
+DESCR("greater than or equal");
+/* Cypher expressions - operators for jsonb */
+DATA(insert OID = 8276 (  "`+`"	   PGNSP PGUID b f f 3802 3802 3802 8276 0 jsonb_add - - ));
+DESCR("add");
+DATA(insert OID = 8278 (  "`-`"	   PGNSP PGUID b f f 3802 3802 3802 0 0 jsonb_sub - - ));
+DESCR("subtract");
+DATA(insert OID = 8280 (  "`*`"	   PGNSP PGUID b f f 3802 3802 3802 8280 0 jsonb_mul - - ));
+DESCR("multiply");
+DATA(insert OID = 8282 (  "`/`"	   PGNSP PGUID b f f 3802 3802 3802 0 0 jsonb_div - - ));
+DESCR("divide");
+DATA(insert OID = 8284 (  "`%`"	   PGNSP PGUID b f f 3802 3802 3802 0 0 jsonb_mod - - ));
+DESCR("modulus");
+DATA(insert OID = 8286 (  "`^`"	   PGNSP PGUID b f f 3802 3802 3802 0 0 jsonb_pow - - ));
+DESCR("exponentiation");
+DATA(insert OID = 8288 (  "`+`"	   PGNSP PGUID l f f 0 3802 3802 0 0 jsonb_uplus - - ));
+DESCR("unary plus");
+DATA(insert OID = 8290 (  "`-`"	   PGNSP PGUID l f f 0 3802 3802 0 0 jsonb_uminus - - ));
+DESCR("negate");
+
 /*
  * function prototypes
  */

@@ -31,9 +31,9 @@ public:
     ~ThreadPoolScheduler();
     int StartUp();
     void DynamicAdjustThreadPool();
-    void SigHupHandler();
     void GPCScheduleCleaner(int* gpc_count);
     void ShutDown() const;
+    void SigHupHandler();
     inline ThreadId GetThreadId()
     {
         return m_tid;
@@ -48,6 +48,8 @@ public:
     }
     MemoryContext m_gpcContext;
     bool m_getSIGHUP;
+    volatile bool m_canAdjustPool;
+    bool m_getKilled;
 private:
     void AdjustWorkerPool(int idx);
     void AdjustStreamPool(int idx);

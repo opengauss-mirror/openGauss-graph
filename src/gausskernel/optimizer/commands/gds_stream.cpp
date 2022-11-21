@@ -19,7 +19,7 @@
 #include "libpq/ip.h"
 #include "utils/builtins.h"
 #include "utils/memutils.h"
-#include "storage/fd.h"
+#include "storage/smgr/fd.h"
 #include "miscadmin.h"
 #include "port.h"
 #include "libpq/pqformat.h"
@@ -137,13 +137,23 @@ void GDSStream::InitSSL(void)
         ereport(ERROR,
             (errmodule(MOD_SSL), errcode_for_file_access(), errmsg("env $GAUSSHOME not found, please set it first")));
     }
-    if (backend_env_valid(homedir, "GAUSSHOME") == false) {
+    char real_homedir[PATH_MAX + 1] = {'\0'};
+    if (realpath(homedir, real_homedir) == NULL) {
+        ereport(ERROR,
+            (errmodule(MOD_EXECUTOR), errcode(ERRCODE_EXTERNAL_ROUTINE_INVOCATION_EXCEPTION),
+            errmsg("Failed to obtain environment value $GAUSSHOME!"),
+            errdetail("N/A"),
+            errcause("Incorrect environment value."),
+            erraction("Please refer to backend log for more details.")));
+    }
+    homedir = NULL;
+    if (backend_env_valid(real_homedir, "GAUSSHOME") == false) {
         ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
             errmsg("Incorrect backend environment variable $GAUSSHOME"),
             errdetail("Please refer to the backend instance log for the detail")));
     }
     /* Load the ROOT CA files */
-    int nRet = snprintf_s(ssl_dir, MAXPGPATH, MAXPGPATH - 1, "%s/share/sslcert/gds/", homedir);
+    int nRet = snprintf_s(ssl_dir, MAXPGPATH, MAXPGPATH - 1, "%s/share/sslcert/gds/", real_homedir);
     securec_check_ss_c(nRet, "\0", "\0");
 
     if (m_ssl == NULL) {
@@ -305,7 +315,8 @@ retry:
             return 0;
 #endif
         ereport(ERROR,
-            (errcode_for_socket_access(), errmsg("Unexpected EOF on GDS connection \"%s\": %m", m_uri->ToString())));
+            (errcode(ERRCODE_CONNECTION_RESET_BY_PEER),
+                errmsg("Unexpected EOF on GDS connection \"%s\": %m", m_uri->ToString())));
         return -1;
 
     } else if (nread == 0)
@@ -600,8 +611,10 @@ void SerializeCmd(CmdBase* cmd, StringInfo buf)
     Assert(CurrentMemoryContext);
 
     cmdtype[cmdtypeSize - 1] = '\0';
+#ifdef ENABLE_MULTIPLE_NODES
     if (u_sess->attr.attr_storage.gds_debug_mod)
         ereport(LOG, (errmodule(MOD_GDS), (errmsg("Sending a %s to GDS", cmdtype))));
+#endif
 }
 
 void PackData(StringInfo dst, StringInfo data)
@@ -763,8 +776,9 @@ CmdBase* DeserializeCmd(StringInfo buf)
     buf->cursor += length;
 
     cmdtype[cmdtypeSize - 1] = '\0';
+#ifdef ENABLE_MULTIPLE_NODES
     if (u_sess->attr.attr_storage.gds_debug_mod)
         ereport(LOG, (errmodule(MOD_GDS), (errmsg("Receiving a %s from GDS", cmdtype))));
-
+#endif
     return cmd;
 }

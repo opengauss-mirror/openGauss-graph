@@ -28,7 +28,9 @@
 #include "threadpool/threadpool.h"
 
 #include "access/xact.h"
+#include "catalog/pg_authid.h"
 #include "catalog/pg_collation.h"
+#include "commands/user.h"
 #include "gssignal/gs_signal.h"
 #include "lib/dllist.h"
 #include "libpq/ip.h"
@@ -50,6 +52,12 @@
 #include "utils/ps_status.h"
 #include "utils/acl.h"
 #include "executor/executor.h"
+
+#include "communication/commproxy_interface.h"
+#ifdef MEMORY_CONTEXT_TRACK
+#include "memory_func.h"
+#endif
+
 
 ThreadPoolSessControl::ThreadPoolSessControl(MemoryContext context)
 {
@@ -95,6 +103,7 @@ knl_session_context* ThreadPoolSessControl::CreateSession(Port* port)
     int rc = memcpy_s(sc->proc_cxt.MyProcPort, sizeof(Port), port, sizeof(Port));
     securec_check(rc, "\0", "\0");
 
+    ereport(DEBUG4, (errmsg("CreateSession fd:[%d] to dispatch.", port->sock)));
     if (AllocateSlot(sc)) {
         sc->stat_cxt.trackedBytes += u_sess->stat_cxt.trackedBytes;
         sc->stat_cxt.trackedMemChunks += u_sess->stat_cxt.trackedMemChunks;
@@ -192,6 +201,8 @@ void ThreadPoolSessControl::MarkAllSessionClose()
         elem = DLGetSucc(elem);
     }
     alock.unLock();
+    ereport(LOG, (errmodule(MOD_THREAD_POOL),
+                    errmsg("pmState:%d, mark all threadpool sessions closed.", pmState)));
 }
 
 void ThreadPoolSessControl::CheckPermissionForSendSignal(knl_session_context* sess, sig_atomic_t* lock)
@@ -201,13 +212,19 @@ void ThreadPoolSessControl::CheckPermissionForSendSignal(knl_session_context* se
     if (!OidIsValid(u_sess->misc_cxt.CurrentUserId)) {
         return;
     }
-    /* Only superuser , DB owner and user himself have the permission to send singal. */
-    if (!superuser() && !pg_database_ownercheck(sess->proc_cxt.MyDatabaseId, u_sess->misc_cxt.CurrentUserId)) {
+
+    /* Only users with sysadmin privilege or the member of gs_role_signal_backend role
+     * or the owner of the database or user himself have the permission to send singal. */
+    bool role_signal_backend_permission = is_member_of_role(GetUserId(), DEFAULT_ROLE_SIGNAL_BACKENDID) &&
+        (sess->proc_cxt.MyRoleId != BOOTSTRAP_SUPERUSERID && !is_role_persistence(sess->proc_cxt.MyRoleId));
+    if (!superuser() && !pg_database_ownercheck(sess->proc_cxt.MyDatabaseId, u_sess->misc_cxt.CurrentUserId) &&
+        !role_signal_backend_permission) {
         if (sess->proc_cxt.MyRoleId != GetUserId()) {
             *lock = 0;
             ereport(ERROR,
                 (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-                    (errmsg("must be system admin, db owner or have the same role to terminate other backend"))));
+                    (errmsg("must have sysadmin privilege or a member of the gs_role_signal_backend role or the "
+                    "owner of the database or the same user to terminate other backend"))));
         }
     }
 }
@@ -246,7 +263,7 @@ int ThreadPoolSessControl::SendSignal(int ctrl_index, int signal)
                 /* Session may be NULL when the session exits during the clean connection process.
                    We do nothing if the session is NULL */
                 if (sess == NULL) {
-                    /* restore the value */
+                    /* restore the value. */
                     ctrl->lock = 0;
                     status = ESRCH;
                     break;
@@ -453,7 +470,8 @@ void ThreadPoolSessControl::HandlePoolerReload()
     Dlelem* elem = DLGetHead(&m_activelist);
     while (elem != NULL) {
         ctrl= (knl_sess_control*)DLE_VAL(elem);
-        ctrl->sess->sig_cxt.got_PoolReload = true;
+        /* we have already send got_pool_reload to threads */
+        ctrl->sess->sig_cxt.got_pool_reload = true;
         ctrl->sess->sig_cxt.cp_PoolReload = true;
         elem = DLGetSucc(elem);
     }
@@ -550,6 +568,108 @@ void ThreadPoolSessControl::getSessionMemoryDetail(Tuplestorestate* tupStore,
     PG_END_TRY();
 }
 
+void ThreadPoolSessControl::calculateClientInfo(
+    knl_session_context* sess, Tuplestorestate* tupStore, TupleDesc tupDesc)
+{
+    /* build one tuple and save it in tuplestore. */
+    const int COLUMN_NUM = 2;
+    Datum values[COLUMN_NUM] = {0};
+    bool nulls[COLUMN_NUM] = {false};
+ 
+    values[0] = Int64GetDatum(sess->session_id);
+    if (sess->plsql_cxt.client_info != NULL) {
+        values[1] = CStringGetTextDatum(sess->plsql_cxt.client_info);
+    } else {
+        nulls[1] = true;
+    }
+    tuplestore_putvalues(tupStore, tupDesc, values, nulls);
+}
+ 
+void ThreadPoolSessControl::getSessionClientInfo(Tuplestorestate* tupStore, TupleDesc tupDesc)
+{
+    AutoMutexLock alock(&m_sessCtrlock);
+    knl_sess_control* ctrl = NULL;
+    Dlelem* elem = NULL;
+    knl_sess_control* sess = NULL;
+ 
+    PG_TRY();
+    {
+        HOLD_INTERRUPTS();
+        alock.lock();
+ 
+        /* collect all the Memory Context status, put in data */
+        elem = DLGetHead(&m_activelist);
+ 
+        while (elem != NULL) {
+            ctrl = (knl_sess_control*)DLE_VAL(elem);
+            sess = ctrl;
+            if (ctrl->sess) {
+                (void)syscalllockAcquire(&ctrl->sess->plsql_cxt.client_info_lock);
+                calculateClientInfo(ctrl->sess, tupStore, tupDesc);
+                (void)syscalllockRelease(&ctrl->sess->plsql_cxt.client_info_lock);
+            }
+            elem = DLGetSucc(elem);
+        }
+        alock.unLock();
+        sess = NULL;
+ 
+        RESUME_INTERRUPTS();
+    }
+    PG_CATCH();
+    {
+        if (sess != NULL) {
+            ctrl = sess;
+            (void)syscalllockRelease(&ctrl->sess->plsql_cxt.client_info_lock);
+        }
+        alock.unLock();
+        PG_RE_THROW();
+    }
+    PG_END_TRY();
+}
+
+void ThreadPoolSessControl::getSessionMemoryContextInfo(const char* ctx_name,
+    StringInfoData* buf, knl_sess_control** sess)
+{
+#ifdef MEMORY_CONTEXT_TRACK
+    AutoMutexLock alock(&m_sessCtrlock);
+    knl_sess_control* ctrl = NULL;
+    Dlelem* elem = NULL;
+
+    PG_TRY();
+    {
+        HOLD_INTERRUPTS();
+        alock.lock();
+
+        /* collect all the Memory Context status, put in data */
+        elem = DLGetHead(&m_activelist);
+
+        while (elem != NULL) {
+            ctrl = (knl_sess_control*)DLE_VAL(elem);
+            *sess = ctrl;
+            if (ctrl->sess) {
+                (void)syscalllockAcquire(&ctrl->sess->utils_cxt.deleMemContextMutex);
+                gs_recursive_unshared_memory_context(ctrl->sess->top_mem_cxt, ctx_name, buf);
+                (void)syscalllockRelease(&ctrl->sess->utils_cxt.deleMemContextMutex);
+            }
+            elem = DLGetSucc(elem);
+        }
+        alock.unLock();
+
+        RESUME_INTERRUPTS();
+    }
+    PG_CATCH();
+    {
+        if (*sess != NULL) {
+            ctrl = *sess;
+            (void)syscalllockRelease(&ctrl->sess->utils_cxt.deleMemContextMutex);
+        }
+        alock.unLock();
+        PG_RE_THROW();
+    }
+    PG_END_TRY();
+#endif
+}
+
 knl_session_context* ThreadPoolSessControl::GetSessionByIdx(int idx)
 {
     if (IsValidCtrlIndex(idx)) {
@@ -583,14 +703,17 @@ void ThreadPoolSessControl::CheckSessionTimeout()
         knl_session_context* sess = ctrl->sess;
         if (sess != NULL && sess->attr.attr_common.SessionTimeout != 0) {
             if (sess->storage_cxt.session_timeout_active) {
-                if (now >= sess->storage_cxt.session_fin_time) {
+                if (now >= sess->storage_cxt.session_fin_time && sess->attr.attr_common.SessionTimeoutCount < 10) {
 #ifdef HAVE_INT64_TIMESTAMP
-                    elog(LOG, "close session : %lu due to session timeout : %d, max finish time is %ld. But now is:%ld",
-                         sess->session_id, sess->attr.attr_common.SessionTimeout, sess->storage_cxt.session_fin_time, now);
+                    elog(LOG, "close session : %lu for %d times due to session timeout : %d, max finish time is %ld. But now is:%ld",
+                         sess->session_id, sess->attr.attr_common.SessionTimeoutCount + 1,
+                         sess->attr.attr_common.SessionTimeout, sess->storage_cxt.session_fin_time, now);
 #else
-                    elog(LOG, "close session : %lu due to session timeout : %d, max finish time is %lf. But now is:%lf",
-                         sess->session_id, sess->attr.attr_common.SessionTimeout, sess->storage_cxt.session_fin_time, now);
+                    elog(LOG, "close session : %lu for %d times due to session timeout : %d, max finish time is %lf. But now is:%lf",
+                         sess->session_id, sess->attr.attr_common.SessionTimeoutCount + 1,
+                         sess->attr.attr_common.SessionTimeout, sess->storage_cxt.session_fin_time, now);
 #endif
+                    sess->attr.attr_common.SessionTimeoutCount++;
                     CloseClientSocket(sess, false);
                 }
             }

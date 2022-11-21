@@ -7,6 +7,7 @@ set enable_seqscan=off;
 set opfusion_debug_mode = 'log';
 set log_min_messages=debug;
 set logging_module = 'on(OPFUSION)';
+set sql_beta_feature = 'index_cost_with_leaf_pages_only';
 -- create table
 drop table if exists test_bypass_sq1;
 NOTICE:  table "test_bypass_sq1" does not exist, skipping
@@ -826,6 +827,11 @@ select * from test_bypass_sq1 where col1>0 and col2>0 order by col1 limit 3 offs
     3 |    3 | 
 (3 rows)
 
+select * from test_bypass_sq1 where col1>0 and col2>0 order by col1 limit 3 offset 30;
+ col1 | col2 | col3 
+------+------+------
+(0 rows)
+
 explain select * from test_bypass_sq1 where col1>0  order by col1 for update limit 3 offset 3;
                                                QUERY PLAN                                               
 --------------------------------------------------------------------------------------------------------
@@ -841,6 +847,16 @@ explain select * from test_bypass_sq1 where col1>0  order by col1 for update lim
 --------------------------------------------------------------------------------------------------------
  [Bypass]
  Limit  (cost=0.00..0.42 rows=3 width=46)
+   ->  LockRows  (cost=0.00..54.95 rows=389 width=46)
+         ->  Index Scan using itest_bypass_sq1 on test_bypass_sq1  (cost=0.00..51.06 rows=389 width=46)
+               Index Cond: (col1 > 0)
+(5 rows)
+
+explain select * from test_bypass_sq1 where col1>0  order by col1 for update limit 3 offset 30;
+                                               QUERY PLAN                                               
+--------------------------------------------------------------------------------------------------------
+ [Bypass]
+ Limit  (cost=4.24..4.66 rows=3 width=46)
    ->  LockRows  (cost=0.00..54.95 rows=389 width=46)
          ->  Index Scan using itest_bypass_sq1 on test_bypass_sq1  (cost=0.00..51.06 rows=389 width=46)
                Index Cond: (col1 > 0)
@@ -863,6 +879,11 @@ select * from test_bypass_sq1 where col1>0 and col2>0 order by col1 offset 3;
     3 |    3 | 
     3 |    3 | test_insert3
 (4 rows)
+
+select * from test_bypass_sq1 where col1>0  order by col1 for update limit 3 offset 30;
+ col1 | col2 | col3 
+------+------+------
+(0 rows)
 
 explain select * from test_bypass_sq1 where col1>0 order by col1 for update offset 3;
                                                QUERY PLAN                                               
@@ -1567,9 +1588,11 @@ select * from test_bypass_sq5 where col2>2 for update;
 
 insert into test_bypass_sq5 values (2,3,4); --fail
 ERROR:  permission denied for relation test_bypass_sq5
+DETAIL:  N/A
 update test_bypass_sq5 set col3 = col3+1 where col2 > 0;
 delete from test_bypass_sq5; --fail
 ERROR:  permission denied for relation test_bypass_sq5
+DETAIL:  N/A
 RESET SESSION AUTHORIZATION;
 revoke update on test_bypass_sq5 from bypassuser;
 revoke select on test_bypass_sq5 from bypassuser;
@@ -1804,7 +1827,7 @@ SET SESSION SESSION AUTHORIZATION qps PASSWORD 'TTEST@123';
 SELECT node_name,select_count, update_count, insert_count, delete_count,  ddl_count, dml_count FROM gs_sql_count where user_name='qps';
  node_name | select_count | update_count | insert_count | delete_count | ddl_count | dml_count 
 -----------+--------------+--------------+--------------+--------------+-----------+-----------
- datanode1 |            0 |            0 |            0 |            0 |         0 |         0
+ datanode1 |            6 |            0 |            0 |            0 |         0 |         6
 (1 row)
 
 SELECT * from test_bypass_sq7 where col1 >10 and col2 >10 order by col1,col2;
@@ -1821,7 +1844,7 @@ delete test_bypass_sq7 where col1 =1;
 SELECT node_name,select_count, update_count, insert_count, delete_count,  ddl_count, dml_count FROM gs_sql_count where user_name='qps';
  node_name | select_count | update_count | insert_count | delete_count | ddl_count | dml_count 
 -----------+--------------+--------------+--------------+--------------+-----------+-----------
- datanode1 |            2 |            1 |            1 |            1 |         0 |         5
+ datanode1 |            8 |            1 |            1 |            1 |         0 |        11
 (1 row)
 
 CREATE OR REPLACE FUNCTION tri_bypass() RETURNS trigger AS $$
@@ -1883,6 +1906,21 @@ revoke update on test_bypass_sq7 from qps;
 revoke select on test_bypass_sq7 from qps;
 DROP OWNED BY qps;
 DROP ROLE qps;
+-- test rule do nothing
+create table test(a int);
+create view v_test as select * from test;
+CREATE OR REPLACE RULE v_delete as ON DELETE TO v_test DO INSTEAD NOTHING;
+delete from v_test;
+set explain_perf_mode=pretty;
+explain delete from v_test;
+        QUERY PLAN         
+---------------------------
+ Query rewrites to nothing
+(1 row)
+
+reset explain_perf_mode;
+drop table test cascade;
+NOTICE:  drop cascades to view v_test
 -- end
 reset track_activities;
 set track_sql_count = off;

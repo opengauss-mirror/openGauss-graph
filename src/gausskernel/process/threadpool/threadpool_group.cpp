@@ -57,7 +57,7 @@
                                 status == STATE_WAIT_XACTSYNC)
 
 ThreadPoolGroup::ThreadPoolGroup(int maxWorkerNum, int expectWorkerNum, int maxStreamNum,
-                                 int groupId, int numaId, int cpuNum, int* cpuArr)
+                                 int groupId, int numaId, int cpuNum, int* cpuArr, bool enableBindCpuNuma)
     : m_listener(NULL),
       m_maxWorkerNum(maxWorkerNum),
       m_maxStreamNum(maxStreamNum),
@@ -72,16 +72,19 @@ ThreadPoolGroup::ThreadPoolGroup(int maxWorkerNum, int expectWorkerNum, int maxS
       m_sessionCount(0),
       m_waitServeSessionCount(0),
       m_processTaskCount(0),
+      m_hasHanged(0),
       m_groupId(groupId),
       m_numaId(numaId),
       m_groupCpuNum(cpuNum),
       m_groupCpuArr(cpuArr),
       m_enableNumaDistribute(false),
+      m_enableBindCpuNuma(enableBindCpuNuma),
       m_workers(NULL),
       m_context(NULL)
 {
     pthread_mutex_init(&m_mutex, NULL);
     CPU_ZERO(&m_nodeCpuSet);
+    CPU_ZERO(&m_CpuNumaSet);
 
     m_streams = NULL;
     m_freeStreamList = NULL;
@@ -112,6 +115,12 @@ void ThreadPoolGroup::Init(bool enableNumaDistribute)
 
     m_listener = New(CurrentMemoryContext) ThreadPoolListener(this);
     m_listener->StartUp();
+
+    if (m_enableBindCpuNuma) {
+        for (int i = 0; i < m_groupCpuNum; i++) {
+            CPU_SET(m_groupCpuArr[i], &m_CpuNumaSet);
+        }
+    }
 
     InitWorkerSentry();
 
@@ -157,6 +166,8 @@ void ThreadPoolGroup::AddWorker(int i)
         if (m_groupCpuArr) {
             if (m_enableNumaDistribute) {
                 AttachThreadToNodeLevel(m_workers[i].worker->GetThreadId());
+            } else if (m_enableBindCpuNuma) {
+                AttachThreadToCpuNuma(m_workers[i].worker->GetThreadId());
             } else {
                 AttachThreadToCPU(m_workers[i].worker->GetThreadId(), m_groupCpuArr[i % m_groupCpuNum]);
             }
@@ -269,7 +280,11 @@ bool ThreadPoolGroup::EnlargeWorkers(int enlargeNum)
         for (int i = num; i < num + wakeUpNum; i++) {
             if (m_workers[i].stat.slotStatus == THREAD_SLOT_INUSE) {
                 worker = m_workers[i].worker;
-                worker->WakeUpToUpdate(THREAD_RUN);
+                if (worker->GetthreadStatus() == THREAD_PENDING) {
+                    worker->WakeUpToUpdate(THREAD_RUN);
+                    elog(LOG, "[SCHEDULER] Group %d enlarge: wakeup pending worker %lu",
+                               m_groupId, m_workers[i].worker->GetThreadId());
+                }
             }
         }
     }
@@ -296,23 +311,29 @@ void ThreadPoolGroup::ReduceWorkers(int reduceNum)
     m_pendingWorkerNum += (num - m_expectWorkerNum);
     elog(LOG, "[SCHEDULER] Group %d reduce worker. Old worker num %d, new worker num %d",
               m_groupId, num, m_expectWorkerNum);
-
+    /* only wake up free thread to pending, if we meet working thread, just skip it. */
     for (int i = m_expectWorkerNum; i < num; i++) {
         if (m_workers[i].stat.slotStatus == THREAD_SLOT_INUSE) {
             Assert(m_workers[i].worker != NULL);
-            m_workers[i].worker->WakeUpToUpdate(THREAD_PENDING);
+            if (m_workers[i].worker->WakeUpToPendingIfFree()) {
+                elog(LOG, "[SCHEDULER] Group %d reduce: pending worker %lu",
+                          m_groupId, m_workers[i].worker->GetThreadId());
+            }
         }
     }
+
+    elog(LOG, "[SCHEDULER] Group %d reduce worker end. Old worker num %d, new worker num %d",
+              m_groupId, num, m_expectWorkerNum);
     alock.unLock();
 }
-
 void ThreadPoolGroup::ShutDownPendingWorkers()
 {
     if (m_pendingWorkerNum == 0) {
         return;
     }
 
-    elog(LOG, "[SCHEDULER] Group %d shut down pending workers.", m_groupId);
+    elog(LOG, "[SCHEDULER] Group %d shut down pending workers start. pending worker num %d, current worker num %d",
+              m_groupId, m_pendingWorkerNum, m_expectWorkerNum);
 
     AutoMutexLock alock(&m_mutex);
     ThreadPoolWorker* worker = NULL;
@@ -320,10 +341,14 @@ void ThreadPoolGroup::ShutDownPendingWorkers()
     for (int i = m_expectWorkerNum; i < m_expectWorkerNum + m_pendingWorkerNum; i++) {
         if (m_workers[i].stat.slotStatus == THREAD_SLOT_INUSE) {
             worker = m_workers[i].worker;
-            worker->WakeUpToUpdate(THREAD_EXIT);
+            if (worker->GetthreadStatus() == THREAD_PENDING) {
+                worker->WakeUpToUpdate(THREAD_EXIT);
+            }
         }
     }
     m_pendingWorkerNum = 0;
+    elog(LOG, "[SCHEDULER] Group %d shut down pending workers end. pending worker num %d, current worker num %d",
+              m_groupId, m_pendingWorkerNum, m_expectWorkerNum);
     alock.unLock();
 }
 
@@ -331,7 +356,7 @@ void ThreadPoolGroup::ShutDownThreads()
 {
     AutoMutexLock alock(&m_mutex);
     alock.lock();
-    for (int i = 0; i < m_expectWorkerNum + m_pendingWorkerNum; i++) {
+    for (int i = 0; i < m_maxWorkerNum; i++) {
         if (m_workers[i].stat.slotStatus != THREAD_SLOT_UNUSE) {
             m_workers[i].worker->WakeUpToUpdate(THREAD_EXIT);
         }
@@ -356,6 +381,17 @@ bool ThreadPoolGroup::IsGroupHang()
     return ishang;
 }
 
+void ThreadPoolGroup::SetGroupHanged(bool isHang)
+{
+    pg_atomic_exchange_u32((volatile uint32*)&m_hasHanged, (uint32)isHang);
+}
+
+bool ThreadPoolGroup::IsGroupHanged()
+{
+    pg_memory_barrier();
+    return m_hasHanged != 0;
+}
+
 void ThreadPoolGroup::AttachThreadToCPU(ThreadId thread, int cpu)
 {
     cpu_set_t cpuset;
@@ -374,6 +410,14 @@ void ThreadPoolGroup::AttachThreadToNodeLevel(ThreadId thread) const
     int ret = pthread_setaffinity_np(thread, sizeof(cpu_set_t), &m_nodeCpuSet);
     if (ret != 0)
         ereport(WARNING, (errmsg("Fail to attach thread %lu to numa node %d", thread, m_numaId)));
+}
+
+void ThreadPoolGroup::AttachThreadToCpuNuma(ThreadId thread)
+{
+    int ret = pthread_setaffinity_np(thread, sizeof(cpu_set_t), &m_CpuNumaSet);
+    if (ret != 0) {
+        ereport(WARNING, (errmsg("Fail to attach thread %lu to CPU NUMA", thread)));
+    }
 }
 
 void ThreadPoolGroup::InitStreamSentry()
@@ -406,6 +450,9 @@ ThreadId ThreadPoolGroup::GetStreamFromPool(StreamProducer* producer)
         }
 
         producer->setChildSlot(AssignPostmasterChildSlot());
+        if (producer->getChildSlot() == -1) {
+            return InvalidTid;
+        }
         tid = AddStream(producer);
     } else {
         Dlelem* elem = m_freeStreamList->RemoveHead();

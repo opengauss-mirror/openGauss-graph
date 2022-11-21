@@ -1,7 +1,7 @@
 /* -------------------------------------------------------------------------
  *
  * xloginsert.cpp
- *		Functions for constructing WAL records
+ *        Functions for constructing WAL records
  *
  * Constructing a WAL record begins with a call to XLogBeginInsert,
  * followed by a number of XLogRegister* calls. The registered data is
@@ -21,6 +21,7 @@
 #include "postgres.h"
 #include "knl/knl_variable.h"
 
+#include "access/visibilitymap.h"
 #include "access/xact.h"
 #include "access/xlog.h"
 #include "access/xlog_internal.h"
@@ -29,10 +30,13 @@
 #include "miscadmin.h"
 #include "storage/buf/bufmgr.h"
 #include "storage/proc.h"
+#include "storage/smgr/segment.h"
 #include "utils/memutils.h"
 #include "utils/guc.h"
 #include "pg_trace.h"
 #include "replication/logical.h"
+#include "pgstat.h"
+#include "access/ustore/knl_upage.h"
 
 /*
  * For each block reference registered with XLogRegisterBuffer, we fill in
@@ -44,6 +48,8 @@ typedef struct registered_buffer {
     RelFileNode rnode; /* identifies the relation and block */
     ForkNumber forkno;
     BlockNumber block;
+    uint8 seg_file_no;  /* segment-page file number (extent type) */
+    BlockNumber seg_block;  /* block number in the segment-page file */
     Page page;               /* page content */
     uint32 rdata_len;        /* total length of data in rdata chain */
     XLogRecData *rdata_head; /* head of the chain of data registered with this block */
@@ -52,13 +58,18 @@ typedef struct registered_buffer {
     uint16 extra_flag;
     XLogRecData bkp_rdatas[2]; /* temporary rdatas used to hold references to
                                 * backup block data in XLogRecordAssemble() */
+    TdeInfo* tdeinfo;
+    bool encrypt;
 } registered_buffer;
 
+#define SizeOfXlogOrigin (sizeof(RepOriginId) + sizeof(char))
+
 #define HEADER_SCRATCH_SIZE \
-    (SizeOfXLogRecord + MaxSizeOfXLogRecordBlockHeader * (XLR_MAX_BLOCK_ID + 1) + SizeOfXLogRecordDataHeaderLong)
+    (SizeOfXLogRecord + MaxSizeOfXLogRecordBlockHeader * (XLR_MAX_BLOCK_ID + 1) + \
+    SizeOfXLogRecordDataHeaderLong + SizeOfXlogOrigin)
 
 static XLogRecData *XLogRecordAssemble(RmgrId rmid, uint8 info, XLogFPWInfo fpw_info, XLogRecPtr *fpw_lsn,
-                                       bool isupgrade = false, int bucket_id = -1);
+                                       int bucket_id = -1, bool istoast = false);
 static void XLogResetLogicalPage(void);
 
 /*
@@ -158,7 +169,18 @@ static void XLogResetLogicalPage(void)
 
         if (PageIsLogical(regbuf->page))
             PageClearLogical(regbuf->page);
+
+        regbuf->in_use = false;
+        regbuf->seg_block = 0;
+        regbuf->seg_file_no = 0;
     }
+
+    t_thrd.xlog_cxt.num_rdatas = 0;
+    t_thrd.xlog_cxt.max_registered_block_id = 0;
+    t_thrd.xlog_cxt.mainrdata_len = 0;
+    t_thrd.xlog_cxt.mainrdata_last = (XLogRecData *)&t_thrd.xlog_cxt.mainrdata_head;
+    t_thrd.xlog_cxt.include_origin = false;
+    t_thrd.xlog_cxt.begininsert_called = false;
 }
 
 /*
@@ -168,8 +190,12 @@ void XLogResetInsertion(void)
 {
     int i;
 
-    for (i = 0; i < t_thrd.xlog_cxt.max_registered_block_id; i++)
-        t_thrd.xlog_cxt.registered_buffers[i].in_use = false;
+    for (i = 0; i < t_thrd.xlog_cxt.max_registered_block_id; i++) {
+        registered_buffer *rbuf = &t_thrd.xlog_cxt.registered_buffers[i];
+        rbuf->in_use = false;
+        rbuf->seg_block = 0;
+        rbuf->seg_file_no = 0;
+    }
 
     t_thrd.xlog_cxt.num_rdatas = 0;
     t_thrd.xlog_cxt.max_registered_block_id = 0;
@@ -183,7 +209,7 @@ void XLogResetInsertion(void)
  * Register a reference to a buffer with the WAL record being constructed.
  * This must be called for every page that the WAL-logged operation modifies.
  */
-void XLogRegisterBuffer(uint8 block_id, Buffer buffer, uint8 flags)
+void XLogRegisterBuffer(uint8 block_id, Buffer buffer, uint8 flags, TdeInfo* tdeinfo)
 {
     registered_buffer *regbuf = NULL;
 
@@ -210,7 +236,36 @@ void XLogRegisterBuffer(uint8 block_id, Buffer buffer, uint8 flags)
         PageClearJustAfterFullPageWrite(regbuf->page);
     }
     regbuf->extra_flag = 0;
+    regbuf->encrypt = false;
 
+    if (PageIsTDE(regbuf->page) && tdeinfo && tdeinfo->algo != 0) {
+        TdeInfo* owntdeinfo = (TdeInfo*)palloc(sizeof(TdeInfo));
+        errno_t rc = EOK;
+        rc = memcpy_s((void*)owntdeinfo, sizeof(TdeInfo), (void*)tdeinfo, sizeof(TdeInfo));
+        securec_check(rc, "", "");
+        regbuf->encrypt = true;
+        regbuf->tdeinfo = owntdeinfo;
+    }
+
+    if (XLOG_NEED_PHYSICAL_LOCATION(regbuf->rnode)) {
+        if (!BufferIsValid(buffer) || BufferIsLocal(buffer)) {
+            ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("buffer is not valid")));
+            return;
+        }
+        BufferDesc *bufDesc = GetBufferDescriptor(buffer - 1);
+        if (bufDesc->seg_fileno != EXTENT_INVALID) {  
+            // buffer descriptor contains the physical location
+            SegmentCheck(bufDesc->seg_fileno <= EXTENT_TYPES);
+            regbuf->seg_file_no = bufDesc->seg_fileno;
+            regbuf->seg_block = bufDesc->seg_blockno;
+        } else {
+            SegPageLocation loc = seg_get_physical_location(regbuf->rnode, regbuf->forkno, regbuf->block);
+            SegmentCheck(loc.blocknum != InvalidBlockNumber);
+
+            regbuf->seg_file_no = (uint8) EXTENT_SIZE_TO_TYPE(loc.extent_size);
+            regbuf->seg_block = loc.blocknum;
+        }
+    }
     /*
      * Check that this page hasn't already been registered with some other
      * block_id.
@@ -239,7 +294,7 @@ void XLogRegisterBuffer(uint8 block_id, Buffer buffer, uint8 flags)
  * shared buffer pool (i.e. when you don't have a Buffer for it).
  */
 void XLogRegisterBlock(uint8 block_id, RelFileNode *rnode, ForkNumber forknum, BlockNumber blknum, Page page,
-                       uint8 flags)
+                       uint8 flags, const XLogPhyBlock *pblk, TdeInfo* tdeinfo)
 {
     registered_buffer *regbuf = NULL;
 
@@ -268,6 +323,24 @@ void XLogRegisterBlock(uint8 block_id, RelFileNode *rnode, ForkNumber forknum, B
         PageClearJustAfterFullPageWrite(regbuf->page);
     }
     regbuf->extra_flag = 0;
+    regbuf->encrypt = false;
+    if ((tdeinfo && tdeinfo->algo != 0)) {
+        regbuf->encrypt = true;
+        regbuf->tdeinfo = tdeinfo;
+    }
+
+    if (XLOG_NEED_PHYSICAL_LOCATION(*rnode)) {
+        if (pblk != NULL) {
+            regbuf->seg_file_no = pblk->relNode;
+            regbuf->seg_block = pblk->block;
+        } else {
+            SegPageLocation loc = seg_get_physical_location(*rnode, forknum, blknum);
+            SegmentCheck(loc.blocknum != InvalidBlockNumber);
+
+            regbuf->seg_file_no = (uint8)EXTENT_SIZE_TO_TYPE(loc.extent_size);
+            regbuf->seg_block = loc.blocknum;
+        }
+    }
     /*
      * Check that this page hasn't already been registered with some other
      * block_id.
@@ -368,15 +441,15 @@ void XLogRegisterBufData(uint8 block_id, char *data, int len)
     regbuf->rdata_len += len;
 }
 
-void XLogInsertTrace(RmgrId rmid, uint8 info, bool isupgrade, XLogRecPtr EndPos)
+void XLogInsertTrace(RmgrId rmid, uint8 info, XLogRecPtr EndPos)
 {
     int block_id;
 
     ereport(DEBUG4,
             (errmodule(MOD_REDO), errcode(ERRCODE_LOG),
              errmsg("[REDO_LOG_TRACE]XLogInsert: ProcLastRecPtr:%lu,XactLastRecEnd:%lu,"
-                    "rmid:%hhu,info:%hhu,isupgrade:%d,newPageLsn:%lu,",
-                    t_thrd.xlog_cxt.ProcLastRecPtr, t_thrd.xlog_cxt.XactLastRecEnd, rmid, info, isupgrade, EndPos)));
+                    "rmid:%hhu,info:%hhu,newPageLsn:%lu,",
+                    t_thrd.xlog_cxt.ProcLastRecPtr, t_thrd.xlog_cxt.XactLastRecEnd, rmid, info, EndPos)));
     /* 'block_id<3'seems to be enough for problem location! */
     for (block_id = 0; block_id < t_thrd.xlog_cxt.max_registered_block_id && block_id < 3; block_id++) {
         registered_buffer *regbuf = &t_thrd.xlog_cxt.registered_buffers[block_id];
@@ -390,6 +463,19 @@ void XLogInsertTrace(RmgrId rmid, uint8 info, bool isupgrade, XLogRecPtr EndPos)
                         "pd_lower:%hu, pd_upper:%hu",
                         block_id, PageGetLSN(page), regbuf->rnode.spcNode, regbuf->rnode.dbNode, regbuf->rnode.relNode,
                         regbuf->block, ((PageHeader)page)->pd_lower, ((PageHeader)page)->pd_upper)));
+    }
+}
+
+void XlogInsertSleep(void)
+{
+    if (g_instance.streaming_dr_cxt.rpoSleepTime > 0) {
+        pgstat_report_waitevent(WAIT_EVENT_LOGCTRL_SLEEP);
+        if (g_instance.streaming_dr_cxt.rpoSleepTime < MAX_RPO_SLEEP_TIME) {
+            pg_usleep(g_instance.streaming_dr_cxt.rpoSleepTime);
+        } else {
+            pg_usleep(MAX_RPO_SLEEP_TIME);
+        }
+        pgstat_report_waitevent(WAIT_EVENT_END);
     }
 }
 
@@ -408,15 +494,25 @@ void XLogInsertTrace(RmgrId rmid, uint8 info, bool isupgrade, XLogRecPtr EndPos)
  * though not on the data they reference.  This is OK since the XLogRecData
  * structs are always just temporaries in the calling code.
  */
-XLogRecPtr XLogInsert(RmgrId rmid, uint8 info, bool isupgrade, int bucket_id)
+XLogRecPtr XLogInsert(RmgrId rmid, uint8 info, int bucket_id, bool istoast)
 {
     XLogRecPtr EndPos;
+    bool isSwitchoverBarrier = ((rmid == RM_BARRIER_ID) && (info == XLOG_BARRIER_SWITCHOVER));
+    if (g_instance.archive_obs_cxt.in_switchover == true || 
+        g_instance.streaming_dr_cxt.isInSwitchover == true) {
+        LWLockAcquire(HadrSwitchoverLock, LW_EXCLUSIVE);
+        if (isSwitchoverBarrier)
+            t_thrd.storage_cxt.isSwitchoverLockHolder = true;
+    }
+
+    XlogInsertSleep();
 
     /*
      * The caller can set rmgr bits and XLR_SPECIAL_REL_UPDATE; the rest are
      * reserved for use by me.
      */
-    if ((info & ~(XLR_RMGR_INFO_MASK | XLR_SPECIAL_REL_UPDATE | XLR_REL_HAS_BUCKET)) != 0) {
+    if ((info & ~(XLR_RMGR_INFO_MASK | XLR_SPECIAL_REL_UPDATE |
+         XLR_BTREE_UPGRADE_FLAG | XLR_REL_COMPRESS | XLR_IS_TOAST)) != 0) {
         ereport(PANIC, (errmsg("invalid xlog info mask %hhx", info)));
     }
 
@@ -444,9 +540,9 @@ XLogRecPtr XLogInsert(RmgrId rmid, uint8 info, bool isupgrade, int bucket_id)
          */
         GetFullPageWriteInfo(&fpw_info);
 
-        rdt = XLogRecordAssemble(rmid, info, fpw_info, &fpw_lsn, isupgrade, bucket_id);
+        rdt = XLogRecordAssemble(rmid, info, fpw_info, &fpw_lsn, bucket_id, istoast);
 
-        EndPos = XLogInsertRecord(rdt, fpw_lsn, isupgrade);
+        EndPos = XLogInsertRecord(rdt, fpw_lsn);
     } while (XLByteEQ(EndPos, InvalidXLogRecPtr));
 
     /*
@@ -454,7 +550,7 @@ XLogRecPtr XLogInsert(RmgrId rmid, uint8 info, bool isupgrade, int bucket_id)
      * when log level belows DEBUG4
      */
     if (module_logging_is_on(MOD_REDO)) {
-        XLogInsertTrace(rmid, info, isupgrade, EndPos);
+        XLogInsertTrace(rmid, info, EndPos);
     }
 
     /*
@@ -463,11 +559,99 @@ XLogRecPtr XLogInsert(RmgrId rmid, uint8 info, bool isupgrade, int bucket_id)
      * backuped page if any. Caller must hold the buffer lock.
      */
     XLogResetLogicalPage();
-
-    XLogResetInsertion();
+    
+    /* Switchover Barrier log will not release the lock */
+    if ((g_instance.archive_obs_cxt.in_switchover == true || 
+        g_instance.streaming_dr_cxt.isInSwitchover == true)) {
+        if (!isSwitchoverBarrier) {
+            LWLockRelease(HadrSwitchoverLock);
+        } else {
+            t_thrd.xlog_cxt.LocalXLogInsertAllowed = 0;
+        }
+    }
 
     return EndPos;
 }
+
+/*
+ * This marco is used to get correct XLogRecData of heap Update/Delete/Insert, only used in function
+ * XLogNeedVMPhysicalLocation. DONNOT change variable name "rdata" in XLogNeedVMPhysicalLocation!!!
+ */
+#define XLOG_GET_UDI_RDATA(type) \
+            Assert(t_thrd.xlog_cxt.mainrdata_len != 0); \
+            if (isinit) { \
+                Assert(rdata->next != NULL); \
+                rdata = rdata->next; \
+            } \
+            Assert(rdata->len > 0); \
+            type *xlrec = (type *)(rdata->data) \
+
+/*
+ * Clearing a visibility map bit is WAL-logged together with heap_insert/heap_update/heap_delete.
+ * Tools like Roach can calculate modified VM block according to heap block in heap-disk, which is
+ * not possible in segment-page storage. Thus, we need to add additional VM physical location if
+ * necessary 
+ */
+static bool XLogNeedVMPhysicalLocation(RmgrId rmi, uint8 info, int blockId)
+{
+    bool isinit = info & XLOG_HEAP_INIT_PAGE;
+    XLogRecData *rdata = t_thrd.xlog_cxt.mainrdata_head;
+    
+    if (rmi == RM_HEAP_ID) {
+        switch (info & XLOG_HEAP_OPMASK) {
+            case XLOG_HEAP_INSERT: {
+                XLOG_GET_UDI_RDATA(xl_heap_insert);
+                Assert(blockId == 0);
+
+                return (xlrec->flags & XLH_INSERT_ALL_VISIBLE_CLEARED) != 0;
+                break;
+            }
+            case XLOG_HEAP_DELETE: {
+                XLOG_GET_UDI_RDATA(xl_heap_delete);
+                Assert(blockId == 0);
+
+                return (xlrec->flags & XLH_DELETE_ALL_VISIBLE_CLEARED) != 0;
+                break;
+            }
+            case XLOG_HEAP_UPDATE:
+            case XLOG_HEAP_HOT_UPDATE: {
+                XLOG_GET_UDI_RDATA(xl_heap_update);
+
+                if (blockId == 0) {
+                    if (t_thrd.xlog_cxt.registered_buffers[1].in_use) {
+                        return (xlrec->flags & XLH_UPDATE_NEW_ALL_VISIBLE_CLEARED) != 0;
+                    } else {
+                        return (xlrec->flags & XLH_UPDATE_OLD_ALL_VISIBLE_CLEARED) != 0;
+                    }
+                } else if (blockId == 1) {
+                    return (xlrec->flags & XLH_UPDATE_OLD_ALL_VISIBLE_CLEARED) != 0;
+                } else {
+                    Assert(0);
+                }
+                break;
+            }
+            default:
+                break;
+        };
+    } else if (rmi == RM_HEAP2_ID) {
+        if ((info & XLOG_HEAP_OPMASK) == XLOG_HEAP2_MULTI_INSERT) {
+            XLOG_GET_UDI_RDATA(xl_heap_multi_insert);
+            
+            Assert(blockId == 0);
+            return (xlrec->flags & XLH_INSERT_ALL_VISIBLE_CLEARED) != 0;
+        }
+    }
+    return false;
+}
+
+/* This macro can be only used in XLogRecordAssemble to assemble on variable into xlog */
+#define XLOG_ASSEMBLE_ONE_ITEM(scratch, size, src, remained_size) \
+    do { \
+        rc = memcpy_s(scratch, remained_size, src, size); \
+        securec_check(rc, "", ""); \
+        (scratch) += (size); \
+        (remained_size) -= (size); \
+    } while (0)
 
 /*
  * Assemble a WAL record from the registered data and buffers into an
@@ -480,9 +664,18 @@ XLogRecPtr XLogInsert(RmgrId rmid, uint8 info, bool isupgrade, int bucket_id)
  * of all of them, *fpw_lsn is set to the lowest LSN among such pages. This
  * signals that the assembled record is only good for insertion on the
  * assumption that the RedoRecPtr and doPageWrites values were up-to-date.
+ * 
+ * After introducing segment-page storage, BlockNumber and RelFileNode in xlog
+ * are logical block number and relation file node. In some scenario, e.g.,
+ * incremental buiild and incremental backup (Roach), these tools need to parse
+ * xlog directly to get the physical locations of modified  blocks.
+ * However, the block map tree (BMT) of related segment may be recycled at the
+ * moment these tools parsing the xlog. Thus, we add physical locaiton info
+ * (file + blocknumber, 5 Bytes in total) for each block in a xlog.
+ * 
  */
 static XLogRecData *XLogRecordAssemble(RmgrId rmid, uint8 info, XLogFPWInfo fpw_info, XLogRecPtr *fpw_lsn,
-                                       bool isupgrade, int bucket_id)
+    int bucket_id, bool istoast)
 {
     XLogRecData *rdt = NULL;
     uint32 total_len = 0;
@@ -492,6 +685,7 @@ static XLogRecData *XLogRecordAssemble(RmgrId rmid, uint8 info, XLogFPWInfo fpw_
     XLogRecData *rdt_datas_last = NULL;
     XLogRecord *rechdr = NULL;
     char *scratch = t_thrd.xlog_cxt.hdr_scratch;
+    ssize_t remained_size = HEADER_SCRATCH_SIZE;
     errno_t rc = EOK;
     bool hashbucket_flag = false;
     bool no_hashbucket_flag = false;
@@ -502,7 +696,7 @@ static XLogRecData *XLogRecordAssemble(RmgrId rmid, uint8 info, XLogFPWInfo fpw_
      * The record begins with the fixed-size header
      */
     rechdr = (XLogRecord *)scratch;
-    scratch += (isupgrade ? SizeOfXLogRecordOld : SizeOfXLogRecord);
+    scratch += SizeOfXLogRecord;
 
     t_thrd.xlog_cxt.ptr_hdr_rdt->next = NULL;
     rdt_datas_last = t_thrd.xlog_cxt.ptr_hdr_rdt;
@@ -522,9 +716,20 @@ static XLogRecData *XLogRecordAssemble(RmgrId rmid, uint8 info, XLogFPWInfo fpw_
         XLogRecordBlockImageHeader bimg;
         bool page_logical = false;
         bool samerel = false;
+        bool tde = false;
+
+        // must be uncompressed table during upgrade
+        bool isCompressedTable = regbuf->rnode.opt != 0;
+        if (t_thrd.proc->workingVersionNum < PAGE_COMPRESSION_VERSION) {
+            Assert(!isCompressedTable);
+        }
 
         if (!regbuf->in_use)
             continue;
+
+        if (regbuf->encrypt) {
+            tde = true;
+        }
 
         /*
          * Determine if this block needs to be backed up. In redo routine, we treate
@@ -576,18 +781,35 @@ static XLogRecData *XLogRecordAssemble(RmgrId rmid, uint8 info, XLogFPWInfo fpw_
             Page page = regbuf->page;
 
             /* check for garbage data. for memory check, It means data modify error in memory. */
-            if (!PageHeaderIsValid((PageHeader)page))
+            /* Note: rmid check is not sufficient to determine the page layout.
+             *       eg: MarkBufferDirtyHint() uses rmid RM_XLOG_ID regardless of the Page version.
+             *       The problem with using PageGetPageLayoutVersion() is it is not self maintaining.
+             *       If a new layout eg PG_UHEAP_PAGE_LAYOUT_VERSION_2 is added then the statement
+             *       below also needs to be updated.
+             */
+            bool isPageValid = (PageGetPageLayoutVersion(page) == PG_UHEAP_PAGE_LAYOUT_VERSION) ?
+                                UPageHeaderIsValid((UHeapPageHeaderData *) page) :
+                                PageHeaderIsValid((PageHeader)page);
+            if (!isPageValid) {
                 ereport(PANIC,
                         (errmsg("invalid page header in block %u, spc oid %u db oid %u relfilenode %u", regbuf->block,
                                 regbuf->rnode.spcNode, regbuf->rnode.dbNode, regbuf->rnode.relNode)));
+            }
 
             /*
              * The page needs to be backed up, so set up *bimg
              */
             if (regbuf->flags & REGBUF_STANDARD) {
                 /* Assume we can omit data between pd_lower and pd_upper */
-                uint16 lower = ((PageHeader)page)->pd_lower;
-                uint16 upper = ((PageHeader)page)->pd_upper;
+                uint16 lower;
+                uint16 upper;
+                if (rmid == RM_UHEAP_ID) {
+                    lower = ((UHeapPageHeaderData *)page)->pd_lower;
+                    upper = ((UHeapPageHeaderData *)page)->pd_upper;
+                } else {
+                    lower = ((PageHeader)page)->pd_lower;
+                    upper = ((PageHeader)page)->pd_upper;
+                }
 
                 if (lower >= GetPageHeaderSize(page) && upper > lower && upper <= BLCKSZ) {
                     bimg.hole_offset = lower;
@@ -649,75 +871,109 @@ static XLogRecData *XLogRecordAssemble(RmgrId rmid, uint8 info, XLogFPWInfo fpw_
             samerel = false;
         prev_regbuf = regbuf;
 
-        if (!samerel && regbuf->rnode.bucketNode != InvalidBktId) {
+        if (!samerel && (IsSegmentFileNode(regbuf->rnode) || isCompressedTable)) {
             Assert(bkpb.id <= XLR_MAX_BLOCK_ID);
-            bkpb.id += BKID_HAS_BUCKET;
+            bkpb.id += BKID_HAS_BUCKET_OR_SEGPAGE;
+        }
+
+        if (!samerel && tde) {
+            bkpb.id += BKID_HAS_TDE_PAGE;
         }
 
         /* Ok, copy the header to the scratch buffer */
-        rc = memcpy_s(scratch, SizeOfXLogRecordBlockHeader, &bkpb, SizeOfXLogRecordBlockHeader);
-        securec_check(rc, "", "");
-        scratch += SizeOfXLogRecordBlockHeader;
+        XLOG_ASSEMBLE_ONE_ITEM(scratch, SizeOfXLogRecordBlockHeader, &bkpb, remained_size);
         if (needs_backup) {
-            rc = memcpy_s(scratch, SizeOfXLogRecordBlockImageHeader, &bimg, SizeOfXLogRecordBlockImageHeader);
-            securec_check(rc, "", "");
-            scratch += SizeOfXLogRecordBlockImageHeader;
+            XLOG_ASSEMBLE_ONE_ITEM(scratch, SizeOfXLogRecordBlockImageHeader, &bimg, remained_size);
         }
 
         if (!samerel) {
-            if (regbuf->rnode.bucketNode != InvalidBktId) {
-                info |= XLR_REL_HAS_BUCKET;
-                rc = memcpy_s(scratch, sizeof(RelFileNode), &regbuf->rnode, sizeof(RelFileNode));
-                securec_check(rc, "\0", "\0");
-                scratch += sizeof(RelFileNode);
-                hashbucket_flag = true;
+            if (IsSegmentFileNode(regbuf->rnode) || isCompressedTable) {
+                if (IsSegmentFileNode(regbuf->rnode)) {
+                    XLOG_ASSEMBLE_ONE_ITEM(scratch, sizeof(RelFileNode), &regbuf->rnode, remained_size);
+                    hashbucket_flag = true;
+                } else if (isCompressedTable) {
+                    if (t_thrd.proc->workingVersionNum < PAGE_COMPRESSION_VERSION) {
+                        Assert(!isCompressedTable);
+                        RelFileNodeV2 relFileNodeV2;
+                        RelFileNodeV2Copy(relFileNodeV2, regbuf->rnode);
+                        XLOG_ASSEMBLE_ONE_ITEM(scratch, sizeof(RelFileNodeV2), &regbuf->rnode, remained_size);
+                    } else {
+                        info |= XLR_REL_COMPRESS;
+                        XLOG_ASSEMBLE_ONE_ITEM(scratch, sizeof(RelFileNode), &regbuf->rnode, remained_size);
+                    }
+                }
             } else {
-                rc = memcpy_s(scratch, sizeof(RelFileNodeOld), &regbuf->rnode, sizeof(RelFileNodeOld));
-                securec_check(rc, "", "");
-                scratch += sizeof(RelFileNodeOld);
+                XLOG_ASSEMBLE_ONE_ITEM(scratch, sizeof(RelFileNodeOld), &regbuf->rnode, remained_size);
                 no_hashbucket_flag = true;
             }
 
-            rc = memcpy_s(scratch, sizeof(uint16), &regbuf->extra_flag, sizeof(uint16));
-            securec_check(rc, "", "");
-            scratch += sizeof(uint16);
+            if (tde) {
+                XLOG_ASSEMBLE_ONE_ITEM(scratch, sizeof(TdeInfo), regbuf->tdeinfo, remained_size);
+            }
+            XLOG_ASSEMBLE_ONE_ITEM(scratch, sizeof(uint16), &regbuf->extra_flag, remained_size);
         }
-        rc = memcpy_s(scratch, sizeof(BlockNumber), &regbuf->block, sizeof(BlockNumber));
-        securec_check(rc, "", "");
-        scratch += sizeof(BlockNumber);
 
-        rc = memcpy_s(scratch, sizeof(XLogRecPtr), &regbuf->lastLsn, sizeof(XLogRecPtr));
-        securec_check(rc, "", "");
-        scratch += sizeof(XLogRecPtr);
+        XLOG_ASSEMBLE_ONE_ITEM(scratch, sizeof(BlockNumber), &regbuf->block, remained_size);
+        /* Record physical block number for segment-page storage */
+        if (XLOG_NEED_PHYSICAL_LOCATION(regbuf->rnode)) {
+            SegmentCheck(regbuf->seg_file_no != EXTENT_INVALID);
+
+            bool vm_loc = XLogNeedVMPhysicalLocation(rmid, info, block_id);
+            if (vm_loc) {
+                regbuf->seg_file_no |= BKPBLOCK_HAS_VM_LOC;
+            }
+
+            XLOG_ASSEMBLE_ONE_ITEM(scratch, sizeof(uint8), &regbuf->seg_file_no, remained_size);
+            XLOG_ASSEMBLE_ONE_ITEM(scratch, sizeof(BlockNumber), &regbuf->seg_block, remained_size);
+
+            if (vm_loc) {
+                // logic block number of visibility map block
+                BlockNumber vm_block = HEAPBLK_TO_MAPBLOCK(regbuf->block);  
+                SegPageLocation loc = seg_get_physical_location(regbuf->rnode, VISIBILITYMAP_FORKNUM, vm_block);
+                uint8 vm_segfileno = (uint8) EXTENT_SIZE_TO_TYPE(loc.extent_size);
+
+                XLOG_ASSEMBLE_ONE_ITEM(scratch, sizeof(uint8), &vm_segfileno, remained_size);
+                XLOG_ASSEMBLE_ONE_ITEM(scratch, sizeof(BlockNumber), &loc.blocknum, remained_size);
+            }
+        }
+        XLOG_ASSEMBLE_ONE_ITEM(scratch, sizeof(XLogRecPtr), &regbuf->lastLsn, remained_size);
     }
 
+    int m_session_id = u_sess->reporigin_cxt.originId != InvalidRepOriginId ?
+        u_sess->reporigin_cxt.originId :
+        u_sess->attr.attr_storage.replorigin_sesssion_origin;
+    bool m_include_origin = t_thrd.xlog_cxt.include_origin;
+
     /* followed by the record's origin, if any */
-    if (u_sess->attr.attr_storage.replorigin_sesssion_origin == 0 &&
+    if (m_session_id == InvalidRepOriginId &&
         (u_sess->attr.attr_sql.enable_cluster_resize || t_thrd.role == AUTOVACUUM_WORKER)) {
-        t_thrd.xlog_cxt.include_origin = true;
-        u_sess->attr.attr_storage.replorigin_sesssion_origin = 1;
+        m_include_origin = true;
+        m_session_id = 1;
     }
 
     /* followed by the record's origin, if any */
-    if (t_thrd.xlog_cxt.include_origin && u_sess->attr.attr_storage.replorigin_sesssion_origin != InvalidRepOriginId) {
+    if (m_include_origin && (m_session_id != InvalidRepOriginId || istoast)) {
+        Assert(remained_size > 0);
         *(scratch++) = XLR_BLOCK_ID_ORIGIN;
-        rc = memcpy_s(scratch, sizeof(u_sess->attr.attr_storage.replorigin_sesssion_origin),
-                      &u_sess->attr.attr_storage.replorigin_sesssion_origin,
-                      sizeof(u_sess->attr.attr_storage.replorigin_sesssion_origin));
-        securec_check(rc, "", "");
-        scratch += sizeof(u_sess->attr.attr_storage.replorigin_sesssion_origin);
+        remained_size--;
+        if (istoast && t_thrd.proc->workingVersionNum >= PARALLEL_DECODE_VERSION_NUM && XLogLogicalInfoActive()) {
+            m_session_id = (int)((uint32)(m_session_id) | TOAST_FLAG);
+        }
+        XLOG_ASSEMBLE_ONE_ITEM(scratch, sizeof(m_session_id), &m_session_id, remained_size);
     }
 
     /* followed by main data, if any */
     if (t_thrd.xlog_cxt.mainrdata_len > 0) {
         if (t_thrd.xlog_cxt.mainrdata_len > 255) {
+            Assert(remained_size > 0);
             *(scratch++) = XLR_BLOCK_ID_DATA_LONG;
-            rc = memcpy_s(scratch, sizeof(uint32), &t_thrd.xlog_cxt.mainrdata_len, sizeof(uint32));
-            securec_check(rc, "", "");
-            scratch += sizeof(uint32);
+            remained_size--;
+            XLOG_ASSEMBLE_ONE_ITEM(scratch, sizeof(uint32), &t_thrd.xlog_cxt.mainrdata_len, remained_size);
         } else {
+            Assert(remained_size >= 2);
             *(scratch++) = XLR_BLOCK_ID_DATA_SHORT;
             *(scratch++) = (uint8)t_thrd.xlog_cxt.mainrdata_len;
+            remained_size--;
         }
         rdt_datas_last->next = t_thrd.xlog_cxt.mainrdata_head;
         rdt_datas_last = t_thrd.xlog_cxt.mainrdata_last;
@@ -745,47 +1001,72 @@ static XLogRecData *XLogRecordAssemble(RmgrId rmid, uint8 info, XLogFPWInfo fpw_
      * the whole record in the order: rdata, then backup blocks, then record
      * header.
      */
-    if (isupgrade) {
-        /* using PG's CRC32 */
-        INIT_CRC32(rdata_crc);
-        COMP_CRC32(rdata_crc, t_thrd.xlog_cxt.hdr_scratch + SizeOfXLogRecordOld,
-                   t_thrd.xlog_cxt.ptr_hdr_rdt->len - SizeOfXLogRecordOld);
-        for (rdt = t_thrd.xlog_cxt.ptr_hdr_rdt->next; rdt != NULL; rdt = rdt->next)
-            COMP_CRC32(rdata_crc, rdt->data, rdt->len);
-    } else {
-        /* using CRC32C */
-        INIT_CRC32C(rdata_crc);
-        COMP_CRC32C(rdata_crc, t_thrd.xlog_cxt.hdr_scratch + SizeOfXLogRecord,
-                    t_thrd.xlog_cxt.ptr_hdr_rdt->len - SizeOfXLogRecord);
-        for (rdt = t_thrd.xlog_cxt.ptr_hdr_rdt->next; rdt != NULL; rdt = rdt->next)
-            COMP_CRC32C(rdata_crc, rdt->data, rdt->len);
-    }
+
+    /* using CRC32C */
+    INIT_CRC32C(rdata_crc);
+    COMP_CRC32C(rdata_crc, t_thrd.xlog_cxt.hdr_scratch + SizeOfXLogRecord,
+                t_thrd.xlog_cxt.ptr_hdr_rdt->len - SizeOfXLogRecord);
+    for (rdt = t_thrd.xlog_cxt.ptr_hdr_rdt->next; rdt != NULL; rdt = rdt->next)
+        COMP_CRC32C(rdata_crc, rdt->data, rdt->len);
 
     /*
      * Fill in the fields in the record header. Prev-link is filled in later,
      * once we know where in the WAL the record will be inserted. The CRC does
      * not include the record header yet.
      */
-    if (isupgrade) {
-        ((XLogRecordOld *)rechdr)->xl_xid = (ShortTransactionId)GetCurrentTransactionIdIfAny();
-        ((XLogRecordOld *)rechdr)->xl_tot_len = total_len;
-        ((XLogRecordOld *)rechdr)->xl_info = info;
-        ((XLogRecordOld *)rechdr)->xl_rmid = rmid;
-        ((XLogRecordOld *)rechdr)->xl_prev = InvalidXLogRecPtrOld;
-        ((XLogRecordOld *)rechdr)->xl_crc = rdata_crc;
-    } else {
-        rechdr->xl_xid = GetCurrentTransactionIdIfAny();
-        rechdr->xl_tot_len = total_len;
-        rechdr->xl_info = info;
-        rechdr->xl_rmid = rmid;
-        rechdr->xl_prev = InvalidXLogRecPtr;
-        rechdr->xl_crc = rdata_crc;
-    }
+    bool isUHeap = (rmid >= RM_UHEAP_ID) && (rmid <= RM_UHEAPUNDO_ID);
+
+    rechdr->xl_xid = (isUHeap) ? GetTopTransactionIdIfAny() : GetCurrentTransactionIdIfAny();
+    rechdr->xl_tot_len = total_len;
+    rechdr->xl_info = info;
+    rechdr->xl_rmid = rmid;
+    rechdr->xl_prev = InvalidXLogRecPtr;
+    rechdr->xl_crc = rdata_crc;
     Assert(hashbucket_flag == false || no_hashbucket_flag == false);
     rechdr->xl_term = Max(g_instance.comm_cxt.localinfo_cxt.term_from_file,
                           g_instance.comm_cxt.localinfo_cxt.term_from_xlog);
-    rechdr->xl_bucket_id = (int2)(bucket_id + 1);
+    if ((rechdr->xl_term & XLOG_CONTAIN_CSN) != 0) {
+        ereport(PANIC, (errmodule(MOD_LOGICAL_DECODE), errcode(ERRCODE_LOG),
+            errmsg("Term has exceeded the limit %u", XLOG_MASK_TERM),
+            errdetail("The highest bit of term is occupied for logical decoding"),
+            errcause("Failover or switchover occurs too frequently"),
+            erraction("Make sure the cluster is under stable state.")));
+    }
+    if (t_thrd.proc->workingVersionNum >= PARALLEL_DECODE_VERSION_NUM && XLogLogicalInfoActive()) {
+        rechdr->xl_term |= XLOG_CONTAIN_CSN;
+    }
+    rechdr->xl_bucket_id = (uint2)(bucket_id + 1);
+
+#ifdef DEBUG_UHEAP
+#endif
+
     return t_thrd.xlog_cxt.ptr_hdr_rdt;
+}
+
+/*
+ * Determine whether the buffer referenced has to be backed up.
+ *
+ * Since we don't yet have the insert lock, fullPageWrites and forcePageWrites
+ * could change later, so the result should be used for optimization purposes
+ * only.
+ */
+bool
+XLogCheckBufferNeedsBackup(Buffer buffer)
+{
+    XLogRecPtr      redoRecPtr;
+    bool            doPageWrites = false;
+    Page            page;
+
+    XLogFPWInfo fpwInfo;
+    GetFullPageWriteInfo(&fpwInfo);
+    doPageWrites = fpwInfo.doPageWrites;
+    redoRecPtr = fpwInfo.redoRecPtr;
+
+    page = BufferGetPage(buffer);
+    if (doPageWrites && PageGetLSN(page) <= redoRecPtr)
+        return true;                    /* buffer requires backup */
+
+    return false;                           /* buffer does not need to be backed up */
 }
 
 /*
@@ -875,7 +1156,7 @@ XLogRecPtr XLogSaveBufferForHint(Buffer buffer, bool buffer_std)
             flags |= REGBUF_STANDARD;
 
         BufferGetTag(buffer, &rnode, &forkno, &blkno);
-        XLogRegisterBlock(0, &rnode, forkno, blkno, copied_buffer, flags);
+        XLogRegisterBlock(0, &rnode, forkno, blkno, copied_buffer, flags, NULL);
 
         recptr = XLogInsert(RM_XLOG_ID, XLOG_FPI_FOR_HINT);
     }

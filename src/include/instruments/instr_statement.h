@@ -159,16 +159,18 @@ typedef struct StatementStatContext {
     char* schema_name;      /* search path */
     char* application_name; /* workload identifier */
     StatLevel level;        /* which level metrics to be collected base on GUC */
+    StatLevel dynamic_track_level;              /* which dynamic level metrics to be collected */
 
     // variant, collect at commit handler
     uint64 unique_query_id;     /* from knl_u_unique_sql_context's unique_sql_id */
     uint64 debug_query_id;      /* from knl_session_context's debug_query_id */
     uint32 unique_sql_cn_id;    /* from knl_session_context's unique_sql_cn_id */
+    char trace_id[MAX_TRACE_ID_SIZE]; /* from knl_session_context's trace_id */
     char* query;                /* from PgBackendStatus's st_activity
                                     or knl_u_unique_sql_context's curr_single_unique_sql */
     TimestampTz start_time;     /* from PgBackendStatus's st_activity_start_timestamp */
     TimestampTz finish_time;    /* commit's GetCurrentTimestamp */
-    int slow_query_threshold;   /* from knl_session_attr_storage's log_min_duration_statement */
+    int64 slow_query_threshold;   /* from knl_session_attr_storage's log_min_duration_statement */
 
     int64 timeModel[TOTAL_TIME_INFO_TYPES];     /* from knl_u_stat_context's localTimeInfoArray */
     uint64 networkInfo[TOTAL_NET_INFO_TYPES];   /* from knl_u_stat_context's localNetInfo */
@@ -205,12 +207,14 @@ extern void instr_stmt_report_txid(uint64 txid);
 extern void instr_stmt_report_query(uint64 unique_query_id);
 extern void instr_stmt_report_query_plan(QueryDesc *queryDesc);
 extern void instr_stmt_report_debug_query_id(uint64 debug_query_id);
+extern void instr_stmt_report_trace_id(char *trace_id);
 extern void instr_stmt_report_start_time();
 extern void instr_stmt_report_finish_time();
 extern bool instr_stmt_need_track_plan();
 extern void instr_stmt_report_returned_rows(uint64 returned_rows);
 extern void instr_stmt_report_soft_parse(uint64 soft_parse);
 extern void instr_stmt_report_hard_parse(uint64 hard_parse);
+extern void instr_stmt_dynamic_change_level();
 
 #endif
 

@@ -21,6 +21,12 @@
  *
  * -------------------------------------------------------------------------
  */
+#ifndef ENABLE_LITE_MODE
+#include "parquet/platform.h"
+#include "parquet/statistics.h"
+#include "parquet/types.h"
+#endif
+
 #include "parquet_column_reader.h"
 #include "parquet_input_stream_adapter.h"
 #include "mb/pg_wchar.h"
@@ -29,7 +35,9 @@
 #include "access/dfs/dfs_query.h"
 #include "access/dfs/dfs_query_check.h"
 #include "access/dfs/dfs_wrapper.h"
+#ifndef ENABLE_LITE_MODE
 #include "arrow/util/bit-util.h"
+#endif
 
 namespace dfs {
 namespace reader {
@@ -143,7 +151,7 @@ Datum convertToDatumT(void *primitiveBatch, uint64 rowId, parquet::Type::type ph
             switch (varType) {
                 case TIMESTAMPOID:
                 case TIMESTAMPTZOID: {
-                    auto nanoSeconds = Int96GetNanoSeconds(tmpValue);
+                    auto nanoSeconds = dfs::Int96GetNanoSeconds(tmpValue);
                     Timestamp timestamp = nanoSecondsToPsqlTimestamp(nanoSeconds);
                     result = TimestampGetDatum(timestamp);
                     break;
@@ -499,7 +507,7 @@ private:
 
         if (!matchDataTypeWithPsql()) {
             auto physicalTypeString = parquet::TypeToString(m_desc->physical_type());
-            auto logicalTypeString = parquet::LogicalTypeToString(m_desc->logical_type());
+            auto logicalTypeString = parquet::ConvertedTypeToString(m_desc->converted_type());
 
             ereport(ERROR, (errcode(ERRCODE_DATA_EXCEPTION), errmodule(MOD_PARQUET),
                             errmsg("Error occurred while reading column %d: PARQUET and mpp "
@@ -906,8 +914,10 @@ private:
                 switch (m_var->vartype) {
                     case TIMESTAMPOID: {
                         SET_SIMPLE_MIN_MAX_STATISTICS(tmpStat, TimestampGetDatum,
-                                                      nanoSecondsToPsqlTimestamp(Int96GetNanoSeconds(tmpStat->min())),
-                                                      nanoSecondsToPsqlTimestamp(Int96GetNanoSeconds(tmpStat->max())));
+                                                      nanoSecondsToPsqlTimestamp(dfs::
+                                                                                 Int96GetNanoSeconds(tmpStat->min())),
+                                                      nanoSecondsToPsqlTimestamp(dfs::
+                                                                                 Int96GetNanoSeconds(tmpStat->max())));
                         ret = 1;
                         break;
                     }
@@ -1416,7 +1426,7 @@ void ParquetColumnReaderImpl<ReaderType>::predicateFilter(uint64_t numValues, bo
                         if (!nullFilter(isSelected, i)) {
                             parquet::Int96 tmpValue = data[i];
 
-                            auto nanoSeconds = Int96GetNanoSeconds(tmpValue);
+                            auto nanoSeconds = dfs::Int96GetNanoSeconds(tmpValue);
                             nanoSeconds -= (PARQUET_PSQL_EPOCH_IN_DAYS * NANOSECONDS_PER_DAY);
                             nanoSeconds += epochOffsetDiff;
                             Timestamp timestamp = (Timestamp)(nanoSeconds / NANOSECONDS_PER_MICROSECOND);

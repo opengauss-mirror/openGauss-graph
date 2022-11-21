@@ -29,9 +29,11 @@
 #include "access/relscan.h"
 #include "access/tableam.h"
 #include "catalog/pg_partition_fn.h"
-#include "executor/execdebug.h"
-#include "executor/nodeIndexscan.h"
+#include "commands/cluster.h"
+#include "executor/exec/execdebug.h"
+#include "executor/node/nodeIndexscan.h"
 #include "optimizer/clauses.h"
+#include "storage/tcap.h"
 #include "utils/array.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
@@ -45,7 +47,6 @@
 
 static TupleTableSlot* IndexNext(IndexScanState* node);
 static void ExecInitNextPartitionForIndexScan(IndexScanState* node);
-
 /* ----------------------------------------------------------------
  *		IndexNext
  *
@@ -61,6 +62,7 @@ static TupleTableSlot* IndexNext(IndexScanState* node)
     IndexScanDesc scandesc;
     HeapTuple tuple;
     TupleTableSlot* slot = NULL;
+    bool isUstore = false;
 
     /*
      * extract necessary information from index scan node
@@ -78,26 +80,67 @@ static TupleTableSlot* IndexNext(IndexScanState* node)
     econtext = node->ss.ps.ps_ExprContext;
     slot = node->ss.ss_ScanTupleSlot;
 
+    isUstore = RelationIsUstoreFormat(node->ss.ss_currentRelation);
+
+#ifdef GS_GRAPH
+    if (scandesc == NULL)
+	{
+		/*
+		 * We reach here if the index scan is not parallel, or if we're
+		 * serially executing an index scan that was planned to be parallel.
+		 */
+		scandesc = index_beginscan(node->ss.ss_currentRelation,
+								   node->iss_RelationDesc,
+								   estate->es_snapshot,
+								   node->iss_NumScanKeys,
+								   node->iss_NumOrderByKeys);
+
+		node->iss_ScanDesc = scandesc;
+
+		/*
+		 * If no run-time keys to calculate or they are ready, go ahead and
+		 * pass the scankeys to the index AM.
+		 */
+		if (node->iss_NumRuntimeKeys == 0 || node->iss_RuntimeKeysReady)
+			index_rescan(scandesc,
+						 node->iss_ScanKeys, node->iss_NumScanKeys,
+						 node->iss_OrderByKeys, node->iss_NumOrderByKeys);
+	}
+#endif
+
     /*
      * ok, now that we have what we need, fetch the next tuple.
      */
-    while ((tuple = scan_handler_idx_getnext(scandesc, direction)) != NULL) {
-        IndexScanDesc index_scan = GetIndexScanDesc(scandesc);
-        /*
-         * Store the scanned tuple in the scan tuple slot of the scan state.
-         * Note: we pass 'false' because tuples returned by amgetnext are
-         * pointers onto disk pages and must not be pfree_ext()'d.
-         */
-        (void)ExecStoreTuple(tuple,  /* tuple to store */
-            slot,              /* slot to store in */
-            index_scan->xs_cbuf, /* buffer containing tuple */
-            false);            /* don't pfree */
+    // we should change abs_idx_getnext to call IdxScanAm(scan)->idx_getnext and channge .idx_getnext in g_HeapIdxAm to
+    // IndexGetnextSlot
+    while (true) {
+        IndexScanDesc indexScan = GetIndexScanDesc(scandesc);
+        if (isUstore) {
+            if (!IndexGetnextSlot(scandesc, direction, slot)) {
+                break;
+            }
+        } else {
+            if ((tuple = scan_handler_idx_getnext(scandesc, direction)) == NULL) {
+                break;
+            }
+            /* Update indexScan, because hashbucket may switch current index in scan_handler_idx_getnext */
+            indexScan = GetIndexScanDesc(scandesc);
+            /*
+             * Store the scanned tuple in the scan tuple slot of the scan state.
+             * Note: we pass 'false' because tuples returned by amgetnext are
+             * pointers onto disk pages and must not be pfree_ext()'d.
+             */
+            (void)ExecStoreTuple(tuple, /* tuple to store */
+                slot,                   /* slot to store in */
+                indexScan->xs_cbuf,     /* buffer containing tuple */
+                false);                 /* don't pfree */
+        }
 
         /*
          * If the index was lossy, we have to recheck the index quals using
          * the fetched tuple.
          */
-        if (index_scan->xs_recheck) {
+        if (indexScan->xs_recheck) {
             econtext->ecxt_scantuple = slot;
             ResetExprContext(econtext);
             if (!ExecQual(node->indexqualorig, econtext, false)) {
@@ -203,7 +246,9 @@ void ExecReScanIndexScan(IndexScanState* node)
     /*
      * deal with partitioned table
      */
-    if (node->ss.isPartTbl) {
+    bool partpruning = ENABLE_SQL_BETA_FEATURE(PARTITION_OPFUSION) && list_length(node->ss.partitions) == 1;
+    /* if only one partition is scaned in indexscan, we don't need do rescan for partition */
+    if (node->ss.isPartTbl && !partpruning) {
         /*
          * if node->ss.ss_ReScan = true, just do rescaning as non-partitioned
          * table; else switch to next partition for scaning.
@@ -230,11 +275,110 @@ void ExecReScanIndexScan(IndexScanState* node)
     }
 
     /* reset index scan */
-    scan_handler_idx_rescan(
-        node->iss_ScanDesc, node->iss_ScanKeys, node->iss_NumScanKeys, node->iss_OrderByKeys, node->iss_NumOrderByKeys);
+#ifdef GS_GRAPH
+    if(node->iss_ScanDesc!=NULL)
+#endif
+        scan_handler_idx_rescan(
+            node->iss_ScanDesc, node->iss_ScanKeys, node->iss_NumScanKeys, node->iss_OrderByKeys, node->iss_NumOrderByKeys);
 
     ExecScanReScan(&node->ss);
 }
+
+#ifdef GS_GRAPH
+static IndexScanContext *getCurrentContext(IndexScanState *node, bool create)
+{
+	IndexScanContext *ctx;
+
+	if (dlist_has_next(&node->ctxs_head, node->prev_ctx_node))
+	{
+		dlist_node *ctx_node;
+
+		ctx_node = dlist_next_node(&node->ctxs_head, node->prev_ctx_node);
+		ctx = dlist_container(IndexScanContext, list, ctx_node);
+	}
+	else if (create)
+	{
+		ctx = (IndexScanContext*)palloc(sizeof(*ctx));
+		ctx->chgParam = NULL;
+		ctx->scanDesc = NULL;
+
+		dlist_push_tail(&node->ctxs_head, &ctx->list);
+	}
+	else
+	{
+		ctx = NULL;
+	}
+
+	return ctx;
+}
+void ExecNextIndexScanContext(IndexScanState *node)
+{
+	IndexScanContext *ctx;
+
+	/* store the current context */
+	ctx = getCurrentContext(node, true);
+	ctx->chgParam = node->ss.ps.chgParam;
+	ctx->scanDesc = node->iss_ScanDesc;
+
+	/* make the current context previous context */
+	node->prev_ctx_node = &ctx->list;
+
+	ctx = getCurrentContext(node, false);
+	if (ctx == NULL)
+	{
+		/* if there is no current context, initialize the current scan */
+		node->ss.ps.chgParam = NULL;
+		node->iss_ScanDesc = NULL;
+	}
+	else
+	{
+		/* if there is the current context already, use it */
+
+		Assert(ctx->chgParam == NULL);
+		node->ss.ps.chgParam = NULL;
+
+		/* ctx->scanDesc can be NULL if ss_skipLabelScan */
+		node->iss_ScanDesc = ctx->scanDesc;
+	}
+}
+
+void
+ExecPrevIndexScanContext(IndexScanState *node)
+{
+	IndexScanContext *ctx;
+	dlist_node *ctx_node;
+
+	/*
+	 * Store the current iss_ScanDesc. It will be reused when the current scan
+	 * is re-scanned next time.
+	 */
+	ctx = getCurrentContext(node, true);
+
+	/* if chgParam is not NULL, free it now */
+	if (node->ss.ps.chgParam != NULL)
+	{
+		bms_free(node->ss.ps.chgParam);
+		node->ss.ps.chgParam = NULL;
+	}
+
+	ctx->chgParam = NULL;
+	ctx->scanDesc = node->iss_ScanDesc;
+
+	/* make the previous scan current scan */
+	ctx_node = node->prev_ctx_node;
+	Assert(ctx_node != &node->ctxs_head.head);
+
+	if (dlist_has_prev(&node->ctxs_head, ctx_node))
+		node->prev_ctx_node = dlist_prev_node(&node->ctxs_head, ctx_node);
+	else
+		node->prev_ctx_node = &node->ctxs_head.head;
+
+	/* restore */
+	ctx = dlist_container(IndexScanContext, list, ctx_node);
+	node->ss.ps.chgParam = ctx->chgParam;
+	node->iss_ScanDesc = ctx->scanDesc;
+}
+#endif
 
 /*
  * ExecIndexEvalRuntimeKeys
@@ -434,6 +578,34 @@ void ExecEndIndexScan(IndexScanState* node)
     (void)ExecClearTuple(node->ss.ps.ps_ResultTupleSlot);
     (void)ExecClearTuple(node->ss.ss_ScanTupleSlot);
 
+#ifdef GS_GRAPH
+    if (!dlist_is_empty(&node->ctxs_head))
+	{
+		dlist_node *ctx_node;
+		IndexScanContext *ctx;
+		dlist_mutable_iter iter;
+
+		/* indexScanDesc is the most recent value. Ignore the first context. */
+		ctx_node = dlist_pop_head_node(&node->ctxs_head);
+		ctx = dlist_container(IndexScanContext, list, ctx_node);
+		pfree(ctx);
+
+		dlist_foreach_modify(iter, &node->ctxs_head)
+		{
+			dlist_delete(iter.cur);
+
+			ctx = dlist_container(IndexScanContext, list, iter.cur);
+
+			if (ctx->scanDesc != NULL)
+				index_endscan(ctx->scanDesc);
+
+			pfree(ctx);
+		}
+	}
+	node->prev_ctx_node = &node->ctxs_head.head;
+
+#endif
+
     /*
      * close the index relation (no-op if we didn't open it)
      */
@@ -458,8 +630,13 @@ void ExecEndIndexScan(IndexScanState* node)
             Assert(PointerIsValid(node->ss.ss_currentPartition));
             releaseDummyRelation(&(node->ss.ss_currentPartition));
 
-            /* close index partition */
-            releasePartitionList(node->iss_RelationDesc, &(node->iss_IndexPartitionList), NoLock);
+            if (RelationIsSubPartitioned(relation)) {
+                releaseSubPartitionList(index_relation_desc, &(node->iss_IndexPartitionList), NoLock);
+                releaseSubPartitionList(node->ss.ss_currentRelation, &(node->ss.subpartitions), NoLock);
+            } else {
+                /* close index partition */
+                releasePartitionList(node->iss_RelationDesc, &(node->iss_IndexPartitionList), NoLock);
+            }
 
             /* close table partition */
             releasePartitionList(node->ss.ss_currentRelation, &(node->ss.partitions), NoLock);
@@ -504,6 +681,108 @@ void ExecIndexRestrPos(IndexScanState* node)
  *			  index relation.
  * ----------------------------------------------------------------
  */
+void ExecInitIndexRelation(IndexScanState* node, EState* estate, int eflags)
+{
+    IndexScanState* index_state = node;
+    Snapshot scanSnap;
+    Relation current_relation = index_state->ss.ss_currentRelation;
+    IndexScan *index_scan = (IndexScan *)node->ss.ps.plan;
+
+    /*
+     * Choose user-specified snapshot if TimeCapsule clause exists, otherwise 
+     * estate->es_snapshot instead.
+     */
+    scanSnap = TvChooseScanSnap(index_state->iss_RelationDesc, &index_scan->scan, &index_state->ss);
+
+    /* deal with partition info */
+    if (index_state->ss.isPartTbl) {
+        index_state->iss_ScanDesc = NULL;
+
+        if (index_scan->scan.itrs > 0) {
+            Partition current_partition = NULL;
+            Partition currentindex = NULL;
+
+            /* Initialize table partition list and index partition list for following scan */
+            ExecInitPartitionForIndexScan(index_state, estate);
+
+            if (index_state->ss.partitions != NIL) {
+                /* construct a dummy relation with the first table partition for following scan */
+                if (RelationIsSubPartitioned(current_relation)) {
+                    Partition subOnePart = (Partition)list_nth(index_state->ss.partitions, index_state->ss.currentSlot);
+                    List *currentSubpartList = (List *)list_nth(index_state->ss.subpartitions, 0);
+                    List *currentindexlist = (List *)list_nth(index_state->iss_IndexPartitionList, 0);
+                    current_partition = (Partition)list_nth(currentSubpartList, 0);
+                    currentindex = (Partition)list_nth(currentindexlist, 0);
+                    Relation subOnePartRel = partitionGetRelation(index_state->ss.ss_currentRelation, subOnePart);
+                    index_state->ss.ss_currentPartition =
+                        partitionGetRelation(subOnePartRel, current_partition);
+                    releaseDummyRelation(&subOnePartRel);
+                } else {
+                    current_partition = (Partition)list_nth(index_state->ss.partitions, 0);
+                    currentindex = (Partition)list_nth(index_state->iss_IndexPartitionList, 0);
+                    index_state->ss.ss_currentPartition =
+                        partitionGetRelation(index_state->ss.ss_currentRelation, current_partition);
+                }
+
+                index_state->iss_CurrentIndexPartition =
+                    partitionGetRelation(index_state->iss_RelationDesc, currentindex);
+
+                /*
+                 * Verify if a DDL operation that froze all tuples in the relation
+                 * occured after taking the snapshot.
+                 */
+                if (RelationIsUstoreFormat(index_state->ss.ss_currentPartition)) {
+                    TransactionId relfrozenxid64 = InvalidTransactionId;
+                    getPartitionRelxids(index_state->ss.ss_currentPartition, &relfrozenxid64);
+                    if (TransactionIdPrecedes(FirstNormalTransactionId, scanSnap->xmax) &&
+                        !TransactionIdIsCurrentTransactionId(relfrozenxid64) &&
+                        TransactionIdPrecedes(scanSnap->xmax, relfrozenxid64)) {
+                        ereport(ERROR,
+                                (errcode(ERRCODE_SNAPSHOT_INVALID),
+                                 (errmsg("Snapshot too old."))));
+                    }
+                }
+
+                /* Initialize scan descriptor for partitioned table */
+                index_state->iss_ScanDesc = scan_handler_idx_beginscan(index_state->ss.ss_currentPartition,
+                    index_state->iss_CurrentIndexPartition,
+                    scanSnap,
+                    index_state->iss_NumScanKeys,
+                    index_state->iss_NumOrderByKeys,
+                    (ScanState*)index_state);
+            }
+        }
+    } else {
+        /*
+         * Verify if a DDL operation that froze all tuples in the relation
+         * occured after taking the snapshot.
+         */
+        if (RelationIsUstoreFormat(current_relation)) {
+            TransactionId relfrozenxid64 = InvalidTransactionId;
+            getRelationRelxids(current_relation, &relfrozenxid64);
+            if (TransactionIdPrecedes(FirstNormalTransactionId, scanSnap->xmax) &&
+                !TransactionIdIsCurrentTransactionId(relfrozenxid64) &&
+                TransactionIdPrecedes(scanSnap->xmax, relfrozenxid64)) {
+                ereport(ERROR,
+                        (errcode(ERRCODE_SNAPSHOT_INVALID),
+                         (errmsg("Snapshot too old."))));
+            }
+        }
+
+        /*
+         * Initialize scan descriptor.
+         */
+        index_state->iss_ScanDesc = scan_handler_idx_beginscan(current_relation,
+            index_state->iss_RelationDesc,
+            scanSnap,
+            index_state->iss_NumScanKeys,
+            index_state->iss_NumOrderByKeys,
+            (ScanState*)index_state);
+    }
+
+    return;
+}
+
 IndexScanState* ExecInitIndexScan(IndexScan* node, EState* estate, int eflags)
 {
     IndexScanState* index_state = NULL;
@@ -544,8 +823,6 @@ IndexScanState* ExecInitIndexScan(IndexScan* node, EState* estate, int eflags)
     index_state->ss.ps.qual = (List*)ExecInitExpr((Expr*)node->scan.plan.qual, (PlanState*)index_state);
     index_state->indexqualorig = (List*)ExecInitExpr((Expr*)node->indexqualorig, (PlanState*)index_state);
 
-
-
     /*
      * open the base relation and acquire appropriate lock on it.
      */
@@ -563,7 +840,7 @@ IndexScanState* ExecInitIndexScan(IndexScan* node, EState* estate, int eflags)
      * get the scan type from the relation descriptor.
      */
     ExecAssignScanType(&index_state->ss, CreateTupleDescCopy(RelationGetDescr(current_relation)));
-    index_state->ss.ss_ScanTupleSlot->tts_tupleDescriptor->tdTableAmType = TAM_HEAP;
+    index_state->ss.ss_ScanTupleSlot->tts_tupleDescriptor->tdTableAmType = current_relation->rd_tam_type;
 
     /*
      * Initialize result tuple type and projection info.
@@ -654,48 +931,7 @@ IndexScanState* ExecInitIndexScan(IndexScan* node, EState* estate, int eflags)
     }
 
     /* deal with partition info */
-    if (node->scan.isPartTbl) {
-        index_state->iss_ScanDesc = NULL;
-
-        if (node->scan.itrs > 0) {
-            Partition current_partition = NULL;
-            Partition currentindex = NULL;
-
-            /* Initialize table partition list and index partition list for following scan */
-            ExecInitPartitionForIndexScan(index_state, estate);
-
-            if (index_state->ss.partitions != NIL) {
-                /* construct a dummy relation with the first table partition for following scan */
-                current_partition = (Partition)list_nth(index_state->ss.partitions, 0);
-                index_state->ss.ss_currentPartition =
-                    partitionGetRelation(index_state->ss.ss_currentRelation, current_partition);
-
-                /* construct a dummy relation with the first table partition for following scan */
-                currentindex = (Partition)list_nth(index_state->iss_IndexPartitionList, 0);
-                index_state->iss_CurrentIndexPartition =
-                    partitionGetRelation(index_state->iss_RelationDesc, currentindex);
-
-                /* Initialize scan descriptor for partitioned table */
-                index_state->iss_ScanDesc = scan_handler_idx_beginscan(index_state->ss.ss_currentPartition,
-                    index_state->iss_CurrentIndexPartition,
-                    estate->es_snapshot,
-                    index_state->iss_NumScanKeys,
-                    index_state->iss_NumOrderByKeys,
-                    (ScanState*)index_state);
-                Assert(PointerIsValid(index_state->iss_ScanDesc));
-            }
-        }
-    } else {
-        /*
-         * Initialize scan descriptor.
-         */
-        index_state->iss_ScanDesc = scan_handler_idx_beginscan(current_relation,
-            index_state->iss_RelationDesc,
-            estate->es_snapshot,
-            index_state->iss_NumScanKeys,
-            index_state->iss_NumOrderByKeys,
-            (ScanState*)index_state);
-    }
+    ExecInitIndexRelation(index_state, estate, eflags);
 
     /*
      * If no run-time keys to calculate, go ahead and pass the scankeys to the
@@ -710,6 +946,11 @@ IndexScanState* ExecInitIndexScan(IndexScan* node, EState* estate, int eflags)
             index_state->iss_OrderByKeys,
             index_state->iss_NumOrderByKeys);
     }
+
+#ifdef GS_GRAPH
+    dlist_init(&index_state->ctxs_head);
+	index_state->prev_ctx_node = &index_state->ctxs_head.head;
+#endif
 
     /*
      * all done.
@@ -954,7 +1195,7 @@ void ExecIndexBuildScanKeys(PlanState* plan_state, Relation index, List* quals, 
                 opno = lfirst_oid(opnos_cell);
                 opnos_cell = lnext(opnos_cell);
 
-                if (index->rd_rel->relam != BTREE_AM_OID || varattno < 1 || varattno > index->rd_index->indnatts)
+                if (!OID_IS_BTREE(index->rd_rel->relam) || varattno < 1 || varattno > index->rd_index->indnatts)
                     ereport(ERROR,
                         (errcode(ERRCODE_INDEX_CORRUPTED),
                             errmsg("bogus RowCompare index qualification, attribute number is %d", varattno)));
@@ -1236,6 +1477,8 @@ static void ExecInitNextPartitionForIndexScan(IndexScanState* node)
     IndexScan* plan = NULL;
     int param_no = -1;
     ParamExecData* param = NULL;
+    int subPartParamno = -1;
+    ParamExecData* SubPrtParam = NULL;
 
     plan = (IndexScan*)(node->ss.ps.plan);
 
@@ -1244,24 +1487,43 @@ static void ExecInitNextPartitionForIndexScan(IndexScanState* node)
     param = &(node->ss.ps.state->es_param_exec_vals[param_no]);
     node->ss.currentSlot = (int)param->value;
 
-    /* construct a dummy relation with the next table partition */
-    current_partition = (Partition)list_nth(node->ss.partitions, node->ss.currentSlot);
-    current_partition_rel = partitionGetRelation(node->ss.ss_currentRelation, current_partition);
+    subPartParamno = plan->scan.plan.subparamno;
+    SubPrtParam = &(node->ss.ps.state->es_param_exec_vals[subPartParamno]);
 
-    /* update scan-related partition */
-    releaseDummyRelation(&(node->ss.ss_currentPartition));
-    node->ss.ss_currentPartition = current_partition_rel;
+    Oid heapOid = node->iss_RelationDesc->rd_index->indrelid;
+    Relation heapRelation = heap_open(heapOid, AccessShareLock);
 
     /* no heap scan here */
     node->ss.ss_currentScanDesc = NULL;
 
     /* construct a dummy relation with the next index partition */
-    current_index_partition = (Partition)list_nth(node->iss_IndexPartitionList, node->ss.currentSlot);
+    if (RelationIsSubPartitioned(heapRelation)) {
+        Partition subOnePart = (Partition)list_nth(node->ss.partitions, node->ss.currentSlot);
+        List *subPartList = (List *)list_nth(node->ss.subpartitions, node->ss.currentSlot);
+        List *subIndexList = (List *)list_nth(node->iss_IndexPartitionList,
+                                              node->ss.currentSlot);
+        current_partition = (Partition)list_nth(subPartList, (int)SubPrtParam->value);
+
+        Relation subOnePartRel = partitionGetRelation(node->ss.ss_currentRelation, subOnePart);
+
+        current_partition_rel = partitionGetRelation(subOnePartRel, current_partition);
+        current_index_partition = (Partition)list_nth(subIndexList, (int)SubPrtParam->value);
+        releaseDummyRelation(&subOnePartRel);
+    } else {
+        current_partition = (Partition)list_nth(node->ss.partitions, node->ss.currentSlot);
+        current_partition_rel = partitionGetRelation(node->ss.ss_currentRelation, current_partition);
+        current_index_partition = (Partition)list_nth(node->iss_IndexPartitionList, node->ss.currentSlot);
+    }
+
     current_index_partition_rel = partitionGetRelation(node->iss_RelationDesc, current_index_partition);
 
     Assert(PointerIsValid(node->iss_CurrentIndexPartition));
     releaseDummyRelation(&(node->iss_CurrentIndexPartition));
     node->iss_CurrentIndexPartition = current_index_partition_rel;
+
+    /* update scan-related partition */
+    releaseDummyRelation(&(node->ss.ss_currentPartition));
+    node->ss.ss_currentPartition = current_partition_rel;
 
     /* Initialize scan descriptor. */
     node->iss_ScanDesc = scan_handler_idx_beginscan(node->ss.ss_currentPartition,
@@ -1276,6 +1538,8 @@ static void ExecInitNextPartitionForIndexScan(IndexScanState* node)
             node->iss_ScanDesc, node->iss_ScanKeys, node->iss_NumScanKeys,
             node->iss_OrderByKeys, node->iss_NumOrderByKeys);
     }
+
+    heap_close(heapRelation, AccessShareLock);
 }
 
 /*
@@ -1306,6 +1570,7 @@ void ExecInitPartitionForIndexScan(IndexScanState* index_state, EState* estate)
     if (plan->scan.itrs > 0) {
         Oid indexid = plan->indexid;
         bool relis_target = false;
+        Partition indexpartition = NULL;
         LOCKMODE lock;
 
         /*
@@ -1326,9 +1591,9 @@ void ExecInitPartitionForIndexScan(IndexScanState* index_state, EState* estate)
         }
         
         if (resultPlan->ls_rangeSelectedPartitions != NULL) {
-            index_state->part_id = resultPlan->ls_rangeSelectedPartitions->length;
+            index_state->ss.part_id = resultPlan->ls_rangeSelectedPartitions->length;
         } else {
-            index_state->part_id = 0;
+            index_state->ss.part_id = 0;
         }
 
         ListCell* cell = NULL;
@@ -1344,25 +1609,78 @@ void ExecInitPartitionForIndexScan(IndexScanState* index_state, EState* estate)
             table_partition = partitionOpen(current_relation, tablepartitionid, lock);
             index_state->ss.partitions = lappend(index_state->ss.partitions, table_partition);
 
-            /* get index partition and add it to a list for following scan */
-            partitionIndexOidList = PartitionGetPartIndexList(table_partition);
-            Assert(PointerIsValid(partitionIndexOidList));
-            if (!PointerIsValid(partitionIndexOidList)) {
-                ereport(ERROR,
-                    (errcode(ERRCODE_WRONG_OBJECT_TYPE),
-                        errmsg("no local indexes found for partition %s", PartitionGetPartitionName(table_partition))));
-            }
-            indexpartitionid = searchPartitionIndexOid(indexid, partitionIndexOidList);
-            list_free_ext(partitionIndexOidList);
+            if (RelationIsSubPartitioned(current_relation)) {
+                ListCell *lc = NULL;
+                SubPartitionPruningResult* subPartPruningResult =
+                    GetSubPartitionPruningResult(resultPlan->ls_selectedSubPartitions, partSeq);
+                if (subPartPruningResult == NULL) {
+                    continue;
+                }
+                List *subpartList = subPartPruningResult->ls_selectedSubPartitions;
+                List *subIndexList = NULL;
+                List *subRelationList = NULL;
 
-            index_partition = partitionOpen(index_state->iss_RelationDesc, indexpartitionid, lock);
-            if (index_partition->pd_part->indisusable == false) {
-                ereport(ERROR,
-                    (errcode(ERRCODE_INDEX_CORRUPTED),
-                        errmsg("can't initialize index scans using unusable local index \"%s\"",
-                            PartitionGetPartitionName(index_partition))));
+                foreach (lc, subpartList)
+                {
+                    int subpartSeq = lfirst_int(lc);
+                    Relation tablepartrel = partitionGetRelation(current_relation, table_partition);
+                    Oid subpartitionid = getPartitionOidFromSequence(tablepartrel, subpartSeq);
+                    Partition subpart = partitionOpen(tablepartrel, subpartitionid, AccessShareLock);
+
+                    partitionIndexOidList = PartitionGetPartIndexList(subpart);
+
+                    Assert(partitionIndexOidList != NULL);
+                    if (!PointerIsValid(partitionIndexOidList)) {
+                        ereport(ERROR, (errmodule(MOD_OPT), errcode(ERRCODE_WRONG_OBJECT_TYPE),
+                                        errmsg("no local indexes found for partition %s",
+                                               PartitionGetPartitionName(subpart))));
+                    }
+
+                    indexpartitionid = searchPartitionIndexOid(indexid, partitionIndexOidList);
+                    list_free_ext(partitionIndexOidList);
+                    indexpartition = partitionOpen(index_state->iss_RelationDesc, indexpartitionid, AccessShareLock);
+
+                    releaseDummyRelation(&tablepartrel);
+
+                    if (indexpartition->pd_part->indisusable == false) {
+                        ereport(
+                            ERROR,
+                            (errcode(ERRCODE_INDEX_CORRUPTED), errmodule(MOD_EXECUTOR),
+                             errmsg(
+                                 "can't initialize bitmap index scans using unusable local index \"%s\" for partition",
+                                 PartitionGetPartitionName(indexpartition))));
+                    }
+
+                    subIndexList = lappend(subIndexList, indexpartition);
+                    subRelationList = lappend(subRelationList, subpart);
+                }
+
+                index_state->iss_IndexPartitionList = lappend(index_state->iss_IndexPartitionList,
+                                                              subIndexList);
+                index_state->ss.subpartitions = lappend(index_state->ss.subpartitions, subRelationList);
+                index_state->ss.subPartLengthList =
+                    lappend_int(index_state->ss.subPartLengthList, list_length(subIndexList));
+            } else {
+                /* get index partition and add it to a list for following scan */
+                partitionIndexOidList = PartitionGetPartIndexList(table_partition);
+                Assert(PointerIsValid(partitionIndexOidList));
+                if (!PointerIsValid(partitionIndexOidList)) {
+                    ereport(ERROR,
+                            (errcode(ERRCODE_WRONG_OBJECT_TYPE), errmsg("no local indexes found for partition %s",
+                                                                        PartitionGetPartitionName(table_partition))));
+                }
+                indexpartitionid = searchPartitionIndexOid(indexid, partitionIndexOidList);
+                list_free_ext(partitionIndexOidList);
+
+                index_partition = partitionOpen(index_state->iss_RelationDesc, indexpartitionid, lock);
+                if (index_partition->pd_part->indisusable == false) {
+                    ereport(ERROR,
+                                (errcode(ERRCODE_INDEX_CORRUPTED),
+                                 errmsg("can't initialize index scans using unusable local index \"%s\"",
+                                     PartitionGetPartitionName(index_partition))));
+                }
+                index_state->iss_IndexPartitionList = lappend(index_state->iss_IndexPartitionList, index_partition);
             }
-            index_state->iss_IndexPartitionList = lappend(index_state->iss_IndexPartitionList, index_partition);
         }
     }
 }

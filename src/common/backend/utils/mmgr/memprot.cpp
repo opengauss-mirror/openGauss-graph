@@ -31,7 +31,7 @@
 #include "utils/aset.h"
 #include "utils/atomic.h"
 #include "utils/memprot.h"
-#include "executor/execStream.h"
+#include "executor/exec/execStream.h"
 #include "tcop/tcopprot.h"
 #include "pgstat.h"
 #include "pgxc/pgxc.h"
@@ -42,7 +42,7 @@
 #include "replication/walsender.h"
 
 /* Track memory usage by all shared memory context */
-int32 shareTrackedMemChunks = 0;
+volatile int32 shareTrackedMemChunks = 0;
 int64 shareTrackedBytes = 0;
 
 /* Track memory usage in storage for it calls malloc directly */
@@ -57,16 +57,19 @@ unsigned int chunkSizeInBits = BITS_IN_MB;
 /* Physical Memory quota of Machine In Memory */
 int physicalMemQuotaInChunks = 0;
 
+/* Smoothing value to eliminate errors */
+int eliminateErrorsMemoryBytes = 1 * 1024 * 512;
+
 int32 maxChunksPerProcess = 0;   // be set by GUC variable --max_dynamic_memory
-int32 processMemInChunks = 200;  // track the memory used by process --dynamic_used_memory
+volatile int32 processMemInChunks = 200;  // track the memory used by process --dynamic_used_memory
 int32 peakChunksPerProcess = 0;  // the peak memory of process --dynamic_peak_memory
 int32 comm_original_memory = 0;  // original comm memory
 int32 maxSharedMemory = 0;       // original shared memory
 int32 backendReservedMemInChunk = 0;  // reserved memory for backend threads
-int32 backendUsedMemInChunk = 0;      // the memory usage for backend threads
+volatile int32 backendUsedMemInChunk = 0;      // the memory usage for backend threads
 
 /* Track memory usage by all dynamic memory context */
-int32 dynmicTrackedMemChunks = 200;
+volatile int32 dynmicTrackedMemChunks = 200;
 
 /* THREAD LOCAL variable for print memory alarm string periodically */
 THR_LOCAL TimestampTz last_print_timestamp = 0;
@@ -110,6 +113,7 @@ bool gs_memory_enjection(void)
     return false;
 }
 #endif
+
 
 /*
  * check if the node is on heavy memory status now?
@@ -571,7 +575,7 @@ template <MemType type>
 static bool memTracker_ReserveMemChunks(int32 numChunksToReserve, bool needProtect)
 {
     int32 total = 0;
-    int32 *currSize = NULL;
+    volatile int32 *currSize = NULL;
     int32 *maxSize = NULL;
 
     Assert(0 < numChunksToReserve);
@@ -594,11 +598,11 @@ static bool memTracker_ReserveMemChunks(int32 numChunksToReserve, bool needProte
         currSize = &processMemInChunks;
         maxSize = &maxChunksPerProcess;
     }
-    total = gs_atomic_add_32(currSize, numChunksToReserve);
+    total = pg_atomic_add_fetch_u32((volatile uint32*)currSize, numChunksToReserve);
 
     /* Query memory quota is exhausted. Reset the counter then return false. */
     if (MemoryIsNotEnough(total, *maxSize, needProtect)) {
-        gs_atomic_add_32(currSize, -numChunksToReserve);
+        (void)pg_atomic_sub_fetch_u32((volatile uint32*)currSize, numChunksToReserve);
         return false;
     }
 
@@ -663,6 +667,9 @@ bool memTracker_ReserveMem(int64 requestedBytes, bool needProtect)
     }
 
     // How many chunks we need so far
+    if (type != MEM_SHRD) {
+        tb = tb + eliminateErrorsMemoryBytes;
+    }
     int32 newszChunk = (uint64)tb >> chunkSizeInBits;
 
     if (newszChunk > tc) {
@@ -680,7 +687,7 @@ bool memTracker_ReserveMem(int64 requestedBytes, bool needProtect)
             u_sess->stat_cxt.trackedBytes -= requestedBytes;
     } else {
         if (type == MEM_SHRD) {
-            gs_atomic_add_32(&shareTrackedMemChunks, needChunk);
+            (void)pg_atomic_add_fetch_u32((volatile uint32*)&shareTrackedMemChunks, needChunk);
             if (shareTrackedMemChunks > peakChunksSharedContext)
                 peakChunksSharedContext = shareTrackedMemChunks;
         } else {
@@ -688,7 +695,9 @@ bool memTracker_ReserveMem(int64 requestedBytes, bool needProtect)
                 t_thrd.utils_cxt.trackedMemChunks = newszChunk;
             else
                 u_sess->stat_cxt.trackedMemChunks = newszChunk;
-            gs_atomic_add_32(&dynmicTrackedMemChunks, needChunk);
+            if (needChunk != 0) {
+                (void)pg_atomic_add_fetch_u32((volatile uint32*)&dynmicTrackedMemChunks, needChunk);
+            }
 
             t_thrd.utils_cxt.basedBytesInQueryLifeCycle += requestedBytes;
             if(t_thrd.utils_cxt.basedBytesInQueryLifeCycle > t_thrd.utils_cxt.peakedBytesInQueryLifeCycle)
@@ -710,9 +719,9 @@ static void memTracker_ReleaseMemChunks(int reduction)
 
     /* reduce chunk quota at global gaussdb process level */
     if (t_thrd.utils_cxt.backend_reserved) {
-        total = gs_atomic_add_32(&backendUsedMemInChunk, -reduction);
+        total = pg_atomic_sub_fetch_u32((volatile uint32*)&backendUsedMemInChunk, reduction);
     } else {
-        total = gs_atomic_add_32(&processMemInChunks, -reduction);
+        total = pg_atomic_sub_fetch_u32((volatile uint32*)&processMemInChunks, reduction);
     }
 
     if (t_thrd.shemem_ptr_cxt.mySessionMemoryEntry && type != MEM_SHRD) {
@@ -765,6 +774,9 @@ void memTracker_ReleaseMem(int64 toBeFreedRequested)
         t_thrd.utils_cxt.basedBytesInQueryLifeCycle -= toBeFreed;
     }
 
+    if (type != MEM_SHRD) {
+        tb = tb + eliminateErrorsMemoryBytes;
+    }
     int newszChunk = (uint64)tb >> chunkSizeInBits;
 
     if (newszChunk < tc) {
@@ -773,13 +785,13 @@ void memTracker_ReleaseMem(int64 toBeFreedRequested)
         memTracker_ReleaseMemChunks<type>(reduction);
 
         if (type == MEM_SHRD)
-            gs_atomic_add_32(&shareTrackedMemChunks, -reduction);
+            (void)pg_atomic_sub_fetch_u32((volatile uint32*)&shareTrackedMemChunks, reduction);
         else {
             if (type == MEM_THRD)
                 t_thrd.utils_cxt.trackedMemChunks = newszChunk;
             else
                 u_sess->stat_cxt.trackedMemChunks = newszChunk;
-            gs_atomic_add_32(&dynmicTrackedMemChunks, -reduction);
+            (void)pg_atomic_sub_fetch_u32((volatile uint32*)&dynmicTrackedMemChunks, reduction);
         }
 
         /* reset the total value if not matching */
@@ -896,6 +908,36 @@ int MemoryProtectFunctions::gs_posix_memalign(void** memptr, Size alignment, Siz
     return ENOMEM; /* insufficient memory */
 }
 
+/**
+ * reseve memory for mmap of compressed table
+ * @tparam mem_type MEM_SHRD is supported only
+ * @param sz reserved size(bytes)
+ * @param needProtect
+ * @return success or not
+ */
+template <MemType type>
+bool MemoryProtectFunctions::gs_memprot_reserve(Size sz, bool needProtect)
+{
+    if (type != MEM_SHRD) {
+        return false;
+    }
+    return memTracker_ReserveMem<type>(sz, needProtect);
+}
+
+/**
+ * release the momery allocated by gs_memprot_reserve
+ * @tparam type MEM_SHRD is supported only
+ * @param sz free size(bytes)
+ */
+template <MemType type>
+void MemoryProtectFunctions::gs_memprot_release(Size sz)
+{
+    if (type != MEM_SHRD) {
+        return;
+    }
+    memTracker_ReleaseMem<type>(sz);
+}
+
 /* thread level initialization */
 void gs_memprot_thread_init(void)
 {
@@ -913,6 +955,7 @@ void gs_memprot_reserved_backend(int avail_mem)
     const int wal_thread_count = 5;
     int reserved_thread_count = g_instance.attr.attr_network.ReservedBackends +
                                 NUM_CMAGENT_PROCS + wal_thread_count +
+                                NUM_DCF_CALLBACK_PROCS +
                                 g_instance.attr.attr_storage.max_wal_senders;
     /* reserve 10MB per-thread for sysadmin user */
     reserved_mem += reserved_thread_count * 10;

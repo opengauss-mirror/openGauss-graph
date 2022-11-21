@@ -23,10 +23,12 @@
 #include <unistd.h>
 
 #include "access/xlog.h"
+#include "access/multi_redo_api.h"
 #include "libpq/pqsignal.h"
 #include "miscadmin.h"
 #include "postmaster/startup.h"
 #include "postmaster/postmaster.h"
+#include "replication/shared_storage_walreceiver.h"
 #include "storage/ipc.h"
 #include "storage/latch.h"
 #include "storage/pmsignal.h"
@@ -39,6 +41,7 @@
 #include "gssignal/gs_signal.h"
 #include "access/parallel_recovery/dispatcher.h"
 #include "access/extreme_rto/dispatcher.h"
+#include "replication/dcf_replication.h"
 
 /* Signal handlers */
 static void startupproc_quickdie(SIGNAL_ARGS);
@@ -92,6 +95,33 @@ static void StartupProcSigUsr1Handler(SIGNAL_ARGS)
     errno = save_errno;
 }
 
+#ifndef ENABLE_MULTIPLE_NODES
+static void WaitApplyAllDCFLog(void)
+{
+    unsigned int all_applied = 0;
+    // Check if walreceiver has written all DCF log into xlog
+    if (g_instance.attr.attr_storage.dcf_attr.enable_dcf &&
+        t_thrd.dcf_cxt.dcfCtxInfo->dcf_to_be_leader) {
+        ereport(LOG, (errmsg("Begin to wait read xlog from DCF!")));
+        /* Check if all the dcf log has been applied to xlog every 10 milliseconds. */
+        int ret = 0;
+        while ((ret = dcf_check_if_all_logs_applied(1, &all_applied)) == 0) {
+            if (all_applied != 0) {
+                t_thrd.dcf_cxt.dcfCtxInfo->dcf_to_be_leader = false;
+                ereport(LOG, (errmsg("All DCF log has been applied!")));
+                return;
+            }
+            pg_usleep(10000L); /* 10 milliseconds */
+        }
+        if (ret) {
+            t_thrd.dcf_cxt.dcfCtxInfo->dcf_to_be_leader = false;
+            ereport(FATAL, (errmsg("Apply all DCF log failed for dcf return false!")));
+        }
+    }
+}
+
+#endif
+
 /* SIGUSR2: set flag to finish recovery */
 /*
  * SIGUSR2 handler for the startup process
@@ -109,11 +139,22 @@ static void StartupProcSigusr2Handler(SIGNAL_ARGS)
         t_thrd.startup_cxt.primary_triggered = true;
     } else if (CheckNotifySignal(NOTIFY_STANDBY)) {
         t_thrd.startup_cxt.standby_triggered = true;
+        if (t_thrd.startup_cxt.failover_triggered && t_thrd.postmaster_cxt.HaShmData->is_hadr_main_standby) {
+            t_thrd.startup_cxt.failover_triggered = false;
+        }
+    } else if (CheckNotifySignal(NOTIFY_CASCADE_STANDBY)) {
+        t_thrd.startup_cxt.standby_triggered = true;
     } else if (CheckNotifySignal(NOTIFY_FAILOVER)) {
         t_thrd.startup_cxt.failover_triggered = true;
+#ifndef ENABLE_MULTIPLE_NODES
+        WaitApplyAllDCFLog();
+#endif
         WakeupRecovery();
     } else if (CheckNotifySignal(NOTIFY_SWITCHOVER)) {
         t_thrd.startup_cxt.switchover_triggered = true;
+#ifndef ENABLE_MULTIPLE_NODES
+        WaitApplyAllDCFLog();
+#endif
         WakeupRecovery();
     }
 
@@ -131,6 +172,17 @@ static void StartupProcSigHupHandler(SIGNAL_ARGS)
     errno = save_errno;
 }
 
+/* SIGINT: set flag to check repair page */
+static void StartupProcSigIntHandler(SIGNAL_ARGS)
+{
+    int save_errno = errno;
+
+    t_thrd.startup_cxt.check_repair = true;
+
+    errno = save_errno;
+}
+
+
 /* SIGTERM: set flag to abort redo and exit */
 static void StartupProcShutdownHandler(SIGNAL_ARGS)
 {
@@ -146,6 +198,14 @@ static void StartupProcShutdownHandler(SIGNAL_ARGS)
     errno = save_errno;
 }
 
+void HandleStartupPageRepair(RepairBlockKey key, XLogPhyBlock pblk)
+{
+    XLogReaderState *record = g_instance.startup_cxt.current_record;
+    parallel_recovery::RecordBadBlockAndPushToRemote(record, key, CRC_CHECK_FAIL,
+                                                     InvalidXLogRecPtr, pblk);
+    return;
+}
+
 /* Handle SIGHUP and SIGTERM signals of startup process */
 void HandleStartupProcInterrupts(void)
 {
@@ -155,6 +215,13 @@ void HandleStartupProcInterrupts(void)
     if (t_thrd.startup_cxt.got_SIGHUP) {
         t_thrd.startup_cxt.got_SIGHUP = false;
         ProcessConfigFile(PGC_SIGHUP);
+    }
+
+    if (t_thrd.startup_cxt.check_repair) {
+        if (!IsExtremeRedo() && !IsParallelRedo()) {
+            parallel_recovery::SeqCheckRemoteReadAndRepairPage();
+        }
+        t_thrd.startup_cxt.check_repair = false;
     }
 
     /*
@@ -176,6 +243,11 @@ static void StartupReleaseAllLocks(int code, Datum arg)
 {
     Assert(t_thrd.proc != NULL);
 
+    if (g_instance.startup_cxt.badPageHashTbl != NULL) {
+        hash_destroy(g_instance.startup_cxt.badPageHashTbl);
+        g_instance.startup_cxt.badPageHashTbl = NULL;
+    }
+
     /* Do nothing if we're not in hot standby mode */
     if (t_thrd.xlog_cxt.standbyState == STANDBY_DISABLED)
         return;
@@ -191,6 +263,27 @@ static void StartupReleaseAllLocks(int code, Datum arg)
      */
     LockReleaseAll(USER_LOCKMETHOD, true);
 }
+
+void DeleteDisConnFileInClusterStandby()
+{
+    if (!IS_SHARED_STORAGE_MODE) {
+        return;
+    }
+
+    struct stat st;
+    if (stat(disable_conn_file, &st) < 0) {
+        return;
+    }
+
+    int ret = unlink(disable_conn_file);
+    if (ret < 0) {
+        ereport(WARNING, (errcode_for_file_access(), errmsg("cluster standby mode, could not remove file \"%s\": %m", 
+                                                            disable_conn_file)));
+    } else {
+        ereport(LOG, (errcode_for_file_access(), errmsg("removed file \"%s\" success.", disable_conn_file)));
+    }
+}
+
 
 /* ----------------------------------
  *	Startup Process main entry point
@@ -209,7 +302,7 @@ void StartupProcessMain(void)
      * Reset some signals that are accepted by postmaster but not here
      */
     (void)gspqsignal(SIGHUP, StartupProcSigHupHandler);    /* reload config file */
-    (void)gspqsignal(SIGINT, SIG_IGN);                     /* ignore query cancel */
+    (void)gspqsignal(SIGINT, StartupProcSigIntHandler);    /* check repair page and file */
     (void)gspqsignal(SIGTERM, StartupProcShutdownHandler); /* request shutdown */
     (void)gspqsignal(SIGQUIT, startupproc_quickdie);       /* hard crash time */
 
@@ -234,11 +327,15 @@ void StartupProcessMain(void)
     (void)gspqsignal(SIGWINCH, SIG_DFL);
 
     (void)RegisterRedoInterruptCallBack(HandleStartupProcInterrupts);
+    (void)RegisterRedoPageRepairCallBack(HandleStartupPageRepair);
     /*
      * Unblock signals (they were blocked when the postmaster forked us)
      */
     gs_signal_setmask(&t_thrd.libpq_cxt.UnBlockSig, NULL);
     (void)gs_signal_unblock_sigusr2();
+
+    t_thrd.utils_cxt.CurrentResourceOwner = ResourceOwnerCreate(NULL, "StartupXLOG",
+        THREAD_GET_MEM_CXT_GROUP(MEMORY_CONTEXT_STORAGE));
 
     SetStaticConnNum();
     pgstat_report_appname("Startup");
@@ -259,6 +356,12 @@ void StartupProcessMain(void)
          * MOT recovery is part of StartupXlog
          */
 #endif
+        DeleteDisConnFileInClusterStandby();
+        if (!dummyStandbyMode) {
+            Assert(g_instance.startup_cxt.badPageHashTbl == NULL);
+            g_instance.startup_cxt.badPageHashTbl = parallel_recovery::BadBlockHashTblCreate();
+        }
+
         StartupXLOG();
     }
 
@@ -420,7 +523,8 @@ static void SetStaticConnNum(void)
 
     for (i = 1; i < MAX_REPLNODE_NUM; i++) {
         repl_list_num = (t_thrd.postmaster_cxt.ReplConnArray[i] != NULL) ? (repl_list_num + 1) : repl_list_num;
-
+        repl_list_num = 
+            (t_thrd.postmaster_cxt.CrossClusterReplConnArray[i] != NULL) ? (repl_list_num + 1) : repl_list_num;
         SpinLockAcquire(&hashmdata->mutex);
         hashmdata->repl_list_num = repl_list_num;
         SpinLockRelease(&hashmdata->mutex);

@@ -40,7 +40,9 @@
 #include "pgstat.h"
 #include "postmaster/autovacuum.h"
 #include "postmaster/postmaster.h"
-#include "storage/fd.h"
+#include "postmaster/snapcapturer.h"
+#include "postmaster/rbcleaner.h"
+#include "storage/smgr/fd.h"
 #include "storage/ipc.h"
 #include "storage/pg_shmem.h"
 #include "storage/proc.h"
@@ -64,8 +66,11 @@
 #ifdef ENABLE_MULTIPLE_NODES
 #include "tsdb/compaction/compaction_entry.h"
 #endif   /* ENABLE_MULTIPLE_NODES */
+#include "access/ustore/knl_undoworker.h"
 
 #define DIRECTORY_LOCK_FILE "postmaster.pid"
+
+#define INIT_SESSION_MAX_INT32_BUFF 20
 
 Alarm alarmItemTooManyDbUserConn[1] = {ALM_AI_Unknown, ALM_AS_Normal, 0, 0, 0, 0, {0}, {0}, NULL};
 
@@ -637,10 +642,12 @@ Oid get_pgxc_logic_groupoid(const char* rolename)
  * NodeGroupCallback
  *		Syscache inval callback function
  */
-static void NodeGroupCallback(Datum arg, int cacheid, uint32 hashvalue)
+static void SessionNodeGroupCallback(Datum arg, int cacheid, uint32 hashvalue)
 {
     u_sess->misc_cxt.current_nodegroup_mode = NG_UNKNOWN;
-    RelationCacheInvalidateBuckets();
+    if (!EnableLocalSysCache()) {
+        RelationCacheInvalidateBuckets();
+    }
 }
 
 /*
@@ -650,7 +657,7 @@ static void NodeGroupCallback(Datum arg, int cacheid, uint32 hashvalue)
 static void RegisterNodeGroupCacheCallback()
 {
     if (IS_PGXC_COORDINATOR && !u_sess->misc_cxt.nodegroup_callback_registered) {
-        CacheRegisterSyscacheCallback(PGXCGROUPOID, NodeGroupCallback, (Datum)0);
+        CacheRegisterSessionSyscacheCallback(PGXCGROUPOID, SessionNodeGroupCallback, (Datum)0);
         u_sess->misc_cxt.nodegroup_callback_registered = true;
     }
 }
@@ -783,10 +790,17 @@ bool has_rolvcadmin(Oid roleid)
     return result;
 }
 
+static void DecreaseUserCountReuse(Oid roleid, bool ispoolerreuse)
+{
+    if (ispoolerreuse == true && IS_THREAD_POOL_WORKER) {
+        DecreaseUserCount(roleid);
+    }
+}
+
 /*
  * Initialize user identity during normal backend startup
  */
-void InitializeSessionUserId(const char* rolename)
+void InitializeSessionUserId(const char* rolename, bool ispoolerreuse, Oid useroid)
 {
     HeapTuple roleTup;
     Form_pg_authid rform;
@@ -796,7 +810,7 @@ void InitializeSessionUserId(const char* rolename)
 
     /*
      * Don't do scans if we're bootstrapping, none of the system catalogs
-     * exist yet, and they should be owned by postgres anyway.
+     * exist yet, and they should be owned by openGauss anyway.
      */
     if (IsBootstrapProcessingMode()) {
         ereport(
@@ -811,12 +825,17 @@ void InitializeSessionUserId(const char* rolename)
             AssertState(false);
             ereport(FATAL,
                 (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-                    errmsg("Abnormal process. UserOid has been reseted. Current userOid[%u], reset username is %s.",
-                        u_sess->misc_cxt.AuthenticatedUserId, rolename)));
+                    errmsg("Abnormal process. UserOid has been reseted. Current userOid[%u], reset username is %s,"
+                           "useroid is %u",
+                        u_sess->misc_cxt.AuthenticatedUserId, rolename, useroid)));
         }
     }
 
-    roleTup = SearchSysCache1(AUTHNAME, PointerGetDatum(rolename));
+    if (rolename != NULL) {
+        roleTup = SearchSysCache1(AUTHNAME, PointerGetDatum(rolename));
+    } else {
+        roleTup = SearchSysCache1(AUTHOID, ObjectIdGetDatum(useroid));
+    }
 
 #ifndef ENABLE_MULTIPLE_NODES
     /*
@@ -829,7 +848,8 @@ void InitializeSessionUserId(const char* rolename)
         char userName[NAMEDATALEN];
         MemoryContext oldcontext = NULL;
         oldcontext = MemoryContextSwitchTo(SESS_GET_MEM_CXT_GROUP(MEMORY_CONTEXT_EXECUTOR));
-        pfree_ext(u_sess->proc_cxt.MyProcPort->user_name);
+        if (u_sess->proc_cxt.MyProcPort->user_name)
+            pfree_ext(u_sess->proc_cxt.MyProcPort->user_name);
         u_sess->proc_cxt.MyProcPort->user_name = pstrdup((char*)GetSuperUserName((char*)userName));
         (void)MemoryContextSwitchTo(oldcontext);
         rolename = u_sess->proc_cxt.MyProcPort->user_name;
@@ -837,6 +857,12 @@ void InitializeSessionUserId(const char* rolename)
 #endif
 
     if (!HeapTupleIsValid(roleTup)) {
+        char roleIdStr[INIT_SESSION_MAX_INT32_BUFF] = {0};
+        if (rolename == NULL) {
+            int rc = sprintf_s(roleIdStr, INIT_SESSION_MAX_INT32_BUFF, "%u", useroid);
+            securec_check_ss(rc, "", "");
+            rolename = roleIdStr;
+        }
         /* 
          * Audit user login 
          * it's unsafe to deal with plugins hooks as dynamic lib may be released 
@@ -858,6 +884,9 @@ void InitializeSessionUserId(const char* rolename)
 
     rform = (Form_pg_authid)GETSTRUCT(roleTup);
     roleid = HeapTupleGetOid(roleTup);
+    if (rolename == NULL) {
+        rolename = NameStr(rform->rolname);
+    }
 
     u_sess->misc_cxt.AuthenticatedUserId = roleid;
     u_sess->misc_cxt.AuthenticatedUserIsSuperuser = rform->rolsuper;
@@ -879,6 +908,7 @@ void InitializeSessionUserId(const char* rolename)
 
     /* Also mark our PGPROC entry with the authenticated user id */
     /* (We assume this is an atomic store so no lock is needed) */
+    DecreaseUserCountReuse(t_thrd.proc->roleId, ispoolerreuse);
     t_thrd.proc->roleId = roleid;
 
     /*
@@ -890,6 +920,10 @@ void InitializeSessionUserId(const char* rolename)
         /*
          * Is role allowed to login at all?
          */
+        if (IS_THREAD_POOL_WORKER) {
+            IncreaseUserCount(roleid);
+        }
+
         if (!rform->rolcanlogin)
             ereport(FATAL,
                 (errcode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION),
@@ -908,7 +942,6 @@ void InitializeSessionUserId(const char* rolename)
         if (rform->rolconnlimit >= 0 && !u_sess->misc_cxt.AuthenticatedUserIsSuperuser &&
             CountUserBackends(roleid) > rform->rolconnlimit) {
             ReportAlarmTooManyDbUserConn(rolename);
-
             ereport(FATAL,
                 (errcode(ERRCODE_TOO_MANY_CONNECTIONS), errmsg("too many connections for role \"%s\"", rolename)));
         } else if (!u_sess->misc_cxt.AuthenticatedUserIsSuperuser) {
@@ -935,10 +968,13 @@ void InitializeSessionUserIdStandalone(void)
      */
 #ifdef ENABLE_MULTIPLE_NODES
     AssertState(!IsUnderPostmaster || IsAutoVacuumWorkerProcess() || IsJobSchedulerProcess() || IsJobWorkerProcess() ||
-                AM_WAL_SENDER || CompactionProcess::IsTsCompactionProcess());
+        AM_WAL_SENDER || IsTxnSnapCapturerProcess() || IsTxnSnapWorkerProcess() || IsUndoWorkerProcess() ||
+        CompactionProcess::IsTsCompactionProcess() || IsRbCleanerProcess() || IsRbWorkerProcess() ||
+        t_thrd.role == PARALLEL_DECODE || t_thrd.role == LOGICAL_READ_RECORD);
 #else   /* ENABLE_MULTIPLE_NODES */
     AssertState(!IsUnderPostmaster || IsAutoVacuumWorkerProcess() || IsJobSchedulerProcess() || IsJobWorkerProcess() ||
-                AM_WAL_SENDER);
+        AM_WAL_SENDER || IsTxnSnapCapturerProcess() || IsTxnSnapWorkerProcess() || IsUndoWorkerProcess() || IsRbCleanerProcess() ||
+        IsRbWorkerProcess() || t_thrd.role == PARALLEL_DECODE || t_thrd.role == LOGICAL_READ_RECORD);
 #endif   /* ENABLE_MULTIPLE_NODES */
 
     /* In pooler stateless reuse mode, to reset session userid */
@@ -1107,6 +1143,37 @@ static void UnlinkLockFile(int status, Datum filename)
 }
 
 /*
+ * proc_exit callback to unlock a lockfile.
+ */
+static void UnLockPidLockFile(int status, Datum fileDes)
+{
+    int fd = DatumGetInt32(fileDes);
+
+    if (fd != -1) {
+        close(fd);
+    }
+}
+
+static void CreatePidLockFile(const char* filename)
+{
+    int fd = -1;
+    char pid_lock_file[MAXPGPATH] = {0};
+    int rc = snprintf_s(pid_lock_file, MAXPGPATH, MAXPGPATH - 1, "%s.lock", filename);
+    securec_check_ss(rc, "", "");
+
+    if ((fd = open(pid_lock_file, O_WRONLY | O_CREAT, S_IRUSR | S_IWUSR)) == -1) {
+        ereport(FATAL, (errcode_for_file_access(), errmsg("could not create or open lock file \"%s\": %m", pid_lock_file)));
+    }
+
+    if (flock(fd, LOCK_EX | LOCK_NB) == -1) {
+        close(fd);
+        ereport(FATAL, (errcode_for_file_access(), errmsg("could not lock file \"%s\": %m", pid_lock_file)));
+    }
+
+    on_proc_exit(UnLockPidLockFile, Int32GetDatum(fd));
+}
+
+/*
  * Create a lockfile.
  *
  * filename is the name of the lockfile to create.
@@ -1123,6 +1190,11 @@ static void CreateLockFile(const char* filename, bool amPostmaster, bool isDDLoc
     pid_t other_pid;
     pid_t my_pid, my_p_pid, my_gp_pid;
     const char* envvar = NULL;
+
+    /* Grab a file lock to establish our priority to process postmaster.pid */
+    if (isDDLock) {
+        CreatePidLockFile(filename);
+    }
 
     /*
      * If the PID in the lockfile is our own PID or our parent's or
@@ -1209,7 +1281,7 @@ static void CreateLockFile(const char* filename, bool amPostmaster, bool isDDLoc
         buffer[len] = '\0';
         encoded_pid = atoi(buffer);
 
-        /* if pid < 0, the pid is for postgres, not postmaster */
+        /* if pid < 0, the pid is for openGauss, not postmaster */
         other_pid = (pid_t)((encoded_pid < 0) ? -encoded_pid : encoded_pid);
 
         if (other_pid <= 0) {
@@ -1253,7 +1325,7 @@ static void CreateLockFile(const char* filename, bool amPostmaster, bool isDDLoc
          * --- which means that whatever process kill() is reporting about
          * isn't the one that made the lockfile.  (NOTE: this last
          * consideration is the only one that keeps us from blowing away a
-         * Unix socket file belonging to an instance of Postgres being run by
+         * Unix socket file belonging to an instance of openGauss being run by
          * someone else, at least on machines where /tmp hasn't got a
          * stickybit.)
          */
@@ -1271,13 +1343,14 @@ static void CreateLockFile(const char* filename, bool amPostmaster, bool isDDLoc
                             errmsg("lock file \"%s\" already exists", filename),
                             isDDLock
                                 ? ((encoded_pid < 0)
-                                          ? errhint("Is another postgres (PID %d) running in data directory \"%s\"?",
+                                          ? errhint("Is another openGauss (PID %d) running in data directory \"%s\"?",
                                                 (int)other_pid,
                                                 refName)
                                           : errhint("Is another postmaster (PID %d) running in data directory \"%s\"?",
                                                 (int)other_pid,
                                                 refName))
-                                : ((encoded_pid < 0) ? errhint("Is another postgres (PID %d) using socket file \"%s\"?",
+                                : ((encoded_pid < 0) ? errhint("Is another openGauss (PID %d) \
+                                                                using socket file \"%s\"?",
                                                          (int)other_pid,
                                                          refName)
                                                    : errhint("Is another postmaster (PID %d) using socket file \"%s\"?",
@@ -1797,4 +1870,36 @@ void Reset_Pseudo_CurrentUserId(void)
     u_sess->misc_cxt.Pseudo_CurrentUserId = &u_sess->misc_cxt.CurrentUserId;
 }
 
+/*
+ * The backend_version is recorded in session_param.
+ * During connection obtaining, the agent_send_connection_params_parallel function
+ * is used to synchronize the version number.
+ */
+void register_backend_version(uint32 backend_version){
+    if (IsBootstrapProcessingMode() || IsInitProcessingMode() || !IS_PGXC_COORDINATOR) {
+        return;
+    }
+    char sql_tmp[CHAR_SIZE];
+    errno_t rc;
+    int ret = 0;
+    rc = memset_s(sql_tmp, CHAR_SIZE, 0, CHAR_SIZE);
+    securec_check_c(rc, "\0", "\0");
+    if (backend_version > 0) {
+        ret = snprintf_s(sql_tmp, CHAR_SIZE, CHAR_SIZE - 1, "set backend_version = %d;", backend_version);
+    } else {
+        ereport(ERROR, (errcode(ERRCODE_SET_QUERY), errmsg("backend_version is a error value: %d", backend_version)));
+    }
+    securec_check_ss_c(ret, "\0", "\0");
+    if (PoolManagerSetCommand(POOL_CMD_GLOBAL_SET, sql_tmp, "backend_version") < 0){
+        ereport(ERROR, (errmodule(MOD_TRANS_HANDLE), errcode(ERRCODE_SET_QUERY), errmsg("ERROR SET backend_version")));
+    }
+}
 
+/*
+ * Check whether the version contains the backend_version parameter.
+ */
+bool contain_backend_version(uint32 version_number) {
+    return ((version_number >= V5R1C20_BACKEND_VERSION_NUM &&
+             version_number < V5R2C00_START_VERSION_NUM) ||
+            (version_number >= V5R2C00_BACKEND_VERSION_NUM));
+}

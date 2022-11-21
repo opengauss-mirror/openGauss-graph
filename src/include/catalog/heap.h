@@ -8,6 +8,7 @@
  * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  * Portions Copyright (c) 2010-2012 Postgres-XC Development Group
+ * Portions Copyright (c) 2021, openGauss Contributors
  *
  * src/include/catalog/heap.h
  *
@@ -54,7 +55,7 @@ typedef struct CeHeapInfo {
 typedef struct HashBucketInfo {
 	oidvector  *bucketlist;
 	int2vector *bucketcol;
-	Oid          bucketOid;    
+	Oid          bucketOid;
 } HashBucketInfo;
 
 typedef struct SliceConstInfo {
@@ -65,39 +66,48 @@ typedef struct SliceConstInfo {
 } SliceConstInfo;
 
 extern Relation heap_create(const char *relname,
-			Oid relnamespace,
-			Oid reltablespace,
-			Oid relid,
-			Oid relfilenode,
-			Oid bucketOid,
-			TupleDesc tupDesc,
-			char relkind,
-			char relpersistence,
-			bool partitioned_relation,
-			bool rowMovement,
-			bool shared_relation,
-			bool mapped_relation,
-			bool allow_system_table_mods,
-			int8 row_compress,
-			Oid ownerid,
-			bool skip_create_storage,
-			TableAmType tam_type);
+                                Oid relnamespace,
+                                Oid reltablespace,
+                                Oid relid,
+                                Oid relfilenode,
+                                Oid bucketOid,
+                                TupleDesc tupDesc,
+                                char relkind,
+                                char relpersistence,
+                                bool partitioned_relation,
+                                bool rowMovement,
+                                bool shared_relation,
+                                bool mapped_relation,
+                                bool allow_system_table_mods,
+                                int8 row_compress,
+                                Datum reloptions,
+                                Oid ownerid,
+                                bool skip_create_storage,
+                                TableAmType tam_type,
+                                int8 relindexsplit = 0,
+                                StorageType storage_type = HEAP_DISK,
+                                bool newcbi = false,
+                                Oid accessMethodObjectId = 0);
 
 extern bool heap_is_matview_init_state(Relation rel);
 
 extern Partition
 heapCreatePartition(const char* part_name,
-						bool for_partitioned_table,
-						Oid part_tablespace,
-						Oid part_id,
-						Oid partFileNode,
-						Oid bucketOid,
-						Oid ownerid);
+                          bool for_partitioned_table,
+                          Oid part_tablespace,
+                          Oid part_id,
+                          Oid partFileNode,
+                          Oid bucketOid,
+                          Oid ownerid,
+                          StorageType storage_type,
+                          bool newcbi = false,
+                          Datum reloptions = Datum(0));
+
 
 extern Oid heap_create_with_catalog(const char *relname,
-						 Oid relnamespace,
-						 Oid reltablespace,
-						 Oid relid,
+                         Oid relnamespace,
+                         Oid reltablespace,
+                         Oid relid,
 						 Oid reltypeid,
 						 Oid reloftypeid,
 						 Oid ownerid,
@@ -115,10 +125,11 @@ extern Oid heap_create_with_catalog(const char *relname,
 						 bool allow_system_table_mods,
 						 PartitionState *partTableState,
 						 int8 row_compress,
-						 List *filenodelist,						 
 						 HashBucketInfo *bucketinfo,
 						 bool record_dependce = true,
-						 List* ceLst = NULL);
+						 List* ceLst = NULL,
+						 StorageType storage_type = HEAP_DISK,
+						 LOCKMODE partLockMode = AccessExclusiveLock);
 
 extern void heap_create_init_fork(Relation rel);
 
@@ -131,28 +142,36 @@ extern void dropDeltaTableOnPartition(Oid partId);
 
 extern void heapDropPartitionToastList(List* toastList);
 extern void heapDropPartitionList(Relation rel, List* partitionList);
-extern Oid heapAddRangePartition(Relation pgPartRel, Oid partTableOid,  Oid partrelfileOid,  Oid partTablespace,
+extern Oid heapAddRangePartition(Relation pgPartRel, Oid partTableOid,  Oid partTablespace,
                                  Oid bucketOid, RangePartitionDefState *newPartDef, Oid ownerid, Datum reloptions,
-                                 const bool* isTimestamptz);
+                                 const bool* isTimestamptz, StorageType storage_type, LOCKMODE partLockMode, int2vector* subpartition_key = NULL, bool isSubPartition = false);
 
-extern Oid HeapAddListPartition(Relation pgPartRel, Oid partTableOid,  Oid partrelfileOid,  Oid partTablespace,
+extern Oid HeapAddListPartition(Relation pgPartRel, Oid partTableOid,  Oid partTablespace,
                                 Oid bucketOid, ListPartitionDefState *newPartDef, Oid ownerid, Datum reloptions,
-                                const bool* isTimestamptz);
+                                const bool* isTimestamptz, StorageType storage_type, int2vector* subpartition_key = NULL, bool isSubPartition = false);
 
-extern Oid HeapAddHashPartition(Relation pgPartRel, Oid partTableOid,  Oid partrelfileOid,  Oid partTablespace,
+extern Oid HeapAddHashPartition(Relation pgPartRel, Oid partTableOid,  Oid partTablespace,
                                 Oid bucketOid, HashPartitionDefState *newPartDef, Oid ownerid, Datum reloptions,
-                                const bool* isTimestamptz);
+                                const bool* isTimestamptz, StorageType storage_type, int2vector* subpartition_key = NULL, bool isSubPartition = false);
+extern Node *MakeDefaultSubpartition(PartitionState *partitionState, Node *partitionDefState);
+extern List *addNewSubPartitionTuplesForPartition(Relation pgPartRel, Oid partTableOid, Oid partTablespace,
+    Oid bucketOid, Oid ownerid, Datum reloptions, const bool *isTimestamptz, StorageType storage_type,
+    PartitionState *partitionState, Node *partitionDefState, LOCKMODE partLockMode);
+
+extern Oid GetPartTablespaceOidForSubpartition(Oid reltablespace, const char* partTablespacename);
 
 extern void heapDropPartitionIndex(Relation parentIndex, Oid partIndexId);
 extern void addNewPartitionTuple(Relation pg_part_desc, Partition new_part_desc, int2vector* pkey, oidvector *intablespace,
     Datum interval, Datum maxValues,  Datum transitionPoint, Datum reloptions);
 
 extern void heap_truncate_one_part(Relation rel , Oid partOid);
-extern Oid heapTupleGetPartitionId(Relation rel, HeapTuple tuple);
+extern Oid heapTupleGetPartitionId(Relation rel, void *tuple);
+extern Oid heapTupleGetSubPartitionId(Relation rel, void *tuple);
 extern void heap_truncate(List *relids);
 extern void heap_truncate_one_rel(Relation rel);
 extern void heap_truncate_check_FKs(List *relations, bool tempTables);
 extern List *heap_truncate_find_FKs(List *relationIds);
+extern void InsertTablebucketidAttribute(Oid relOid);
 extern void InsertPgAttributeTuple(Relation pg_attribute_rel, Form_pg_attribute new_attribute, CatalogIndexState indstate);
 
 extern void InsertPgClassTuple(Relation pg_class_desc, Relation new_rel_desc, Oid new_rel_oid, Datum relacl,
@@ -174,7 +193,7 @@ extern void RemoveAttrDefaultById(Oid attrdefId);
 template<char starelkind>
 extern void RemoveStatistics(Oid relid, AttrNumber attnum);
 
-extern Form_pg_attribute SystemAttributeDefinition(AttrNumber attno, bool relhasoids, bool relhasbucket);
+extern Form_pg_attribute SystemAttributeDefinition(AttrNumber attno, bool relhasoids, bool relhasbucket, bool relhasuids);
 extern Form_pg_attribute SystemAttributeByName(const char *attname, bool relhasoids);
 
 extern int GetSysAttLength(bool hasBucketAttr = true);
@@ -185,11 +204,12 @@ extern void CheckAttributeType(const char *attname, Oid atttypid, Oid attcollati
 #ifdef PGXC
 /* Functions related to distribution data of relations */
 extern void AddRelationDistribution(const char *relname, Oid relid, DistributeBy *distributeby, 
-	PGXCSubCluster *subcluster, List *parentOids, TupleDesc descriptor, bool isinstallationgroup);
+	PGXCSubCluster *subcluster, List *parentOids, TupleDesc descriptor, bool isinstallationgroup,
+        bool isbucket = false, int bucketmaplen = 0);
 extern void GetRelationDistributionItems(Oid relid, DistributeBy *distributeby, TupleDesc descriptor, char *locatortype,
     int *hashalgorithm, int *hashbuckets, AttrNumber *attnum);
 extern HashBucketInfo *GetRelationBucketInfo(DistributeBy *distributeby, TupleDesc tupledsc, 
-    bool *createbucket, Oid bucket, bool enable_createbucket);
+    bool *createbucket, bool enable_createbucket);
 extern void TryReuseIndex(Oid oldId, IndexStmt *stmt);
 extern void tryReusePartedIndex(Oid oldId, IndexStmt *stmt, Relation rel);
 extern Oid *GetRelationDistributionNodes(PGXCSubCluster *subcluster, int *numnodes);
@@ -218,10 +238,11 @@ extern char* make_column_map(TupleDesc tuple_desc);
  * @return: a bool array to indicate the result. The length of array is equal to the number of partition keys.
  * @Notes: remember to pfree the array.
  */
-extern bool* check_partkey_has_timestampwithzone(Relation partTableRel);
+extern bool* CheckPartkeyHasTimestampwithzone(Relation partTableRel, bool isForSubPartition = false);
 
-extern Oid AddNewIntervalPartition(Relation rel, HeapTuple insertTuple);
+extern Oid AddNewIntervalPartition(Relation rel, void* insertTuple);
 
 extern int GetIndexKeyAttsByTuple(Relation relation, HeapTuple indexTuple);
 
+extern void AddOrDropUidsAttr(Oid relOid, bool oldRelHasUids, bool newRelHasUids);
 #endif   /* HEAP_H */

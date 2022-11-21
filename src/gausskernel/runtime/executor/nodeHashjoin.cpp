@@ -17,10 +17,10 @@
 #include "knl/knl_variable.h"
 
 #include "executor/executor.h"
-#include "executor/execStream.h"
+#include "executor/exec/execStream.h"
 #include "executor/hashjoin.h"
-#include "executor/nodeHash.h"
-#include "executor/nodeHashjoin.h"
+#include "executor/node/nodeHash.h"
+#include "executor/node/nodeHashjoin.h"
 #include "miscadmin.h"
 #include "utils/anls_opt.h"
 #include "utils/memutils.h"
@@ -109,6 +109,7 @@ TupleTableSlot* ExecHashJoin(HashJoinState* node)
     for (;;) {
         switch (node->hj_JoinState) {
             case HJ_BUILD_HASHTABLE: {
+                CheckHashJoinStateIschangeOrNot(node);
                 /*
                  * First time through: build hash table for inner relation.
                  */
@@ -225,10 +226,11 @@ TupleTableSlot* ExecHashJoin(HashJoinState* node)
                 node->hj_OuterNotEmpty = false;
 
                 node->hj_JoinState = HJ_NEED_NEW_OUTER;
+                CheckHashJoinStateIschangeOrNot(node);
             }
             /* fall through */
             case HJ_NEED_NEW_OUTER:
-
+                CheckHashJoinStateIschangeOrNot(node);
                 /*
                  * We don't have an outer tuple, try to get the next one
                  */
@@ -277,14 +279,13 @@ TupleTableSlot* ExecHashJoin(HashJoinState* node)
 
                 /* OK, let's scan the bucket for matches */
                 node->hj_JoinState = HJ_SCAN_BUCKET;
-
                 /* Prepare for the clear-process if necessary */
                 if (jointype == JOIN_RIGHT_ANTI || jointype == JOIN_RIGHT_SEMI)
                     node->hj_PreTuple = NULL;
-
+                CheckHashJoinStateIschangeOrNot(node);
                 /* fall through */
             case HJ_SCAN_BUCKET:
-
+                CheckHashJoinStateIschangeOrNot(node);
                 /*
                  * We check for interrupts here because this corresponds to
                  * where we'd fetch a row from a child plan node in other join
@@ -345,6 +346,11 @@ TupleTableSlot* ExecHashJoin(HashJoinState* node)
                         if (jointype == JOIN_SEMI)
                             node->hj_JoinState = HJ_NEED_NEW_OUTER;
                     }
+
+#ifdef GS_GRAPH
+                    if (node->js.single_match)
+						node->hj_JoinState = HJ_NEED_NEW_OUTER;
+#endif
 
                     if (otherqual == NIL || ExecQual(otherqual, econtext, false)) {
                         TupleTableSlot* result = NULL;
@@ -565,6 +571,14 @@ HashJoinState* ExecInitHashJoin(HashJoin* node, EState* estate, int eflags)
      */
     ExecInitResultTupleSlot(estate, &hjstate->js.ps);
     hjstate->hj_OuterTupleSlot = ExecInitExtraTupleSlot(estate);
+
+#ifdef GS_GRAPH
+    /*
+	 * detect whether we need only consider the first matching inner tuple
+	 */
+	hjstate->js.single_match = (node->join.inner_unique ||
+								node->join.jointype == JOIN_SEMI);
+#endif
 
     /* set up null tuples for outer joins, if needed */
     switch (node->join.jointype) {

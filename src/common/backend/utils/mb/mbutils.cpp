@@ -349,6 +349,7 @@ Datum pg_convert_to_nocase(PG_FUNCTION_ARGS)
     Datum dest_encoding_name = PG_GETARG_DATUM(1);
     Datum src_encoding_name = DirectFunctionCall1(namein, CStringGetDatum(u_sess->mb_cxt.DatabaseEncoding->name));
     Datum result;
+    FUNC_CHECK_HUGE_POINTER(PG_ARGISNULL(0), DatumGetPointer(string), "pg_convert()");
 
     /*
      * pg_convert expects a bytea as its first argument. We're passing it a
@@ -825,6 +826,20 @@ int pg_mbstrlen_with_len_eml(const char* mbstr, int limit, int eml)
     return len;
 }
 
+int pg_mbstrlen_with_len_toast(const char* mbstr, int* limit)
+{
+    int len = 0;
+
+    while (*limit > 0 && *mbstr) {
+        int l = pg_mblen(mbstr);
+
+        *limit -= l;
+        mbstr += l;
+        len++;
+    }
+    return len;
+}
+
 /*
  * returns the byte length of a multibyte string
  * (not necessarily NULL terminated)
@@ -970,6 +985,7 @@ void pg_bind_textdomain_codeset(const char* domain_name)
     const char* ctype = gs_setlocale_r(LC_CTYPE, NULL);
 
     if (pg_strcasecmp(ctype, "C") != 0 && pg_strcasecmp(ctype, "POSIX") != 0) {
+        localeLock.unLock();
         return;
     }
 

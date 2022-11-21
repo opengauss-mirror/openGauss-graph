@@ -1,5 +1,5 @@
 /*
- * psql - the PostgreSQL interactive terminal
+ * psql - the openGauss interactive terminal
  *
  * Copyright (c) 2000-2012, PostgreSQL Global Development Group
  *
@@ -30,8 +30,6 @@
 #include "help.h"
 #include "input.h"
 #include "sql_help.h"
-
-static char* GetEnvStr(const char* env);
 
 /*
  * PLEASE:
@@ -135,7 +133,6 @@ void usage(void)
     printf(_("  -C, --enable-client-encryption              enable client encryption feature\n"));
     printf(_("  -s, --single-step        single-step mode (confirm each query)\n"));
     printf(_("  -S, --single-line        single-line mode (end of line terminates SQL command)\n"));
-
     printf(_("\nOutput format options:\n"));
     printf(_("  -A, --no-align           unaligned table output mode\n"));
     printf(_("  -F, --field-separator=STRING\n"
@@ -153,6 +150,8 @@ void usage(void)
              "                           set field separator to zero byte\n"));
     printf(_("  -0, --record-separator-zero\n"
              "                           set record separator to zero byte\n"));
+    printf(_("  -2, --pipeline           use pipeline to pass the password, forbidden to use in terminal\n"
+             "                           must use with -c or -f\n"));
 #ifdef USE_ASSERT_CHECKING
     printf(_("  -g,                      echo all sql with separator from specified file \n"));
 #endif
@@ -161,8 +160,14 @@ void usage(void)
     tmp = GetEnvStr("PGHOST");
     if (tmp != NULL)
         check_env_value(tmp);
+#ifndef ENABLE_MULTIPLE_NODES
+    printf(_("  -h, --host=HOSTNAME      database server host or socket directory (default: \"%s\")\n"
+             "                           allow multi host IP address with comma separator in centralized cluster\n"),
+        tmp != NULL ? tmp : _("local socket"));
+#else
     printf(_("  -h, --host=HOSTNAME      database server host or socket directory (default: \"%s\")\n"),
         tmp != NULL ? tmp : _("local socket"));
+#endif
     if (NULL != tmp)
         free(tmp);
     tmp = NULL;
@@ -272,6 +277,7 @@ void slashUsage(unsigned short int pager)
     fprintf(output, _("  \\di[S+] [PATTERN]      list indexes\n"));
     fprintf(output, _("  \\dl                    list large objects, same as \\lo_list\n"));
     fprintf(output, _("  \\dL[S+] [PATTERN]      list procedural languages\n"));
+    fprintf(output, _("  \\dm[S+] [PATTERN]      list materialized views\n"));
     fprintf(output, _("  \\dn[S+] [PATTERN]      list schemas\n"));
     fprintf(output, _("  \\do[S]  [PATTERN]      list operators\n"));
     fprintf(output, _("  \\dO[S+] [PATTERN]      list collations\n"));
@@ -299,7 +305,8 @@ void slashUsage(unsigned short int pager)
     fprintf(output,
         _("  \\pset NAME [VALUE]     set table output option\n"
           "                         (NAME := {format|border|expanded|fieldsep|fieldsep_zero|footer|null|\n"
-          "                         numericlocale|recordsep|recordsep_zero|tuples_only|title|tableattr|pager})\n"));
+          "                         numericlocale|recordsep|recordsep_zero|tuples_only|title|tableattr|pager|\n"
+          "                         feedback})\n"));
     fprintf(output, _("  \\t [on|off]            show only rows (currently %s)\n"), ON(pset.popt.topt.tuples_only));
     fprintf(output, _("  \\T [STRING]            set HTML <table> tag attributes, or unset if none\n"));
     fprintf(output,
@@ -379,8 +386,8 @@ void helpSQL(const char* topic, unsigned short int pager)
             fprintf(output, "  ");
             for (j = 0; j < ncolumns - 1; j++)
                 fprintf(output, "%-*s", QL_MAX_CMD_LEN + 1, VALUE_OR_NULL(QL_HELP[i + j * nrows].cmd));
-            if (i + j * nrows < QL_HELP_COUNT)
-                fprintf(output, "%s", VALUE_OR_NULL(QL_HELP[i + j * nrows].cmd));
+            if (i + j * nrows >= 0 && i + j * nrows < QL_HELP_COUNT)  // first branch to suppress "-Werror=array-bounds"
+                fprintf(output, "%s", VALUE_OR_NULL(QL_HELP[i + j * nrows].cmd)); 
             fputc('\n', output);
         }
 
@@ -470,29 +477,4 @@ void print_copyright(void)
 {
     puts("GaussDB Kernel Database Management System\n"
          "Copyright (c) Huawei Technologies Co., Ltd. 2018. All rights reserved.\n");
-}
-
-/*
- * GetEnvStr
- *
- * Note: malloc space for get the return of getenv() function, then return the malloc space.
- *         so, this space need be free.
- */
-static char* GetEnvStr(const char* env)
-{
-    char* tmpvar = NULL;
-    const char* temp = getenv(env);
-    errno_t rc = 0;
-    if (temp != NULL) {
-        size_t len = strlen(temp);
-        if (len == 0)
-            return NULL;
-        tmpvar = (char*)malloc(len + 1);
-        if (tmpvar != NULL) {
-            rc = strcpy_s(tmpvar, len + 1, temp);
-            securec_check_c(rc, "\0", "\0");
-            return tmpvar;
-        }
-    }
-    return NULL;
 }

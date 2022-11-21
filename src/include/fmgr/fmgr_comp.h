@@ -2,6 +2,7 @@
  *
  * Portions Copyright (c) 2020 Huawei Technologies Co.,Ltd.
  * Portions Copyright (c) 2002-2007, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2021, openGauss Contributors
  *
  * fmgr_comp.h
  * Definitions for the fmgr-compatible function
@@ -77,13 +78,13 @@
  */
 extern struct varlena* pg_detoast_datum(struct varlena* datum);
 extern struct varlena* pg_detoast_datum_copy(struct varlena* datum);
-extern struct varlena* pg_detoast_datum_slice(struct varlena* datum, int32 first, int32 count);
+extern struct varlena* pg_detoast_datum_slice(struct varlena* datum, int64 first, int32 count);
 extern struct varlena* pg_detoast_datum_packed(struct varlena* datum);
 
 #define PG_DETOAST_DATUM(datum) pg_detoast_datum((struct varlena*)DatumGetPointer(datum))
 #define PG_DETOAST_DATUM_COPY(datum) pg_detoast_datum_copy((struct varlena*)DatumGetPointer(datum))
 #define PG_DETOAST_DATUM_SLICE(datum, f, c) \
-    pg_detoast_datum_slice((struct varlena*)DatumGetPointer(datum), (int32)(f), (int32)(c))
+    pg_detoast_datum_slice((struct varlena*)DatumGetPointer(datum), (int64)(f), (int32)(c))
 /* WARNING -- unaligned pointer */
 #define PG_DETOAST_DATUM_PACKED(datum) pg_detoast_datum_packed((struct varlena*)DatumGetPointer(datum))
 
@@ -121,6 +122,7 @@ extern struct varlena* pg_detoast_datum_packed(struct varlena* datum);
 #define PG_GETARG_FLOAT4(n) DatumGetFloat4(PG_GETARG_DATUM(n))
 #define PG_GETARG_FLOAT8(n) DatumGetFloat8(PG_GETARG_DATUM(n))
 #define PG_GETARG_INT64(n) DatumGetInt64(PG_GETARG_DATUM(n))
+#define PG_GETARG_INT128(n) DatumGetInt128(PG_GETARG_DATUM(n))
 #define PG_GETARG_TRANSACTIONID(n) DatumGetTransactionId(PG_GETARG_DATUM(n))
 #define PG_GETARG_SHORTTRANSACTIONID(n) DatumGetShortTransactionId(PG_GETARG_DATUM(n))
 /* use this if you want the raw, possibly-toasted input datum: */
@@ -216,6 +218,7 @@ extern struct varlena* pg_detoast_datum_packed(struct varlena* datum);
 #define PG_RETURN_FLOAT4(x) return Float4GetDatum(x)
 #define PG_RETURN_FLOAT8(x) return Float8GetDatum(x)
 #define PG_RETURN_INT64(x) return Int64GetDatum(x)
+#define PG_RETURN_INT128(x) return Int128GetDatum(x)
 #define PG_RETURN_TRANSACTIONID(x) return TransactionIdGetDatum(x)
 #define PG_RETURN_SHORTTRANSACTIONID(x) return ShortTransactionIdGetDatum(x)
 /* RETURN macros for other pass-by-ref types will typically look like this: */
@@ -285,7 +288,7 @@ typedef enum COMM_ARR_IDX {
  * !!! OLD INTERFACE !!!
  *
  * fmgr() is the only remaining vestige of the old-style caller support
- * functions.  It's no longer used anywhere in the Postgres distribution,
+ * functions.  It's no longer used anywhere in the openGauss distribution,
  * but we should leave it around for a release or two to ease the transition
  * for user-supplied C functions.  OidFunctionCallN() replaces it for new
  * code.

@@ -1,4 +1,5 @@
 /*
+ * Portions Copyright (c) 2021, openGauss Contributors
  * Portions Copyright (c) 2020 Huawei Technologies Co.,Ltd.
  * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
@@ -51,8 +52,8 @@
 #include "knl/knl_guc.h"
 #include "knl/knl_session.h"
 #include "nodes/pg_list.h"
-#include "replication/walprotocol.h"
 #include "storage/lock/s_lock.h"
+#include "utils/knl_localsysdbcache.h"
 #include "utils/palloc.h"
 #include "storage/latch.h"
 #include "portability/instr_time.h"
@@ -65,11 +66,20 @@
 #include "utils/memgroup.h"
 #include "lib/circularqueue.h"
 #include "pgxc/barrier.h"
+#include "communication/commproxy_basic.h"
+#include "replication/replicainternal.h"
+#include "replication/libpqwalreceiver.h"
+#include "replication/worker_internal.h"
+#include "replication/origin.h"
+#include "catalog/pg_subscription.h"
+#include "port/pg_crc32c.h"
 #define MAX_PATH_LEN 1024
 
-#define RESERVE_SIZE 36
+#define RESERVE_SIZE 52
+#define PARTKEY_VALUE_MAXNUM 64
 
 typedef struct ResourceOwnerData* ResourceOwner;
+typedef struct logicalLog logicalLog;
 
 typedef struct knl_t_codegen_context {
     void* thr_codegen_obj;
@@ -157,6 +167,60 @@ typedef struct xllist {
     uint32 total_len;  /* total data bytes in chain */
 } xllist;
 
+typedef struct {
+    volatile uint64 totalDuration;
+    volatile uint64 counter;
+    volatile uint64 startTime;
+}RedoTimeCost;
+
+typedef enum {
+    TIME_COST_STEP_1 = 0,
+    TIME_COST_STEP_2,
+    TIME_COST_STEP_3,
+    TIME_COST_STEP_4,
+    TIME_COST_STEP_5,
+    TIME_COST_STEP_6,
+    TIME_COST_STEP_7,
+    TIME_COST_STEP_8,
+    TIME_COST_STEP_9,
+    TIME_COST_NUM,
+} TimeCostPosition;
+
+/*
+for extreme rto
+thread                step1                     step2                 step3                 step4
+               step5                 step6                step7        step8
+redo batch          get a record           redo record(total)   update stanbystate        parse xlog
+         dispatch to redo manager    null                 null          null
+redo manager        get a record           redo record(total)   proc page xlog            redo ddl
+         dispatch to redo worker     null                 null          null
+redo worker         get a record           redo record(total)   redo page xlog(total)     read xlog page
+          redo page xlog          redi other xlog       fsm update   full sync wait
+trxn mamanger       get a record           redo record(total)   update flush lsn           wait sync work
+         dispatch to trxn worker  global lsn update     null           null
+trxn worker         get a record           redo record(total)   redo xlog                 update thread lsn
+         full sync wait             null                null          null
+read worker         get xlog page(total)   read xlog page       change segment              null
+         null                      null                 null          null
+read page worker    get a record           make lsn forwarder   get new item              put to dispatch thread
+        update thread lsn        crc check             null          null
+startup             get a record           check stop           delay redo                 dispatch(total)
+         decode                  null                  null          null
+
+for parallel redo
+thread     step1            step2               step3                 step4                step5
+          step6              step7                  step8                    step9
+page redo  get a record    redo record(total)  update stanbystate   redo undo log     redo share trxn log
+   redo sync trxn log     redo single log    redo all workers log     redo multi workers log
+startup    read a record   check stop          delay redo          dispatch(total)   trxn apply
+        force apply wait    null                   null                  null
+*/
+
+typedef struct RedoWorkerTimeCountsInfo {
+    char *worker_name;
+    RedoTimeCost *time_cost;
+}RedoWorkerTimeCountsInfo;
+
 typedef struct knl_t_xact_context {
     /* var in transam.cpp */
     typedef uint64 CommitSeqNo;
@@ -204,7 +268,7 @@ typedef struct knl_t_xact_context {
     bool twophaseExitRegistered;
     TransactionId cached_xid;
     struct GlobalTransactionData* cached_gxact;
-    struct TwoPhaseStateData* TwoPhaseState;
+    struct TwoPhaseStateData** TwoPhaseState;
     xllist records;
 
     /* var in varsup.cpp*/
@@ -246,10 +310,10 @@ typedef struct knl_t_xact_context {
     CommandId currentCommandId;
     bool currentCommandIdUsed;
     /*
-     * Parameters for communication control of Command ID between Postgres-XC nodes.
+     * Parameters for communication control of Command ID between openGauss nodes.
      * isCommandIdReceived is used to determine of a command ID has been received by a remote
      * node from a Coordinator.
-     * sendCommandId is used to determine if a Postgres-XC node needs to communicate its command ID.
+     * sendCommandId is used to determine if a openGauss node needs to communicate its command ID.
      * This is possible for both remote nodes and Coordinators connected to applications.
      * receivedCommandId is the command ID received on Coordinator from remote node or on remote node
      * from Coordinator.
@@ -288,12 +352,6 @@ typedef struct knl_t_xact_context {
     bool XactPrepareSent;
     bool AlterCoordinatorStmt;
 
-    /* white-box check TransactionID, when there is no 2pc
-     *  the thread local variable save the executor cn commit(abort) xid
-     *  compare with the remote-commit xid in other CNs and DNs
-     */
-    TransactionId XactXidStoreForCheck;
-    TransactionId reserved_nextxid_check;
     /*
      * Some commands want to force synchronous commit.
      */
@@ -304,7 +362,6 @@ typedef struct knl_t_xact_context {
      * when we've run out of memory.
      */
     MemoryContext TransactionAbortContext;
-    struct GTMCallbackItem* GTM_callbacks;
     struct GTMCallbackItem* Seq_callbacks;
 
     LocalTransactionId lxid;
@@ -334,6 +391,7 @@ typedef struct knl_t_xact_context {
      */
     struct SERIALIZABLEXACT* MySerializableXact;
     bool MyXactDidWrite;
+    bool applying_subxact_undo;
 
 #ifdef PGXC
     bool useLocalSnapshot;
@@ -343,12 +401,20 @@ typedef struct knl_t_xact_context {
      * Allocated from t_thrd.mem_cxt.top_transaction_mem_cxt.
      */
     uint2 *PGXCBucketMap;
+    int    PGXCBucketCnt;
+    int    PGXCGroupOid;
     int    PGXCNodeId;
-	bool   inheritFileNode;
+    bool   inheritFileNode;
+    bool enable_lock_cancel;
 #endif
+    TransactionId XactXidStoreForCheck;
+    Oid ActiveLobRelid;
+    bool isSelectInto;
 } knl_t_xact_context;
 
+typedef struct RepairBlockKey RepairBlockKey;
 typedef void (*RedoInterruptCallBackFunc)(void);
+typedef void (*RedoPageRepairCallBackFunc)(RepairBlockKey key, XLogPhyBlock pblk);
 
 typedef struct knl_t_xlog_context {
 #define MAXFNAMELEN 64
@@ -443,9 +509,11 @@ typedef struct knl_t_xlog_context {
     bool recoveryPauseAtTarget;
     TransactionId recoveryTargetXid;
     TimestampTz recoveryTargetTime;
+    char* obsRecoveryTargetTime;
     char* recoveryTargetBarrierId;
     char* recoveryTargetName;
     XLogRecPtr recoveryTargetLSN;
+    bool isRoachSingleReplayDone;
     /* options taken from recovery.conf for XLOG streaming */
     bool StandbyModeRequested;
     char* PrimaryConnInfo;
@@ -504,6 +572,9 @@ typedef struct knl_t_xlog_context {
 
     XLogRecPtr XactLastRecEnd;
 
+    /* record end of last commit record, used for subscription */
+    XLogRecPtr XactLastCommitEnd;
+
     /*
      * RedoRecPtr is this backend's local copy of the REDO record pointer
      * (which is almost but not quite the same as a pointer to the most recent
@@ -536,6 +607,7 @@ typedef struct knl_t_xlog_context {
     XLogRecPtr RedoStartLSN;
     ServerMode server_mode;
     bool is_cascade_standby;
+    bool is_hadr_main_standby;
 
     /* Flags to tell if we are in an startup process */
     bool startup_processing;
@@ -569,9 +641,6 @@ typedef struct knl_t_xlog_context {
      * record from and failed.
      */
     unsigned int failedSources; /* OR of XLOG_FROM_* codes */
-
-    bool readfrombuffer;
-
     /*
      * These variables track when we last obtained some WAL data to process,
      * and where we got it from.  (XLogReceiptSource is initially the same as
@@ -663,6 +732,8 @@ typedef struct knl_t_xlog_context {
 
     struct HTAB* invalid_page_tab;
 
+    struct HTAB* remain_segs;
+
     /* state maintained across calls */
     uint32 sendId;
     int sendFile;
@@ -676,7 +747,6 @@ typedef struct knl_t_xlog_context {
     MemoryContext gist_opCtx;
     MemoryContext gin_opCtx;
 
-    bool redo_oldversion_xlog;
     /*
      * Statistics for current checkpoint are collected in this global struct.
      * Because only the checkpointer or a stand-alone backend can perform
@@ -684,6 +754,7 @@ typedef struct knl_t_xlog_context {
      */
     struct CheckpointStatsData* CheckpointStats;
     struct XLogwrtResult* LogwrtResult;
+    struct XLogwrtPaxos* LogwrtPaxos;
     bool needImmediateCkp;
     int redoItemIdx;
     /* ignore cleanup when startup end. when isIgoreCleanup is true, a standby DN always keep isIgoreCleanup true */
@@ -693,11 +764,18 @@ typedef struct knl_t_xlog_context {
     XLogRecPtr  max_page_flush_lsn;
     bool        permit_finish_redo;
 
-#ifndef ENABLE_MULTIPLE_NODES
     /* redo RM_STANDBY_ID record committing csn's transaction id */
     List* committing_csn_list;
-#endif
+
     RedoInterruptCallBackFunc redoInterruptCallBackFunc;
+    RedoPageRepairCallBackFunc redoPageRepairCallBackFunc;
+
+    void *xlog_atomic_op;
+    /* Record current xlog lsn to avoid pass parameter to underlying functions level-to-level */
+    XLogRecPtr current_redo_xlog_lsn;
+    /* for switchover failed when load xlog record invalid retry count */
+    int currentRetryTimes;
+    RedoTimeCost timeCost[TIME_COST_NUM];
 } knl_t_xlog_context;
 
 typedef struct knl_t_dfs_context {
@@ -848,9 +926,13 @@ typedef struct knl_t_shemem_ptr_context {
      */
     union LWLockPadded *mainLWLockArray;
 
-    // for GTT table to track sessions and their usage of GTTs 
+    // for GTT table to track sessions and their usage of GTTs
     struct gtt_ctl_data* gtt_shared_ctl;
     struct HTAB* active_gtt_shared_hash;
+
+    struct HTAB* undoGroupLinkMap;
+    /* Maintain an image of DCF paxos index file */
+    struct DCFData *dcfData;
 } knl_t_shemem_ptr_context;
 
 typedef struct knl_t_cstore_context {
@@ -872,6 +954,15 @@ typedef struct knl_t_cstore_context {
     struct AioDispatchCUDesc** InProgressAioCUDispatch;
     int InProgressAioCUDispatchCount;
 } knl_t_cstore_context;
+
+typedef struct knl_t_undo_context {
+    int zids[UNDO_PERSISTENCE_LEVELS];
+    TransactionId prevXid[UNDO_PERSISTENCE_LEVELS];
+    void *slots[UNDO_PERSISTENCE_LEVELS];
+    uint64 slotPtr[UNDO_PERSISTENCE_LEVELS];
+    uint64 transUndoSize;
+    bool fetchRecord;
+} knl_t_undo_context;
 
 typedef struct knl_t_index_context {
     typedef uint64 XLogRecPtr;
@@ -1042,6 +1133,8 @@ typedef struct knl_t_log_context {
     /* for elog.cpp */
     struct ErrorContextCallback* error_context_stack;
 
+    struct FormatCallStack* call_stack;
+
     sigjmp_buf* PG_exception_stack;
 
     char** thd_bt_symbol;
@@ -1121,9 +1214,6 @@ typedef struct knl_t_format_context {
 
 typedef struct knl_t_audit_context {
     bool Audit_delete;
-    /*
-   +     * Flags set by interrupt handlers for later service in the main loop.
-   +     */
     /* for only sessionid needed by SDBSS */
     TimestampTz user_login_time;
     volatile sig_atomic_t need_exit;
@@ -1138,8 +1228,10 @@ typedef struct knl_t_audit_context {
     FILE *policyauditFile;
     Latch sysAuditorLatch;
     time_t last_pgaudit_start_time;
-    struct AuditIndexTable* audit_indextbl;
+    struct AuditIndexTableNew* audit_indextbl;
     char pgaudit_filepath[MAXPGPATH];
+
+    int cur_thread_idx;
 #define NBUFFER_LISTS 256
     List* buffer_lists[NBUFFER_LISTS];
 } knl_stat_context;
@@ -1187,12 +1279,33 @@ typedef struct knl_t_arch_context {
     Latch mainloop_latch;
 
     XLogRecPtr pitr_task_last_lsn;
+    TimestampTz arch_start_timestamp;
+    XLogRecPtr arch_start_lsn;
     /* millsecond */
     int task_wait_interval;
     int sync_walsender_idx;
+#ifndef ENABLE_MULTIPLE_NODES
+    int sync_follower_id;
+#endif
     /* for standby millsecond*/
     long last_arch_time;
+    char *slot_name;
+    volatile int slot_tline;
+    int slot_idx;
+    int archive_task_idx;
+    struct ArchiveSlotConfig* archive_config;
 } knl_t_arch_context;
+
+typedef struct knl_t_barrier_arch_context {
+    volatile sig_atomic_t ready_to_stop;
+    volatile sig_atomic_t got_SIGHUP;
+    volatile sig_atomic_t got_SIGTERM;
+    volatile sig_atomic_t wakened;
+    char* slot_name;
+    char barrierName[MAX_BARRIER_ID_LENGTH];
+    XLogRecPtr lastArchiveLoc;
+}knl_t_barrier_arch_context;
+
 
 /* Maximum length of a timezone name (not including trailing null) */
 #define TZ_STRLEN_MAX 255
@@ -1277,11 +1390,14 @@ typedef struct knl_t_interrupt_context {
 
     volatile uint32 CritSectionCount;
 
+    volatile uint32 QueryCancelHoldoffCount;
+
     volatile bool InterruptByCN;
 
     volatile bool InterruptCountResetFlag;
 
-    volatile bool ignoreBackendSignal;
+    volatile bool ignoreBackendSignal; /* ignore signal for threadpool worker */
+
 } knl_t_interrupt_context;
 
 typedef int64 pg_time_t;
@@ -1356,8 +1472,9 @@ typedef struct knl_t_autovacuum_context {
     volatile sig_atomic_t got_SIGUSR2;
     volatile sig_atomic_t got_SIGTERM;
 
-    /* Comparison point for determining whether freeze_max_age is exceeded */
+    /* Comparison points for determining whether freeze_max_age is exceeded */
     TransactionId recentXid;
+    MultiXactId recentMulti;
 
     /* Default freeze ages to use for autovacuum (varies by database) */
     int64 default_freeze_min_age;
@@ -1386,6 +1503,49 @@ typedef struct knl_t_autovacuum_context {
     TimestampTz last_read;
 } knl_t_autovacuum_context;
 
+typedef struct knl_t_undolauncher_context {
+    /* Flags set by signal handlers */
+    volatile sig_atomic_t got_SIGHUP;
+    volatile sig_atomic_t got_SIGUSR2;
+    volatile sig_atomic_t got_SIGTERM;
+
+    /* PID of launcher, valid only in worker while shutting down */
+    ThreadId UndoLauncherPid;
+
+    struct UndoWorkerShmemStruct *UndoWorkerShmem;
+} knl_t_undolauncher_context;
+
+typedef struct knl_t_undoworker_context {
+    /* Flags set by signal handlers */
+    volatile sig_atomic_t got_SIGHUP;
+    volatile sig_atomic_t got_SIGUSR2;
+    volatile sig_atomic_t got_SIGTERM;
+} knl_t_undoworker_context;
+
+typedef struct knl_t_undorecycler_context {
+    /* Flags set by signal handlers */
+    volatile sig_atomic_t got_SIGHUP;
+    volatile sig_atomic_t shutdown_requested;
+} knl_t_undorecycler_context;
+
+typedef struct knl_t_rollback_requests_context {
+    /* This hash holds all pending rollback requests */
+    struct HTAB *rollback_requests_hash;
+
+    /* Pointer to the next hash bucket for scan.
+     * We do not want to always start at bucket zero
+     * when scanning the hash for the next request to process.
+     */
+    uint32 next_bucket_for_scan;
+} knl_t_rollback_requests_context;
+
+typedef struct knl_t_gstat_context {
+    /* Flags set by signal handlers */
+    volatile sig_atomic_t got_SIGHUP;
+    volatile sig_atomic_t got_SIGUSR2;
+    volatile sig_atomic_t got_SIGTERM;
+} knl_t_gstat_context;
+
 typedef struct knl_t_aiocompleter_context {
     /* Flags set by interrupt handlers for later service in the main loop. */
     volatile sig_atomic_t shutdown_requested;
@@ -1401,17 +1561,38 @@ typedef struct knl_t_twophasecleaner_context {
 typedef struct knl_t_bgwriter_context {
     volatile sig_atomic_t got_SIGHUP;
     volatile sig_atomic_t shutdown_requested;
-    int thread_id;
-    uint64 next_flush_time;
 } knl_t_bgwriter_context;
 
 typedef struct knl_t_pagewriter_context {
     volatile sig_atomic_t got_SIGHUP;
     volatile sig_atomic_t shutdown_requested;
+    volatile sig_atomic_t sync_requested;
+    volatile sig_atomic_t sync_retry;
     int page_writer_after;
     int pagewriter_id;
     uint64 next_flush_time;
+    uint64 next_scan_time;
 } knl_t_pagewriter_context;
+
+typedef struct knl_t_pagerepair_context {
+    volatile sig_atomic_t got_SIGHUP;
+    volatile sig_atomic_t shutdown_requested;
+    volatile sig_atomic_t page_repair_requested;
+    volatile sig_atomic_t file_repair_requested;
+} knl_t_pagerepair_context;
+
+
+typedef struct knl_t_sharestoragexlogcopyer_context_ {
+    volatile sig_atomic_t got_SIGHUP;
+    volatile sig_atomic_t shutdown_requested;
+    bool wakeUp;
+    int readFile;
+    XLogSegNo readSegNo;
+    uint32 readOff;
+    char *originBuf;
+    char *buf;
+} knl_t_sharestoragexlogcopyer_context;
+
 
 #define MAX_SEQ_SCANS 100
 
@@ -1443,7 +1624,7 @@ typedef struct knl_t_dynahash_context {
      * a warning at transaction end for reference leaks, so any bugs leading to
      * lack of notification should be easy to catch.
      */
-    HTAB* seq_scan_tables[MAX_SEQ_SCANS]; /* tables being scanned */
+    HTAB *seq_scan_tables[MAX_SEQ_SCANS]; /* tables being scanned */
 
     int seq_scan_level[MAX_SEQ_SCANS]; /* subtransaction nest level */
 
@@ -1602,14 +1783,12 @@ typedef struct knl_t_utils_context {
      */
     int ContextUsedCount;
     struct PartitionIdentifier* partId;
-#define RANGE_PARTKEYMAXNUM 4
-    struct Const* valueItemArr[RANGE_PARTKEYMAXNUM];
+    struct Const* valueItemArr[PARTKEY_VALUE_MAXNUM + 1];
     struct ResourceOwnerData* TopResourceOwner;
     struct ResourceOwnerData* CurrentResourceOwner;
     struct ResourceOwnerData* STPSavedResourceOwner;
     struct ResourceOwnerData* CurTransactionResourceOwner;
     struct ResourceOwnerData* TopTransactionResourceOwner;
-    struct ResourceReleaseCallbackItem* ResourceRelease_callbacks;
     bool SortColumnOptimize;
     struct RelationData* pRelatedRel;
 
@@ -1635,7 +1814,7 @@ typedef struct knl_t_utils_context {
     bool gs_mp_inited;
 
     /* Memory Protecting need flag */
-    bool memNeedProtect; 
+    bool memNeedProtect;
 
     /* Track memory usage in chunks at individual thread level */
     int32 trackedMemChunks;
@@ -1669,12 +1848,14 @@ typedef struct knl_t_pgxc_context {
     int* shmemNumCoordsInCluster;
     int* shmemNumDataNodes;
     int* shmemNumDataStandbyNodes;
+    int* shmemNumSkipNodes;
 
     /* Shared memory tables of node definitions */
     struct NodeDefinition* coDefs;
     struct NodeDefinition* coDefsInCluster;
     struct NodeDefinition* dnDefs;
     struct NodeDefinition* dnStandbyDefs;
+    struct SkipNodeDefinition* skipNodes;
 
     /* pgxcnode.cpp */
     struct PGXCNodeNetCtlLayer* pgxc_net_ctl;
@@ -1707,15 +1888,6 @@ typedef struct knl_t_pgxc_context {
     char begin_cmd[BEGIN_CMD_BUFF_SIZE];
 } knl_t_pgxc_context;
 
-typedef enum CommLockStatus {
-    CommLockInvalid = 0,
-    CommLockFree,
-    CommLockHold
-} CommLockStatus;
-typedef struct knl_t_pgxc_comm_context {
-    CommLockStatus s_nodename_cache_mutex_status;
-} knl_t_pgxc_comm_context;
-
 typedef struct knl_t_conn_context {
     /* connector.cpp */
     char* value_drivertype;
@@ -1742,6 +1914,7 @@ typedef struct {
     volatile sig_atomic_t shutdown_requested;
     volatile sig_atomic_t got_SIGHUP;
     volatile sig_atomic_t sleep_long;
+    volatile sig_atomic_t check_repair;
 } knl_t_page_redo_context;
 
 typedef struct knl_t_startup_context {
@@ -1760,6 +1933,7 @@ typedef struct knl_t_startup_context {
      * that it's safe to just proc_exit.
      */
     volatile sig_atomic_t in_restore_command;
+    volatile sig_atomic_t check_repair;
 
     struct notifysignaldata* NotifySigState;
 } knl_t_startup_context;
@@ -1773,20 +1947,27 @@ typedef struct knl_t_alarmchecker_context {
     volatile sig_atomic_t gotSigdie; /* the signal flag of SIGTERM and SIGINT */
 } knl_t_alarmchecker_context;
 
+typedef struct knl_t_snapcapturer_context {
+    /* signal handle flags */
+    volatile sig_atomic_t got_SIGHUP;
+    volatile sig_atomic_t got_SIGTERM;
+
+    struct TxnSnapCapShmemStruct *snapCapShmem;
+} knl_t_snapcapturer_context;
+
+typedef struct knl_t_rbcleaner_context {
+    /* private variables for rbcleaner thread */
+    volatile sig_atomic_t got_SIGHUP;
+    volatile sig_atomic_t got_SIGTERM;
+
+    struct RbCleanerShmemStruct *RbCleanerShmem;
+} knl_t_rbcleaner_context;
+
 typedef struct knl_t_lwlockmoniter_context {
     /* Flags set by interrupt handlers for later service in the main loop. */
     volatile sig_atomic_t got_SIGHUP;
     volatile sig_atomic_t shutdown_requested;
 } knl_t_lwlockmoniter_context;
-
-typedef struct knl_t_remoteservice_context {
-    /*
-     * Flags set by interrupt handlers for later service in the main loop.
-     */
-    volatile sig_atomic_t got_SIGHUP;
-    volatile sig_atomic_t shutdown_requested;
-    struct RPCServerContext* server_context;
-} knl_t_remoteservice_context;
 
 typedef struct knl_t_walwriter_context {
     volatile sig_atomic_t got_SIGHUP;
@@ -1800,6 +1981,7 @@ typedef struct knl_t_walwriterauxiliary_context {
 
 typedef struct knl_t_poolcleaner_context {
     volatile sig_atomic_t shutdown_requested;
+    volatile sig_atomic_t got_SIGHUP;
 } knl_t_poolcleaner_context;
 
 typedef struct knl_t_catchup_context {
@@ -1833,7 +2015,7 @@ typedef struct knl_t_checkpoint_context {
     pg_time_t last_checkpoint_time;
     pg_time_t last_xlog_switch_time;
     pg_time_t last_truncate_log_time;
-    int absorb_counter;
+    int absorbCounter;
     int ckpt_done;
 } knl_t_checkpoint_context;
 
@@ -1963,6 +2145,11 @@ typedef struct knl_t_libwalreceiver_context {
 
     /* Buffer for currently read records */
     char* recvBuf;
+    char* shared_storage_buf;
+    char* shared_storage_read_buf;
+    char* decompressBuf;
+    XLogReaderState* xlogreader;
+    LibpqrcvConnectParam connect_param;
 } knl_t_libwalreceiver_context;
 
 typedef struct knl_t_sig_context {
@@ -2088,6 +2275,9 @@ typedef struct knl_t_walreceiver_context {
     bool AmWalReceiverForFailover;
     bool AmWalReceiverForStandby;
     int control_file_writed;
+    bool checkConsistencyOK;
+    bool hasReceiveNewData;
+    bool termChanged;
 } knl_t_walreceiver_context;
 
 typedef struct knl_t_walsender_context {
@@ -2179,20 +2369,39 @@ typedef struct knl_t_walsender_context {
     /* for config_file */
     char gucconf_file[MAXPGPATH];
     char gucconf_lock_file[MAXPGPATH];
+    char slotname[NAMEDATALEN];
     /* the dummy data reader fd for the wal streaming */
     FILE* ws_dummy_data_read_file_fd;
     uint32 ws_dummy_data_read_file_num;
     /* Missing CU checking stuff */
     struct cbmarray* CheckCUArray;
     struct LogicalDecodingContext* logical_decoding_ctx;
+    struct ParallelLogicalDecodingContext* parallel_logical_decoding_ctx;
     XLogRecPtr logical_startptr;
     int remotePort;
     /* Have we caught up with primary? */
     bool walSndCaughtUp;
+    int LogicalSlot;
+
     /* Notify primary to advance logical replication slot. */
     struct pg_conn* advancePrimaryConn;
     /* Timestamp of the last check-timeout time in WalSndCheckTimeOut. */
     TimestampTz last_check_timeout_timestamp;
+
+    /* Read data from WAL into xlogReadBuf, then compress it to compressBuf */
+    char *xlogReadBuf;
+    char *compressBuf;
+
+    /* flag set in WalSndCheckTimeout */
+    bool isWalSndSendTimeoutMessage;
+
+    int datafd;
+    int ep_fd;
+    logicalLog* restoreLogicalLogHead;
+    /* is obs backup, in this mode, skip backup replication slot */
+    bool is_obsmode;
+    bool standbyConnection;
+    bool cancelLogCtl;
 } knl_t_walsender_context;
 
 typedef struct knl_t_walreceiverfuncs_context {
@@ -2212,7 +2421,7 @@ typedef struct knl_t_replscanner_context {
 
 typedef struct knl_t_syncrepgram_context {
     /* Result of parsing is returned in one of these two variables */
-    struct SyncRepConfigData* syncrep_parse_result;
+    List* syncrep_parse_result;
 } knl_t_syncrepgram_context;
 
 typedef struct knl_t_syncrepscanner_context {
@@ -2222,7 +2431,10 @@ typedef struct knl_t_syncrepscanner_context {
 } knl_t_syncrepscanner_context;
 
 typedef struct knl_t_syncrep_context {
-    struct SyncRepConfigData* SyncRepConfig;
+    struct SyncRepConfigData** SyncRepConfig;   // array of SyncRepConfig
+    int SyncRepConfigGroups;                    // group of SyncRepConfig
+    int SyncRepMaxPossib;                       // max possible sync standby number
+
     bool announce_next_takeover;
 } knl_t_syncrep_context;
 
@@ -2231,8 +2443,30 @@ typedef struct knl_t_logical_context {
     uint64 sendSegNo;
     uint32 sendOff;
     bool ExportInProgress;
+    bool IsAreaDecode;
     ResourceOwner SavedResourceOwnerDuringExport;
 } knl_t_logical_context;
+
+extern struct ParallelDecodeWorker** parallelDecodeWorker;
+
+typedef struct knl_t_parallel_decode_worker_context {
+    volatile sig_atomic_t shutdown_requested;
+    volatile sig_atomic_t got_SIGHUP;
+    volatile sig_atomic_t sleep_long;
+    int slotId;
+    int parallelDecodeId;
+} knl_t_parallel_decode_worker_context;
+
+typedef struct knl_t_logical_read_worker_context {
+    volatile sig_atomic_t shutdown_requested;
+    volatile sig_atomic_t got_SIGHUP;
+    volatile sig_atomic_t sleep_long;
+    volatile sig_atomic_t got_SIGTERM;
+    MemoryContext ReadWorkerCxt;
+    ParallelDecodeWorker** parallelDecodeWorkers;
+    int slotId;
+    int totalWorkerCount;
+} knl_t_logical_read_worker_context;
 
 typedef struct knl_t_dataqueue_context {
     struct DataQueueData* DataSenderQueue;
@@ -2266,7 +2500,7 @@ typedef struct ONEXIT {
     pg_on_exit_callback function;
     Datum arg;
 } ONEXIT;
-#define MAX_ON_EXITS 20
+#define MAX_ON_EXITS 21
 typedef struct knl_t_storage_context {
     /*
      * Bookkeeping for tracking emulated transactions in recovery
@@ -2274,7 +2508,6 @@ typedef struct knl_t_storage_context {
     TransactionId latestObservedXid;
     struct RunningTransactionsData* CurrentRunningXacts;
     struct VirtualTransactionId* proc_vxids;
-
     union BufferDescPadded* BufferDescriptors;
     char* BufferBlocks;
     struct WritebackContext* BackendWritebackContext;
@@ -2340,6 +2573,17 @@ typedef struct knl_t_storage_context {
 
     /* Pointers to shared state */
     struct BufferStrategyControl* StrategyControl;
+    int NLocBuffer; /* until buffers are initialized */
+    struct BufferDesc* LocalBufferDescriptors;
+    Block* LocalBufferBlockPointers;
+    int32* LocalRefCount;
+    int nextFreeLocalBuf;
+    struct HTAB* LocalBufHash;
+    char* cur_block;
+    int next_buf_in_block;
+    int num_bufs_in_block;
+    int total_bufs_allocated;
+    MemoryContext LocalBufferContext;
     /* remember global block slot in progress */
     CacheSlotId_t CacheBlockInProgressIO;
     CacheSlotId_t CacheBlockInProgressUncompress;
@@ -2381,7 +2625,7 @@ typedef struct knl_t_storage_context {
     struct DEADLOCK_INFO* deadlockDetails;
     int nDeadlockDetails;
     /* PGPROC pointer of all blocking autovacuum worker found and its max size.
-     * blocking_autovacuum_proc_num is in [0, autovacuum_max_workers].
+     * blocking_autovacuum_proc_num is in [0, max_blocking_autovacuum_proc_num].
      *
      * Partitioned table has been supported, which maybe have hundreds of partitions.
      * When a few autovacuum workers are active and running, partitions of the same partitioned
@@ -2390,6 +2634,7 @@ typedef struct knl_t_storage_context {
      */
     struct PGPROC** blocking_autovacuum_proc;
     int blocking_autovacuum_proc_num;
+    int max_blocking_autovacuum_proc_num;
     TimestampTz deadlock_checker_start_time;
     const char* conflicting_lock_mode_name;
     ThreadId conflicting_lock_thread_id;
@@ -2444,9 +2689,15 @@ typedef struct knl_t_storage_context {
     /* statement_fin_time is valid only if statement_timeout_active is true */
     TimestampTz statement_fin_time;
     TimestampTz statement_fin_time2; /* valid only in recovery */
+    /* restimems is used for timer pause */
+    int restimems;
+    bool timeIsPausing; /* To ensure invoke pause_sig_alarm and resume_sig_alarm properly */
+
     /* global variable */
     char* pageCopy;
+    char* segPageCopy;
 
+    bool isSwitchoverLockHolder;
     int num_held_lwlocks;
     struct LWLockHandle* held_lwlocks;
     int lock_addin_request;
@@ -2468,16 +2719,18 @@ typedef struct knl_t_storage_context {
     bool atexit_callback_setup;
     ONEXIT on_proc_exit_list[MAX_ON_EXITS];
     ONEXIT on_shmem_exit_list[MAX_ON_EXITS];
-    ONEXIT before_shmem_exit_list[MAX_ON_EXITS];
     int on_proc_exit_index;
     int on_shmem_exit_index;
-    int before_shmem_exit_index;
 
     union CmprMetaUnion* cmprMetaInfo;
 
     /* Thread share file id cache */
     struct HTAB* DataFileIdCache;
+    /* Thread shared Seg Spc cache */
+    struct HTAB* SegSpcCache;
 
+    struct HTAB* uidHashCache;
+    struct HTAB* DisasterCache;
     /*
      * Maximum number of file descriptors to open for either VFD entries or
      * AllocateFile/AllocateDir/OpenTransientFile operations.  This is initialized
@@ -2491,6 +2744,8 @@ typedef struct knl_t_storage_context {
     int max_safe_fds; /* default if not changed */
     /* reserve `1000' for thread-private file id */
     int max_userdatafiles;
+
+    int timeoutRemoteOpera;
 
 } knl_t_storage_context;
 
@@ -2513,13 +2768,18 @@ typedef struct knl_t_tsearch_context {
     int ntres;
 } knl_t_tsearch_context;
 
+typedef enum {
+    NO_CHANGE = 0,
+    OLD_REPL_CHANGE_IP_OR_PORT,
+    ADD_REPL_CONN_INFO_WITH_OLD_LOCAL_IP_PORT,
+    ADD_REPL_CONN_INFO_WITH_NEW_LOCAL_IP_PORT,
+    ADD_DISASTER_RECOVERY_INFO
+} ReplConnInfoChangeType;
+
+
 typedef struct knl_t_postmaster_context {
 /* Notice: the value is same sa GUC_MAX_REPLNODE_NUM */
-#ifdef ENABLE_MULTIPLE_NODES
-#define MAX_REPLNODE_NUM 8
-#else
 #define MAX_REPLNODE_NUM 9
-#endif
 #define MAXLISTEN 64
 #define IP_LEN 64
 
@@ -2539,8 +2799,10 @@ typedef struct knl_t_postmaster_context {
      * ReplConn*2 is used to connect secondary on primary or standby, or connect primary
      * or standby on secondary.
      */
-    struct replconninfo* ReplConnArray[MAX_REPLNODE_NUM];
-    bool ReplConnChanged[MAX_REPLNODE_NUM];
+    struct replconninfo* ReplConnArray[DOUBLE_MAX_REPLNODE_NUM + 1];
+    int ReplConnChangeType[DOUBLE_MAX_REPLNODE_NUM + 1];
+    struct replconninfo* CrossClusterReplConnArray[MAX_REPLNODE_NUM];
+    bool CrossClusterReplConnChanged[MAX_REPLNODE_NUM];
     struct hashmemdata* HaShmData;
 
     /* The socket(s) we're listening to. */
@@ -2598,6 +2860,7 @@ typedef struct knl_t_postmaster_context {
 #ifndef WIN32
     int syslogPipe[2];
 #endif
+
 } knl_t_postmaster_context;
 
 #define CACHE_BUFF_LEN 128
@@ -2619,6 +2882,7 @@ typedef struct knl_t_buf_context {
     char show_tcp_keepalives_count_buf[16];
     char show_unix_socket_permissions_buf[8];
 } knl_t_buf_context;
+#define SQL_STATE_BUF_LEN 12
 
 typedef struct knl_t_bootstrap_context {
 #define MAXATTR 40
@@ -2696,6 +2960,14 @@ typedef struct knl_t_perf_snap_context {
     volatile bool is_mem_protect;
 } knl_t_perf_snap_context;
 
+#ifdef DEBUG_UHEAP
+typedef struct knl_t_uheap_stats_context {
+    /* monitoring infrastructure */
+    struct UHeapStat_Collect *uheap_stat_shared;
+    struct UHeapStat_Collect *uheap_stat_local;
+} knl_t_uheap_stats_context;
+#endif
+
 typedef struct knl_t_ash_context {
     time_t last_ash_start_time;
     volatile sig_atomic_t need_exit;
@@ -2709,8 +2981,8 @@ typedef struct knl_t_statement_context {
     volatile bool got_SIGHUP;
     int slow_sql_retention_time;
     int full_sql_retention_time;
+    void *instr_prev_post_parse_analyze_hook;
 } knl_t_statement_context;
-
 
 /* Default send interval is 1s */
 const int DEFAULT_SEND_INTERVAL = 1000;
@@ -2718,6 +2990,8 @@ typedef struct knl_t_heartbeat_context {
     volatile sig_atomic_t got_SIGHUP;
     volatile sig_atomic_t shutdown_requested;
     struct heartbeat_state* state;
+    int total_failed_times;
+    TimestampTz last_failed_timestamp;
 } knl_t_heartbeat_context;
 
 /* compaction and compaction worker use */
@@ -2735,16 +3009,34 @@ typedef struct knl_t_security_policy_context {
     MemoryContext VectorMemoryContext;
     MemoryContext MapMemoryContext;
     MemoryContext SetMemoryContext;
+    MemoryContext OidRBTreeMemoryContext;
 
     // masking
     const char* prepare_stmt_name;
     int node_location;
 } knl_t_security_policy_context;
 
+typedef struct knl_t_security_ledger_context {
+    void *prev_ExecutorEnd;
+} knl_t_security_ledger_context;
+
 typedef struct knl_t_csnmin_sync_context {
     volatile sig_atomic_t got_SIGHUP;
     volatile sig_atomic_t shutdown_requested;
 } knl_t_csnmin_sync_context;
+
+typedef struct knl_t_bgworker_context {
+    slist_head  bgwlist;
+    void   *bgwcontext;
+    void   *bgworker;
+    uint64  bgworkerId;
+} knl_t_bgworker_context;
+
+typedef struct knl_t_index_advisor_context {
+    List* stmt_table_list;
+    List* stmt_target_list;
+}
+knl_t_index_advisor_context;
 
 #ifdef ENABLE_MOT
 /* MOT thread attributes */
@@ -2796,7 +3088,159 @@ typedef struct knl_t_mot_context {
 typedef struct knl_t_barrier_creator_context {
     volatile sig_atomic_t got_SIGHUP;
     volatile sig_atomic_t shutdown_requested;
+    bool is_first_barrier;
+    struct BarrierUpdateLastTimeInfo* barrier_update_last_time_info;
+    List* archive_slot_names;
+    uint64 first_cn_timeline;
 } knl_t_barrier_creator_context;
+
+typedef struct knl_t_barrier_preparse_context {
+    volatile sig_atomic_t got_SIGHUP;
+    volatile sig_atomic_t shutdown_requested;
+} knl_t_barrier_preparse_context;
+
+
+// the length of t_thrd.proxy_cxt.identifier
+#define IDENTIFIER_LENGTH    64
+typedef struct knl_t_proxy_context {
+    char identifier[IDENTIFIER_LENGTH];
+} knl_t_proxy_context;
+
+#define DCF_MAX_NODES 10
+/* For log ctrl. Willing let standby flush and apply log under RTO seconds */
+typedef struct DCFLogCtrlData {
+    int64 prev_sleep_time;
+    int64 sleep_time;
+    int64 balance_sleep_time;
+    int64 prev_RTO;
+    int64 current_RTO;
+    uint64 sleep_count;
+    uint64 sleep_count_limit;
+    XLogRecPtr prev_flush;
+    XLogRecPtr prev_apply;
+    TimestampTz prev_reply_time;
+    uint64 pre_rate1;
+    uint64 pre_rate2;
+    int64 prev_RPO;
+    int64 current_RPO;
+    bool just_keep_alive;
+} DCFLogCtrlData;
+
+typedef struct DCFStandbyInfo {
+    /*
+     * The xlog locations that have been received, written, flushed, and applied by
+     * standby-side. These may be invalid if the standby-side is unable to or
+     * chooses not to report these.
+     */
+    uint32 nodeID;
+    bool isMember;
+    bool isActive;
+    XLogRecPtr receive;
+    XLogRecPtr write;
+    XLogRecPtr flush;
+    XLogRecPtr apply;
+    XLogRecPtr applyRead;
+
+    /* local role on walreceiver, they will be sent to walsender */
+    ServerMode peer_role;
+    DbState peer_state;
+
+    /* Sender's system clock at the time of transmission */
+    TimestampTz sendTime;
+} DCFStandbyInfo;
+
+typedef struct DcfContextInfo {
+    /* 1.Control dcf launch */
+    bool isDcfStarted;
+    slock_t dcfStartedMutex;
+
+    /* 2.Control index save and truncate */
+    bool isWalRcvReady;
+    bool isRecordIdxBlocked;
+    slock_t recordDcfIdxMutex;
+    uint64 recordLsn;
+    uint64 dcfRecordIndex;
+    uint64 appliedLsn;          /* the lsn replayed */
+    uint64 truncateDcfIndex;    /* consider set it properly after start */
+
+    /* 3.Control promote */
+    bool dcf_to_be_leader;      /* used by promoting leader */
+
+    /* 4.Control full build */
+    /* check version systemid and timeline between standby and primary */
+    bool dcf_build_done;
+    bool dcf_need_build_set;
+
+    /* 5.Control config file sync */
+    /* leader need sync config to follower after guc reload */
+    bool dcfNeedSyncConfig;
+    char gucconf_file[MAXPGPATH];
+    char temp_guc_conf_file[MAXPGPATH];
+    char bak_guc_conf_file[MAXPGPATH];
+    char gucconf_lock_file[MAXPGPATH];
+    TimestampTz last_sendfilereply_timestamp;
+    int check_file_timeout;
+    time_t standby_config_modify_time;
+    time_t Primary_config_modify_time;
+    struct ConfigModifyTimeMessage* reply_modify_message;
+
+    /* 6.Control flow speed */
+    struct DCFStandbyReplyMessage* dcf_reply_message;
+    DCFStandbyInfo nodes_info[DCF_MAX_NODES];
+    DCFLogCtrlData log_ctrl[DCF_MAX_NODES];
+    int targetRTO;
+    int targetRPO;
+} DcfContextInfo;
+
+/* dcf (distribute consensus frame work) */
+typedef struct knl_t_dcf_context {
+    bool isDcfShmemInited;
+    bool is_dcf_thread;
+    DcfContextInfo* dcfCtxInfo;
+} knl_t_dcf_context;
+
+typedef struct knl_t_lsc_context {
+    LocalSysDBCache *lsc;
+    bool enable_lsc;
+    FetTupleFrom FetchTupleFromCatCList;
+}knl_t_lsc_context;
+
+/* replication apply launcher, for subscription */
+typedef struct knl_t_apply_launcher_context {
+    /* Flags set by signal handlers */
+    volatile sig_atomic_t got_SIGHUP;
+    volatile sig_atomic_t newWorkerRequest;
+    volatile sig_atomic_t got_SIGTERM;
+    bool onCommitLauncherWakeup;
+    ApplyLauncherShmStruct *applyLauncherShm;
+} knl_t_apply_launcher_context;
+
+/* replication apply worker, for subscription */
+typedef struct knl_t_apply_worker_context {
+    /* Flags set by signal handlers */
+    volatile sig_atomic_t got_SIGHUP;
+    volatile sig_atomic_t got_SIGTERM;
+    dlist_head lsnMapping;
+    HTAB *logicalRepRelMap;
+    TimestampTz sendTime;
+    XLogRecPtr lastRecvpos;
+    XLogRecPtr lastWritepos;
+    XLogRecPtr lastFlushpos;
+
+    Subscription *mySubscription;
+    bool mySubscriptionValid;
+    bool inRemoteTransaction;
+    LogicalRepWorker *curWorker;
+    MemoryContext messageContext;
+    MemoryContext logicalRepRelMapContext;
+    MemoryContext applyContext;
+} knl_t_apply_worker_context;
+
+typedef struct knl_t_publication_context {
+    bool publications_valid;
+    /* Map used to remember which relation schemas we sent. */
+    HTAB* RelationSyncCache;
+} knl_t_publication_context;
 
 /* thread context. */
 typedef struct knl_thrd_context {
@@ -2808,6 +3252,8 @@ typedef struct knl_thrd_context {
     struct PGPROC* proc;
     struct PGXACT* pgxact;
     struct Backend* bn;
+    int child_slot;
+    bool is_inited; /* is new thread get new backend? */
     // we need to have a fake session to do some initialize
     knl_session_context* fake_session;
 
@@ -2815,11 +3261,18 @@ typedef struct knl_thrd_context {
 
     MemoryContext top_mem_cxt;
     MemoryContextGroup* mcxt_group;
+    knl_t_lsc_context lsc_cxt;
+
+	/* variables to support comm proxy */
+    CommSocketOption comm_sock_option;
+    CommEpollOption comm_epoll_option;
+    CommPollOption comm_poll_option;
 
     knl_t_aes_context aes_cxt;
     knl_t_aiocompleter_context aio_cxt;
     knl_t_alarmchecker_context alarm_cxt;
     knl_t_arch_context arch;
+    knl_t_barrier_arch_context barrier_arch;
     knl_t_async_context asy_cxt;
     knl_t_audit_context audit;
     knl_t_autovacuum_context autovacuum_cxt;
@@ -2827,6 +3280,9 @@ typedef struct knl_thrd_context {
     knl_t_bgwriter_context bgwriter_cxt;
     knl_t_bootstrap_context bootstrap_cxt;
     knl_t_pagewriter_context pagewriter_cxt;
+    knl_t_pagerepair_context pagerepair_cxt;
+    knl_t_sharestoragexlogcopyer_context sharestoragexlogcopyer_cxt;
+    knl_t_barrier_preparse_context barrier_preparse_cxt;
     knl_t_buf_context buf_cxt;
     knl_t_bulkload_context bulk_cxt;
     knl_t_cbm_context cbm_cxt;
@@ -2856,14 +3312,12 @@ typedef struct knl_thrd_context {
     knl_t_lwlockmoniter_context lwm_cxt;
     knl_t_mem_context mem_cxt;
     knl_t_obs_context obs_cxt;
-    knl_t_pgxc_comm_context pgxc_comm_cxt;
     knl_t_pgxc_context pgxc_cxt;
     knl_t_port_context port_cxt;
     knl_t_postgres_context postgres_cxt;
     knl_t_postmaster_context postmaster_cxt;
     knl_t_proc_context proc_cxt;
     knl_t_relopt_context relopt_cxt;
-    knl_t_remoteservice_context rs_cxt;
     knl_t_replgram_context replgram_cxt;
     knl_t_replscanner_context replscanner_cxt;
     knl_t_shemem_ptr_context shemem_ptr_cxt;
@@ -2895,9 +3349,19 @@ typedef struct knl_thrd_context {
     knl_t_percentile_context percentile_cxt;
     knl_t_perf_snap_context perf_snap_cxt;
     knl_t_page_redo_context page_redo_cxt;
+    knl_t_parallel_decode_worker_context parallel_decode_cxt;
+    knl_t_logical_read_worker_context logicalreadworker_cxt;
     knl_t_heartbeat_context heartbeat_cxt;
     knl_t_security_policy_context security_policy_cxt;
+    knl_t_security_ledger_context security_ledger_cxt;
     knl_t_poolcleaner_context poolcleaner_cxt;
+    knl_t_snapcapturer_context snapcapturer_cxt;
+    knl_t_rbcleaner_context rbcleaner_cxt;
+    knl_t_undo_context undo_cxt;
+    knl_t_undolauncher_context undolauncher_cxt;
+    knl_t_undoworker_context undoworker_cxt;
+    knl_t_undorecycler_context undorecycler_cxt;
+    knl_t_rollback_requests_context rollback_requests_cxt;
     knl_t_ts_compaction_context ts_compaction_cxt;
     knl_t_ash_context ash_cxt;
     knl_t_statement_context statement_cxt;
@@ -2906,13 +3370,28 @@ typedef struct knl_thrd_context {
 #ifdef ENABLE_MOT
     knl_t_mot_context mot_cxt;
 #endif
+
+    knl_t_gstat_context gstat_cxt;
+
+#ifdef DEBUG_UHEAP
+    knl_t_uheap_stats_context uheap_stats_cxt;
+#endif
+
     knl_t_barrier_creator_context barrier_creator_cxt;
+    knl_t_proxy_context proxy_cxt;
+    knl_t_dcf_context dcf_cxt;
+    knl_t_bgworker_context bgworker_cxt;
+    knl_t_index_advisor_context index_advisor_cxt;
+    knl_t_apply_launcher_context applylauncher_cxt;
+    knl_t_apply_worker_context applyworker_cxt;
+    knl_t_publication_context publication_cxt;
 } knl_thrd_context;
 
 #ifdef ENABLE_MOT
 extern void knl_thread_mot_init();
 #endif
 
+extern void knl_t_syscache_init();
 extern void knl_thread_init(knl_thread_role role);
 extern THR_LOCAL knl_thrd_context t_thrd;
 
@@ -2931,12 +3410,9 @@ inline bool StreamTopConsumerAmI()
     return (t_thrd.subrole == TOP_CONSUMER);
 }
 
-#ifdef ENABLE_MULTIPLE_NODES
-#define BUCKETDATALEN (t_thrd.pgxc_cxt.globalBucketLen)
-#define BUCKETSTRLEN (6*BUCKETDATALEN)
-#endif
-
 RedoInterruptCallBackFunc RegisterRedoInterruptCallBack(RedoInterruptCallBackFunc func);
 void RedoInterruptCallBack();
+RedoPageRepairCallBackFunc RegisterRedoPageRepairCallBack(RedoPageRepairCallBackFunc func);
+void RedoPageRepairCallBack(RepairBlockKey key, XLogPhyBlock pblk);
 
 #endif /* SRC_INCLUDE_KNL_KNL_THRD_H_ */

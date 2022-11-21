@@ -34,6 +34,9 @@ select a, avg(b), sum(c) from t1 group by a order by 1,2,3;
 explain (costs off) select median(a) from t1;
 select median(a) from t1;
 
+explain (costs off) select first(a) from t1;
+select first(a) from t1;
+
 explain (costs off) select sum(b)+median(a) as result from t1;
 select sum(b)+median(a) as result from t1;
 
@@ -51,6 +54,12 @@ select * from t1 where t1.a in (select t2.a from t2, t3 where t2.b = t3.c) order
 
 explain (costs off) with s1 as (select t1.a as a, t3.b as b from t1,t3 where t1.b=t3.c) select * from t2, s1 where t2.b=s1.a order by 1,2,3,4;
 with s1 as (select t1.a as a, t3.b as b from t1,t3 where t1.b=t3.c) select * from t2, s1 where t2.b=s1.a order by 1,2,3,4;
+
+explain (costs off) select * from t1 order by a limit 10;
+select * from t1 order by a limit 10;
+
+explain (costs off) select * from t1 order by a limit 10 offset 20;
+select * from t1 order by a limit 10 offset 20;
 
 --clean
 set search_path=public;

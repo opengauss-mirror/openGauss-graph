@@ -53,6 +53,7 @@ static inline void PRXLogRecGetBlockTag(XLogRecParseState *recordBlockState, Rel
         rnode->relNode = blockparse->blockhead.relNode;
         rnode->spcNode = blockparse->blockhead.spcNode;
         rnode->bucketNode = blockparse->blockhead.bucketNode;
+        rnode->opt = blockparse->blockhead.opt;
     }
     if (blknum != NULL) {
         *blknum = blockparse->blockhead.blkno;
@@ -212,30 +213,56 @@ void PRTrackDatabaseDrop(XLogRecParseState *recordBlockState, HTAB *hashMap)
     XLogBlockParseStateRelease(recordBlockState);
 }
 
+void PRTrackDropFiles(HTAB *redoItemHash, XLogBlockDdlParse *ddlParse, XLogRecPtr lsn)
+{
+    ColFileNodeRel *xnodes = (ColFileNodeRel *)ddlParse->mainData;
+    for (int i = 0; i < ddlParse->rels; ++i) {
+        ColFileNode colFileNode;
+        ColFileNodeRel *colFileNodeRel = xnodes + i;
+        ColFileNodeCopy(&colFileNode, colFileNodeRel);
+
+        if (IS_COMPRESS_DELETE_FORK(colFileNode.forknum)) {
+            SET_OPT_BY_NEGATIVE_FORK(colFileNode.filenode, colFileNode.forknum);
+            colFileNode.forknum = MAIN_FORKNUM;
+        }
+
+        if (!IsValidColForkNum(colFileNode.forknum)) {
+            for (int i = 0; i < MAX_FORKNUM; ++i)
+                PRTrackRelTruncate(redoItemHash, colFileNode.filenode, i, 0);
+        } else {
+            PRTrackRelTruncate(redoItemHash, colFileNode.filenode, colFileNode.forknum, 0);
+        }
+#ifdef USE_ASSERT_CHECKING
+        ereport(LOG, (errmsg("PRTrackRelTruncate(drop):(%X/%X)clear relation %u/%u/%u forknum %d record",
+            (uint32)(lsn >> 32), (uint32)(lsn), colFileNode.filenode.spcNode, colFileNode.filenode.dbNode,
+            colFileNode.filenode.relNode, colFileNode.forknum)));
+#endif
+    }
+}
+
 void PRTrackRelStorageDrop(XLogRecParseState *recordBlockState, HTAB *redoItemHash)
 {
     XLogBlockParse *blockparse = &(recordBlockState->blockparse);
-    XLogBlockDdlParse *ddlParse = &(recordBlockState->blockparse.extra_rec.blockddlrec);
-    RelFileNode rNode;
-    rNode.spcNode = blockparse->blockhead.spcNode;
-    rNode.dbNode = blockparse->blockhead.dbNode;
-    rNode.relNode = blockparse->blockhead.relNode;
-    rNode.bucketNode = blockparse->blockhead.bucketNode;
-
-#ifdef USE_ASSERT_CHECKING
-    ereport(LOG, (errmsg("PRTrackRelTruncate:(%X/%X)clear relation %u/%u/%u forknum %u record",
-                         (uint32)(blockparse->blockhead.end_ptr >> 32), (uint32)(blockparse->blockhead.end_ptr),
-                         rNode.spcNode, rNode.dbNode, rNode.relNode, blockparse->blockhead.forknum)));
-#endif
+    XLogBlockDdlParse *ddlParse = NULL;
+    XLogBlockParseGetDdlParse(recordBlockState, ddlParse);
 
     if (ddlParse->blockddltype == BLOCK_DDL_TRUNCATE_RELNODE) {
+        RelFileNode rNode;
+        rNode.spcNode = blockparse->blockhead.spcNode;
+        rNode.dbNode = blockparse->blockhead.dbNode;
+        rNode.relNode = blockparse->blockhead.relNode;
+        rNode.bucketNode = blockparse->blockhead.bucketNode;
+        rNode.opt = blockparse->blockhead.opt;
+#ifdef USE_ASSERT_CHECKING
+        ereport(LOG, (errmsg("PRTrackRelTruncate:(%X/%X)clear relation %u/%u/%u forknum %u record",
+            (uint32)(blockparse->blockhead.end_ptr >> 32), (uint32)(blockparse->blockhead.end_ptr), rNode.spcNode,
+            rNode.dbNode, rNode.relNode, blockparse->blockhead.forknum)));
+#endif
         PRTrackRelTruncate(redoItemHash, rNode, blockparse->blockhead.forknum, blockparse->blockhead.blkno);
-    } else if (!IsValidColForkNum(blockparse->blockhead.forknum)) {
-        for (int i = 0; i < MAX_FORKNUM; ++i)
-            PRTrackRelTruncate(redoItemHash, rNode, i, 0);
     } else {
-        PRTrackRelTruncate(redoItemHash, rNode, blockparse->blockhead.forknum, 0);
+        PRTrackDropFiles(redoItemHash, ddlParse, blockparse->blockhead.end_ptr);
     }
+
     XLogBlockParseStateRelease(recordBlockState);
 }
 
@@ -265,6 +292,8 @@ void PRTrackAddBlock(XLogRecParseState *recordBlockState, HTAB *redoItemHash)
 */
 void PRTrackClearBlock(XLogRecParseState *recordBlockState, HTAB *redoItemHash)
 {
+    Assert(recordBlockState != NULL);
+    Assert(redoItemHash != NULL);
     XLogBlockParse *blockparse = &(recordBlockState->blockparse);
     if (blockparse->blockhead.block_valid == BLOCK_DATA_DDL_TYPE) {
         PRTrackRelStorageDrop(recordBlockState, redoItemHash);

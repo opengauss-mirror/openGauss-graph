@@ -212,4 +212,8 @@ extern Datum timetz_izone(PG_FUNCTION_ARGS);
 extern Datum timetz_pl_interval(PG_FUNCTION_ARGS);
 extern Datum timetz_mi_interval(PG_FUNCTION_ARGS);
 
+#ifdef GS_GRAPH
+extern void call_EncodeSpecialDate(DateADT dt, char *str, int strlen);
+#endif /* GS_GRAPH */
+
 #endif /* DATE_H */

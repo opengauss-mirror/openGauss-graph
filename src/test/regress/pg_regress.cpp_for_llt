@@ -1695,12 +1695,6 @@ initdb_node_config_file(bool standby)
         (void)snprintf(buf, sizeof(buf), "pooler_port = %d\n", myinfo.dn_pool_port[i]);
         fputs(buf, pg_conf);
 
-	    (void)snprintf(buf, sizeof(buf), "comm_control_port = %d\n", myinfo.dn_ctl_port[i]);
-        fputs(buf, pg_conf);
-
-	    (void)snprintf(buf, sizeof(buf), "comm_sctp_port = %d\n", myinfo.dn_sctp_port[i]);
-        fputs(buf, pg_conf);
-
 		if (comm_tcp_mode == false)
 	    	fputs("comm_tcp_mode = false\n", pg_conf);
 
@@ -1797,12 +1791,6 @@ initdb_node_config_file(bool standby)
 		fputs("\n# Configuration added by pg_regress\n\n", pg_conf);
 
 		(void)snprintf(buf, sizeof(buf), "port = %d\n", myinfo.dns_port[i]);
-		fputs(buf, pg_conf);
-
-		(void)snprintf(buf, sizeof(buf), "comm_control_port = %d\n", myinfo.dns_ctl_port[i]);
-		fputs(buf, pg_conf);
-
-		(void)snprintf(buf, sizeof(buf), "comm_sctp_port = %d\n", myinfo.dns_sctp_port[i]);
 		fputs(buf, pg_conf);
 
 		(void)snprintf(buf, sizeof(buf),
@@ -4813,13 +4801,6 @@ create_database(const char* dbname)
 	else
 		psql_command("postgres", "CREATE DATABASE \"%s\" TEMPLATE=TEMPLATE0%s", dbname,
 					 (nolocale) ? " LC_COLLATE='C' LC_CTYPE='C'" : "");
-	psql_command(dbname,
-				 "ALTER DATABASE \"%s\" SET lc_messages TO 'C';"
-				 "ALTER DATABASE \"%s\" SET lc_monetary TO 'C';"
-				 "ALTER DATABASE \"%s\" SET lc_numeric TO 'C';"
-				 "ALTER DATABASE \"%s\" SET lc_time TO 'C';"
-			"ALTER DATABASE \"%s\" SET timezone_abbreviations TO 'Default';",
-				 dbname, dbname, dbname, dbname, dbname);
 
     /*
      * Install any requested procedural languages.	We use CREATE OR REPLACE

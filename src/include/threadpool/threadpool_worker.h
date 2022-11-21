@@ -49,6 +49,7 @@ extern void SetThreadLocalGUC(knl_session_context* session);
  */
 typedef struct Backend {
     ThreadId pid;       /* process id of backend */
+    knl_thread_role role; /* thread role */
     long cancel_key;    /* cancel key for cancels for this backend */
     int child_slot;     /* PMChildSlot for this backend, if any */
     bool is_autovacuum; /* is it an autovacuum process? */
@@ -88,13 +89,9 @@ public:
     void CleanUpSessionWithLock();
     bool WakeUpToWork(knl_session_context* session);
     void WakeUpToUpdate(ThreadStatus status);
+    bool WakeUpToPendingIfFree();
 
     friend class ThreadPoolListener;
-
-    inline knl_session_context* GetAttachSession()
-    {
-        return m_currentSession;
-    }
 
     inline ThreadPoolGroup* GetGroup()
     {
@@ -109,6 +106,17 @@ public:
     inline void SetSession(knl_session_context* session)
     {
         m_currentSession = session;
+    }
+    const inline knl_thrd_context *GetThreadContextPtr()
+    {
+        return m_thrd;
+    }
+
+
+    inline ThreadStatus GetthreadStatus()
+    {
+        pg_memory_barrier();
+        return m_threadStatus;
     }
 
     static Backend* CreateBackend();
@@ -141,6 +149,7 @@ private:
     ThreadPoolGroup* m_group;
     pthread_mutex_t* m_mutex;
     pthread_cond_t* m_cond;
+    knl_thrd_context *m_thrd;
 };
 
 #endif /* THREAD_POOL_WORKER_H */

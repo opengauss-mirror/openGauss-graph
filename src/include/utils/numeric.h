@@ -1,11 +1,12 @@
 /* -------------------------------------------------------------------------
  *
  * numeric.h
- *	  Definitions for the exact numeric data type of Postgres
+ *	  Definitions for the exact numeric data type of openGauss
  *
  * Original coding 1998, Jan Wieck.  Heavily revised 2003, Tom Lane.
  *
  * Copyright (c) 1998-2012, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2021, openGauss Contributors
  *
  * src/include/utils/numeric.h
  *
@@ -194,6 +195,7 @@ int32 numeric_maximum_size(int32 typmod);
 extern char* numeric_out_sci(Numeric num, int scale);
 extern Datum numtodsinterval(PG_FUNCTION_ARGS);
 extern int cmp_numerics(Numeric num1, Numeric num2);
+extern int128 numeric_int16_internal(Numeric num);
 
 //
 // Numeric Compression Codes Area
@@ -233,7 +235,7 @@ extern int convert_int128_to_short_numeric_byscale(
     _out_ char* outBuf, _in_ int128 v, _in_ int32 typmod, _in_ int32 vscale);
 extern Datum convert_short_numeric_to_int64(_in_ Numeric inNum, _out_ bool* outSuccess);
 extern Datum convert_short_numeric_to_int128(_in_ Numeric inNum, _out_ bool* outSuccess);
-extern Datum try_convert_numeric_normal_to_fast(Datum value);
+extern Datum try_convert_numeric_normal_to_fast(Datum value, ScalarVector *arr = NULL);
 extern int64 convert_short_numeric_to_int64_byscale(_in_ Numeric n, _in_ int scale);
 extern void convert_short_numeric_to_int128_byscale(_in_ Numeric n, _in_ int scale, _out_ int128& result);
 extern int32 get_ndigit_from_numeric(_in_ Numeric num);
@@ -298,9 +300,11 @@ typedef struct NumericVar {
 #define init_var(v)        MemSetAligned(v, 0, sizeof(NumericVar))
 Numeric makeNumeric(NumericVar* var);
 extern Numeric make_result(NumericVar *var);
+extern void init_var_from_num(Numeric num, NumericVar* dest);
 extern void free_var(NumericVar *var);
+extern bool numericvar_to_int64(const NumericVar* var, int64* result);
 extern void int64_to_numericvar(int64 val, NumericVar *var);
 extern void add_var(NumericVar *var1, NumericVar *var2, NumericVar *result);
 extern char *numeric_normalize(Numeric num);
-
+extern Datum numeric_scale(PG_FUNCTION_ARGS);
 #endif /* _PG_NUMERIC_H_ */

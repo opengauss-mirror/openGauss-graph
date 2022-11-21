@@ -41,9 +41,14 @@
 #include "client_logic_cache/icached_column.h"
 #include "client_logic_common/statement_data.h"
 #include "client_logic_fmt/copy_state_data.h"
+
 #define ISOCTAL(c) (((c) >= '0') && ((c) <= '7'))
 #define OCTVALUE(c) ((c) - '0')
 #define INTEGER_SIZE 64
+
+#ifdef ENABLE_UT
+#define static
+#endif
 
 /* non-export function prototypes */
 static CopyStateData *begin_copy(bool is_from, bool is_rel, Node *raw_query, const char *query_string,
@@ -113,11 +118,16 @@ int deprocess_copy_line(PGconn *conn, const char *in_buffer, int msg_length, cha
 
         msg_length = remove_line_end(cstate, in_buffer, msg_length);
 
+        int decrypted_msg_length = 0;
         if (cstate->csv_mode) {
-            return deprocess_csv_line(conn, entry, in_buffer, msg_length, buffer);
+            decrypted_msg_length = deprocess_csv_line(conn, entry, in_buffer, msg_length, buffer);
         } else {
-            return deprocess_txt_line(conn, entry, in_buffer, msg_length, buffer);
+            decrypted_msg_length = deprocess_txt_line(conn, entry, in_buffer, msg_length, buffer);
         }
+        if (decrypted_msg_length < 0) {
+            libpq_free(*buffer);
+        }
+        return decrypted_msg_length;
     }
 }
 
@@ -134,17 +144,20 @@ int process_copy_chunk(PGconn *conn, const char *in_buffer, int msg_length, char
     }
     if (cstate->binary) {
         /* DO NOT SUPPORT BINARY COPY FOR NOW */
+        fprintf(stderr, "cstate->binary is NULL\n");
         return -1;
     } else {
         char *full_chunk(NULL);
         if (entry->partial_csv_column_size > 0) {
             /* we need to concatenate the partialCsv we have saved with the incoming buffer */
             if ((size_t)msg_length > (size_t)PG_INT32_MAX - entry->partial_csv_column_size) {
+                Assert(false);
                 return -1;
             }
             size_t new_size = entry->partial_csv_column_size + msg_length;
             full_chunk = (char *)malloc(new_size);
             if (full_chunk == NULL) {
+                Assert(false);
                 return -1;
             } else {
                 check_memset_s(memset_s(full_chunk, new_size, 0, new_size));
@@ -172,6 +185,9 @@ int process_copy_chunk(PGconn *conn, const char *in_buffer, int msg_length, char
             ret = process_csv_chunk(conn, entry, in_buffer, msg_length, buffer);
         } else {
             ret = process_txt_chunk(conn, entry, in_buffer, msg_length, buffer);
+        }
+        if (ret < 0) {
+            libpq_free(*buffer);
         }
         if (full_chunk != NULL) {
             free(full_chunk);
@@ -313,14 +329,26 @@ static bool field_needs_processing(PGconn *conn, PreparedStatement *entry)
         Assert(false);
         return false;
     }
-    size_t cached_columns_size = entry->cached_copy_columns->size();
-    for (size_t i = 0; i < cached_columns_size; ++i) {
-        const ICachedColumn *cached_column = entry->cached_copy_columns->at(i);
-        if (!cached_column) {
-            continue;
-        }
-        if (entry->copy_state->fieldno == (int)cached_column->get_col_idx() - 1) {
+
+    /*
+     * if the attlist is not null, copy the specifying columns
+     * if the attlist is null, copy the whole table
+     */
+    if (!entry->copy_state->is_attlist_null) {
+        const ICachedColumn *cached_column = entry->cached_copy_columns->at(entry->copy_state->fieldno);
+        if (cached_column) {
             return true;
+        }
+    } else {
+        size_t cached_columns_size = entry->cached_copy_columns->size();
+        for (size_t i = 0; i < cached_columns_size; ++i) {
+            const ICachedColumn *cached_column = entry->cached_copy_columns->at(i);
+            if (!cached_column) {
+                continue;
+            }
+            if (entry->copy_state->fieldno == (int)cached_column->get_col_idx() - 1) {
+                return true;
+            }
         }
     }
     return false;
@@ -376,9 +404,7 @@ static int deprocess_txt_line(PGconn *conn, PreparedStatement *entry, const char
         /* Make sure there is enough space for the next value */
         if (cstate->fieldno >= (int)entry->original_data_types_oids_size) {
             free(data);
-            free(*buffer);
             data = NULL;
-            *buffer = NULL;
             return -1;
         }
 
@@ -524,9 +550,7 @@ static int deprocess_txt_line(PGconn *conn, PreparedStatement *entry, const char
         } else {
             if (!deprocess_and_replace(conn, entry, data, data_size, false, buffer, written, res_length)) {
                 free(data);
-                free(*buffer);
                 data = NULL;
-                *buffer = NULL;
                 return -1;
             }
             if (!append_buffer(buffer, res_length, written, end_ptr, cur_ptr - end_ptr)) {
@@ -564,6 +588,7 @@ static int deprocess_txt_line(PGconn *conn, PreparedStatement *entry, const char
 static int process_txt_chunk(PGconn *conn, PreparedStatement *entry, const char *in_buffer, int msg_length,
     char **buffer)
 {
+    *buffer = NULL;
     if (!entry) {
         return -1;
     }
@@ -571,11 +596,11 @@ static int process_txt_chunk(PGconn *conn, PreparedStatement *entry, const char 
     size_t data_allocated = DATA_BUFFER_SIZE;
     char *data = (char *)calloc(sizeof(char), data_allocated);
     if (data == NULL) {
+        printfPQExpBuffer(&conn->errorMessage, "ERROR(CLIENT): failed to allocate memory for data\n");
         return -1;
     }
     size_t data_size = 0;
 
-    *buffer = NULL;
     CopyStateData *cstate = entry->copy_state;
 
     char delimc = cstate->delim;
@@ -594,6 +619,7 @@ static int process_txt_chunk(PGconn *conn, PreparedStatement *entry, const char 
     if (*buffer == NULL) {
         free(data);
         data = NULL;
+        printfPQExpBuffer(&conn->errorMessage, "ERROR(CLIENT): failed to allocate memory for buffer\n");
         return -1;
     } else {
         check_memset_s(memset_s(*buffer, buffer_size, 0, buffer_size));
@@ -745,6 +771,7 @@ static int process_txt_chunk(PGconn *conn, PreparedStatement *entry, const char 
                 if (data_size >= data_allocated) {
                     data = (char *)libpq_realloc(data, data_allocated, data_allocated + DATA_BUFFER_SIZE);
                     if (data == NULL) {
+                        printfPQExpBuffer(&conn->errorMessage, "ERROR(CLIENT): failed to realloc memory for data\n");
                         return -1;
                     }
                     data_allocated += DATA_BUFFER_SIZE;
@@ -762,20 +789,20 @@ static int process_txt_chunk(PGconn *conn, PreparedStatement *entry, const char 
             if (!append_buffer(buffer, res_length, written, start_ptr, cur_ptr - start_ptr)) {
                 free(data);
                 data = NULL;
+                printfPQExpBuffer(&conn->errorMessage, "ERROR(CLIENT): failed to append buffer for data\n");
                 return -1;
             }
         } else if (found_delim || found_eol || (end_ptr == line_end_ptr)) {
             /* process */
             if (!process_and_replace(conn, entry, data, data_size, false, buffer, written, res_length)) {
                 free(data);
-                free(*buffer);
                 data = NULL;
-                *buffer = NULL;
                 return -1;
             }
             if (!append_buffer(buffer, res_length, written, end_ptr, cur_ptr - end_ptr)) {
                 free(data);
                 data = NULL;
+                printfPQExpBuffer(&conn->errorMessage, "ERROR(CLIENT): failed to append buffer for process data\n");
                 return -1;
             }
         } else {
@@ -787,6 +814,8 @@ static int process_txt_chunk(PGconn *conn, PreparedStatement *entry, const char 
                 if (entry->partial_csv_column == NULL) {
                     free(data);
                     data = NULL;
+                    printfPQExpBuffer(&conn->errorMessage,
+                        "ERROR(CLIENT): failed to realloc memory for partial_csv_column");
                     return -1;
                 }
                 entry->partial_csv_column_allocated = new_size;
@@ -812,6 +841,7 @@ static int process_txt_chunk(PGconn *conn, PreparedStatement *entry, const char 
 
     if (written) {
         if (!append_buffer(buffer, res_length, written, "\0", 1)) {
+            printfPQExpBuffer(&conn->errorMessage, "ERROR(CLIENT): failed to append buffer for written data");
             return -1;
         }
         --written;
@@ -873,9 +903,7 @@ static int deprocess_csv_line(PGconn *conn, PreparedStatement *entry, const char
         /* Make sure there is enough space for the next value */
         if (cstate->fieldno >= (int)entry->original_data_types_oids_size) {
             free(data);
-            free(*buffer);
             data = NULL;
-            *buffer = NULL;
             return -1;
         }
 
@@ -930,9 +958,7 @@ static int deprocess_csv_line(PGconn *conn, PreparedStatement *entry, const char
                 end_ptr = cur_ptr;
                 if (cur_ptr >= line_end_ptr) {
                     free(data);
-                    free(*buffer);
                     data = NULL;
-                    *buffer = NULL;
                     return -1;
                 }
 
@@ -1003,9 +1029,7 @@ static int deprocess_csv_line(PGconn *conn, PreparedStatement *entry, const char
         } else {
             if (!deprocess_and_replace(conn, entry, data, data_size, saw_quote, buffer, written, res_length)) {
                 free(data);
-                free(*buffer);
                 data = NULL;
-                *buffer = NULL;
                 return -1;
             }
             if (!append_buffer(buffer, res_length, written, end_ptr, cur_ptr - end_ptr)) {
@@ -1143,10 +1167,8 @@ int process_csv_chunk(PGconn *conn, PreparedStatement *entry, const char *in_buf
                 end_ptr = cur_ptr;
                 if (cur_ptr >= line_end_ptr) {
                     free(data);
-                    free(*buffer);
                     data = NULL;
-                    *buffer = NULL;
-                    return 0;
+                    return -1;
                 }
 
                 c = *cur_ptr++;
@@ -1212,15 +1234,13 @@ int process_csv_chunk(PGconn *conn, PreparedStatement *entry, const char *in_buf
             if (!append_buffer(buffer, res_length, written, start_ptr, cur_ptr - start_ptr)) {
                 free(data);
                 data = NULL;
-                return 0;
+                return -1;
             }
         } else if (found_delim || found_eol || (end_ptr == line_end_ptr)) {
             /* process */
             if (!process_and_replace(conn, entry, data, data_size, false, buffer, written, res_length)) {
                 free(data);
-                free(*buffer);
                 data = NULL;
-                *buffer = NULL;
                 return -1;
             }
             if (!append_buffer(buffer, res_length, written, end_ptr, cur_ptr - end_ptr)) {
@@ -1575,19 +1595,28 @@ static bool process_and_replace(PGconn *conn, PreparedStatement *entry, const ch
         return false;
     }
 
-    size_t cached_columns_size = entry->cached_copy_columns->size();
-    bool is_found(false);
-    for (size_t i = 0; i < cached_columns_size; ++i) {
-        cached_column = entry->cached_copy_columns->at(i);
-        if (!cached_column) {
-            continue;
-        }
-        if (entry->copy_state->fieldno == (int)cached_column->get_col_idx() - 1) {
+    bool is_found = false;
+    if (!entry->copy_state->is_attlist_null) {
+        cached_column = entry->cached_copy_columns->at(entry->copy_state->fieldno);
+        if (cached_column) {
             is_found = true;
-            break;
+        }
+    } else {
+        size_t cached_columns_size = entry->cached_copy_columns->size();
+        for (size_t i = 0; i < cached_columns_size; ++i) {
+            cached_column = entry->cached_copy_columns->at(i);
+            if (!cached_column) {
+                continue;
+            }
+            if (entry->copy_state->fieldno == (int)cached_column->get_col_idx() - 1) {
+                is_found = true;
+                break;
+            }
         }
     }
+
     if (!is_found) {
+        Assert(false);
         return false;
     }
 
@@ -1625,8 +1654,9 @@ static bool deprocess_and_replace(PGconn *conn, PreparedStatement *entry, const 
 
     unsigned char *plaintext = NULL;
     size_t plaintext_len;
+    ProcessStatus process_status = ONLY_VALUE;
     if (ValuesProcessor::deprocess_value(conn, (const unsigned char *)processed_bytea, processed_bytea_size,
-        entry->original_data_types_oids[entry->copy_state->fieldno], 0, &plaintext, plaintext_len, false) == 
+        entry->original_data_types_oids[entry->copy_state->fieldno], 0, &plaintext, plaintext_len, process_status) == 
         DEC_DATA_SUCCEED) {
         size_t escaped_size = 0;
         char *escaped = escape_and_quote(conn, entry, plaintext, is_quoted, &escaped_size);
@@ -1636,6 +1666,8 @@ static bool deprocess_and_replace(PGconn *conn, PreparedStatement *entry, const 
     } else {
         printfPQExpBuffer(&conn->errorMessage,
             libpq_gettext("ERROR(CLIENT): failed to deprocess data of processed column"));
+        conn->client_logic->isInvalidOperationOnColumn = true; /* FAILED TO READ */
+        checkRefreshCacheOnError(conn);
     }
 
     return ret;
@@ -1989,6 +2021,7 @@ static CopyStateData *begin_copy(bool is_from, bool is_rel, Node *raw_query, con
     copy_state_data_init(cstate);
     /* Extract options from the statement node tree */
     fe_process_copy_options(cstate, is_from, options);
+    cstate->is_attlist_null = (attnamelist == NIL);
 
     /* Process the source/target relation or query */
     cstate->is_rel = is_rel;

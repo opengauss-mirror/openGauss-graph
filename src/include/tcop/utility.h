@@ -4,6 +4,7 @@
  *	  prototypes for utility.c.
  *
  *
+ * Portions Copyright (c) 2021, openGauss Contributors
  * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
@@ -16,6 +17,14 @@
 
 #include "pgxc/pgxcnode.h"
 #include "tcop/tcopprot.h"
+
+
+typedef enum
+{
+	PROCESS_UTILITY_TOPLEVEL,	/* toplevel interactive command */
+	PROCESS_UTILITY_QUERY,		/* a complete query, but not toplevel */
+	PROCESS_UTILITY_SUBCOMMAND	/* a portion of a query */
+} ProcessUtilityContext;
 
 #define CHOOSE_EXEC_NODES(is_temp) ((is_temp) ? EXEC_ON_DATANODES : EXEC_ON_ALL_NODES)
 
@@ -37,7 +46,8 @@ typedef void (*ProcessUtility_hook_type)(Node* parsetree, const char* queryStrin
 #ifdef PGXC
     bool sentToRemote,
 #endif /* PGXC */
-    char* completionTag);
+    char* completionTag,
+    bool isCTAS);
 extern THR_LOCAL PGDLLIMPORT ProcessUtility_hook_type ProcessUtility_hook;
 
 extern void ProcessUtility(Node* parsetree, const char* queryString, ParamListInfo params, bool isTopLevel,
@@ -45,22 +55,25 @@ extern void ProcessUtility(Node* parsetree, const char* queryString, ParamListIn
 #ifdef PGXC
     bool sentToRemote,
 #endif /* PGXC */
-    char* completionTag);
+    char* completionTag,
+    bool isCTAS = false);
 extern void standard_ProcessUtility(Node* parsetree, const char* queryString, ParamListInfo params, bool isTopLevel,
     DestReceiver* dest,
 #ifdef PGXC
     bool sentToRemote,
 #endif /* PGXC */
-    char* completionTag);
+    char* completionTag,
+    bool isCTAS = false);
 
 extern char* find_first_exec_cn();
 extern bool find_hashbucket_options(List* stmts);
 
 #ifdef PGXC
-extern void CreateCommand(
-    CreateStmt* parsetree, const char* queryString, ParamListInfo params, bool isTopLevel, bool sentToRemote);
+extern void CreateCommand(CreateStmt *parsetree, const char *queryString, ParamListInfo params, bool isTopLevel,
+    bool sentToRemote, bool isCTAS = false);
 #else
-extern void CreateCommand(CreateStmt* parsetree, const char* queryString, ParamListInfo params, bool isTopLevel);
+extern void CreateCommand(CreateStmt *parsetree, const char *queryString, ParamListInfo params, bool isTopLevel,
+    bool isCTAS = false);
 #endif
 
 extern void ReindexCommand(ReindexStmt* stmt, bool isTopLevel);
@@ -84,6 +97,7 @@ typedef enum {
     ARQ_TYPE_SAMPLE, /* include sample rows or sample table. */
 } ANALYZE_RQTYPE;
 
+extern bool pg_try_advisory_lock_for_redis(Relation rel);
 extern void pgxc_lock_for_utility_stmt(Node* parsetree, bool is_temp);
 extern void ExecUtilityStmtOnNodes(const char* queryString, ExecNodes* nodes, bool sentToRemote, bool force_autocommit,
     RemoteQueryExecType exec_type, bool is_temp, Node* parsetree = NULL);
@@ -116,6 +130,8 @@ extern bool ObjectsInSameNodeGroup(List* objects, NodeTag stmttype);
 extern void EstIdxMemInfo(
     Relation rel, RangeVar* relation, UtilityDesc* desc, IndexInfo* info, const char* accessMethod);
 extern void AdjustIdxMemInfo(AdaptMem* operatorMem, UtilityDesc* desc);
+extern void AlterGlobalConfig(AlterGlobalConfigStmt *stmt);
+extern void DropGlobalConfig(DropGlobalConfigStmt *stmt);
 
 /*
  * @hdfs The struct HDFSTableAnalyze is used to store datanode work infomation
@@ -191,6 +207,5 @@ extern void ClearCreateSeqStmtUUID(CreateSeqStmt* stmt);
 extern void ClearCreateStmtUUIDS(CreateStmt* stmt);
 extern bool IsSchemaInDistribution(const Oid namespaceOid);
 extern Oid GetNamespaceIdbyRelId(const Oid relid);
-
 
 #endif /* UTILITY_H */

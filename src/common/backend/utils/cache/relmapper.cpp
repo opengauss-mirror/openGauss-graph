@@ -51,7 +51,7 @@
 #include "catalog/pg_tablespace.h"
 #include "catalog/storage.h"
 #include "miscadmin.h"
-#include "storage/fd.h"
+#include "storage/smgr/fd.h"
 #include "storage/lock/lwlock.h"
 #include "utils/inval.h"
 #include "utils/relmapper.h"
@@ -59,12 +59,19 @@
 /* non-export function prototypes */
 static void apply_map_update(RelMapFile* map, Oid relationId, Oid fileNode, bool add_okay);
 static void merge_map_updates(RelMapFile* map, const RelMapFile* updates, bool add_okay);
-static void load_relmap_file(bool shared);
-static void recover_relmap_file(bool shared, bool backupfile);
 static void write_relmap_file(bool shared, RelMapFile* newmap, bool write_wal, bool send_sinval, bool preserve_files,
     Oid dbid, Oid tsid, const char* dbpath);
 static void perform_relmap_update(bool shared, const RelMapFile* updates);
+static int WriteOldVersionRelmap(RelMapFile* map, int fd);
+static int ReadOldVersionRelmap(RelMapFile* map, int fd);
+static void InitRelmapVerTag(RelMapVerTag* mapTag, bool isNewMap);
+static bool IsNewVersionMap(int fd, char* fileName);
+static void RegistRelMapWal(RelMapFile* map);
+static pg_crc32 RelmapCrcComp(RelMapFile* map);
+static int32 ReadRelMapFile(RelMapFile* map, int fd, bool isNewMap);
+static int32 WriteRelMapFile(RelMapFile* map, int fd);
 
+static void recover_relmap_file(bool shared, bool backupfile, RelMapFile* real_map);
 /*
  * RelationMapOidToFilenode
  *
@@ -81,29 +88,29 @@ Oid RelationMapOidToFilenode(Oid relationId, bool shared)
 {
     const RelMapFile* map = NULL;
     int32 i;
-
+    knl_u_relmap_context *relmap_cxt = GetRelMapCxt();
     /* If there are active updates, believe those over the main maps */
     if (shared) {
-        map = u_sess->relmap_cxt.active_shared_updates;
+        map = relmap_cxt->active_shared_updates;
         for (i = 0; i < map->num_mappings; i++) {
             if (relationId == map->mappings[i].mapoid) {
                 return map->mappings[i].mapfilenode;
             }
         }
-        map = u_sess->relmap_cxt.shared_map;
+        map = relmap_cxt->shared_map;
         for (i = 0; i < map->num_mappings; i++) {
             if (relationId == map->mappings[i].mapoid) {
                 return map->mappings[i].mapfilenode;
             }
         }
     } else {
-        map = u_sess->relmap_cxt.active_local_updates;
+        map = relmap_cxt->active_local_updates;
         for (i = 0; i < map->num_mappings; i++) {
             if (relationId == map->mappings[i].mapoid) {
                 return map->mappings[i].mapfilenode;
             }
         }
-        map = u_sess->relmap_cxt.local_map;
+        map = relmap_cxt->local_map;
         for (i = 0; i < map->num_mappings; i++) {
             if (relationId == map->mappings[i].mapoid) {
                 return map->mappings[i].mapfilenode;
@@ -130,29 +137,29 @@ Oid RelationMapFilenodeToOid(Oid filenode, bool shared)
 {
     const RelMapFile* map = NULL;
     int32 i;
-
+    knl_u_relmap_context *relmap_cxt = GetRelMapCxt();
     /* If there are active updates, believe those over the main maps */
     if (shared) {
-        map = u_sess->relmap_cxt.active_shared_updates;
+        map = relmap_cxt->active_shared_updates;
         for (i = 0; i < map->num_mappings; i++) {
             if (filenode == map->mappings[i].mapfilenode) {
                 return map->mappings[i].mapoid;
             }
         }
-        map = u_sess->relmap_cxt.shared_map;
+        map = relmap_cxt->shared_map;
         for (i = 0; i < map->num_mappings; i++) {
             if (filenode == map->mappings[i].mapfilenode) {
                 return map->mappings[i].mapoid;
             }
         }
     } else {
-        map = u_sess->relmap_cxt.active_local_updates;
+        map = relmap_cxt->active_local_updates;
         for (i = 0; i < map->num_mappings; i++) {
             if (filenode == map->mappings[i].mapfilenode) {
                 return map->mappings[i].mapoid;
             }
         }
-        map = u_sess->relmap_cxt.local_map;
+        map = relmap_cxt->local_map;
         for (i = 0; i < map->num_mappings; i++) {
             if (filenode == map->mappings[i].mapfilenode) {
                 return map->mappings[i].mapoid;
@@ -174,15 +181,15 @@ Oid RelationMapFilenodeToOid(Oid filenode, bool shared)
 void RelationMapUpdateMap(Oid relationId, Oid fileNode, bool shared, bool immediate)
 {
     RelMapFile* map = NULL;
-
+    knl_u_relmap_context *relmap_cxt = GetRelMapCxt();
     if (IsBootstrapProcessingMode()) {
         /*
          * In bootstrap mode, the mapping gets installed in permanent map.
          */
         if (shared) {
-            map = u_sess->relmap_cxt.shared_map;
+            map = relmap_cxt->shared_map;
         } else {
-            map = u_sess->relmap_cxt.local_map;
+            map = relmap_cxt->local_map;
         }
     } else {
         /*
@@ -198,16 +205,16 @@ void RelationMapUpdateMap(Oid relationId, Oid fileNode, bool shared, bool immedi
         if (immediate) {
             /* Make it active, but only locally */
             if (shared) {
-                map = u_sess->relmap_cxt.active_shared_updates;
+                map = relmap_cxt->active_shared_updates;
             } else {
-                map = u_sess->relmap_cxt.active_local_updates;
+                map = relmap_cxt->active_local_updates;
             }
         } else {
             /* Make it pending */
             if (shared) {
-                map = u_sess->relmap_cxt.pending_shared_updates;
+                map = relmap_cxt->pending_shared_updates;
             } else {
-                map = u_sess->relmap_cxt.pending_local_updates;
+                map = relmap_cxt->pending_local_updates;
             }
         }
     }
@@ -226,6 +233,8 @@ void RelationMapUpdateMap(Oid relationId, Oid fileNode, bool shared, bool immedi
 static void apply_map_update(RelMapFile* map, Oid relationId, Oid fileNode, bool add_okay)
 {
     int32 i;
+    RelMapVerTag mapTag;
+    InitRelmapVerTag(&mapTag, IS_MAGIC_EXIST(map->magic) ? IS_NEW_RELMAP(map->magic) : true);
 
     /* Replace any existing mapping */
     for (i = 0; i < map->num_mappings; i++) {
@@ -241,8 +250,15 @@ static void apply_map_update(RelMapFile* map, Oid relationId, Oid fileNode, bool
             (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
                 errmsg("attempt to apply a mapping to unmapped relation %u", relationId)));
     }
-    if (map->num_mappings >= MAX_MAPPINGS) {
-        ereport(ERROR, (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED), errmsg("ran out of space in relation map")));
+
+    if (map->num_mappings >= mapTag.relMaxMappings) {
+        // switch relmap to new version
+        if (map->magic == RELMAPPER_FILEMAGIC) {
+            map->magic = RELMAPPER_FILEMAGIC_4K;
+            ereport(LOG, (errmsg("Switch relmap to new version!")));
+        } else {
+            ereport(ERROR, (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED), errmsg("ran out of space in relation map")));
+        }
     }
     map->mappings[map->num_mappings].mapoid = relationId;
     map->mappings[map->num_mappings].mapfilenode = fileNode;
@@ -274,7 +290,7 @@ static void merge_map_updates(RelMapFile* map, const RelMapFile* updates, bool a
  */
 void RelationMapRemoveMapping(Oid relationId)
 {
-    RelMapFile* map = u_sess->relmap_cxt.active_local_updates;
+    RelMapFile* map = GetRelMapCxt()->active_local_updates;
     int32 i;
 
     for (i = 0; i < map->num_mappings; i++) {
@@ -301,16 +317,25 @@ void RelationMapRemoveMapping(Oid relationId)
  */
 void RelationMapInvalidate(bool shared)
 {
+    if (EnableLocalSysCache()) {
+        knl_u_relmap_context *relmap_cxt = GetRelMapCxt();
+        RelMapFile *rel_map = shared ? relmap_cxt->shared_map : relmap_cxt->local_map;
+        if (IS_MAGIC_EXIST(rel_map->magic)) {
+            t_thrd.lsc_cxt.lsc->LoadRelMapFromGlobal(shared);
+        }
+        return;
+    }
+
     if (shared) {
-        if (u_sess->relmap_cxt.shared_map->magic == RELMAPPER_FILEMAGIC) {
+        if (IS_MAGIC_EXIST(u_sess->relmap_cxt.shared_map->magic)) {
             LWLockAcquire(RelationMappingLock, LW_SHARED);
-            load_relmap_file(true);
+            load_relmap_file(true, u_sess->relmap_cxt.shared_map);
             LWLockRelease(RelationMappingLock);
         }
     } else {
-        if (u_sess->relmap_cxt.local_map->magic == RELMAPPER_FILEMAGIC) {
+        if (IS_MAGIC_EXIST(u_sess->relmap_cxt.local_map->magic)) {
             LWLockAcquire(RelationMappingLock, LW_SHARED);
-            load_relmap_file(false);
+            load_relmap_file(false, u_sess->relmap_cxt.local_map);
             LWLockRelease(RelationMappingLock);
         }
     }
@@ -325,12 +350,23 @@ void RelationMapInvalidate(bool shared)
  */
 void RelationMapInvalidateAll(void)
 {
-    LWLockAcquire(RelationMappingLock, LW_SHARED);
-    if (u_sess->relmap_cxt.shared_map->magic == RELMAPPER_FILEMAGIC) {
-        load_relmap_file(true);
+    if (EnableLocalSysCache()) {
+        knl_u_relmap_context *relmap_cxt = GetRelMapCxt();
+        if (IS_MAGIC_EXIST(relmap_cxt->shared_map->magic)) {
+            t_thrd.lsc_cxt.lsc->LoadRelMapFromGlobal(true);
+        }
+        if (IS_MAGIC_EXIST(relmap_cxt->local_map->magic)) {
+            t_thrd.lsc_cxt.lsc->LoadRelMapFromGlobal(false);
+        }
+        return;
     }
-    if (u_sess->relmap_cxt.local_map->magic == RELMAPPER_FILEMAGIC) {
-        load_relmap_file(false);
+    
+    LWLockAcquire(RelationMappingLock, LW_SHARED);
+    if (IS_MAGIC_EXIST(u_sess->relmap_cxt.shared_map->magic)) {
+        load_relmap_file(true, u_sess->relmap_cxt.shared_map);
+    }
+    if (IS_MAGIC_EXIST(u_sess->relmap_cxt.local_map->magic)) {
+        load_relmap_file(false, u_sess->relmap_cxt.local_map);
     }
     LWLockRelease(RelationMappingLock);
 }
@@ -342,13 +378,14 @@ void RelationMapInvalidateAll(void)
  */
 void AtCCI_RelationMap(void)
 {
-    if (u_sess->relmap_cxt.pending_shared_updates->num_mappings != 0) {
-        merge_map_updates(u_sess->relmap_cxt.active_shared_updates, u_sess->relmap_cxt.pending_shared_updates, true);
-        u_sess->relmap_cxt.pending_shared_updates->num_mappings = 0;
+    knl_u_relmap_context *relmap_cxt = GetRelMapCxt();
+    if (relmap_cxt->pending_shared_updates->num_mappings != 0) {
+        merge_map_updates(relmap_cxt->active_shared_updates, relmap_cxt->pending_shared_updates, true);
+        relmap_cxt->pending_shared_updates->num_mappings = 0;
     }
-    if (u_sess->relmap_cxt.pending_local_updates->num_mappings != 0) {
-        merge_map_updates(u_sess->relmap_cxt.active_local_updates, u_sess->relmap_cxt.pending_local_updates, true);
-        u_sess->relmap_cxt.pending_local_updates->num_mappings = 0;
+    if (relmap_cxt->pending_local_updates->num_mappings != 0) {
+        merge_map_updates(relmap_cxt->active_local_updates, relmap_cxt->pending_local_updates, true);
+        relmap_cxt->pending_local_updates->num_mappings = 0;
     }
 }
 
@@ -369,32 +406,33 @@ void AtCCI_RelationMap(void)
  */
 void AtEOXact_RelationMap(bool isCommit)
 {
+    knl_u_relmap_context *relmap_cxt = GetRelMapCxt();
     if (isCommit) {
         /*
          * We should not get here with any "pending" updates.  (We could
          * logically choose to treat such as committed, but in the current
          * code this should never happen.)
          */
-        Assert(u_sess->relmap_cxt.pending_shared_updates->num_mappings == 0);
-        Assert(u_sess->relmap_cxt.pending_local_updates->num_mappings == 0);
+        Assert(relmap_cxt->pending_shared_updates->num_mappings == 0);
+        Assert(relmap_cxt->pending_local_updates->num_mappings == 0);
 
         /*
          * Write any active updates to the actual map files, then reset them.
          */
-        if (u_sess->relmap_cxt.active_shared_updates->num_mappings != 0) {
-            perform_relmap_update(true, u_sess->relmap_cxt.active_shared_updates);
-            u_sess->relmap_cxt.active_shared_updates->num_mappings = 0;
+        if (relmap_cxt->active_shared_updates->num_mappings != 0) {
+            perform_relmap_update(true, relmap_cxt->active_shared_updates);
+            relmap_cxt->active_shared_updates->num_mappings = 0;
         }
-        if (u_sess->relmap_cxt.active_local_updates->num_mappings != 0) {
-            perform_relmap_update(false, u_sess->relmap_cxt.active_local_updates);
-            u_sess->relmap_cxt.active_local_updates->num_mappings = 0;
+        if (relmap_cxt->active_local_updates->num_mappings != 0) {
+            perform_relmap_update(false, relmap_cxt->active_local_updates);
+            relmap_cxt->active_local_updates->num_mappings = 0;
         }
     } else {
         /* Abort --- drop all local and pending updates */
-        u_sess->relmap_cxt.active_shared_updates->num_mappings = 0;
-        u_sess->relmap_cxt.active_local_updates->num_mappings = 0;
-        u_sess->relmap_cxt.pending_shared_updates->num_mappings = 0;
-        u_sess->relmap_cxt.pending_local_updates->num_mappings = 0;
+        relmap_cxt->active_shared_updates->num_mappings = 0;
+        relmap_cxt->active_local_updates->num_mappings = 0;
+        relmap_cxt->pending_shared_updates->num_mappings = 0;
+        relmap_cxt->pending_local_updates->num_mappings = 0;
     }
 }
 
@@ -410,10 +448,11 @@ void AtPrepare_RelationMap(void)
     if (u_sess->attr.attr_common.IsInplaceUpgrade) {
         return;
     }
-    if (u_sess->relmap_cxt.active_shared_updates->num_mappings != 0 ||
-        u_sess->relmap_cxt.active_local_updates->num_mappings != 0 ||
-        u_sess->relmap_cxt.pending_shared_updates->num_mappings != 0 ||
-        u_sess->relmap_cxt.pending_local_updates->num_mappings != 0) {
+    knl_u_relmap_context *relmap_cxt = GetRelMapCxt();
+    if (relmap_cxt->active_shared_updates->num_mappings != 0 ||
+        relmap_cxt->active_local_updates->num_mappings != 0 ||
+        relmap_cxt->pending_shared_updates->num_mappings != 0 ||
+        relmap_cxt->pending_local_updates->num_mappings != 0) {
         ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
             errmsg("cannot PREPARE a transaction that modified relation mapping")));
         }
@@ -447,16 +486,17 @@ void RelationMapFinishBootstrap(void)
 {
     Assert(IsBootstrapProcessingMode());
 
+    knl_u_relmap_context *relmap_cxt = GetRelMapCxt();
     /* Shouldn't be anything "pending" ... */
-    Assert(u_sess->relmap_cxt.active_shared_updates->num_mappings == 0);
-    Assert(u_sess->relmap_cxt.active_local_updates->num_mappings == 0);
-    Assert(u_sess->relmap_cxt.pending_shared_updates->num_mappings == 0);
-    Assert(u_sess->relmap_cxt.pending_local_updates->num_mappings == 0);
+    Assert(relmap_cxt->active_shared_updates->num_mappings == 0);
+    Assert(relmap_cxt->active_local_updates->num_mappings == 0);
+    Assert(relmap_cxt->pending_shared_updates->num_mappings == 0);
+    Assert(relmap_cxt->pending_local_updates->num_mappings == 0);
 
     /* Write the files; no WAL or sinval needed */
-    write_relmap_file(true, u_sess->relmap_cxt.shared_map, false, false, false, InvalidOid, GLOBALTABLESPACE_OID, NULL);
+    write_relmap_file(true, relmap_cxt->shared_map, false, false, false, InvalidOid, GLOBALTABLESPACE_OID, NULL);
     write_relmap_file(false,
-        u_sess->relmap_cxt.local_map,
+        relmap_cxt->local_map,
         false,
         false,
         false,
@@ -473,6 +513,11 @@ void RelationMapFinishBootstrap(void)
  */
 void RelationMapInitialize(void)
 {
+    if (EnableLocalSysCache()) {
+        /* when first init or rebuild lsc, they are all palloc0, so nothing need to do
+         * when switchdb , we memset them zero, nothing need to do */
+        return;
+    }
     /* The static variables should initialize to zeroes, but let's be sure */
     u_sess->relmap_cxt.shared_map->magic = 0; /* mark it not loaded */
     u_sess->relmap_cxt.local_map->magic = 0;
@@ -501,8 +546,12 @@ void RelationMapInitializePhase2(void)
     /*
      * Load the shared map file, die on error.
      */
+    if (EnableLocalSysCache()) {
+        t_thrd.lsc_cxt.lsc->InitRelMapPhase2();
+        return;
+    }
     LWLockAcquire(RelationMappingLock, LW_SHARED);
-    load_relmap_file(true);
+    load_relmap_file(true, u_sess->relmap_cxt.shared_map);
     LWLockRelease(RelationMappingLock);
 }
 
@@ -523,8 +572,13 @@ void RelationMapInitializePhase3(void)
     /*
      * Load the local map file, die on error.
      */
+    if (EnableLocalSysCache()) {
+        t_thrd.lsc_cxt.lsc->InitRelMapPhase3();
+        return;
+    }
+
     LWLockAcquire(RelationMappingLock, LW_SHARED);
-    load_relmap_file(false);
+    load_relmap_file(false, u_sess->relmap_cxt.local_map);
     LWLockRelease(RelationMappingLock);
 }
 
@@ -536,9 +590,8 @@ void RelationMapInitializePhase3(void)
  *
  * Note that the local case requires u_sess->proc_cxt.DatabasePath to be set up.
  */
-static void load_relmap_file(bool shared)
+void load_relmap_file(bool shared, RelMapFile *map)
 {
-    RelMapFile* map = NULL;
     char map_file_name[2][MAXPGPATH];
     char* file_name = NULL;
     pg_crc32 crc;
@@ -547,23 +600,22 @@ static void load_relmap_file(bool shared)
     bool retry = false;
     struct stat stat_buf;
     errno_t rc;
+    RelMapVerTag mapTag;
+    bool isNewMap;
 
     if (shared) {
         rc = snprintf_s(
-            map_file_name[0], sizeof(map_file_name[0]), sizeof(map_file_name[0]) - 1, "global/%s", RELMAPPER_FILENAME);
+        map_file_name[0], sizeof(map_file_name[0]), sizeof(map_file_name[0]) - 1, "global/%s", RELMAPPER_FILENAME);
         securec_check_ss(rc, "\0", "\0");
-
         rc = snprintf_s(map_file_name[1], sizeof(map_file_name[1]), sizeof(map_file_name[1]) - 1, "global/%s",
             RELMAPPER_FILENAME_BAK);
-
         securec_check_ss(rc, "\0", "\0");
-        map = u_sess->relmap_cxt.shared_map;
     } else {
         rc = snprintf_s(map_file_name[0],
             sizeof(map_file_name[0]),
             sizeof(map_file_name[0]) - 1,
             "%s/%s",
-            u_sess->proc_cxt.DatabasePath,
+            GetMyDatabasePath(),
             RELMAPPER_FILENAME);
         securec_check_ss(rc, "\0", "\0");
 
@@ -571,10 +623,9 @@ static void load_relmap_file(bool shared)
             sizeof(map_file_name[1]),
             sizeof(map_file_name[1]) - 1,
             "%s/%s",
-            u_sess->proc_cxt.DatabasePath,
+            GetMyDatabasePath(),
             RELMAPPER_FILENAME_BAK);
         securec_check_ss(rc, "\0", "\0");
-        map = u_sess->relmap_cxt.local_map;
     }
 
     // check backup file
@@ -606,7 +657,11 @@ loop:
      * look, the sinval signaling mechanism will make us re-read it before we
      * are able to access any relation that's affected by the change.
      */
-    if (read(fd, map, sizeof(RelMapFile)) != sizeof(RelMapFile)) {
+    isNewMap = IsNewVersionMap(fd, file_name);
+    (void)lseek(fd, 0, SEEK_SET);
+    InitRelmapVerTag(&mapTag, isNewMap);
+    int readBytes = ReadRelMapFile(map, fd, isNewMap);
+    if (readBytes != mapTag.relSize) {
         close(fd);
         ereport(
             FATAL, (errcode_for_file_access(), errmsg("could not read relation mapping file \"%s\": %m", file_name)));
@@ -615,10 +670,7 @@ loop:
         ereport(PANIC, (errcode_for_file_access(), errmsg("could not close control file: %m")));
     }
     /* verify the CRC */
-    INIT_CRC32(crc);
-    COMP_CRC32(crc, (char*)map, offsetof(RelMapFile, crc));
-    FIN_CRC32(crc);
-
+    crc = RelmapCrcComp(map);
     if (!EQ_CRC32(crc, (pg_crc32)(map->crc))) {
         if (retry == false) {
             ereport(WARNING,
@@ -638,13 +690,13 @@ loop:
     }
 
     // check for correct magic number, etc
-    if (map->magic != RELMAPPER_FILEMAGIC || map->num_mappings < 0 || map->num_mappings > MAX_MAPPINGS) {
+    if (map->magic != mapTag.relMagic || map->num_mappings < 0 || map->num_mappings > mapTag.relMaxMappings) {
         ereport(FATAL, (errmsg("relation mapping file \"%s\" contains invalid data", file_name)));
     }
     if (retry == true) {
-        recover_relmap_file(shared, false);
+        recover_relmap_file(shared, false, map);
     } else if (fix_backup == true) {
-        recover_relmap_file(shared, true);
+        recover_relmap_file(shared, true, map);
     }
 
 }
@@ -677,17 +729,21 @@ static void write_relmap_file(bool shared, RelMapFile* newmap, bool write_wal, b
     char map_file_name[MAXPGPATH];
     errno_t rc = 0;
     char* fname[2];
+    RelMapVerTag mapTag;
+
+    if (!IS_MAGIC_EXIST(newmap->magic)) {
+        newmap->magic = RELMAPPER_FILEMAGIC_4K;
+    }
+    InitRelmapVerTag(&mapTag, IS_NEW_RELMAP(newmap->magic));
+
     /*
      * Fill in the overhead fields and update CRC.
      */
-    newmap->magic = RELMAPPER_FILEMAGIC;
-    if (newmap->num_mappings < 0 || newmap->num_mappings > MAX_MAPPINGS) {
+    if (newmap->num_mappings < 0 || newmap->num_mappings > mapTag.relMaxMappings) {
         ereport(
             ERROR, (errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE), errmsg("attempt to write bogus relation mapping")));
     }
-    INIT_CRC32(newmap->crc);
-    COMP_CRC32(newmap->crc, (char*)newmap, offsetof(RelMapFile, crc));
-    FIN_CRC32(newmap->crc);
+    newmap->crc = RelmapCrcComp(newmap);
 
     /*
      * Open the target file.  We prefer to do this before entering the
@@ -702,15 +758,16 @@ static void write_relmap_file(bool shared, RelMapFile* newmap, bool write_wal, b
     fname[0] = RELMAPPER_FILENAME_BAK;
     fname[1] = RELMAPPER_FILENAME;
 
+    knl_u_relmap_context *relmap_cxt = GetRelMapCxt();
     for (int i = 0; i < 2; i++) {
         if (shared) {
             rc = snprintf_s(map_file_name, sizeof(map_file_name), sizeof(map_file_name) - 1, "global/%s", fname[i]);
             securec_check_ss_c(rc, "\0", "\0");
-            real_map = u_sess->relmap_cxt.shared_map;
+            real_map = relmap_cxt->shared_map;
         } else {
             rc = snprintf_s(map_file_name, sizeof(map_file_name), sizeof(map_file_name) - 1, "%s/%s", dbpath, fname[i]);
             securec_check_ss_c(rc, "\0", "\0");
-            real_map = u_sess->relmap_cxt.local_map;
+            real_map = relmap_cxt->local_map;
         }
 
         fd = BasicOpenFile(map_file_name, O_WRONLY | O_CREAT | PG_BINARY, S_IRUSR | S_IWUSR);
@@ -727,12 +784,14 @@ static void write_relmap_file(bool shared, RelMapFile* newmap, bool write_wal, b
 
             xlrec.dbid = dbid;
             xlrec.tsid = tsid;
-            xlrec.nbytes = sizeof(RelMapFile);
-
+            if (IS_NEW_RELMAP(newmap->magic)) {
+                xlrec.nbytes = sizeof(RelMapFile);
+            } else {
+                xlrec.nbytes = RELMAP_SIZE_OLD;
+            }
             XLogBeginInsert();
             XLogRegisterData((char*)(&xlrec), MinSizeOfRelmapUpdate);
-            XLogRegisterData((char*)newmap, sizeof(RelMapFile));
-
+            RegistRelMapWal(newmap);
             lsn = XLogInsert(RM_RELMAP_ID, XLOG_RELMAP_UPDATE);
 
             /* As always, WAL must hit the disk before the data update does */
@@ -740,7 +799,8 @@ static void write_relmap_file(bool shared, RelMapFile* newmap, bool write_wal, b
         }
 
         errno = 0;
-        if (write(fd, newmap, sizeof(RelMapFile)) != sizeof(RelMapFile)) {
+        int writeBytes = WriteRelMapFile(newmap, fd);
+        if (writeBytes != mapTag.relSize) {
             close(fd);
             /* if write didn't set errno, assume problem is no disk space */
             if (errno == 0) {
@@ -767,6 +827,9 @@ static void write_relmap_file(bool shared, RelMapFile* newmap, bool write_wal, b
             ereport(ERROR,
                 (errcode_for_file_access(), errmsg("could not close relation mapping file \"%s\": %m", map_file_name)));
         }
+    }
+    if (EnableLocalSysCache()) {
+        t_thrd.lsc_cxt.lsc->InvalidateGlobalRelMap(shared, dbid, newmap);
     }
     /*
      * Now that the file is safely on disk, send sinval message to let other
@@ -836,16 +899,20 @@ static void perform_relmap_update(bool shared, const RelMapFile* updates)
      * trouble.
      */
     LWLockAcquire(RelationMappingLock, LW_EXCLUSIVE);
-
+    knl_u_relmap_context *relmap_cxt = GetRelMapCxt();
     /* Be certain we see any other updates just made */
-    load_relmap_file(shared);
+    if (EnableLocalSysCache()) {
+        t_thrd.lsc_cxt.lsc->LoadRelMapFromGlobal(shared);
+    } else {
+        load_relmap_file(shared, shared ? relmap_cxt->shared_map : relmap_cxt->local_map);
+    }
 
     /* Prepare updated data in a local variable */
     if (shared) {
-        rc = memcpy_s(&new_map, sizeof(RelMapFile), u_sess->relmap_cxt.shared_map, sizeof(RelMapFile));
+        rc = memcpy_s(&new_map, sizeof(RelMapFile), relmap_cxt->shared_map, sizeof(RelMapFile));
         securec_check(rc, "", "");
     } else {
-        rc = memcpy_s(&new_map, sizeof(RelMapFile), u_sess->relmap_cxt.local_map, sizeof(RelMapFile));
+        rc = memcpy_s(&new_map, sizeof(RelMapFile), relmap_cxt->local_map, sizeof(RelMapFile));
         securec_check(rc, "", "");
     }
 
@@ -857,6 +924,7 @@ static void perform_relmap_update(bool shared, const RelMapFile* updates)
         updates,
         (g_instance.attr.attr_common.allowSystemTableMods || u_sess->attr.attr_common.IsInplaceUpgrade));
 
+    Assert(CheckMyDatabaseMatch());
     /* Write out the updated map and do other necessary tasks */
     write_relmap_file(shared,
         &new_map,
@@ -876,14 +944,14 @@ static void perform_relmap_update(bool shared, const RelMapFile* updates)
  * we should recover the file using the content of backup file or,
  * if there is no backup file, we create it immediately.
  */
-static void recover_relmap_file(bool shared, bool backupfile)
+static void recover_relmap_file(bool shared, bool backupfile, RelMapFile* real_map)
 {
     int fd;
-    RelMapFile* real_map = NULL;
     char map_file_name[MAXPGPATH];
     char* file_name = NULL;
     int level;
     errno_t rc;
+    int32 relmapSize;
 
     if (backupfile) {
         file_name = RELMAPPER_FILENAME_BAK;
@@ -896,16 +964,14 @@ static void recover_relmap_file(bool shared, bool backupfile)
     if (shared) {
         rc = snprintf_s(map_file_name, sizeof(map_file_name), sizeof(map_file_name) - 1, "global/%s", file_name);
         securec_check_ss(rc, "\0", "\0");
-        real_map = u_sess->relmap_cxt.shared_map;
     } else {
         rc = snprintf_s(map_file_name,
             sizeof(map_file_name),
             sizeof(map_file_name) - 1,
             "%s/%s",
-            u_sess->proc_cxt.DatabasePath,
+            GetMyDatabasePath(),
             file_name);
         securec_check_ss(rc, "\0", "\0");
-        real_map = u_sess->relmap_cxt.local_map;
     }
     ereport(level, (errmsg("recover the relation mapping file %s", map_file_name)));
 
@@ -915,7 +981,15 @@ static void recover_relmap_file(bool shared, bool backupfile)
             map_file_name)));
     }
     errno = 0;
-    if (write(fd, real_map, sizeof(RelMapFile)) != sizeof(RelMapFile)) {
+    int writeBytes = 0;
+    if (IS_NEW_RELMAP(real_map->magic)) {
+        relmapSize = RELMAP_SIZE_NEW;
+        writeBytes = write(fd, real_map, sizeof(RelMapFile));
+    } else {
+        relmapSize = RELMAP_SIZE_OLD;
+        writeBytes = WriteOldVersionRelmap(real_map, fd);
+    }
+    if (writeBytes != relmapSize) {
         /* if write didn't set errno, assume problem is no disk space */
         if (errno == 0) {
             errno = ENOSPC;
@@ -935,6 +1009,10 @@ static void recover_relmap_file(bool shared, bool backupfile)
             (errcode_for_file_access(),
                 errmsg("recover failed could not close relation mapping file \"%s\": %m", map_file_name)));
     }
+    if (EnableLocalSysCache()) {
+        t_thrd.lsc_cxt.lsc->InvalidateGlobalRelMap(shared,
+            shared ? InvalidOid : u_sess->proc_cxt.MyDatabaseId, real_map);
+    }
 }
 
 /*
@@ -952,16 +1030,28 @@ void relmap_redo(XLogReaderState* record)
         RelMapFile new_map;
         char* dbpath = NULL;
         errno_t rc;
+        RelMapVerTag mapTag;
+        int32 magicNum;
 
-        if (xlrec->nbytes != sizeof(RelMapFile)) {
+        rc = memcpy_s(&magicNum, sizeof(int32), xlrec->data, sizeof(int32));
+        securec_check(rc, "\0", "\0");
+        InitRelmapVerTag(&mapTag, IS_NEW_RELMAP(magicNum));
+
+        if (xlrec->nbytes != mapTag.relSize) {
             ereport(PANIC,
                 (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
                     errmsg("relmap_redo: wrong size %d in relmap update record", xlrec->nbytes)));
         }
 
-        rc = memcpy_s(&new_map, sizeof(new_map), xlrec->data, sizeof(new_map));
-        securec_check(rc, "\0", "\0");
-
+        if (IS_NEW_RELMAP(magicNum)) {
+            rc = memcpy_s(&new_map, sizeof(new_map), xlrec->data, sizeof(new_map));
+            securec_check(rc, "\0", "\0");
+        } else {
+            rc = memcpy_s(&new_map, sizeof(new_map), xlrec->data, MAPPING_LEN_OLDMAP_HEAD);
+            securec_check(rc, "\0", "\0");
+            rc = memcpy_s(&new_map.crc, MAPPING_LEN_TAIL, xlrec->data + MAPPING_LEN_OLDMAP_HEAD, MAPPING_LEN_TAIL);
+            securec_check(rc, "\0", "\0");
+        }
         /* We need to construct the pathname for this database */
         dbpath = GetDatabasePath(xlrec->dbid, xlrec->tsid);
 
@@ -977,9 +1067,119 @@ void relmap_redo(XLogReaderState* record)
         XLogRecPtr lsn = record->EndRecPtr;
         UpdateMinRecoveryPoint(lsn, false);
         write_relmap_file((xlrec->dbid == InvalidOid), &new_map, false, true, false, xlrec->dbid, xlrec->tsid, dbpath);
-
         pfree_ext(dbpath);
     } else {
         ereport(PANIC, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("relmap_redo: unknown op code %u", info)));
     }
+}
+
+static int WriteOldVersionRelmap(RelMapFile* map, int fd)
+{
+    errno_t rc;
+    char* mapCache = (char*)palloc0(RELMAP_SIZE_OLD);
+    rc = memcpy_s(mapCache, RELMAP_SIZE_OLD, map, MAPPING_LEN_OLDMAP_HEAD);
+    securec_check(rc, "\0", "\0");
+    rc = memcpy_s(
+        mapCache + MAPPING_LEN_OLDMAP_HEAD, RELMAP_SIZE_OLD - MAPPING_LEN_OLDMAP_HEAD, &(map->crc), MAPPING_LEN_TAIL);
+    securec_check(rc, "\0", "\0");
+    int writeBytes = write(fd, mapCache, RELMAP_SIZE_OLD);
+    pfree_ext(mapCache);
+    return writeBytes;
+}
+
+static int ReadOldVersionRelmap(RelMapFile* map, int fd)
+{
+    errno_t rc;
+    char* mapCache = (char*)palloc0(RELMAP_SIZE_OLD);
+    int readByte = read(fd, mapCache, RELMAP_SIZE_OLD);
+    rc = memcpy_s(map, sizeof(RelMapFile), mapCache, MAPPING_LEN_OLDMAP_HEAD);
+    securec_check(rc, "\0", "\0");
+    rc = memcpy_s(&(map->crc), MAPPING_LEN_TAIL, mapCache + MAPPING_LEN_OLDMAP_HEAD, MAPPING_LEN_TAIL);
+    securec_check(rc, "\0", "\0");
+    pfree_ext(mapCache);
+    return readByte;
+}
+
+static void InitRelmapVerTag(RelMapVerTag* mapTag, bool isNewMap)
+{
+    if (isNewMap) {
+        mapTag->relMagic = RELMAPPER_FILEMAGIC_4K;
+        mapTag->relMaxMappings = MAX_MAPPINGS_4K;
+        mapTag->relSize = RELMAP_SIZE_NEW;
+    } else {
+        mapTag->relMagic = RELMAPPER_FILEMAGIC;
+        mapTag->relMaxMappings = MAX_MAPPINGS;
+        mapTag->relSize = RELMAP_SIZE_OLD;
+    }
+}
+
+static bool IsNewVersionMap(int fd, char* fileName)
+{
+    int32 magicNum;
+    bool ret = false;
+    int readByte = read(fd, &magicNum, sizeof(int32));
+    if (readByte != sizeof(int32)) {
+        close(fd);
+        ereport(
+            FATAL, (errcode_for_file_access(), errmsg("could not read relation mapping file \"%s\": %m", fileName)));
+    }
+
+    switch (magicNum) {
+        case RELMAPPER_FILEMAGIC:
+            ret = false;
+            break;
+        case RELMAPPER_FILEMAGIC_4K:
+            ret = true;
+            break;
+        default:
+            close(fd);
+            ereport(FATAL,
+                (errmsg("Illegal magic number %d for relation mapping file \"%s\": %m", magicNum, fileName)));
+    }
+    return ret;
+}
+
+static void RegistRelMapWal(RelMapFile* map)
+{
+    if (IS_NEW_RELMAP(map->magic)) {
+        XLogRegisterData((char*)map, sizeof(RelMapFile));
+    } else {
+        XLogRegisterData((char*)map, MAPPING_LEN_OLDMAP_HEAD);
+        XLogRegisterData((char*)&map->crc, MAPPING_LEN_TAIL);
+    }
+}
+
+static pg_crc32 RelmapCrcComp(RelMapFile* map)
+{
+    pg_crc32 crc;
+    INIT_CRC32(crc);
+    if (IS_NEW_RELMAP(map->magic)) {
+        COMP_CRC32(crc, (char*)map, offsetof(RelMapFile, crc));
+    } else {
+        COMP_CRC32(crc, (char*)map, MAPPING_LEN_OLDMAP_HEAD);
+    }
+    FIN_CRC32(crc);
+    return crc;
+}
+
+static int32 ReadRelMapFile(RelMapFile* map, int fd, bool isNewMap)
+{
+    int32 readBytes = 0;
+    if (isNewMap) {
+        readBytes = read(fd, map, sizeof(RelMapFile));
+    } else {
+        readBytes = ReadOldVersionRelmap(map, fd);
+    }
+    return readBytes;
+}
+
+static int32 WriteRelMapFile(RelMapFile* map, int fd)
+{
+    int32 writeBytes = 0;
+    if (IS_NEW_RELMAP(map->magic)) {
+        writeBytes = write(fd, map, sizeof(RelMapFile));
+    } else {
+        writeBytes = WriteOldVersionRelmap(map, fd);
+    }
+    return writeBytes;
 }

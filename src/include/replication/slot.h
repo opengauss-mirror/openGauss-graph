@@ -17,10 +17,13 @@
 
 #include "fmgr.h"
 #include "access/xlog.h"
+#include "replication/walprotocol.h"
 #include "storage/lock/lwlock.h"
 #include "storage/shmem.h"
 #include "storage/spin.h"
+
 extern const uint32 EXTRA_SLOT_VERSION_NUM;
+#define ARCHIVE_PITR_PREFIX  "pitr_"
 
 /*
  * Behaviour of replication slots, upon release or crash.
@@ -33,6 +36,13 @@ extern const uint32 EXTRA_SLOT_VERSION_NUM;
  * EPHEMERAL slots can be made PERSISTENT by calling ReplicationSlotPersist().
  */
 typedef enum ReplicationSlotPersistency { RS_PERSISTENT, RS_EPHEMERAL, RS_BACKUP } ReplicationSlotPersistency;
+
+typedef enum ArchiveMediaType {
+    ARCHIVE_NONE,
+    ARCHIVE_OBS,
+    ARCHIVE_NAS
+} ArchiveMediaType;
+
 
 /*
  * On-Disk data of a replication slot, preserved across restarts.
@@ -91,13 +101,20 @@ typedef struct ReplicationSlotOnDisk {
     ReplicationSlotPersistentData slotdata;
 } ReplicationSlotOnDisk;
 
-typedef struct ObsArchiveConfig {
+typedef struct ArchiveConnConfig {
     char *obs_address;
     char *obs_bucket;
     char *obs_ak;
     char *obs_sk;
-    char *obs_prefix;
-} ObsArchiveConfig;
+} ArchiveConnConfig;
+
+typedef struct ArchiveConfig {
+    ArchiveMediaType media_type;
+    ArchiveConnConfig *conn_config;
+    char *archive_prefix;
+    bool is_recovery;
+    bool vote_replicate_first;
+} ArchiveConfig;
 
 /*
  * Shared memory state of a single replication slot.
@@ -148,9 +165,18 @@ typedef struct ReplicationSlot {
     XLogRecPtr candidate_xmin_lsn;
     XLogRecPtr candidate_restart_valid;
     XLogRecPtr candidate_restart_lsn;
-    ObsArchiveConfig* archive_obs;
+    ArchiveConfig* archive_config;
+    bool is_recovery;
     char* extra_content;
 } ReplicationSlot;
+
+typedef struct ArchiveSlotConfig {
+    char slotname[NAMEDATALEN];
+    bool in_use;
+    int slot_tline;
+    slock_t mutex;
+    ArchiveConfig archive_config;
+}ArchiveSlotConfig;
 
 
 #define ReplicationSlotPersistentDataConstSize sizeof(ReplicationSlotPersistentData)
@@ -171,6 +197,12 @@ typedef struct ReplicationSlot {
 #define INT32_HIGH_MASK 0xFF00
 #define INT32_LOW_MASK 0x00FF
 
+/*
+ * Interval in which standby snapshots are logged into the WAL stream, in
+ * milliseconds.
+ */
+#define LOG_SNAPSHOT_INTERVAL_MS 15000
+
 /* we steal two bytes from persistency for updagrade */
 #define GET_SLOT_EXTRA_DATA_LENGTH(data) (((int)((data).persistency)) >> 16)
 #define SET_SLOT_EXTRA_DATA_LENGTH(data, length) ((data).persistency = (ReplicationSlotPersistency)((int)(((data).persistency) & INT32_LOW_MASK) | ((length) << 16)))
@@ -188,6 +220,9 @@ typedef struct ReplicationSlotCtlData {
 typedef struct ReplicationSlotState {
     XLogRecPtr min_required;
     XLogRecPtr max_required;
+    XLogRecPtr quorum_min_required;
+    XLogRecPtr min_tools_required;
+    XLogRecPtr min_archive_slot_required;
     bool exist_in_use;
 } ReplicationSlotState;
 /*
@@ -197,6 +232,27 @@ typedef struct LogicalPersistentData {
     int SlotNum;
     ReplicationSlotPersistentData replication_slots[FLEXIBLE_ARRAY_MEMBER];
 } LogicalPersistentData;
+
+typedef struct ArchiveTaskStatus {
+    /* communicate between archive and walreceiver */
+    /* archive thread set when archive done */
+    bool pitr_finish_result;
+    /*
+     * walreceiver set when get task from walsender
+     * 0 for no task
+     * 1 walreceive get task from walsender and set it for archive thread
+     * 2 archive thread set when task is done
+     */
+    volatile unsigned int pitr_task_status;
+    /* for standby */
+    ArchiveXlogMessage archive_task;
+    XLogRecPtr archived_lsn;
+    slock_t mutex;
+    int sync_walsender_term;
+    char slotname[NAMEDATALEN];
+    bool in_use;
+    Latch* archiver_latch;
+}ArchiveTaskStatus;
 
 /* shmem initialization functions */
 extern Size ReplicationSlotsShmemSize(void);
@@ -209,6 +265,7 @@ extern void ReplicationSlotPersist(void);
 extern void ReplicationSlotDrop(const char* name, bool for_backup = false);
 extern void ReplicationSlotAcquire(const char* name, bool isDummyStandby, bool allowDrop = false);
 extern bool IsReplicationSlotActive(const char *name);
+extern bool IsLogicalReplicationSlot(const char *name);
 bool ReplicationSlotFind(const char* name);
 extern void ReplicationSlotRelease(void);
 extern void ReplicationSlotSave(void);
@@ -244,19 +301,38 @@ extern Datum pg_get_replication_slot_name(PG_FUNCTION_ARGS);
 /* slot redo */
 extern void slot_redo(XLogReaderState* record);
 extern void slot_desc(StringInfo buf, XLogReaderState* record);
+extern const char* slot_type_name(uint8 subtype);
 extern void redo_slot_advance(const ReplicationSlotPersistentData* slotInfo);
-extern void log_slot_advance(const ReplicationSlotPersistentData* slotInfo);
+extern void log_slot_advance(const ReplicationSlotPersistentData* slotInfo, char* extra_content = NULL);
 extern void log_slot_drop(const char* name);
 extern void LogCheckSlot();
 extern Size GetAllLogicalSlot(LogicalPersistentData*& LogicalSlot);
 extern char* get_my_slot_name();
-extern ObsArchiveConfig* formObsConfigFromStr(char *content, bool encrypted);
-extern char *formObsConfigStringFromStruct(ObsArchiveConfig *obs_config);
+extern ArchiveConfig* formArchiveConfigFromStr(char *content, bool encrypted);
+extern char *formArchiveConfigStringFromStruct(ArchiveConfig *obs_config);
 extern bool is_archive_slot(ReplicationSlotPersistentData data);
 extern void log_slot_create(const ReplicationSlotPersistentData *slotInfo, char* extra_content = NULL);
-extern ReplicationSlot *getObsReplicationSlot();
-extern void advanceObsSlot(XLogRecPtr restart_pos);
+extern void AdvanceArchiveSlot(XLogRecPtr restart_pos);
 extern void redo_slot_reset_for_backup(const ReplicationSlotPersistentData *xlrec);
-extern void markObsSlotOperate(int p_slot_num);
+extern void MarkArchiveSlotOperate();
+extern void init_instance_slot();
+extern void init_instance_slot_thread();
+extern void add_archive_slot_to_instance(ReplicationSlot *slot);
+extern void remove_archive_slot_from_instance_list(const char *slot_name);
+extern ArchiveSlotConfig* find_archive_slot_from_instance_list(const char* name);
+extern void release_archive_slot(ArchiveSlotConfig** archive_conf);
+extern ArchiveSlotConfig* copy_archive_slot(ArchiveSlotConfig* archive_conf_origin);
+extern ArchiveSlotConfig *getArchiveReplicationSlotWithName(const char *slot_name);
+extern ArchiveSlotConfig *getArchiveRecoverySlotWithName(const char *slot_name);
+extern ArchiveSlotConfig* getArchiveReplicationSlot();
+extern ArchiveSlotConfig* GetArchiveRecoverySlot();
+extern List *GetAllArchiveSlotsName();
+extern List *GetAllRecoverySlotsName();
+extern ArchiveTaskStatus* find_archive_task_status(const char* name);
+extern ArchiveTaskStatus* find_archive_task_status(int *idx);
+extern ArchiveTaskStatus* walreceiver_find_archive_task_status(unsigned int expected_pitr_task_status);
+extern void get_hadr_cn_info(char* keyCn, bool* isExitKey, char* deleteCn, bool* isExitDelete, 
+    ArchiveSlotConfig *archive_conf);
+
 
 #endif /* SLOT_H */

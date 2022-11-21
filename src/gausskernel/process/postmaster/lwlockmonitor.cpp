@@ -644,11 +644,15 @@ NON_EXEC_STATIC void FaultMonitorMain()
         /* Since not using PG_TRY, must reset error stack by hand */
         t_thrd.log_cxt.error_context_stack = NULL;
 
+        t_thrd.log_cxt.call_stack = NULL;
+
         /* Prevent interrupts while cleaning up */
         HOLD_INTERRUPTS();
 
         /* Report the error to the server log */
         EmitErrorReport();
+        /* release resource held by lsc */
+        AtEOXact_SysDBCache(false);
 
         /*
          * Now return to normal top-level context and clear ErrorContext for

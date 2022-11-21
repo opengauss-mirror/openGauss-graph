@@ -3,7 +3,7 @@
  * extension.cpp
  *	  Commands to manipulate extensions
  *
- * Extensions in PostgreSQL allow management of collections of SQL objects.
+ * Extensions in openGauss allow management of collections of SQL objects.
  *
  * All we need internally to manage an extension is an OID so that the
  * dependent objects can be associated with it.  An extension is created by
@@ -175,7 +175,7 @@ char* get_extension_name(Oid ext_oid)
  *
  * Returns InvalidOid if no such extension.
  */
-static Oid get_extension_schema(Oid ext_oid)
+Oid get_extension_schema(Oid ext_oid)
 {
     Oid result;
     Relation rel;
@@ -185,7 +185,13 @@ static Oid get_extension_schema(Oid ext_oid)
 
     rel = heap_open(ExtensionRelationId, AccessShareLock);
 
-    ScanKeyInit(&entry[0], ObjectIdAttributeNumber, BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(ext_oid));
+    ScanKeyInit(&entry[0],
+#if PG_VERSION_NUM >= 120000
+        Anum_pg_extension_oid,
+#else
+        ObjectIdAttributeNumber,
+#endif
+        BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(ext_oid));
 
     scandesc = systable_beginscan(rel, ExtensionOidIndexId, true, NULL, 1, entry);
 
@@ -864,7 +870,7 @@ static void execute_extension_script(Oid extensionOid, ExtensionControlFile* con
             t_sql,
             CStringGetTextDatum("^\\\\echo.*$"),
             CStringGetTextDatum(""),
-            CStringGetTextDatum("ng"));
+            CStringGetTextDatum("mg"));
 
         /*
          * If it's not relocatable, substitute the target schema name for
@@ -1169,6 +1175,10 @@ void CreateExtension(CreateExtensionStmt* stmt)
         FEATURE_NOT_PUBLIC_ERROR("EXTENSION is not yet supported.");
     }
 
+    if (pg_strcasecmp(stmt->extname, "b_sql_plugin") == 0 && !DB_IS_CMPT(B_FORMAT)) {
+        ereport(ERROR,
+            (errmsg("please create extension \"%s\" with B type DBCOMPATIBILITY", stmt->extname)));
+    }
     /* Check extension name validity before any filesystem access */
     check_valid_extension_name(stmt->extname);
 
@@ -1407,6 +1417,10 @@ void CreateExtension(CreateExtensionStmt* stmt)
     }
 
     u_sess->exec_cxt.extension_is_valid = true;
+
+    if (pg_strcasecmp(stmt->extname, "b_sql_plugin") == 0) {
+         u_sess->attr.attr_sql.b_sql_plugin = true;
+    }
 
     /*
      * Insert new tuple into pg_extension, and create dependency entries.
@@ -2910,4 +2924,27 @@ void RepallocSessionVarsArrayIfNecessary()
         securec_check(rc, "", "");
         u_sess->attr.attr_common.extension_session_vars_array_size = currExtensionNum * 2;
     }
+}
+
+bool CheckIfExtensionExists(const char* extname)
+{
+    Relation rel;
+    ScanKeyData entry[1];
+    SysScanDesc scandesc;
+    HeapTuple tuple;
+    bool isExists = false;
+
+    /* search pg_extension to check if extension exists. */
+    rel = heap_open(ExtensionRelationId, AccessShareLock);
+    ScanKeyInit(&entry[0], Anum_pg_extension_extname, BTEqualStrategyNumber, F_NAMEEQ, CStringGetDatum(extname));
+    scandesc = systable_beginscan(rel, ExtensionNameIndexId, true, NULL, 1, entry);
+    tuple = systable_getnext(scandesc);
+
+    isExists = HeapTupleIsValid(tuple);
+
+    systable_endscan(scandesc);
+
+    heap_close(rel, AccessShareLock);
+
+    return isExists;
 }

@@ -1,7 +1,7 @@
 /* -------------------------------------------------------------------------
  *
  * portal.h
- *	  POSTGRES portal definitions.
+ *	  openGauss portal definitions.
  *
  * A portal is an abstraction which represents the execution state of
  * a running or runnable query.  Portals support both SQL-level CURSORs
@@ -36,6 +36,7 @@
  * to look like NO SCROLL cursors.
  *
  *
+ * Portions Copyright (c) 2021, openGauss Contributors
  * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
@@ -47,7 +48,7 @@
 #define PORTAL_H
 
 #include "datatype/timestamp.h"
-#include "executor/execdesc.h"
+#include "executor/exec/execdesc.h"
 #include "utils/resowner.h"
 
 /*
@@ -220,6 +221,7 @@ typedef struct PortalData {
     bool atEnd;
     bool posOverflow;
     long portalPos;
+    bool hasStreamForPlpgsql; /* true if plpgsql's portal has stream may cause hang in for-loop */
 
     /* Presentation data, primarily used by the pg_cursors system view */
     TimestampTz creation_time; /* time at which this portal was defined */
@@ -233,6 +235,8 @@ typedef struct PortalData {
     bool is_from_spi;
 #ifndef ENABLE_MULTIPLE_NODES
     PortalStream streamInfo;
+    bool isAutoOutParam;  /* is autonomous transaction procedure out param? */
+    bool isPkgCur; /* cursor variable is a package variable? */
 #endif
 } PortalData;
 
@@ -256,8 +260,8 @@ extern void AtAbort_Portals(bool STP_rollback = false);
 extern void AtCleanup_Portals(void);
 extern void PortalErrorCleanup(void);
 extern void AtSubCommit_Portals(SubTransactionId mySubid, SubTransactionId parentSubid, ResourceOwner parentXactOwner);
-extern void AtSubAbort_Portals(
-    SubTransactionId mySubid, SubTransactionId parentSubid, ResourceOwner myXactOwner, ResourceOwner parentXactOwner);
+extern void AtSubAbort_Portals(SubTransactionId mySubid, SubTransactionId parentSubid,
+    ResourceOwner myXactOwner, ResourceOwner parentXactOwner, bool inSTP);
 extern void AtSubCleanup_Portals(SubTransactionId mySubid);
 extern Portal CreatePortal(const char* name, bool allowDup, bool dupSilent, bool is_from_spi = false);
 extern Portal CreateNewPortal(bool is_from_spi = false);
@@ -274,6 +278,7 @@ extern Node* PortalListGetPrimaryStmt(List* stmts);
 extern void PortalCreateHoldStore(Portal portal);
 extern void PortalHashTableDeleteAll(void);
 extern bool ThereAreNoReadyPortals(void);
-extern void ResetPortalCursor(SubTransactionId mySubid, Oid funOid, int funUseCount);
+extern void ResetPortalCursor(SubTransactionId mySubid, Oid funOid, int funUseCount, bool reset = true);
 extern void HoldPinnedPortals(void);
+extern void HoldPortal(Portal portal);
 #endif /* PORTAL_H */

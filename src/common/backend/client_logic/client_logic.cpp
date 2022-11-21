@@ -25,6 +25,7 @@
 #include "client_logic/client_logic.h"
 #include "client_logic/cstrings_map.h"
 #include "access/sysattr.h"
+#include "access/tableam.h"
 #include "commands/dbcommands.h"
 #include "catalog/dependency.h"
 #include "catalog/pg_namespace.h"
@@ -32,6 +33,7 @@
 #include "utils/builtins.h"
 #include "utils/timestamp.h"
 #include "utils/acl.h"
+#include "access/hash.h"
 #include "access/heapam.h"
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
@@ -42,28 +44,96 @@
 #include "catalog/namespace.h"
 #include "commands/sec_rls_cmds.h"
 #include "rewrite/rewriteRlsPolicy.h"
+#include "nodes/makefuncs.h"
 #include "commands/tablecmds.h"
 #include "nodes/pg_list.h"
 #include "tcop/utility.h"
 #include "pgxc/pgxc.h"
 #include "utils/fmgroids.h"
-#include "MurmurHash3.h"
-
-#define INIT_VALUES_NULLS(type, id)                                                         \
-    do {                                                                                    \
-        HeapTuple htup = NULL;                                                              \
-        Relation rel = heap_open(id, RowExclusiveLock);                                     \
-        bool type##_nulls[Natts_gs_sec_##type];                                             \
-        Datum type##_values[Natts_gs_sec_##type];                                           \
-        int rc = memset_s(type##_values, sizeof(type##_values), 0, sizeof(type##_values));  \
-        securec_check(rc, "\0", "\0");                                                      \
-        rc = memset_s(type##_nulls, sizeof(type##_nulls), false, sizeof(type##_nulls));     \
-        securec_check(rc, "\0", "\0");                                                      \
-    } while (0)
+#include "funcapi.h"
 
 const size_t ENCRYPTED_VALUE_MIN_LENGTH = 170;
 const size_t ENCRYPTED_VALUE_MAX_LENGTH = 1024;
 static bool get_cmk_name(const Oid global_key_id, NameData &cmk_name);
+
+void delete_client_master_keys(Oid roleid)
+{
+    Relation relation = heap_open(ClientLogicGlobalSettingsId, AccessShareLock);
+    if (relation == NULL) {
+        return;
+    }
+    HeapTuple rtup = NULL;
+    Form_gs_client_global_keys rel_data = NULL;
+    List *global_keys = NIL;
+    ListCell* cell = NULL;
+    TableScanDesc scan = tableam_scan_begin(relation, SnapshotNow, 0, NULL);
+    while (scan && (rtup = (HeapTuple) tableam_scan_getnexttuple(scan, ForwardScanDirection))) {
+        rel_data = (Form_gs_client_global_keys)GETSTRUCT(rtup);
+        if (rel_data == NULL) {
+            continue;
+        }
+        if (rel_data->key_owner == roleid) {
+            Oid global_key_id = HeapTupleGetOid(rtup);
+            if (global_key_id != InvalidOid) {
+                KeyOidNameMap* key_map = (KeyOidNameMap*)palloc(sizeof(KeyOidNameMap));
+                key_map->key_oid = global_key_id;
+                key_map->key_name = rel_data->global_key_name;
+                global_keys = lappend(global_keys, key_map);
+            }
+        }
+    }
+    tableam_scan_end(scan);
+    heap_close(relation, AccessShareLock);
+
+    foreach (cell, global_keys) {
+        KeyOidNameMap *global_key = (KeyOidNameMap *)lfirst(cell);
+        Oid global_key_id = global_key->key_oid;
+        ObjectAddress cmk_addr;
+        cmk_addr.classId = ClientLogicGlobalSettingsId;
+        cmk_addr.objectId = global_key_id;
+        cmk_addr.objectSubId = 0;
+        ereport(NOTICE, (errmsg("drop cascades to client master key: %s", global_key->key_name.data)));
+        performDeletion(&cmk_addr, DROP_CASCADE, 0);
+    }
+    list_free(global_keys);
+}
+
+void delete_column_keys(Oid roleid)
+{
+    Relation relation = heap_open(ClientLogicColumnSettingsId, AccessShareLock);
+    if (relation == NULL) {
+        return;
+    }
+    HeapTuple rtup = NULL;
+    Form_gs_column_keys rel_data = NULL;
+    List *column_keys = NIL;
+    ListCell* cell = NULL;
+    TableScanDesc scan = tableam_scan_begin(relation, SnapshotNow, 0, NULL);
+    while (scan && (rtup = (HeapTuple) tableam_scan_getnexttuple(scan, ForwardScanDirection))) {
+        rel_data = (Form_gs_column_keys)GETSTRUCT(rtup);
+        if (rel_data == NULL) {
+            continue;
+        }
+        if (rel_data->key_owner == roleid) {
+            Oid column_key_id = HeapTupleGetOid(rtup);
+            if (column_key_id != InvalidOid) {
+                column_keys = lappend_oid(column_keys, column_key_id);
+            }
+        }
+    }
+    tableam_scan_end(scan);
+    heap_close(relation, AccessShareLock);
+
+    foreach (cell, column_keys) {
+        Oid column_key_id = lfirst_oid(cell);
+        ObjectAddress cek_addr;
+        cek_addr.classId = ClientLogicColumnSettingsId;
+        cek_addr.objectId = column_key_id;
+        cek_addr.objectSubId = 0;
+        performDeletion(&cek_addr, DROP_CASCADE, 0);
+    }
+    list_free(column_keys);
+}
 
 static Oid check_namespace(const List *key_name, Node * const stmt, char **keyname)
 {
@@ -121,7 +191,7 @@ Oid get_column_key_id_by_namespace(const char *key_name, const Oid namespace_id,
     HeapTuple rtup = NULL;
     Form_gs_column_keys rel_data = NULL;
     Oid column_key_id = InvalidOid;
-    rtup = search_syscache_cek_name(key_name, namespace_id);
+    rtup = SearchSysCache2(COLUMNSETTINGNAME, PointerGetDatum(key_name), ObjectIdGetDatum(namespace_id));
     if (rtup != NULL) {
         rel_data = (Form_gs_column_keys)GETSTRUCT(rtup);
         if (rel_data != NULL && namespace_id == rel_data->key_namespace &&
@@ -183,7 +253,7 @@ void get_catalog_name(const RangeVar * const rel)
     Oid existing_relid;
     RangeVar *relation = const_cast<RangeVar *>(rel);
     relation->catalogname = get_database_name(u_sess->proc_cxt.MyDatabaseId);
-    namespace_id = RangeVarGetAndCheckCreationNamespace(relation, NoLock, &existing_relid);
+    namespace_id = RangeVarGetAndCheckCreationNamespace(relation, NoLock, &existing_relid, '\0');
     if (relation->schemaname == NULL) {
         relation->schemaname = get_namespace_name(namespace_id);
     }
@@ -197,11 +267,7 @@ int process_encrypted_columns(const ColumnDef * const def, CeHeapInfo *ce_heap_i
     ce_heap_info->orig_mod = def->clientLogicColumnRef->orig_typname->typemod;
     Oid global_key_id(0);
     ce_heap_info->cek_id = get_column_key_id(def->clientLogicColumnRef->column_key_name, GetUserId(), global_key_id);
-    if (
-#ifdef ENABLE_MULTIPLE_NODES
-        IS_PGXC_COORDINATOR && 
-#endif
-        ce_heap_info->cek_id == InvalidOid) {
+    if (ce_heap_info->cek_id == InvalidOid) {
         ereport(ERROR, (errcode(ERRCODE_SYNTAX_ERROR), errmsg("object does not exist. column encryption key: %s",
             NameListToString(def->clientLogicColumnRef->column_key_name))));
         return -1;
@@ -219,9 +285,15 @@ void insert_gs_sec_encrypted_column_tuple(CeHeapInfo *ce_heap_info, Relation rel
     CatalogIndexState indstate)
 {
 #ifdef ENABLE_MULTIPLE_NODES
-    if (!IS_PGXC_COORDINATOR)
-        return;
+    if (IS_MAIN_COORDINATOR && !u_sess->attr.attr_common.enable_full_encryption) {
+#else
+    if (!u_sess->attr.attr_common.enable_full_encryption) {
 #endif
+        ereport(ERROR,
+            (errcode(ERRCODE_OPERATE_NOT_SUPPORTED),
+                errmsg("Un-support to add column encryption key when client encryption is disabled.")));
+    }
+
     HeapTuple htup = NULL;
 
     bool encrypted_columns_nulls[Natts_gs_encrypted_columns];
@@ -319,25 +391,6 @@ static bool process_global_settings_flush_args(Oid global_key_id, const char *gl
     return true;
 }
 
-#if ((defined(ENABLE_MULTIPLE_NODES)) || (defined(ENABLE_PRIVATEGAUSS)))
-static void check_key_path(const char *key_path)
-{
-    const char *key_path_tag = "gs_ktool/";
-    if (key_path == NULL) {
-        ereport(ERROR, (errcode(ERRCODE_SYNTAX_ERROR), errmsg("Invalid key path")));
-    }
-    if ((strlen(key_path) <= strlen(key_path_tag)) || 
-        (strncmp(key_path, key_path_tag, strlen(key_path_tag)) != 0)) {
-        ereport(ERROR, (errcode(ERRCODE_SYNTAX_ERROR), errmsg("Invalid key path")));
-    }
-    for (size_t i = strlen(key_path_tag); i < strlen(key_path); i++) {
-        if (key_path[i] < '0' || key_path[i] > '9') {
-            ereport(ERROR, (errcode(ERRCODE_SYNTAX_ERROR), errmsg("Invalid key path")));
-        }
-    }
-}
-#endif
-
 static int process_global_settings_args(CreateClientLogicGlobal *parsetree, Oid global_key_id)
 {
     /* get arguments */
@@ -351,34 +404,14 @@ static int process_global_settings_args(CreateClientLogicGlobal *parsetree, Oid 
                 global_function = global_param->value;
                 break;
             case ClientLogicGlobalProperty::CMK_KEY_STORE: {
-                CmkKeyStore key_store = get_key_store_from_string(global_param->value);
-#if ((defined(ENABLE_MULTIPLE_NODES)) || (defined(ENABLE_PRIVATEGAUSS)))
-                if (key_store != CmkKeyStore::GS_KTOOL) {
-#else
-                if (key_store != CmkKeyStore::LOCALKMS) {
-#endif              
-                    ereport(ERROR, (errcode(ERRCODE_SYNTAX_ERROR), errmsg("Invalid key store")));
-                }
                 string_args.set("KEY_STORE", global_param->value);
                 break;
             }
             case ClientLogicGlobalProperty::CMK_KEY_PATH: {
-#if ((defined(ENABLE_MULTIPLE_NODES)) || (defined(ENABLE_PRIVATEGAUSS)))
-                check_key_path(global_param->value);
-#endif  
                 string_args.set("KEY_PATH", global_param->value);
                 break;
             }
             case ClientLogicGlobalProperty::CMK_ALGORITHM: {
-                CmkAlgorithm cmk_algo = get_algorithm_from_string(global_param->value);
-#if ((defined(ENABLE_MULTIPLE_NODES)) || (defined(ENABLE_PRIVATEGAUSS)))
-                if (cmk_algo != CmkAlgorithm::AES_256_CBC) {
-#else
-                if (cmk_algo != CmkAlgorithm::RSA_2048) {
-#endif
-
-                    ereport(ERROR, (errcode(ERRCODE_SYNTAX_ERROR), errmsg("Invalid algorithm")));
-                }
                 string_args.set("ALGORITHM", global_param->value);
                 break;
             }
@@ -436,7 +469,40 @@ int process_global_settings(CreateClientLogicGlobal *parsetree)
     /* write to catalog table */
     Relation rel = heap_open(ClientLogicGlobalSettingsId, RowExclusiveLock);
     HeapTuple htup = heap_form_tuple(rel->rd_att, client_master_keys_values, client_master_keys_nulls);
-    const Oid global_key_id = finish_processing(&rel, &htup);
+    /*
+     * try to report a nicer error message rather than 'duplicate key'
+     */
+    MemoryContext old_context = CurrentMemoryContext;	
+    Oid global_key_id = InvalidOid;
+    PG_TRY();
+    {
+        /*
+         * NOTE: we could get a unique-index failure here, in case someone else is
+         * creating the same key name in parallel but hadn't committed yet when
+         * we checked for a duplicate name above. in such case we try to emit a
+         * nicer error message using try...catch
+         */
+        global_key_id = finish_processing(&rel, &htup);
+    } 
+    PG_CATCH();
+    {
+        ErrorData* edata = NULL;
+        (void*)MemoryContextSwitchTo(old_context);
+        edata = CopyErrorData();
+        if (edata->sqlerrcode == ERRCODE_UNIQUE_VIOLATION) {
+            FlushErrorState();
+            /* the old edata is no longer used */
+            FreeErrorData(edata);
+            ereport(ERROR,
+                (errcode(ERRCODE_DUPLICATE_KEY),
+                    errmodule(MOD_SEC_FE),
+                    errmsg("client master key \"%s\" already exists", keyname)));
+        } else {
+            /* we still reporting other error messages */
+            ReThrowError(edata);
+        }
+    }
+    PG_END_TRY();
 
     /* update dependency tables */
     ObjectAddress nsp_addr;
@@ -479,7 +545,7 @@ static Oid get_cmk_oid(const char *key_name, const Oid namespace_id)
     HeapTuple rtup = NULL;
     Form_gs_client_global_keys rel_data = NULL;
     Oid cmk_oid = InvalidOid;
-    rtup = search_syscache_cmk_name(key_name, namespace_id);
+    rtup = SearchSysCache2(GLOBALSETTINGNAME, PointerGetDatum(key_name), ObjectIdGetDatum(namespace_id));
     if (rtup != NULL) {
         rel_data = (Form_gs_client_global_keys)GETSTRUCT(rtup);
         if (rel_data != NULL && namespace_id == rel_data->key_namespace &&
@@ -562,6 +628,15 @@ static bool get_cmk_name(const Oid global_key_id, NameData &cmk_name)
 static bool process_column_settings_flush_args(Oid column_key_id, const char *column_function, const char *key,
     size_t keySize, const char *value, size_t valueSize)
 {
+#ifdef ENABLE_MULTIPLE_NODES
+    if (IS_MAIN_COORDINATOR && !u_sess->attr.attr_common.enable_full_encryption) {
+#else
+    if (!u_sess->attr.attr_common.enable_full_encryption) {
+#endif
+        ereport(ERROR,
+            (errcode(ERRCODE_OPERATE_NOT_SUPPORTED),
+                errmsg("Un-support to process column keys when client encryption is disabled.")));
+    }
     char key_str[MAX_ARGS_SIZE];
     char value_str[MAX_ARGS_SIZE];
     errno_t rc = EOK;
@@ -677,7 +752,7 @@ int process_column_settings(CreateClientLogicColumn *parsetree)
     Acl *key_acl = get_user_default_acl(ACL_OBJECT_COLUMN_SETTING, user_id, namespace_id);
 
     schema_name = get_namespace_name(namespace_id);
-    /* retrieve global setting id (foreign key) */
+    /* retrieve client master key id (foreign key) */
     ListCell *key_item(NULL);
     Oid global_key_id(InvalidOid);
     const char *global_key_name = NULL;
@@ -720,10 +795,9 @@ int process_column_settings(CreateClientLogicColumn *parsetree)
     securec_check(rc, "\0", "\0");
 
     /* fill catalog variable */
-    Oid distid = 0;
     column_settings_values[Anum_gs_column_keys_column_key_name - 1] =
         DirectFunctionCall1(namein, CStringGetDatum(cek_name));
-    MurmurHash3_x86_32(fqdn, strlen(fqdn), 0x12345, &distid);
+    Oid distid = hash_any((unsigned char*)fqdn, strlen(fqdn));
     column_settings_values[Anum_gs_column_keys_column_key_distributed_id - 1] = ObjectIdGetDatum(distid);
     column_settings_values[Anum_gs_column_keys_global_key_id - 1] = ObjectIdGetDatum(global_key_id);
     column_settings_values[Anum_gs_column_keys_key_namespace - 1] = ObjectIdGetDatum(namespace_id);
@@ -738,7 +812,40 @@ int process_column_settings(CreateClientLogicColumn *parsetree)
     /* write to catalog table */
     Relation rel = heap_open(ClientLogicColumnSettingsId, RowExclusiveLock);
     HeapTuple htup = heap_form_tuple(rel->rd_att, column_settings_values, column_settings_nulls);
-    const Oid column_key_id = finish_processing(&rel, &htup);
+    /*
+     * try to report a nicer error message rather than 'duplicate key'
+     */
+    MemoryContext old_context = CurrentMemoryContext;	
+    Oid column_key_id = InvalidOid;
+    PG_TRY();
+    {
+        /*
+         * NOTE: we could get a unique-index failure here, in case someone else is
+         * creating the same key name in parallel but hadn't committed yet when
+         * we checked for a duplicate name above. in such case we try to emit a
+         * nicer error message using try...catch
+         */
+        column_key_id = finish_processing(&rel, &htup);
+    } 
+    PG_CATCH();
+    {
+        ErrorData* edata = NULL;
+        (void*)MemoryContextSwitchTo(old_context);
+        edata = CopyErrorData();
+        if (edata->sqlerrcode == ERRCODE_UNIQUE_VIOLATION) {
+            FlushErrorState();
+            /* the old edata is no longer used */
+            FreeErrorData(edata);
+            ereport(ERROR,
+                (errcode(ERRCODE_DUPLICATE_KEY),
+                    errmodule(MOD_SEC_FE),
+                    errmsg("column encryption key \"%s\" already exists", cek_name)));
+        } else {
+            /* we still reporting other error messages */
+            ReThrowError(edata);
+        }
+    }
+    PG_END_TRY();
 
     /* update dependency table */
     ObjectAddress cmk_addr;
@@ -779,34 +886,19 @@ int process_column_settings(CreateClientLogicColumn *parsetree)
     }
     return 0;
 }
-int set_column_encryption(const ColumnDef *def, CeHeapInfo *ce_heap_info)
-{
-    Oid res = 0;
-#ifdef ENABLE_MULTIPLE_NODES
-    if (IS_PGXC_COORDINATOR)
-#endif
-        res = process_encrypted_columns(def, ce_heap_info);
-    return res;
-}
 
 int drop_global_settings(DropStmt *stmt)
 {
 #ifdef ENABLE_MULTIPLE_NODES
-    if (!IS_PGXC_COORDINATOR) {
-        return 0;
-    }
-    if (!IsConnFromCoord() && !u_sess->attr.attr_common.enable_full_encryption) {
-        ereport(ERROR,
-            (errcode(ERRCODE_OPERATE_NOT_SUPPORTED),
-                errmsg("Un-support to drop client master key when client encryption is disabled.")));
-    }
+    if (IS_MAIN_COORDINATOR && !u_sess->attr.attr_common.enable_full_encryption) {
 #else
     if (!u_sess->attr.attr_common.enable_full_encryption) {
+#endif
         ereport(ERROR,
             (errcode(ERRCODE_OPERATE_NOT_SUPPORTED),
                 errmsg("Un-support to drop client master key when client encryption is disabled.")));
     }
-#endif
+    
     char *global_key_name = NULL;
     ListCell *cell = NULL;
     foreach (cell, stmt->objects) {
@@ -865,21 +957,14 @@ int drop_global_settings(DropStmt *stmt)
 int drop_column_settings(DropStmt *stmt)
 {
 #ifdef ENABLE_MULTIPLE_NODES
-    if (!IS_PGXC_COORDINATOR) {
-        return 0;
-    }
-    if (!IsConnFromCoord() && !u_sess->attr.attr_common.enable_full_encryption) {
-        ereport(ERROR,
-            (errcode(ERRCODE_OPERATE_NOT_SUPPORTED),
-                errmsg("Un-support to drop column encryption key when client encryption is disabled.")));
-    }
+    if (IS_MAIN_COORDINATOR && !u_sess->attr.attr_common.enable_full_encryption) {
 #else
     if (!u_sess->attr.attr_common.enable_full_encryption) {
+#endif
         ereport(ERROR,
             (errcode(ERRCODE_OPERATE_NOT_SUPPORTED),
                 errmsg("Un-support to drop column encryption key when client encryption is disabled.")));
     }
-#endif
     char *cek_name = NULL;
     ListCell *cell = NULL;
     foreach (cell, stmt->objects) {
@@ -975,6 +1060,15 @@ void remove_cmk_by_id(Oid id)
 }
 void remove_encrypted_col_by_id(Oid id)
 {
+#ifdef ENABLE_MULTIPLE_NODES
+    if (IS_MAIN_COORDINATOR && !u_sess->attr.attr_common.enable_full_encryption) {
+#else
+    if (!u_sess->attr.attr_common.enable_full_encryption) {
+#endif
+        ereport(ERROR,
+            (errcode(ERRCODE_OPERATE_NOT_SUPPORTED),
+                errmsg("Un-support to remove encrypted column when client encryption is disabled.")));
+    }
     Relation ce_rel = heap_open(ClientLogicCachedColumnsId, RowExclusiveLock);
     HeapTuple tup = SearchSysCache1(CEOID, ObjectIdGetDatum(id));
     if (!HeapTupleIsValid(tup)) /* should not happen */
@@ -1152,4 +1246,107 @@ bool is_exist_encrypted_column(const ObjectAddresses *targetObjects)
         }
     }
     return false;
+}
+
+bool is_enc_type(Oid type_oid)
+{
+    Oid enc_type[] = {
+        BYTEAWITHOUTORDERWITHEQUALCOLOID,
+        BYTEAWITHOUTORDERCOLOID,
+        BYTEAWITHOUTORDERWITHEQUALCOLARRAYOID,
+        BYTEAWITHOUTORDERCOLARRAYOID,
+    };
+
+    for (size_t i = 0; i < sizeof(enc_type) / sizeof(enc_type[0]); i++) {
+        if (type_oid == enc_type[i]) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool is_enc_type(const char *type_name)
+{
+    const char *enc_type[] = {
+        "byteawithoutordercol",
+        "byteawithoutorderwithequalcol",
+        "_byteawithoutordercol",
+        "_byteawithoutorderwithequalcol",
+    };
+
+    for (size_t i = 0; i < sizeof(enc_type) / sizeof(enc_type[0]); i++) {
+        if (strcmp(type_name, enc_type[i]) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/*
+ * if a column is encrypted, we will rewrite its type and
+ *  (1) store its source col_type in catalog 'gs_encrypted_columns'
+ *  (2) store its new col_type in catalog 'pg_attribute'
+ * 
+ * while process 'CREATE TABLE AS' / 'SELECT INTO' statement,
+ * we need get the source col_type from  'gs_encrypted_columns', then rewrite the parse tree
+ */
+ClientLogicColumnRef *get_column_enc_def(Oid rel_oid, const char *col_name)
+{
+    ClientLogicColumnRef *enc_def = makeNode(ClientLogicColumnRef);
+    HeapTuple enc_col_tup;
+    Form_gs_encrypted_columns enc_col;
+    HeapTuple cek_tup;
+    Form_gs_column_keys cek;
+
+    /* search CEK oid from catalog 'gs_encrypted_columns' */
+    enc_col_tup = SearchSysCache2(CERELIDCOUMNNAME, ObjectIdGetDatum(rel_oid), CStringGetDatum(col_name));
+    if (!HeapTupleIsValid(enc_col_tup)) {
+        return NULL;
+    }
+    enc_col = (Form_gs_encrypted_columns)GETSTRUCT(enc_col_tup);
+
+    /* search CEK name from catalog 'gs_column_keys' */
+    cek_tup = SearchSysCache1(COLUMNSETTINGOID, ObjectIdGetDatum(enc_col->column_key_id));
+    if (!HeapTupleIsValid(cek_tup)) {
+        ReleaseSysCache(enc_col_tup);
+        return NULL;
+    }
+    cek = (Form_gs_column_keys) GETSTRUCT(cek_tup);
+
+    enc_def->columnEncryptionAlgorithmType = (EncryptionType)enc_col->encryption_type;
+    enc_def->column_key_name = list_make1(makeString(NameStr(cek->column_key_name)));
+    enc_def->orig_typname = makeTypeNameFromOid(enc_col->data_type_original_oid,  enc_col->data_type_original_mod);
+    enc_def->dest_typname = NULL;
+    enc_def->location = -1; /* not used */
+    
+    ReleaseSysCache(enc_col_tup);
+    ReleaseSysCache(cek_tup);
+
+    return enc_def;
+}
+
+Datum get_client_info(PG_FUNCTION_ARGS)
+{
+    ReturnSetInfo* rsinfo = (ReturnSetInfo*)fcinfo->resultinfo;
+    TupleDesc tupdesc;
+    Tuplestorestate* tupstore = NULL;
+    const int COLUMN_NUM = 2;
+    MemoryContext oldcontext = MemoryContextSwitchTo(rsinfo->econtext->ecxt_per_query_memory);
+    tupdesc = CreateTemplateTupleDesc(COLUMN_NUM, false, TAM_HEAP);
+    TupleDescInitEntry(tupdesc, (AttrNumber)1, "sid", INT8OID, -1, 0);
+    TupleDescInitEntry(tupdesc, (AttrNumber)2, "client_info", TEXTOID, -1, 0);
+ 
+    tupstore = tuplestore_begin_heap(true, false, u_sess->attr.attr_memory.work_mem);
+    rsinfo->returnMode = SFRM_Materialize;
+    rsinfo->setResult = tupstore;
+    rsinfo->setDesc = BlessTupleDesc(tupdesc);
+ 
+    (void)MemoryContextSwitchTo(oldcontext);
+    if (ENABLE_THREAD_POOL) {
+        g_threadPoolControler->GetSessionCtrl()->getSessionClientInfo(rsinfo->setResult, rsinfo->setDesc);
+    }
+ 
+    tuplestore_donestoring(rsinfo->setResult);
+    return (Datum)0;
 }

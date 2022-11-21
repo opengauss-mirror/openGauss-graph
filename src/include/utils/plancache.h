@@ -8,6 +8,7 @@
  * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
+ * Portions Copyright (c) 2021, openGauss Contributors
  * src/include/utils/plancache.h
  *
  * -------------------------------------------------------------------------
@@ -70,6 +71,29 @@ typedef enum {
 	GPC_VALID,
     GPC_INVALID,
 } GPCSourceSharedStatus;
+
+typedef enum {
+    SHARED_PLANCACHE = 0,
+    UPSERT_UPDATE_QUERY,
+#ifdef ENABLE_MOT
+    PBE_OPT_AND_MOT_ENGINE,
+#endif
+    PARAM_EXPR,
+    ONE_SHOT_PLAN,
+    NO_BOUND_PARAM,
+    TRANSACTION_STAT,
+    CALLER_FORCE_GPLAN,
+    CALLER_FORCE_CPLAN,
+    CSTORE_TABLE,
+    CHOOSE_BY_HINT,
+    PBE_OPTIMIZATION,
+    SETTING_FORCE_GPLAN,
+    SETTING_FORCE_CPLAN,
+    TRY_CPLAN,
+    COST_PREFER_GPLAN,
+    DEFAULT_CHOOSE,
+    MAX_PLANCHOOSEREASON
+} PlanChooseReason;
 
 class GPCPlanStatus
 {
@@ -276,6 +300,7 @@ typedef struct CachedPlanSource {
     const char* query_string;    /* source text of query */
     const char* commandTag;      /* command tag (a constant!), or NULL */
     Oid* param_types;            /* array of parameter type OIDs, or NULL */
+	char* param_modes;
     int num_params;              /* length of param_types array */
     ParserSetupHook parserSetup; /* alternative parameter spec method */
     void* parserSetupArg;
@@ -353,10 +378,12 @@ typedef struct CachedPlan {
     bool is_saved;            /* is CachedPlan in a long-lived context? */
     bool is_valid;            /* is the stmt_list currently valid? */
     bool is_oneshot;          /* is it a "oneshot" plan? */
+
 #ifdef ENABLE_MOT
     StorageEngineType storageEngineType;    /* which storage engine is used*/
     JitExec::JitContext* mot_jit_context;   /* MOT JIT context required for executing LLVM jitted code */
 #endif
+
     bool dependsOnRole;       /* is plan specific to that role? */
     Oid planRoleId;           /* Role ID the plan was created for */
     TransactionId saved_xmin; /* if valid, replan when TransactionXmin
@@ -388,7 +415,7 @@ extern CachedPlanSource* CreateCachedPlan(Node* raw_parse_tree, const char* quer
 extern CachedPlanSource* CreateOneShotCachedPlan(
     Node* raw_parse_tree, const char* query_string, const char* commandTag);
 extern void CompleteCachedPlan(CachedPlanSource* plansource, List* querytree_list, MemoryContext querytree_context,
-    Oid* param_types, int num_params, ParserSetupHook parserSetup, void* parserSetupArg, int cursor_options,
+    Oid* param_types, const char* paramModes, int num_params, ParserSetupHook parserSetup, void* parserSetupArg, int cursor_options,
     bool fixed_result, const char* stmt_name, ExecNodes* single_exec_node = NULL, bool is_read_only = false);
 
 extern void SaveCachedPlan(CachedPlanSource* plansource);
@@ -417,5 +444,6 @@ extern void PlanCacheSysCallback(Datum arg, int cacheid, uint32 hashvalue);
 extern bool IsStreamSupport();
 extern void AcquirePlannerLocks(List* stmt_list, bool acquire);
 extern void AcquireExecutorLocks(List* stmt_list, bool acquire);
-
+extern bool CachedPlanAllowsSimpleValidityCheck(CachedPlanSource *plansource, CachedPlan *plan, ResourceOwner owner);
+extern bool CachedPlanIsSimplyValid(CachedPlanSource *plansource, CachedPlan *plan, ResourceOwner owner);
 #endif /* PLANCACHE_H */

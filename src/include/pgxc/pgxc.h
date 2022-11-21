@@ -1,7 +1,7 @@
 /* -------------------------------------------------------------------------
  *
  * pgxc.h
- *		Postgres-XC flags and connection control information
+ *		openGauss flags and connection control information
  *
  *
  * Portions Copyright (c) 1996-2011  PostgreSQL Global Development Group
@@ -39,12 +39,13 @@ typedef enum {
 #define IS_PGXC_COORDINATOR (g_instance.role == VCOORDINATOR && !is_streaming_engine())
 #define IS_PGXC_DATANODE (g_instance.role == VDATANODE || g_instance.role == VSINGLENODE || is_streaming_engine())
 #else
-#define IS_PGXC_COORDINATOR (g_instance.role == VCOORDINATOR)
-#define IS_PGXC_DATANODE (g_instance.role == VDATANODE || g_instance.role == VSINGLENODE)
+#define IS_PGXC_COORDINATOR false
+#define IS_PGXC_DATANODE true
 #endif
 #define IS_SINGLE_NODE (g_instance.role == VSINGLENODE)
 #define REMOTE_CONN_TYPE u_sess->attr.attr_common.remoteConnType
 #define COORDINATOR_NOT_SINGLE (g_instance.role == VDATANODE && g_instance.role != VSINGLENODE)
+#define IS_SERVICE_NODE (g_instance.role == VCOORDINATOR || g_instance.role == VSINGLENODE)
 
 #define IsConnFromApp() (u_sess->attr.attr_common.remoteConnType == REMOTE_CONN_APP)
 #define IsConnFromCoord() (u_sess->attr.attr_common.remoteConnType == REMOTE_CONN_COORD)
@@ -57,7 +58,9 @@ typedef enum {
 /* Is the CN receive SQL statement ? */
 #define IS_MAIN_COORDINATOR (IS_PGXC_COORDINATOR && !IsConnFromCoord())
 
-#define IS_SERVICE_NODE (g_instance.role == VCOORDINATOR || g_instance.role == VSINGLENODE)
+#define ENABLE_THREAD_POOL_DN_LOGICCONN ((g_instance.attr.attr_common.enable_thread_pool && \
+    g_instance.attr.attr_storage.comm_cn_dn_logic_conn &&                                   \
+    IS_PGXC_DATANODE))
 
 /* key pair to be used as object id while using advisory lock for backup */
 #define XC_LOCK_FOR_BACKUP_KEY_1 0xFFFF

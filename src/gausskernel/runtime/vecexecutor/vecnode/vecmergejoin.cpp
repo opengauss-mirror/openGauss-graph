@@ -48,8 +48,8 @@
 
 #include "postgres.h"
 #include "knl/knl_variable.h"
-#include "executor/execdebug.h"
-#include "executor/execStream.h"
+#include "executor/exec/execdebug.h"
+#include "executor/exec/execStream.h"
 #include "vecexecutor/vecmergejoin.h"
 #include "miscadmin.h"
 #include "utils/acl.h"

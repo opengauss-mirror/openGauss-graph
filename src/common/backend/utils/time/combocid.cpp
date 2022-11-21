@@ -68,6 +68,8 @@ typedef ComboCidEntryData* ComboCidEntry;
 
 /* Initial size of the array */
 #define CCID_ARRAY_SIZE 100
+/* If size is not enough, increase it */
+#define CCID_ARRAY_INCSIZE 10000
 
 /* prototypes for internal functions */
 static CommandId GetComboCommandId(CommandId cmin, CommandId cmax);
@@ -87,7 +89,6 @@ CommandId HeapTupleHeaderGetCmin(HeapTupleHeader tup, Page page)
 {
     CommandId cid = HeapTupleHeaderGetRawCommandId(tup);
 
-    Assert(!(tup->t_infomask & HEAP_MOVED));
     Assert(TransactionIdIsCurrentTransactionId(HeapTupleHeaderGetXmin(page, tup)));
 
     if (tup->t_infomask & HEAP_COMBOCID)
@@ -113,9 +114,7 @@ CommandId HeapTupleGetCmax(HeapTuple tup)
     HeapTupleHeader htup = tup->t_data;
     CommandId cid = HeapTupleHeaderGetRawCommandId(htup);
 
-    /* We do not store cmax when locking a tuple */
-    Assert(!(htup->t_infomask & (HEAP_IS_LOCKED)));
-    Assert(TransactionIdIsCurrentTransactionId(HeapTupleGetRawXmax(tup)));
+    Assert(TransactionIdIsCurrentTransactionId(HeapTupleGetUpdateXid(tup)));
 
     if (htup->t_infomask & HEAP_COMBOCID)
         return GetRealCmax(cid);
@@ -127,9 +126,7 @@ CommandId HeapTupleHeaderGetCmax(HeapTupleHeader tup, Page page)
 {
     CommandId cid = HeapTupleHeaderGetRawCommandId(tup);
 
-    /* We do not store cmax when locking a tuple */
-    Assert(!(tup->t_infomask & (HEAP_MOVED | HEAP_IS_LOCKED)));
-    Assert(TransactionIdIsCurrentTransactionId(HeapTupleHeaderGetXmax(page, tup)));
+    Assert(TransactionIdIsCurrentTransactionId(HeapTupleHeaderGetUpdateXid(page, tup)));
 
     if (tup->t_infomask & HEAP_COMBOCID)
         return GetRealCmax(cid);
@@ -142,7 +139,6 @@ bool CheckStreamCombocid(HeapTupleHeader tup, CommandId current_cid, Page page)
 {
     CommandId cid = HeapTupleHeaderGetRawCommandId(tup);
 
-    Assert(!(tup->t_infomask & HEAP_MOVED));
     Assert(TransactionIdIsCurrentTransactionId(HeapTupleHeaderGetXmin(page, tup)));
 
     /*
@@ -282,7 +278,7 @@ static CommandId GetComboCommandId(CommandId cmin, CommandId cmax)
      */
     if (u_sess->utils_cxt.usedComboCids >= u_sess->utils_cxt.sizeComboCids) {
         /* We need to grow the array */
-        int newsize = u_sess->utils_cxt.sizeComboCids * 2;
+        int newsize = u_sess->utils_cxt.sizeComboCids + CCID_ARRAY_INCSIZE;
 
         u_sess->utils_cxt.comboCids =
             (ComboCidKeyData*)repalloc(u_sess->utils_cxt.comboCids, sizeof(ComboCidKeyData) * newsize);
@@ -346,6 +342,4 @@ void StreamTxnContextRestoreComboCid(void* stc)
     STCRestoreElem((ComboCidKey)(((StreamTxnContext*)stc)->comboCids), u_sess->utils_cxt.comboCids);
     STCRestoreElem(((StreamTxnContext*)stc)->usedComboCids, u_sess->utils_cxt.usedComboCids);
     STCRestoreElem(((StreamTxnContext*)stc)->sizeComboCids, u_sess->utils_cxt.sizeComboCids);
-    Assert((u_sess->utils_cxt.sizeComboCids > 0 && u_sess->utils_cxt.comboHash) ||
-           (u_sess->utils_cxt.sizeComboCids == 0 && !u_sess->utils_cxt.comboHash));
 }

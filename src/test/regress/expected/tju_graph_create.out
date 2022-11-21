@@ -1,0 +1,54 @@
+CREATE graph test;
+NOTICE:  CREATE TABLE / PRIMARY KEY will create implicit index "gs_vertex_pkey" for table "gs_vertex"
+SET graph_path=test;
+SHOW graph_path;
+ graph_path 
+------------
+ test
+(1 row)
+
+DROP graph test cascade;
+NOTICE:  drop cascades to 3 other objects
+DETAIL:  drop cascades to sequence test.gs_label_seq
+drop cascades to vlabel gs_vertex
+drop cascades to elabel gs_edge
+CREATE graph test;
+NOTICE:  CREATE TABLE / PRIMARY KEY will create implicit index "gs_vertex_pkey" for table "gs_vertex"
+SET graph_path=test;
+CREATE VLABEL person;
+NOTICE:  merging column "id" with inherited definition
+NOTICE:  merging column "properties" with inherited definition
+NOTICE:  CREATE TABLE / PRIMARY KEY will create implicit index "person_pkey" for table "person"
+CREATE VLABEL friend inherits (person);
+NOTICE:  merging column "id" with inherited definition
+NOTICE:  merging column "properties" with inherited definition
+NOTICE:  CREATE TABLE / PRIMARY KEY will create implicit index "friend_pkey" for table "friend"
+CREATE ELABEL knows;
+NOTICE:  merging column "id" with inherited definition
+NOTICE:  merging column "start" with inherited definition
+NOTICE:  merging column "end" with inherited definition
+NOTICE:  merging column "properties" with inherited definition
+CREATE ELABEL live_together;
+NOTICE:  merging column "id" with inherited definition
+NOTICE:  merging column "start" with inherited definition
+NOTICE:  merging column "end" with inherited definition
+NOTICE:  merging column "properties" with inherited definition
+CREATE ELABEL room_mate inherits (knows, live_together);
+NOTICE:  merging multiple inherited definitions of column "id"
+NOTICE:  merging multiple inherited definitions of column "start"
+NOTICE:  merging multiple inherited definitions of column "end"
+NOTICE:  merging multiple inherited definitions of column "properties"
+NOTICE:  merging column "id" with inherited definition
+NOTICE:  merging column "start" with inherited definition
+NOTICE:  merging column "end" with inherited definition
+NOTICE:  merging column "properties" with inherited definition
+DROP VLABEL friend;
+DROP ELABEL knows CASCADE;
+NOTICE:  drop cascades to elabel room_mate
+DROP graph test cascade;
+NOTICE:  drop cascades to 5 other objects
+DETAIL:  drop cascades to sequence test.gs_label_seq
+drop cascades to vlabel gs_vertex
+drop cascades to elabel gs_edge
+drop cascades to vlabel person
+drop cascades to elabel live_together

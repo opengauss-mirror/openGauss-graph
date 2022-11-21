@@ -17,7 +17,7 @@
 #include "knl/knl_variable.h"
 
 #include "commands/prepare.h"
-#include "executor/execStream.h"
+#include "executor/exec/execStream.h"
 #include "parser/parse_relation.h"
 #ifdef PGXC
 #include "optimizer/planmain.h"
@@ -97,7 +97,11 @@ static bool IsEqualConditionandNestLoopOnly(Plan* plan);
  */
 static bool IsEqualConditionandNestLoopOnly(Plan* plan)
 {
+#ifdef GS_GRAPH
+    Assert(nodeTag(plan) == T_NestLoop || nodeTag(plan) == T_VecNestLoop || nodeTag(plan) == T_NestLoopVLE);
+#else
     Assert(nodeTag(plan) == T_NestLoop || nodeTag(plan) == T_VecNestLoop);
+#endif
 
     ListCell* lc = NULL;
     NestLoop* nestloop = (NestLoop*)plan;
@@ -944,6 +948,9 @@ List* PlanAnalyzerOperator(QueryDesc* querydesc, PlanState* planstate)
                 break;
             }
             case T_VecNestLoop:
+#ifdef GS_GRAPH
+            case T_NestLoopVLE:
+#endif
             case T_NestLoop: {
                 bool is_eq_nestloop_only = IsEqualConditionandNestLoopOnly(plan);
                 /* Check large table runs as nestloop with equalness join-cond */

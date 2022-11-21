@@ -1,7 +1,7 @@
 /* -------------------------------------------------------------------------
  *
  * tuptoaster.h
- *	  POSTGRES definitions for external and compressed storage
+ *	  openGauss definitions for external and compressed storage
  *	  of variable size attributes.
  *
  * Copyright (c) 2000-2012, PostgreSQL Global Development Group
@@ -67,8 +67,10 @@
  * If an index value is larger than TOAST_INDEX_TARGET, we will try to
  * compress it (we can't move it out-of-line, however).  Note that this
  * number is per-datum, not per-tuple, for simplicity in index_form_tuple().
+ * Note that 16 is used as the divisor because it seems to work well in most cases.
  */
-#define TOAST_INDEX_TARGET (MaxHeapTupleSize / 16)
+#define TOAST_INDEX_TARGET (MaxHeapTupleSize / 16) // 509
+#define UTOAST_INDEX_TARGET (DefaultTdMaxUHeapTupleSize / 16)
 
 /*
  * When we store an oversize datum externally, we divide it into chunks
@@ -89,6 +91,8 @@
 
 /* Size of an EXTERNAL datum that contains a standard TOAST pointer */
 #define TOAST_POINTER_SIZE (VARHDRSZ_EXTERNAL + sizeof(struct varatt_external))
+#define LARGE_TOAST_POINTER_SIZE (VARHDRSZ_EXTERNAL + sizeof(struct varatt_lob_external))
+#define LOB_POINTER_SIZE (VARHDRSZ_EXTERNAL + sizeof(struct varatt_lob_pointer))
 
 /* Size of an indirect datum that contains a standard TOAST pointer */
 #define INDIRECT_POINTER_SIZE (VARHDRSZ_EXTERNAL + sizeof(struct varatt_indirect))
@@ -101,6 +105,23 @@
  */
 #define VARATT_EXTERNAL_IS_COMPRESSED(toast_pointer) \
     ((toast_pointer).va_extsize < (toast_pointer).va_rawsize - VARHDRSZ)
+
+#define VARATT_EXTERNAL_GET_HUGE_POINTER(large_toast_pointer, attr) \
+do { \
+   varattrib_1b_e *attre = (varattrib_1b_e *) (attr); \
+   errno_t rcs; \
+   Assert(VARATT_IS_HUGE_TOAST_POINTER(attre)); \
+   if (VARATT_IS_EXTERNAL_BUCKET(attre)) \
+   { \
+       Assert(VARSIZE_EXTERNAL(attre) == sizeof(large_toast_pointer) + VARHDRSZ_EXTERNAL + sizeof(int2)); \
+   }\
+   else\
+   { \
+       Assert(VARSIZE_EXTERNAL(attre) == sizeof(large_toast_pointer) + VARHDRSZ_EXTERNAL); \
+   }\
+   rcs = memcpy_s(&(large_toast_pointer), sizeof(large_toast_pointer), VARDATA_EXTERNAL(attre), sizeof(large_toast_pointer)); \
+   securec_check(rcs, "", ""); \
+} while (0)
 
 /*
  * Macro to fetch the possibly-unaligned contents of an EXTERNAL datum
@@ -149,6 +170,8 @@ do { \
    } \
 } while (0)
 
+class ScalarVector;
+
 
 /* ----------
  * toast_insert_or_update -
@@ -157,7 +180,14 @@ do { \
  * ----------
  */
 extern HeapTuple toast_insert_or_update(
-    Relation rel, HeapTuple newtup, HeapTuple oldtup, int options, Page pageForOldTup);
+    Relation rel, HeapTuple newtup, HeapTuple oldtup, int options, Page pageForOldTup, bool allow_update_self = false);
+
+extern Datum toast_save_datum(Relation rel, Datum value, struct varlena* oldexternal, int options);
+
+extern void toast_delete_datum(Relation rel, Datum value, int options, bool allow_update_self = false);
+extern void toast_delete_datum_internal(varatt_external toast_pointer, int options, bool allow_update_self, int2 bucketid = InvalidBktId);
+extern void toast_huge_delete_datum(Relation rel, Datum value, int options, bool allow_update_self = false);
+extern void checkHugeToastPointer(struct varlena *value);
 
 /* ----------
  * toast_delete -
@@ -176,6 +206,8 @@ extern void toast_delete(Relation rel, HeapTuple oldtup, int options);
  * ----------
  */
 extern struct varlena* heap_tuple_fetch_attr(struct varlena* attr);
+extern struct varlena* heap_internal_toast_fetch_datum(struct varatt_external toast_pointer,
+    Relation toastrel, Relation toastidx);
 
 /* ----------
  * heap_tuple_untoast_attr() -
@@ -184,7 +216,7 @@ extern struct varlena* heap_tuple_fetch_attr(struct varlena* attr);
  *		it as needed.
  * ----------
  */
-extern struct varlena* heap_tuple_untoast_attr(struct varlena* attr);
+extern struct varlena* heap_tuple_untoast_attr(struct varlena* attr, ScalarVector *arr = NULL);
 
 /* ----------
  * heap_tuple_untoast_attr_slice() -
@@ -193,7 +225,7 @@ extern struct varlena* heap_tuple_untoast_attr(struct varlena* attr);
  *		(Handles all cases for attribute storage)
  * ----------
  */
-extern struct varlena* heap_tuple_untoast_attr_slice(struct varlena* attr, int32 sliceoffset, int32 slicelength);
+extern struct varlena* heap_tuple_untoast_attr_slice(struct varlena* attr, int64 sliceoffset, int32 slicelength);
 
 /* ----------
  * toast_flatten_tuple -
@@ -214,6 +246,8 @@ extern HeapTuple toast_flatten_tuple(HeapTuple tup, TupleDesc tupleDesc);
  * ----------
  */
 extern Datum toast_flatten_tuple_attribute(Datum value, Oid typeId, int32 typeMod);
+extern text* text_catenate_huge(text* t1, text* t2, Oid toastOid);
+extern int64 calculate_huge_length(text* t);
 
 /* ----------
  * toast_compress_datum -
@@ -240,6 +274,29 @@ extern Size toast_raw_datum_size(Datum value);
 extern Size toast_datum_size(Datum value);
 
 extern bool toastrel_valueid_exists(Relation toastrel, Oid valueid);
+
+extern bool create_toast_by_sid(Oid *toastOid);
+extern Oid get_toast_oid();
+extern varlena* toast_huge_write_datum_slice(struct varlena* attr1, struct varlena* attr2, int64 sliceoffset, int32 length);
+extern varlena* toast_pointer_fetch_data(TupleTableSlot* varSlot, Form_pg_attribute attr, int varNumber);
+extern Datum fetch_lob_value_from_tuple(varatt_lob_pointer* lob_pointer, Oid update_oid, bool* is_null);
+
+inline Datum fetch_real_lob_if_need(Datum toast_pointer)
+{
+    Datum ret = toast_pointer;
+    if (VARATT_IS_EXTERNAL_LOB(toast_pointer)) {
+        bool isNull = false;
+        struct varatt_lob_pointer* lob_pointer = (varatt_lob_pointer*)(VARDATA_EXTERNAL(toast_pointer));
+        ret = fetch_lob_value_from_tuple(lob_pointer, InvalidOid, &isNull);
+        if (unlikely(isNull)) {
+            ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                errmsg("Invalid lob pointer.")));
+        }
+    }
+    return ret;
+}
+
+extern HeapTuple ctid_get_tuple(Relation relation, ItemPointer tid);
 
 #endif /* TUPTOASTER_H */
 

@@ -6,6 +6,7 @@
  * Portions Copyright (c) 2020 Huawei Technologies Co.,Ltd.
  * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
+ * Portions Copyright (c) 2021, openGauss Contributors
  *
  *
  * IDENTIFICATION
@@ -22,9 +23,10 @@
 #include "postgres.h"
 #include "knl/knl_variable.h"
 #include "catalog/pg_partition_fn.h"
-#include "executor/execdebug.h"
-#include "executor/nodeBitmapIndexscan.h"
-#include "executor/nodeIndexscan.h"
+#include "executor/exec/execdebug.h"
+#include "executor/node/nodeBitmapIndexscan.h"
+#include "executor/node/nodeIndexscan.h"
+#include "storage/tcap.h"
 #include "miscadmin.h"
 #include "utils/memutils.h"
 #include "optimizer/pruning.h"
@@ -33,10 +35,18 @@
 
 static void ExecInitNextPartitionForBitmapIndexScan(BitmapIndexScanState* node);
 /* If bitmapscan uses global partition index, set tbm to global */
-static inline void GpiUpdateTbmType(BitmapIndexScanState* node, TIDBitmap* tbm)
+static inline void GPIUpdateTbmType(BitmapIndexScanState* node, TIDBitmap* tbm)
 {
     if (RelationIsGlobalIndex(node->biss_RelationDesc)) {
         tbm_set_global(tbm, true);
+    }
+}
+
+/* if bitmapscan uses crossbucket index, set tbm->crossbucket to true */
+static inline void CBIUpdateTbmType(BitmapIndexScanState* node, TIDBitmap* tbm)
+{
+    if (RelationIsCrossBucketIndex(node->biss_RelationDesc)) {
+        tbm_set_crossbucket(tbm, true);
     }
 }
 
@@ -50,6 +60,7 @@ Node* MultiExecBitmapIndexScan(BitmapIndexScanState* node)
     IndexScanDesc scandesc;
     double nTuples = 0;
     bool doscan = false;
+    bool isUstore = ((BitmapIndexScan*)node->ss.ps.plan)->is_ustore;
 
     /* must provide our own instrumentation support */
     if (node->ss.ps.instrument)
@@ -67,25 +78,13 @@ Node* MultiExecBitmapIndexScan(BitmapIndexScanState* node)
      * array key so we should do nothing.
      */
     if (!node->biss_RuntimeKeysReady && (node->biss_NumRuntimeKeys != 0 || node->biss_NumArrayKeys != 0)) {
-        if (node->ss.isPartTbl) {
-            if (PointerIsValid(node->biss_IndexPartitionList)) {
-                node->ss.ss_ReScan = true;
-
-                ExecReScan((PlanState*)node);
-                doscan = node->biss_RuntimeKeysReady;
-            } else {
-                doscan = false;
-            }
-        } else {
-            ExecReScan((PlanState*)node);
-            doscan = node->biss_RuntimeKeysReady;
+        if (node->ss.isPartTbl && PointerIsValid(node->biss_IndexPartitionList)) {
+            node->ss.ss_ReScan = true;
         }
+        ExecReScan((PlanState*)node);
+        doscan = node->biss_RuntimeKeysReady;
     } else {
-        if (node->ss.isPartTbl && !PointerIsValid(node->biss_IndexPartitionList)) {
-            doscan = false;
-        } else {
-            doscan = true;
-        }
+        doscan = !(node->ss.isPartTbl && !PointerIsValid(node->biss_IndexPartitionList));
     }
 
     /*
@@ -99,15 +98,21 @@ Node* MultiExecBitmapIndexScan(BitmapIndexScanState* node)
         node->biss_result = NULL; /* reset for next time */
     } else {
         /* XXX should we use less than u_sess->attr.attr_memory.work_mem for this? */
-        tbm = tbm_create(u_sess->attr.attr_memory.work_mem * 1024L);
+        tbm = TbmCreate(u_sess->attr.attr_memory.work_mem * 1024L, isUstore);
 
-        /* If bitmapscan uses global partition index, set tbm to global */
-        GpiUpdateTbmType(node, tbm);
+        /* If bitmapscan uses global partition index, set tbm to global. */
+        GPIUpdateTbmType(node, tbm);
+
+        /* If bitmapscan uses crossbucket index, set tbm->crossbucket to true. */
+        CBIUpdateTbmType(node, tbm);
     }
 
-    if (hbkt_idx_need_switch_bkt(scandesc, node->ss.ps.hbktScanSlot.currSlot)) {
+    /* Cross-bucket index scan should not switch the index bucket. */
+    if (hbkt_idx_need_switch_bkt(scandesc, node->ss.ps.hbktScanSlot.currSlot) && 
+        !RelationIsCrossBucketIndex(node->biss_RelationDesc)) {
         hbkt_idx_bitmapscan_switch_bucket(scandesc, node->ss.ps.hbktScanSlot.currSlot);
     }
+
     /*
      * Get TIDs from index and insert into bitmap
      */
@@ -245,8 +250,15 @@ void ExecEndBitmapIndexScan(BitmapIndexScanState* node)
             Assert(PointerIsValid(node->biss_CurrentIndexPartition));
             releaseDummyRelation(&(node->biss_CurrentIndexPartition));
 
-            /* close index partition */
-            releasePartitionList(node->biss_RelationDesc, &(node->biss_IndexPartitionList), NoLock);
+            Oid heapOid = node->biss_RelationDesc->rd_index->indrelid;
+            Relation heapRelation = heap_open(heapOid, AccessShareLock);
+            if (RelationIsSubPartitioned(heapRelation)) {
+                releaseSubPartitionList(node->biss_RelationDesc, &(node->biss_IndexPartitionList), NoLock);
+            } else {
+                /* close index partition */
+                releasePartitionList(node->biss_RelationDesc, &(node->biss_IndexPartitionList), NoLock);
+            }
+            heap_close(heapRelation, AccessShareLock);
         }
     }
 
@@ -264,6 +276,7 @@ BitmapIndexScanState* ExecInitBitmapIndexScan(BitmapIndexScan* node, EState* est
 {
     BitmapIndexScanState* indexstate = NULL;
     bool relistarget = false;
+    Snapshot scanSnap;
 
     /* check for unsupported flags */
     Assert(!(eflags & (EXEC_FLAG_BACKWARD | EXEC_FLAG_MARK)));
@@ -365,6 +378,12 @@ BitmapIndexScanState* ExecInitBitmapIndexScan(BitmapIndexScan* node, EState* est
         indexstate->biss_RuntimeContext = NULL;
     }
 
+    /*
+     * Choose user-specified snapshot if TimeCapsule clause exists, otherwise 
+     * estate->es_snapshot instead.
+     */
+    scanSnap = TvChooseScanSnap(indexstate->biss_RelationDesc, &node->scan, &indexstate->ss);
+
     /* get index partition list and table partition list */
     if (node->scan.isPartTbl) {
         indexstate->biss_ScanDesc = NULL;
@@ -380,14 +399,19 @@ BitmapIndexScanState* ExecInitBitmapIndexScan(BitmapIndexScan* node, EState* est
 
             if (indexstate->biss_IndexPartitionList != NIL) {
                 /* get the first index partition */
-                currentindex = (Partition)list_nth(indexstate->biss_IndexPartitionList, 0);
+                if (RelationIsSubPartitioned(currentrel)) {
+                    List *currentindexlist = (List *)list_nth(indexstate->biss_IndexPartitionList, 0);
+                    currentindex = (Partition)list_nth(currentindexlist, 0);
+                } else {
+                    currentindex = (Partition)list_nth(indexstate->biss_IndexPartitionList, 0);
+                }
                 indexstate->biss_CurrentIndexPartition = 
                     partitionGetRelation(indexstate->biss_RelationDesc, currentindex);
 
                 ExecCloseScanRelation(currentrel);
-    
+
                 indexstate->biss_ScanDesc = scan_handler_idx_beginscan_bitmap(indexstate->biss_CurrentIndexPartition,
-                    estate->es_snapshot,
+                    scanSnap,
                     indexstate->biss_NumScanKeys,
                     (ScanState*)indexstate);
             }
@@ -397,7 +421,7 @@ BitmapIndexScanState* ExecInitBitmapIndexScan(BitmapIndexScan* node, EState* est
          * Initialize scan descriptor.
          */
         indexstate->biss_ScanDesc = scan_handler_idx_beginscan_bitmap(
-            indexstate->biss_RelationDesc, estate->es_snapshot, indexstate->biss_NumScanKeys, (ScanState*)indexstate);
+            indexstate->biss_RelationDesc, scanSnap, indexstate->biss_NumScanKeys, (ScanState*)indexstate);
     }
 
     /*
@@ -435,6 +459,8 @@ static void ExecInitNextPartitionForBitmapIndexScan(BitmapIndexScanState* node)
     BitmapIndexScan* plan = NULL;
     int paramno = -1;
     ParamExecData* param = NULL;
+    int subPartParamno = -1;
+    ParamExecData* SubPrtParam = NULL;
 
     plan = (BitmapIndexScan*)(node->ss.ps.plan);
 
@@ -443,10 +469,21 @@ static void ExecInitNextPartitionForBitmapIndexScan(BitmapIndexScanState* node)
     param = &(node->ss.ps.state->es_param_exec_vals[paramno]);
     node->ss.currentSlot = (int)param->value;
 
+    subPartParamno = plan->scan.plan.subparamno;
+    SubPrtParam = &(node->ss.ps.state->es_param_exec_vals[subPartParamno]);
+
     node->ss.ss_currentScanDesc = NULL;
 
-    /* get the index partition for the special partitioned index and table partition */
-    currentindexpartition = (Partition)list_nth(node->biss_IndexPartitionList, node->ss.currentSlot);
+    Oid heapOid = node->biss_RelationDesc->rd_index->indrelid;
+    Relation heapRelation = heap_open(heapOid, AccessShareLock);
+    if (RelationIsSubPartitioned(heapRelation)) {
+        List *subPartList = (List *)list_nth(node->biss_IndexPartitionList,
+                                             node->ss.currentSlot);
+        currentindexpartition = (Partition)list_nth(subPartList, (int)SubPrtParam->value);
+    } else {
+        /* get the index partition for the special partitioned index and table partition */
+        currentindexpartition = (Partition)list_nth(node->biss_IndexPartitionList, node->ss.currentSlot);
+    }
 
     /* construct a relation for the index partition */
     currentindexpartitionrel = partitionGetRelation(node->biss_RelationDesc, currentindexpartition);
@@ -458,6 +495,8 @@ static void ExecInitNextPartitionForBitmapIndexScan(BitmapIndexScanState* node)
     /* Initialize scan descriptor. */
     node->biss_ScanDesc = scan_handler_idx_beginscan_bitmap(
         node->biss_CurrentIndexPartition, node->ss.ps.state->es_snapshot, node->biss_NumScanKeys, (ScanState*)node);
+
+    heap_close(heapRelation, AccessShareLock);
 
     Assert(PointerIsValid(node->biss_ScanDesc));
 }
@@ -491,20 +530,24 @@ void ExecInitPartitionForBitmapIndexScan(BitmapIndexScanState* indexstate, EStat
         indexstate->lockMode = lock;
         PruningResult* resultPlan = NULL;
         if (plan->scan.pruningInfo->expr) {
-            if (estate->pruningResult) {
-                resultPlan = estate->pruningResult;
+            if (ENABLE_SQL_BETA_FEATURE(PARTITION_OPFUSION)) {
+                if (estate->pruningResult) {
+                    resultPlan = estate->pruningResult;
+                } else {
+                    resultPlan = GetPartitionInfo(plan->scan.pruningInfo, estate, rel);
+                    destroyPruningResult(estate->pruningResult);
+                    estate->pruningResult = resultPlan;
+                }
             } else {
                 resultPlan = GetPartitionInfo(plan->scan.pruningInfo, estate, rel);
-                destroyPruningResult(estate->pruningResult);
-                estate->pruningResult = resultPlan;
             }
         } else {
             resultPlan = plan->scan.pruningInfo;
         }
         if (resultPlan->ls_rangeSelectedPartitions != NULL) {
-            indexstate->part_id = resultPlan->ls_rangeSelectedPartitions->length;
+            indexstate->ss.part_id = resultPlan->ls_rangeSelectedPartitions->length;
         } else {
-            indexstate->part_id = 0;
+            indexstate->ss.part_id = 0;
         }
 
         ListCell* cell = NULL;
@@ -521,29 +564,79 @@ void ExecInitPartitionForBitmapIndexScan(BitmapIndexScanState* indexstate, EStat
             tablepartitionid = getPartitionOidFromSequence(rel, partSeq);
             tablePartition = partitionOpen(rel, tablepartitionid, lock);
 
-            partitionIndexOidList = PartitionGetPartIndexList(tablePartition);
-            Assert(PointerIsValid(partitionIndexOidList));
-            if (!PointerIsValid(partitionIndexOidList)) {
-                ereport(ERROR,
-                    (errcode(ERRCODE_WRONG_OBJECT_TYPE),
-                        errmodule(MOD_EXECUTOR),
-                        errmsg("no local indexes found for partition %s BitmapIndexScan",
-                            PartitionGetPartitionName(tablePartition))));
-            }
-            indexpartitionid = searchPartitionIndexOid(indexid, partitionIndexOidList);
-            list_free_ext(partitionIndexOidList);
-            partitionClose(rel, tablePartition, NoLock);
+            if (RelationIsSubPartitioned(rel)) {
+                ListCell *lc = NULL;
+                SubPartitionPruningResult *subPartPruningResult =
+                    GetSubPartitionPruningResult(resultPlan->ls_selectedSubPartitions, partSeq);
+                if (subPartPruningResult == NULL) {
+                    continue;
+                }
+                List *subpartList = subPartPruningResult->ls_selectedSubPartitions;
+                List *subIndexList = NULL;
 
-            indexpartition = partitionOpen(indexstate->biss_RelationDesc, indexpartitionid, lock);
-            if (indexpartition->pd_part->indisusable == false) {
-                ereport(ERROR,
-                    (errcode(ERRCODE_INDEX_CORRUPTED),
-                        errmodule(MOD_EXECUTOR),
-                        errmsg("can't initialize bitmap index scans using unusable local index \"%s\" for partition",
-                            PartitionGetPartitionName(indexpartition))));
+                foreach (lc, subpartList)
+                {
+                    int subpartSeq = lfirst_int(lc);
+                    Relation tablepartrel = partitionGetRelation(rel, tablePartition);
+                    Oid subpartitionid = getPartitionOidFromSequence(tablepartrel, subpartSeq);
+                    Partition subpart = partitionOpen(tablepartrel, subpartitionid, AccessShareLock);
+
+                    partitionIndexOidList = PartitionGetPartIndexList(subpart);
+
+                    Assert(partitionIndexOidList != NULL);
+                    if (!PointerIsValid(partitionIndexOidList)) {
+                        ereport(ERROR, (errmodule(MOD_OPT), errcode(ERRCODE_WRONG_OBJECT_TYPE),
+                                        errmsg("no local indexes found for partition %s",
+                                               PartitionGetPartitionName(subpart))));
+                    }
+
+                    indexpartitionid = searchPartitionIndexOid(indexid, partitionIndexOidList);
+                    indexpartition = partitionOpen(indexstate->biss_RelationDesc, indexpartitionid, AccessShareLock);
+
+                    list_free_ext(partitionIndexOidList);
+                    partitionClose(tablepartrel, subpart, AccessShareLock);
+                    releaseDummyRelation(&tablepartrel);
+
+                    if (indexpartition->pd_part->indisusable == false) {
+                        ereport(
+                            ERROR,
+                            (errcode(ERRCODE_INDEX_CORRUPTED), errmodule(MOD_EXECUTOR),
+                             errmsg(
+                                 "can't initialize bitmap index scans using unusable local index \"%s\" for partition",
+                                 PartitionGetPartitionName(indexpartition))));
+                    }
+
+                    subIndexList = lappend(subIndexList, indexpartition);
+                }
+
+                partitionClose(rel, tablePartition, NoLock);
+                indexstate->biss_IndexPartitionList = lappend(indexstate->biss_IndexPartitionList,
+                                                              subIndexList);
+            } else {
+                partitionIndexOidList = PartitionGetPartIndexList(tablePartition);
+                Assert(PointerIsValid(partitionIndexOidList));
+                if (!PointerIsValid(partitionIndexOidList)) {
+                    ereport(ERROR,
+                                (errcode(ERRCODE_WRONG_OBJECT_TYPE),
+                                 errmodule(MOD_EXECUTOR),
+                                 errmsg("no local indexes found for partition %s BitmapIndexScan",
+                                     PartitionGetPartitionName(tablePartition))));
+                }
+                indexpartitionid = searchPartitionIndexOid(indexid, partitionIndexOidList);
+                list_free_ext(partitionIndexOidList);
+                partitionClose(rel, tablePartition, NoLock);
+
+                indexpartition = partitionOpen(indexstate->biss_RelationDesc, indexpartitionid, lock);
+                if (indexpartition->pd_part->indisusable == false) {
+                    ereport(
+                        ERROR,
+                        (errcode(ERRCODE_INDEX_CORRUPTED), errmodule(MOD_EXECUTOR),
+                         errmsg("can't initialize bitmap index scans using unusable local index \"%s\" for partition",
+                                PartitionGetPartitionName(indexpartition))));
+                }
+                /* add index partition to list for the following scan */
+                indexstate->biss_IndexPartitionList = lappend(indexstate->biss_IndexPartitionList, indexpartition);
             }
-            /* add index partition to list for the following scan */
-            indexstate->biss_IndexPartitionList = lappend(indexstate->biss_IndexPartitionList, indexpartition);
         }
     }
 }

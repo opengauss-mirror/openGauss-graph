@@ -44,6 +44,8 @@
 #include "bin/elog.h"
 #include "file_ops.h"
 #include "catalog/catalog.h"
+#include "port/pg_crc32c.h"
+#include "replication/dcf_data.h"
 
 #ifdef ENABLE_MOT
 #include "fetchmot.h"
@@ -59,6 +61,7 @@
 
 /* Global options */
 char* basedir = NULL;
+bool isBuildFromStandby = false;
 char format = 'p'; /* p(lain)/t(ar) */
 char* label = "gs_ctl full build";
 bool showprogress = true;
@@ -91,6 +94,7 @@ static char conf_file[MAXPGPATH] = {0};
 static char buildstart_file[MAXPGPATH] = {0};
 static char builddone_file[MAXPGPATH] = {0};
 static char build_label_file[MAXPGPATH] = {0};
+static char paxos_index_file[MAXPGPATH] = {0};
 
 /* Progress counters */
 static uint64 totalsize = 0;
@@ -116,23 +120,23 @@ static volatile LONG has_xlogendptr = 0;
 
 static void BuildReaper(SIGNAL_ARGS);
 extern void UpdateDBStateFile(char* path, GaussState* state);
-static void disconnect_and_exit(int code);
-static void verify_dir_is_empty_or_create(char* dirname);
+static bool verify_dir_is_empty_or_create(char* dirname);
 static void removeCreatedTblspace(void);
 static void progress_report(int tablespacenum, const char* filename, bool force);
-static void ReceiveAndUnpackTarFile(PGconn* conn, PGresult* res, int rownum);
-static void BaseBackup(const char* dirname, uint32 term = 0);
+static bool ReceiveAndUnpackTarFile(PGconn* conn, PGresult* res, int rownum);
+static bool BaseBackup(const char* dirname, uint32 term = 0);
 static bool reached_end_position(XLogRecPtr segendpos, uint32 timeline, bool segment_finished);
-void backup_incremental_xlog(char* dir);
-static void create_backup_label(const char* dirname, const char* startsysid, TimeLineID starttli);
-static void xlog_streamer_backup(const char* dirname);
+bool backup_incremental_xlog(char* dir);
+static bool create_backup_label(const char* dirname, const char* startsysid, TimeLineID starttli);
+static bool xlog_streamer_backup(const char* dirname);
 static XLogRecPtr read_full_backup_label(
     const char* dirname, char* sysid, uint32 sysid_len, char* tline, uint32 tline_len);
 static int replace_node_name(char* sSrc, const char* sMatchStr, const char* sReplaceStr);
 static void show_full_build_process(const char* errmg);
-static void backup_dw_file(const char* target_dir);
+static bool backup_dw_file(const char* target_dir);
 void get_xlog_location(char (&xlog_location)[MAXPGPATH]);
-static void DeleteAlreadyDropedFile(const char* path, bool is_table_space);
+static bool UpdatePaxosIndexFile(unsigned long long paxosIndex);
+static bool DeleteAlreadyDropedFile(const char* path, bool is_table_space);
 static int DeleteUnusedFile(const char* path, unsigned int SegNo, unsigned int fileNode);
 
 /*
@@ -204,32 +208,6 @@ static int tblspaceIndex = 0;
         }                                           \
     }
 
-/* rename all tablespace name to local name */
-#define RENAME_TABLESPACE_LIST()                                                                                     \
-    if (NULL != tblspaceParentDirectory && NULL != tblspaceDirectory) {                                              \
-        errno_t rcm = 0;                                                                                             \
-        int k;                                                                                                       \
-        char nodetblspcparentpath[MAXPGPATH] = {0};                                                                  \
-        for (k = 0; k < tblspaceCount; k++) {                                                                        \
-            if (tblspaceDirectory[k] != NULL && tblspaceParentDirectory[k] != NULL) {                                \
-                rcm = snprintf_s(nodetblspcparentpath,                                                               \
-                    MAXPGPATH,                                                                                       \
-                    sizeof(nodetblspcparentpath) - 1,                                                                \
-                    "%s/%s_%s",                                                                                      \
-                    tblspaceParentDirectory[k],                                                                      \
-                    TABLESPACE_VERSION_DIRECTORY,                                                                    \
-                    remotenodename);                                                                                 \
-                securec_check_ss_c(rcm, "", "");                                                                     \
-                if (rename(nodetblspcparentpath, tblspaceDirectory[k]) < 0) {                                        \
-                    pg_log(                                                                                          \
-                        PG_WARNING, _(" failed to rename %s to %s.\n"), nodetblspcparentpath, tblspaceDirectory[k]); \
-                    disconnect_and_exit(1);                                                                          \
-                }                                                                                                    \
-                rcm = memset_s(nodetblspcparentpath, sizeof(nodetblspcparentpath), 0, sizeof(nodetblspcparentpath)); \
-                securec_check_ss_c(rcm, "", "");                                                                     \
-            }                                                                                                        \
-        }                                                                                                            \
-    }
 
 /* get LSN and node name from remote node */
 #define GET_FLUSHED_LSN()                                                                        \
@@ -240,23 +218,27 @@ static int tblspaceIndex = 0;
         res = PQexec(streamConn, "IDENTIFY_MAXLSN");                                             \
         if (PQresultStatus(res) != PGRES_TUPLES_OK) {                                            \
             pg_log(PG_WARNING, _(" could not identify maxlsn: %s"), PQerrorMessage(streamConn)); \
-            disconnect_and_exit(1);                                                              \
+            DisconnectConnection();                                                              \
+            return false;                                                                        \
         }                                                                                        \
         if (PQntuples(res) != 1 || PQnfields(res) != 1) {                                        \
             pg_log(PG_WARNING,                                                                   \
                 _(" could not identify maxlsn, got %d rows and %d fields\n"),                    \
                 PQntuples(res),                                                                  \
                 PQnfields(res));                                                                 \
-            disconnect_and_exit(1);                                                              \
+            DisconnectConnection();                                                              \
+            return false;                                                                        \
         }                                                                                        \
         return_value = PQgetvalue(res, 0, 0);                                                    \
         if (NULL == return_value) {                                                              \
             pg_log(PG_WARNING, _(" get remote lsn failed\n"));                                   \
-            disconnect_and_exit(1);                                                              \
+            DisconnectConnection();                                                              \
+            return false;                                                                        \
         }                                                                                        \
         if (NULL == strchr(return_value, '|')) {                                                 \
             pg_log(PG_WARNING, _(" get remote lsn style failed\n"));                             \
-            disconnect_and_exit(1);                                                              \
+            DisconnectConnection();                                                              \
+            return false;                                                                        \
         }                                                                                        \
         err = strncpy_s(remotelsn, MAXPGPATH, return_value, MAXPGPATH - 1);                      \
         securec_check_c(err, "", "");                                                            \
@@ -267,7 +249,8 @@ static int tblspaceIndex = 0;
 #define GET_REMOTE_NODENAME()                                                        \
     if (0 == remotelsn[0]) {                                                         \
         pg_log(PG_WARNING, _(" get remote node name failed.\n"));                    \
-        disconnect_and_exit(1);                                                      \
+        DisconnectConnection();                                                      \
+        return false;                                                                \
     }                                                                                \
     char* save = NULL;                                                               \
     char* rname = NULL;                                                              \
@@ -275,7 +258,8 @@ static int tblspaceIndex = 0;
     rname = strtok_r(remotelsn, "|", &save);                                         \
     if (NULL == rname) {                                                             \
         pg_log(PG_WARNING, _(" get remote node name failed from %s.\n"), remotelsn); \
-        disconnect_and_exit(1);                                                      \
+        DisconnectConnection();                                                      \
+        return false;                                                                \
     }                                                                                \
     rcm = strncpy_s(remotenodename, MAXPGPATH, rname, MAXPGPATH - 1);                \
     remotenodename[MAXPGPATH - 1] = '\0';                                          \
@@ -289,7 +273,8 @@ static int tblspaceIndex = 0;
         strtok_r(remotelsn, "|", &save);                                           \
         if (NULL == save) {                                                        \
             pg_log(PG_WARNING, _(" get remote lsn failed from %s.\n"), remotelsn); \
-            disconnect_and_exit(1);                                                \
+            DisconnectConnection();                                                \
+            return false;                                                          \
         }                                                                          \
         rcm = strncpy_s(xlogend, MAXFNAMELEN, save, MAXFNAMELEN - 1);              \
         (xlogend)[MAXFNAMELEN - 1] = '\0';                                         \
@@ -308,18 +293,11 @@ static int tblspaceIndex = 0;
         securec_check_ss_c(rcm, "", "");                                                                        \
         rcm = snprintf_s(build_label_file, MAXPGPATH, MAXPGPATH - 1, "%s/%s", dirname, FULL_BACKUP_LABEL_FILE); \
         securec_check_ss_c(rcm, "", "");                                                                        \
+        if (GetPaxosValue(conf_file)) {                                                                       \
+            rcm = snprintf_s(paxos_index_file, MAXPGPATH, MAXPGPATH - 1, "%s/paxosindex", dirname);       \
+            securec_check_ss_c(rcm, "", "");                                                                    \
+        }                                                                                                       \
     } while (0)
-
-/* crete build start tag file */
-#define CREATE_BUILD_FILE(buildstart_file)                                          \
-    if (0 != (buildstart_file)[0]) {                                                \
-        errno_t rcm = 0;                                                            \
-        rcm = CreateBuildtagFile(buildstart_file);                                  \
-        if (rcm == FALSE) {                                                         \
-            pg_log(PG_WARNING, _(" could not create file %s.\n"), buildstart_file); \
-            disconnect_and_exit(1);                                                 \
-        }                                                                           \
-    }
 
 /* rename build tag file to done */
 #define RENAME_BUILD_FILE(buildstart_file, builddone_file)                                       \
@@ -328,7 +306,15 @@ static int tblspaceIndex = 0;
         exit(1);                                                                                 \
     }
 
-static void disconnect_and_exit(int code)
+#define FREE_AND_RESET(ptr)  \
+    do {                     \
+        if (NULL != (ptr)) { \
+            free(ptr);       \
+            (ptr) = NULL;    \
+        }                    \
+    } while (0)
+
+static void DisconnectConnection()
 {
     if (streamConn != NULL) {
         PQfinish(streamConn);
@@ -346,8 +332,10 @@ static void disconnect_and_exit(int code)
 #endif
 
     removeCreatedTblspace();
-
-    exit(code);
+    if (g_is_obsmode) {
+        update_obs_build_status("build failed");
+        PQfinish(dbConn);
+    }
 }
 
 /*
@@ -452,6 +440,7 @@ typedef struct {
     char* sysidentifier;
     int timeline;
     uint32 term;
+    bool isBuildFromStandby;
 } logstreamer_param;
 
 static int LogStreamerMain(logstreamer_param* param)
@@ -459,7 +448,14 @@ static int LogStreamerMain(logstreamer_param* param)
     int ret = 0;
 
     /* get second connection info in child process for the sake of memmory leak */
-    param->bgconn = check_and_conn(standby_connect_timeout, standby_recv_timeout, param->term);
+    
+    if (g_is_obsmode) {
+        param->bgconn = GetConnection();
+    } else if (param->isBuildFromStandby) {
+        param->bgconn = check_and_conn_for_standby(standby_connect_timeout, standby_recv_timeout, param->term);
+    } else {
+        param->bgconn = check_and_conn(standby_connect_timeout, standby_recv_timeout, param->term);
+    }
     if (param->bgconn == NULL) {
         return 1;
     }
@@ -491,7 +487,7 @@ static int LogStreamerMain(logstreamer_param* param)
  * The background stream will use its own database connection so we can
  * stream the logfile in parallel with the backups.
  */
-void StartLogStreamer(
+bool StartLogStreamer(
     char* startpos, uint32 timeline, char* sysidentifier, const char* xloglocation, uint primaryTerm)
 {
     logstreamer_param* param = NULL;
@@ -503,13 +499,15 @@ void StartLogStreamer(
     param->timeline = timeline;
     param->sysidentifier = sysidentifier;
     param->term = primaryTerm;
+    param->isBuildFromStandby = isBuildFromStandby;
 
     /* Convert the starting position */
     if (sscanf_s(startpos, "%X/%X", &hi, &lo) != 2) {
         pg_log(PG_WARNING, _(" invalid format of xlog location: %s.\n"), startpos);
-        free(param);
+        PQfreemem(param);
         param = NULL;
-        disconnect_and_exit(1);
+        DisconnectConnection();
+        return false;
     }
     param->startptr = (((uint64)hi) << 32) | lo;
 
@@ -523,7 +521,8 @@ void StartLogStreamer(
         pg_log(PG_WARNING, _(" invalid format of xlog location: %s.\n"), startpos);
         PQfreemem(param);
         param = NULL;
-        disconnect_and_exit(1);
+        DisconnectConnection();
+        return false;
     }
 #endif
 
@@ -536,7 +535,13 @@ void StartLogStreamer(
     securec_check_c(rc, "", "");
 
     param->xlogdir[MAXPGPATH - 1] = '\0';
-    verify_dir_is_empty_or_create(param->xlogdir);
+    bool varifySuccess = verify_dir_is_empty_or_create(param->xlogdir);
+    if (!varifySuccess) {
+        PQfreemem(param);
+        param = NULL;
+        DisconnectConnection();
+        return false;
+    }
 
     /*
      * Start a child process and tell it to start streaming. On Unix, this is
@@ -554,7 +559,8 @@ void StartLogStreamer(
         pg_log(PG_WARNING, _(" could not create background process: %s.\n"), strerror(errno));
         PQfreemem(param);
         param = NULL;
-        disconnect_and_exit(1);
+        DisconnectConnection();
+        return false;
     }
 
     /*
@@ -566,7 +572,8 @@ void StartLogStreamer(
         pg_log(PG_WARNING, _(" could not create background thread: %s.\n"), strerror(errno));
         PQfreemem(param);
         param = NULL;
-        disconnect_and_exit(1);
+        DisconnectConnection();
+        return false;
     }
 #endif
 
@@ -574,8 +581,9 @@ void StartLogStreamer(
         PQfinish(param->bgconn);
         param->bgconn = NULL;
     }
-    free(param);
+    PQfreemem(param);
     param = NULL;
+    return true;
 }
 
 /*
@@ -583,7 +591,7 @@ void StartLogStreamer(
  * exist, it is created. If it exists but is not empty, an error will
  * be give and the process ended.
  */
-static void verify_dir_is_empty_or_create(char* dirname)
+static bool verify_dir_is_empty_or_create(char* dirname)
 {
     switch (pg_check_dir(dirname)) {
         case 0:
@@ -593,15 +601,15 @@ static void verify_dir_is_empty_or_create(char* dirname)
              */
             if (pg_mkdir_p(dirname, S_IRWXU) == -1) {
                 pg_log(PG_WARNING, _("could not create directory \"%s\": %s\n"), dirname, strerror(errno));
-                disconnect_and_exit(1);
+                return false;
             }
-            return;
+            return true;
         case 1:
 
             /*
              * Exists, empty
              */
-            return;
+            return true;
         case 2:
 
             /*
@@ -609,30 +617,31 @@ static void verify_dir_is_empty_or_create(char* dirname)
              */
             if (strcmp(progname, "gs_rewind") == 0) {
                 pg_log(PG_WARNING, _("in gs_rewind proecess,so no need remove.\n"));
-                return;
+                return true;
             }
             pg_log(PG_WARNING, _("directory \"%s\" exists but is not empty,so remove and recreate it\n"), dirname);
 
             if (!rmtree(dirname, true)) {
                 pg_log(PG_WARNING, _("failed to remove dir %s.\n"), dirname);
-                disconnect_and_exit(1);
+                return false;
             }
             /* recreate it */
             if (pg_mkdir_p(dirname, S_IRWXU) == -1) {
                 pg_log(PG_WARNING, _("could not create directory \"%s\": %s\n"), dirname, strerror(errno));
-                disconnect_and_exit(1);
+                return false;
             }
-            return;
+            return true;
         case -1:
 
             /*
              * Access problem
              */
             pg_log(PG_WARNING, _("could not access directory \"%s\": %s\n"), dirname, strerror(errno));
-            disconnect_and_exit(1);
+            return false;
         default:
             break;
     }
+    return true;
 }
 
 /*
@@ -704,6 +713,37 @@ static void progress_report(int tablespacenum, const char* filename, bool force)
     }
 }
 
+static bool GetCurrentPath(char *currentPath, PGresult *res, int rownum)
+{
+    char* get_value = NULL;
+    errno_t rc = EOK;
+
+    if (PQgetisnull(res, rownum, 0)) {
+        rc = strncpy_s(currentPath, MAXPGPATH, basedir, strlen(basedir));
+        securec_check_c(rc, "", "");
+
+        currentPath[MAXPGPATH - 1] = '\0';
+    } else {
+        get_value = PQgetvalue(res, rownum, 1);
+        if (get_value == NULL) {
+            pg_log(PG_WARNING, _("PQgetvalue get value failed\n"));
+            DisconnectConnection();
+            return false;
+        }
+        char* relative = PQgetvalue(res, rownum, 3);
+        if (*relative == '1') {
+            rc = snprintf_s(currentPath, MAXPGPATH, MAXPGPATH - 1, "%s/%s", basedir, get_value);
+            securec_check_ss_c(rc, "\0", "\0");
+        } else {
+            rc = strncpy_s(currentPath, MAXPGPATH, get_value, strlen(get_value));
+            securec_check_c(rc, "\0", "\0");
+        }
+        currentPath[MAXPGPATH - 1] = '\0';
+    }
+
+    return true;
+}
+
 /*
  * Receive a tar format stream from the connection to the server, and unpack
  * the contents of it into a directory. Only files, directories and
@@ -714,7 +754,7 @@ static void progress_report(int tablespacenum, const char* filename, bool force)
  * in the original directory, since relocation of tablespaces is not
  * supported.
  */
-static void ReceiveAndUnpackTarFile(PGconn* conn, PGresult* res, int rownum)
+static bool ReceiveAndUnpackTarFile(PGconn* conn, PGresult* res, int rownum)
 {
     char current_path[MAXPGPATH] = {0};
     char filename[MAXPGPATH] = {0};
@@ -723,31 +763,12 @@ static void ReceiveAndUnpackTarFile(PGconn* conn, PGresult* res, int rownum)
     uint64 current_padding = 0;
     char* copybuf = NULL;
     FILE* file = NULL;
-    char* get_value = NULL;
     struct stat st;
-    errno_t rc = EOK;
     int nRet = 0;
+    bool forbid_write = false;
 
-    if (PQgetisnull(res, rownum, 0)) {
-        rc = strncpy_s(current_path, MAXPGPATH, basedir, strlen(basedir));
-        securec_check_c(rc, "", "");
-
-        current_path[MAXPGPATH - 1] = '\0';
-    } else {
-        get_value = PQgetvalue(res, rownum, 1);
-        if (get_value == NULL) {
-            pg_log(PG_WARNING, _("PQgetvalue get value failed\n"));
-            disconnect_and_exit(1);
-        }
-        char* relative = PQgetvalue(res, rownum, 3);
-        if (*relative == '1') {
-            nRet = snprintf_s(current_path, MAXPGPATH, MAXPGPATH - 1, "%s/%s", basedir, get_value);
-            securec_check_ss_c(nRet, "\0", "\0");
-        } else {
-            rc = strncpy_s(current_path, MAXPGPATH, get_value, strlen(get_value));
-            securec_check_c(rc, "\0", "\0");
-        }
-        current_path[MAXPGPATH - 1] = '\0';
+    if (!GetCurrentPath(current_path, res, rownum)) {
+        return false;
     }
 
     /*
@@ -756,7 +777,9 @@ static void ReceiveAndUnpackTarFile(PGconn* conn, PGresult* res, int rownum)
     res = PQgetResult(conn);
     if (PQresultStatus(res) != PGRES_COPY_OUT) {
         pg_log(PG_WARNING, _("could not get COPY data stream: %s"), PQerrorMessage(conn));
-        disconnect_and_exit(1);
+        DisconnectConnection();
+        PQclear(res);
+        return false;
     }
     PQclear(res);
 
@@ -765,7 +788,8 @@ static void ReceiveAndUnpackTarFile(PGconn* conn, PGresult* res, int rownum)
 
         if (build_interrupted) {
             pg_log(PG_WARNING, _("build walreceiver process terminated abnormally\n"));
-            disconnect_and_exit(1);
+            DisconnectConnection();
+            return false;
         }
 
         if (copybuf != NULL) {
@@ -784,9 +808,11 @@ static void ReceiveAndUnpackTarFile(PGconn* conn, PGresult* res, int rownum)
             }
             break;
         } else if (r == -2) {
-            pg_log(PG_WARNING, _("could not read COPY data: %s"), PQerrorMessage(conn));
+            pg_log(PG_WARNING, _("could not read COPY data: %s\n"), PQerrorMessage(conn));
 
-            disconnect_and_exit(1);
+            DisconnectConnection();
+            FREE_AND_RESET(copybuf);
+            return false;
         }
 
         if (file == NULL) {
@@ -798,19 +824,25 @@ static void ReceiveAndUnpackTarFile(PGconn* conn, PGresult* res, int rownum)
             if (r != BUILD_PATH_LEN) {
                 pg_log(PG_WARNING, _("invalid tar block header size: %d\n"), r);
 
-                disconnect_and_exit(1);
+                DisconnectConnection();
+                FREE_AND_RESET(copybuf);
+                return false;
             }
             totaldone += BUILD_PATH_LEN;
 
             if (sscanf_s(copybuf + 1048, "%20lo", &current_len_left) != 1) {
                 pg_log(PG_WARNING, _("could not parse file size\n"));
-                disconnect_and_exit(1);
+                DisconnectConnection();
+                FREE_AND_RESET(copybuf);
+                return false;
             }
 
             /* Set permissions on the file */
             if (sscanf_s(&copybuf[1024], "%07o ", &filemode) != 1) {
                 pg_log(PG_WARNING, _("could not parse file mode\n"));
-                disconnect_and_exit(1);
+                DisconnectConnection();
+                FREE_AND_RESET(copybuf);
+                return false;
             }
 
             /*
@@ -818,7 +850,9 @@ static void ReceiveAndUnpackTarFile(PGconn* conn, PGresult* res, int rownum)
              */
             if (current_len_left < 0 || current_len_left > INT_MAX - 511) {
                 pg_log(PG_WARNING, _("current_len_left is invalid\n"));
-                disconnect_and_exit(1);
+                DisconnectConnection();
+                FREE_AND_RESET(copybuf);
+                return false;
             }
             current_padding = ((current_len_left + 511) & ~511) - current_len_left;
 
@@ -829,6 +863,7 @@ static void ReceiveAndUnpackTarFile(PGconn* conn, PGresult* res, int rownum)
                 (void)replace_node_name(copybuf, (const char*)remotenodename, (const char*)pgxcnodename);
             nRet = snprintf_s(filename, MAXPGPATH, sizeof(filename) - 1, "%s/%s", current_path, copybuf);
             securec_check_ss_c(nRet, "\0", "\0");
+            forbid_write = (IS_CROSS_CLUSTER_BUILD && strcmp(copybuf, "pg_hba.conf") == 0);
 
             if (filename[strlen(filename) - 1] == '/') {
                 int len = strlen("/pg_xlog");
@@ -851,19 +886,17 @@ static void ReceiveAndUnpackTarFile(PGconn* conn, PGresult* res, int rownum)
                              * on that.
                              */
                             if (!streamwal || strcmp(filename + strlen(filename) - len, "/pg_xlog") != 0) {
-                                pg_log(PG_WARNING,
-                                    _("could not create directory \"%s\": %s\n"),
-                                    filename,
+                                pg_log(PG_WARNING, _("could not create directory \"%s\": %s\n"), filename,
                                     strerror(errno));
 
-                                disconnect_and_exit(1);
+                                DisconnectConnection();
+                                FREE_AND_RESET(copybuf);
+                                return false;
                             }
                         }
 #ifndef WIN32
                         if (chmod(filename, filemode))
-                            pg_log(PG_WARNING,
-                                _("could not set permissions on directory \"%s\": %s\n"),
-                                filename,
+                            pg_log(PG_WARNING, _("could not set permissions on directory \"%s\": %s\n"), filename,
                                 strerror(errno));
 
 #endif
@@ -876,12 +909,11 @@ static void ReceiveAndUnpackTarFile(PGconn* conn, PGresult* res, int rownum)
                     filename[strlen(filename) - 1] = '\0'; /* Remove trailing slash */
                     if (symlink(&copybuf[bufOffset + 1], filename) != 0) {
                         if (!streamwal || strcmp(filename + strlen(filename) - len, "/pg_xlog") != 0) {
-                            pg_log(PG_WARNING,
-                                _("could not create symbolic link from \"%s\" to \"%s\": %s\n"),
-                                filename,
-                                &copybuf[1081],
-                                strerror(errno));
-                            disconnect_and_exit(1);
+                            pg_log(PG_WARNING, _("could not create symbolic link from \"%s\" to \"%s\": %s\n"),
+                                filename, &copybuf[1081], strerror(errno));
+                            DisconnectConnection();
+                            FREE_AND_RESET(copybuf);
+                            return false;
                         }
                     }
                 } else if (copybuf[bufOffset] == '3') {
@@ -900,17 +932,18 @@ static void ReceiveAndUnpackTarFile(PGconn* conn, PGresult* res, int rownum)
 
                     if (symlink(absolut_path, filename) != 0) {
                         if (!streamwal || strcmp(filename + strlen(filename) - len, "/pg_xlog") != 0) {
-                            pg_log(PG_WARNING,
-                                _("could not create symbolic link from \"%s\" to \"%s\": %s\n"),
-                                filename,
-                                &copybuf[1081],
-                                strerror(errno));
-                            disconnect_and_exit(1);
+                            pg_log(PG_WARNING, _("could not create symbolic link from \"%s\" to \"%s\": %s\n"),
+                                filename, &copybuf[1081], strerror(errno));
+                            DisconnectConnection();
+                            FREE_AND_RESET(copybuf);
+                            return false;
                         }
                     }
                 } else {
                     pg_log(PG_WARNING, _("unrecognized link indicator \"%c\"\n"), copybuf[1080]);
-                    disconnect_and_exit(1);
+                    DisconnectConnection();
+                    FREE_AND_RESET(copybuf);
+                    return false;
                 }
                 continue; /* directory or link handled */
             }
@@ -919,10 +952,16 @@ static void ReceiveAndUnpackTarFile(PGconn* conn, PGresult* res, int rownum)
             /*
              * regular file
              */
-            file = fopen(filename, "wb");
+            if (forbid_write) {
+                file = fopen(filename, "ab");
+            } else {
+                file = fopen(filename, "wb");
+            }
             if (NULL == file) {
                 pg_log(PG_WARNING, _("could not create file \"%s\": %s\n"), filename, strerror(errno));
-                disconnect_and_exit(1);
+                DisconnectConnection();
+                FREE_AND_RESET(copybuf);
+                return false;
             }
 
 #ifndef WIN32
@@ -954,14 +993,18 @@ static void ReceiveAndUnpackTarFile(PGconn* conn, PGresult* res, int rownum)
                 totaldone += r;
                 continue;
             }
-
-            if (fwrite(copybuf, r, 1, file) != 1) {
-                pg_log(PG_WARNING, _("could not write to file \"%s\": %s\n"), filename, strerror(errno));
-                disconnect_and_exit(1);
+            if (forbid_write == false) {
+                if (fwrite(copybuf, r, 1, file) != 1) {
+                    pg_log(PG_WARNING, _("could not write to file \"%s\": %s\n"), filename, strerror(errno));
+                    DisconnectConnection();
+                    FREE_AND_RESET(copybuf);
+                    return false;
+                }
             }
             totaldone += r;
-            if (showprogress)
+            if (showprogress && build_mode != COPY_SECURE_FILES_BUILD) {
                 progress_report(rownum, filename, false);
+            }
 
             current_len_left -= r;
             if (current_len_left == 0 && current_padding == 0) {
@@ -977,20 +1020,24 @@ static void ReceiveAndUnpackTarFile(PGconn* conn, PGresult* res, int rownum)
         } /* continuing data in existing file */
     }     /* loop over all data blocks */
 
-    if (showprogress)
+    if (showprogress && build_mode != COPY_SECURE_FILES_BUILD) {
         progress_report(rownum, filename, true);
+    }
 
     if (file != NULL) {
         fclose(file);
         file = NULL;
         pg_log(PG_WARNING, _("COPY stream ended before last file was finished\n"));
-        disconnect_and_exit(1);
+        DisconnectConnection();
+        FREE_AND_RESET(copybuf);
+        return false;
     }
 
     if (copybuf != NULL) {
         PQfreemem(copybuf);
         copybuf = NULL;
     }
+    return true;
 }
 
 /*
@@ -1019,7 +1066,68 @@ bool CreateBuildtagFile(const char* fulltagname)
     return true;
 }
 
-static void BaseBackup(const char* dirname, uint32 term)
+bool ModifyControlFile(const char* dirname)
+{
+    ControlFileData controlFileNew;
+    char controlFilePath[MAXPGPATH] = {0};
+    size_t size = 0;
+    int writelen;
+    int fd = -1;
+    int ss = 0;
+    char* buffer = NULL;
+    char writeBuf[PG_CONTROL_SIZE];
+    errno_t errorNo = EOK;
+
+    buffer = slurpFile(dirname, "global/pg_control", &size);
+    if (buffer == NULL) {
+        pg_log(PG_WARNING, _("could not read anything from file pg_control. \n"));
+        DisconnectConnection();
+        return false;
+    }
+    errorNo = memcpy_s(&controlFileNew, sizeof(ControlFileData), buffer, sizeof(ControlFileData));
+    securec_check_c(errorNo, "\0", "\0");
+    pg_free(buffer);
+    buffer = NULL;
+    controlFileNew.state = DB_IN_ARCHIVE_RECOVERY;
+    INIT_CRC32C(controlFileNew.crc);
+    COMP_CRC32C(controlFileNew.crc, (char*)&controlFileNew, offsetof(ControlFileData, crc));
+    FIN_CRC32C(controlFileNew.crc);
+    errorNo = memset_s(writeBuf, PG_CONTROL_SIZE, 0, PG_CONTROL_SIZE);
+    securec_check_c(errorNo, "", "");
+    errorNo = memcpy_s(writeBuf, PG_CONTROL_SIZE, &controlFileNew, sizeof(ControlFileData));
+    securec_check_c(errorNo, "", "");
+    ss = snprintf_s(controlFilePath, MAXPGPATH, MAXPGPATH - 1, "%s/global/pg_control", dirname);
+    securec_check_ss_c(ss, "\0", "\0");
+
+    int mode = O_WRONLY | O_CREAT | PG_BINARY;
+    int flags = 0600;
+    fd = open(controlFilePath, mode, flags);
+    if (fd < 0) {
+        pg_log(PG_WARNING, ("could not open pg_control file. \n"));
+        DisconnectConnection();
+        return false;
+    }
+    if (lseek(fd, 0, SEEK_SET) == -1) {
+        (void)close(fd);
+        fd = -1;
+        pg_log(PG_WARNING, "could not seek in target file \"%s\"\n", controlFilePath);
+        DisconnectConnection();
+        return false;
+    }
+    writelen = write(fd, writeBuf, PG_CONTROL_SIZE);
+    if (writelen != PG_CONTROL_SIZE) {
+        pg_log(PG_WARNING, "could not write in target file \"%s\"\n", controlFilePath);
+        (void)close(fd);
+        fd = -1;
+        DisconnectConnection();
+        return false;
+    }
+    close(fd);
+    return true;
+}
+
+
+static bool BaseBackup(const char* dirname, uint32 term)
 {
     PGresult* res = NULL;
     char* sysidentifier = NULL;
@@ -1037,6 +1145,7 @@ static void BaseBackup(const char* dirname, uint32 term)
     bool ret = FALSE;
     char* get_value = NULL;
     char xlog_location[MAXPGPATH] = {0};
+    char backup_location[MAXPGPATH] = {0};
     errno_t rc = EOK;
     int nRet = 0;
     struct stat st;
@@ -1056,41 +1165,57 @@ static void BaseBackup(const char* dirname, uint32 term)
 
     chmod(dirname, (mode_t)S_IRWXU);
 #endif
-    /* save connection info from command line or postgresql file */
-    get_conninfo(conf_file);
 
-    /* find a available conn */
-    streamConn = check_and_conn(standby_connect_timeout, standby_recv_timeout, term);
-    if (streamConn == NULL) {
-        show_full_build_process("could not connect to server.");
-        disconnect_and_exit(1);
+    if (g_is_obsmode) {
+        streamConn = GetConnection();
+        nRet = snprintf_s(backup_location, MAXPGPATH, MAXPGPATH - 1, "%s/obs_backup", dirname);
+        securec_check_ss_c(nRet, "\0", "\0");
+        pg_free(basedir);
+        basedir = NULL;
+        basedir = xstrdup(backup_location);
+    } else {
+        /* save connection info from command line or postgresql file */
+        get_conninfo(conf_file);
+
+        /* find a available conn */
+        if (isBuildFromStandby) {
+            streamConn = check_and_conn_for_standby(standby_connect_timeout, standby_recv_timeout, term);
+        } else {
+            streamConn = check_and_conn(standby_connect_timeout, standby_recv_timeout, term);
+        }
+        if (streamConn == NULL) {
+            show_full_build_process("could not connect to server.");
+            DisconnectConnection();
+            return false;
+        }
+
+        show_full_build_process("connect to server success, build started.");
+        /* create  build tag file */
+        ret = CreateBuildtagFile(buildstart_file);
+        if (ret == FALSE) {
+            pg_log(PG_WARNING, _("could not create file %s.\n"), buildstart_file);
+            DisconnectConnection();
+            return false;
+        }
+
+        show_full_build_process("create build tag file success");
+
+        /* delete data/ and  pg_tblspc/, but keep .config */
+        delete_datadir(dirname);
+
+        show_full_build_process("clear old target dir success");
+
+        /* create  build tag file again*/
+        ret = CreateBuildtagFile(buildstart_file);
+        if (ret == FALSE) {
+            pg_log(PG_WARNING, _("could not create file again %s.\n"), buildstart_file);
+
+            DisconnectConnection();
+            return false;
+        }
+
+        show_full_build_process("create build tag file again success");
     }
-
-    show_full_build_process("connect to server success, build started.");
-    /* create  build tag file */
-    ret = CreateBuildtagFile(buildstart_file);
-    if (ret == FALSE) {
-        pg_log(PG_WARNING, _("could not create file %s.\n"), buildstart_file);
-
-        disconnect_and_exit(1);
-    }
-
-    show_full_build_process("create build tag file success");
-
-    /* delete data/ and  pg_tblspc/, but keep .config */
-    delete_datadir(dirname);
-
-    show_full_build_process("clear old target dir success");
-
-    /* create  build tag file again*/
-    ret = CreateBuildtagFile(buildstart_file);
-    if (ret == FALSE) {
-        pg_log(PG_WARNING, _("could not create file again %s.\n"), buildstart_file);
-
-        disconnect_and_exit(1);
-    }
-
-    show_full_build_process("create build tag file again success");
 
     /*
      * Run IDENTIFY_SYSTEM so we can get the timeline
@@ -1098,12 +1223,15 @@ static void BaseBackup(const char* dirname, uint32 term)
     res = PQexec(streamConn, "IDENTIFY_SYSTEM");
     if (PQresultStatus(res) != PGRES_TUPLES_OK) {
         pg_log(PG_WARNING, _("could not identify system: %s"), PQerrorMessage(streamConn));
-
-        disconnect_and_exit(1);
+        DisconnectConnection();
+        PQclear(res);
+        return false;
     }
     if (PQntuples(res) != 1 || PQnfields(res) != 4) {
         pg_log(PG_WARNING, _("could not identify system, got %d rows and %d fields\n"), PQntuples(res), PQnfields(res));
-        disconnect_and_exit(1);
+        DisconnectConnection();
+        PQclear(res);
+        return false;
     }
     sysidentifier = pg_strdup(PQgetvalue(res, 0, 0));
     timeline = atoi(PQgetvalue(res, 0, 1));
@@ -1111,36 +1239,53 @@ static void BaseBackup(const char* dirname, uint32 term)
 
     show_full_build_process("get system identifier success");
 
-    create_backup_label(dirname, sysidentifier, timeline);
+    if (!g_is_obsmode) {
+        bool createLabelSuccess = create_backup_label(dirname, sysidentifier, timeline);
+        if (!createLabelSuccess) {
+            pg_free(sysidentifier);
+            sysidentifier = NULL;
+            DisconnectConnection();
+            return false;
+        }
 
-    show_full_build_process("create backup label success");
+        show_full_build_process("create backup label success");
 
-    /*
-     * Run IDENTIFY_MAXLSN then get the remote node name
-     * The name use for rename tablespace name
-     */
-    GET_FLUSHED_LSN();
-    GET_REMOTE_NODENAME();
+        /*
+         * Run IDENTIFY_MAXLSN then get the remote node name
+         * The name use for rename tablespace name
+         */
+        GET_FLUSHED_LSN();
+        GET_REMOTE_NODENAME();
+
+        (void)PQsetRwTimeout(streamConn, Max(BUILD_RW_TIMEOUT, standby_recv_timeout));
+    }
 
     /*
      * Start the actual backup
      */
-    (void)PQsetRwTimeout(streamConn, Max(BUILD_RW_TIMEOUT, standby_recv_timeout));
     (void)PQescapeStringConn(streamConn, escaped_label, label, sizeof(escaped_label), &i);
+    if (isBuildFromStandby) {
+        fastcheckpoint = false;
+    }
     nRet = snprintf_s(current_path,
         MAXPGPATH,
         sizeof(current_path) - 1,
-        "BASE_BACKUP LABEL '%s' %s %s %s %s",
+        "BASE_BACKUP LABEL '%s' %s %s %s %s %s %s",
         escaped_label,
         showprogress ? "PROGRESS" : "",
         includewal && !streamwal ? "WAL" : "",
         fastcheckpoint ? "FAST" : "",
-        includewal ? "NOWAIT" : "");
+        includewal ? "NOWAIT" : "",
+        isBuildFromStandby ? "BUILDSTANDBY" : "",
+        g_is_obsmode ? "OBSMODE" : "");
     securec_check_ss_c(nRet, "", "");
 
     if (PQsendQuery(streamConn, current_path) == 0) {
         pg_log(PG_WARNING, _("could not send base backup command: %s"), PQerrorMessage(streamConn));
-        disconnect_and_exit(1);
+        pg_free(sysidentifier);
+        sysidentifier = NULL;
+        DisconnectConnection();
+        return false;
     }
 
     /*
@@ -1149,17 +1294,29 @@ static void BaseBackup(const char* dirname, uint32 term)
     res = PQgetResult(streamConn);
     if (PQresultStatus(res) != PGRES_TUPLES_OK) {
         pg_log(PG_WARNING, _("could not get xlog location: %s"), PQerrorMessage(streamConn));
-        disconnect_and_exit(1);
+        pg_free(sysidentifier);
+        sysidentifier = NULL;
+        DisconnectConnection();
+        PQclear(res);
+        return false;
     }
     if (PQntuples(res) != 1) {
         pg_log(PG_WARNING, _("no xlog location returned from server\n"));
-        disconnect_and_exit(1);
+        pg_free(sysidentifier);
+        sysidentifier = NULL;
+        DisconnectConnection();
+        PQclear(res);
+        return false;
     }
     get_value = PQgetvalue(res, 0, 0);
     /* if linkpath is NULL ? */
     if (get_value == NULL) {
         pg_log(PG_WARNING, _("get xlog location failed\n"));
-        disconnect_and_exit(1);
+        pg_free(sysidentifier);
+        sysidentifier = NULL;
+        DisconnectConnection();
+        PQclear(res);
+        return false;
     }
 
     /*
@@ -1177,22 +1334,35 @@ static void BaseBackup(const char* dirname, uint32 term)
     res = PQgetResult(streamConn);
     if (PQresultStatus(res) != PGRES_TUPLES_OK) {
         pg_log(PG_WARNING, _("could not initiate base backup: %s"), PQerrorMessage(streamConn));
-        disconnect_and_exit(1);
+        pg_free(sysidentifier);
+        sysidentifier = NULL;
+        DisconnectConnection();
+        PQclear(res);
+        return false;
     }
     if (PQntuples(res) != 1) {
         pg_log(PG_WARNING, _("no start point returned from server\n"));
-        disconnect_and_exit(1);
+        pg_free(sysidentifier);
+        sysidentifier = NULL;
+        DisconnectConnection();
+        PQclear(res);
+        return false;
     }
     get_value = PQgetvalue(res, 0, 0);
     if (get_value == NULL) {
         pg_log(PG_WARNING, _("get xlog start point failed\n"));
-        disconnect_and_exit(1);
+        pg_free(sysidentifier);
+        sysidentifier = NULL;
+        DisconnectConnection();
+        PQclear(res);
+        return false;
     }
     rc = strncpy_s(xlogstart, sizeof(xlogstart), get_value, strlen(get_value));
     securec_check_c(rc, "", "");
 
     xlogstart[63] = '\0';
-    if (verbose && includewal) {
+    bool needPrintXLogInfo = verbose && includewal;
+    if (needPrintXLogInfo) {
         pg_log(PG_WARNING, "xlog start point: %s\n", xlogstart);
     }
     PQclear(res);
@@ -1206,12 +1376,21 @@ static void BaseBackup(const char* dirname, uint32 term)
      */
     res = PQgetResult(streamConn);
     if (PQresultStatus(res) != PGRES_TUPLES_OK) {
-        pg_log(PG_WARNING, _("could not get backup header: %s"), PQerrorMessage(streamConn));
-        disconnect_and_exit(1);
+        pg_log(PG_WARNING, _("could not get backup header. Please check server's information. Error message: %s"),
+            PQerrorMessage(streamConn));
+        pg_free(sysidentifier);
+        sysidentifier = NULL;
+        DisconnectConnection();
+        PQclear(res);
+        return false;
     }
     if (PQntuples(res) < 1) {
         pg_log(PG_WARNING, _("no data returned from server\n"));
-        disconnect_and_exit(1);
+        pg_free(sysidentifier);
+        sysidentifier = NULL;
+        DisconnectConnection();
+        PQclear(res);
+        return false;
     }
 
     /*
@@ -1258,7 +1437,14 @@ static void BaseBackup(const char* dirname, uint32 term)
                 pgxcnodename);
             securec_check_ss_c(nRet, "\0", "\0");
 
-            verify_dir_is_empty_or_create(nodetablespacepath);
+            bool varifySuccess = verify_dir_is_empty_or_create(nodetablespacepath);
+            if (!varifySuccess) {
+                pg_free(sysidentifier);
+                sysidentifier = NULL;
+                DisconnectConnection();
+                PQclear(res);
+                return false;
+            }
 
             /* Save the tablespace directory here so we can remove it when errors happen. */
             SAVE_TABLESPACE_DIRECTORY(nodetablespacepath, nodetablespaceparentpath);
@@ -1272,7 +1458,11 @@ static void BaseBackup(const char* dirname, uint32 term)
      */
     if (format == 't' && strcmp(basedir, "-") == 0 && PQntuples(res) > 1) {
         pg_log(PG_WARNING, _("can only write single tablespace to stdout, database has %d\n"), PQntuples(res));
-        disconnect_and_exit(1);
+        pg_free(sysidentifier);
+        sysidentifier = NULL;
+        DisconnectConnection();
+        PQclear(res);
+        return false;
     }
 
     show_full_build_process("begin get xlog by xlogstream");
@@ -1286,22 +1476,37 @@ static void BaseBackup(const char* dirname, uint32 term)
             pg_log(PG_WARNING, _("starting background WAL receiver\n"));
         }
         show_full_build_process("starting walreceiver");
-        StartLogStreamer(xlogstart, timeline, sysidentifier, (const char*)xlog_location, term);
+        bool startSuccess = StartLogStreamer(xlogstart, timeline, sysidentifier, (const char*)xlog_location, term);
+        if (!startSuccess) {
+            pg_log(PG_WARNING, _("start log streamer failed \n"));
+            pg_free(sysidentifier);
+            sysidentifier = NULL;
+            DisconnectConnection();
+            PQclear(res);
+            return false;
+        }
     }
 
     /* free sysidentifier after use */
     pg_free(sysidentifier);
+    sysidentifier = NULL;
     show_full_build_process("begin receive tar files");
 
     /*
      * Start receiving chunks, Loop over all tablespaces
      */
     for (i = 0; i < PQntuples(res); i++) {
-        ReceiveAndUnpackTarFile(streamConn, res, i);
+        bool getFileSuccess = ReceiveAndUnpackTarFile(streamConn, res, i);
+        if (!getFileSuccess) {
+            DisconnectConnection();
+            PQclear(res);
+            return false;
+        }
     }
 
-    if (showprogress)
+    if (showprogress) {
         progress_report(PQntuples(res), NULL, true);
+    }
     PQclear(res);
 
     show_full_build_process("finish receive tar files");
@@ -1312,30 +1517,69 @@ static void BaseBackup(const char* dirname, uint32 term)
     res = PQgetResult(streamConn);
     if (PQresultStatus(res) != PGRES_TUPLES_OK) {
         pg_log(PG_WARNING, _("could not get WAL end position from server: %s"), PQerrorMessage(streamConn));
-        disconnect_and_exit(1);
+        DisconnectConnection();
+        PQclear(res);
+        return false;
     }
     if (PQntuples(res) != 1) {
         pg_log(PG_WARNING, _("no WAL end position returned from server\n"));
-        disconnect_and_exit(1);
+        DisconnectConnection();
+        PQclear(res);
+        return false;
     }
     get_value = PQgetvalue(res, 0, 0);
     if (get_value == NULL) {
         pg_log(PG_WARNING, _("get xlog end point failed\n"));
-        disconnect_and_exit(1);
+        DisconnectConnection();
+        PQclear(res);
+        return false;
     }
     rc = strncpy_s(xlogend, sizeof(xlogend), get_value, strlen(get_value));
     securec_check_c(rc, "", "");
 
     xlogend[63] = '\0';
-    if (verbose && includewal) {
+    if (needPrintXLogInfo) {
         pg_log(PG_WARNING, "xlog end point: %s\n", xlogend);
+    }
+
+    /* If the res has two fields, it shows that paxos index sent, then write paxos index in a file. */
+    bool dcfEnabled = GetPaxosValue(conf_file);
+    int nfields = PQnfields(res);
+    if (dcfEnabled) {
+        if (nfields <= 1) {
+            pg_log(PG_WARNING, _("Received nfields from PQ is less than 2\n"));
+            DisconnectConnection();
+            PQclear(res);
+            return false;
+        }
+        get_value = PQgetvalue(res, 0, 1);
+        char* tmp = NULL;
+        unsigned long long paxosIndex = strtoul(PQgetvalue(res, 0, 1), &tmp, 10);
+        if (*tmp != '\0') {
+            pg_log(PG_WARNING, _("Unexpected paxos index specified!\n"));
+            DisconnectConnection();
+            PQclear(res);
+            return false;
+        }
+        /* Keep the paxos index info in a file, then Gaussdb server can read it after start. */
+        if (UpdatePaxosIndexFile(paxosIndex) == false) {
+            pg_log(PG_WARNING, _("Failed to write paxos index to a file!\n"));
+            DisconnectConnection();
+            PQclear(res);
+            return false;
+        }
+        pg_log(PG_PROGRESS,
+            _("Enable DCF and paxos index written in paxosindex file is %llu\n"),
+            paxosIndex);
     }
     PQclear(res);
 
     res = PQgetResult(streamConn);
     if (PQresultStatus(res) != PGRES_COMMAND_OK) {
         pg_log(PG_WARNING, _("final receive failed: %s"), PQerrorMessage(streamConn));
-        disconnect_and_exit(1);
+        DisconnectConnection();
+        PQclear(res);
+        return false;
     }
 
     /*
@@ -1352,7 +1596,9 @@ static void BaseBackup(const char* dirname, uint32 term)
          * otherwise we have problem! Report error and disconnect.
          */
         pg_log(PG_WARNING, _("unexpected result received after final result, status: %u\n"), PQresultStatus(res));
-        disconnect_and_exit(1);
+        DisconnectConnection();
+        PQclear(res);
+        return false;
     }
 
     show_full_build_process("fetching MOT checkpoint");
@@ -1381,26 +1627,31 @@ static void BaseBackup(const char* dirname, uint32 term)
 #ifndef WIN32
         if ((unsigned int)write(bgpipe[1], xlogend, strlen(xlogend)) != strlen(xlogend)) {
             pg_log(PG_WARNING, _("could not send command to background pipe: %s\n"), strerror(errno));
-            disconnect_and_exit(1);
+            DisconnectConnection();
+            return false;
         }
 
         /* Just wait for the background process to exit */
         r = waitpid(bgchild, &status, 0);
         if (r == -1) {
             pg_log(PG_WARNING, _("could not wait for child process: %s\n"), strerror(errno));
-            disconnect_and_exit(1);
+            DisconnectConnection();
+            return false;
         }
         if (r != bgchild) {
             pg_log(PG_WARNING, _("child %d died, expected %d\n"), r, (int)bgchild);
-            disconnect_and_exit(1);
+            DisconnectConnection();
+            return false;
         }
         if (!WIFEXITED(status)) {
             pg_log(PG_WARNING, _("child process did not exit normally\n"));
-            disconnect_and_exit(1);
+            DisconnectConnection();
+            return false;
         }
         if (WEXITSTATUS(status) != 0) {
             pg_log(PG_WARNING, _("child process exited with error %d\n"), WEXITSTATUS(status));
-            disconnect_and_exit(1);
+            DisconnectConnection();
+            return false;
         }
         /* Exited normally, we're happy! */
 #else /* WIN32 */
@@ -1412,7 +1663,8 @@ static void BaseBackup(const char* dirname, uint32 term)
          */
         if (sscanf_s(xlogend, "%X/%X", &hi, &lo) != 2) {
             pg_log(PG_WARNING, _("could not parse xlog end position \"%s\"\n"), xlogend);
-            disconnect_and_exit(1);
+            DisconnectConnection();
+            return false;
         }
         xlogendptr = ((uint64)hi) << 32 | lo(void) InterlockedIncrement(&has_xlogendptr);
 
@@ -1420,16 +1672,19 @@ static void BaseBackup(const char* dirname, uint32 term)
         if (WaitForSingleObjectEx((HANDLE)bgchild, INFINITE, FALSE) != WAIT_OBJECT_0) {
             _dosmaperr(GetLastError());
             pg_log(PG_WARNING, _("could not wait for child thread: %s\n"), strerror(errno));
-            disconnect_and_exit(1);
+            DisconnectConnection();
+            return false;
         }
         if (GetExitCodeThread((HANDLE)bgchild, &status) == 0) {
             _dosmaperr(GetLastError());
             pg_log(PG_WARNING, _("could not get child thread exit status: %s\n"), strerror(errno));
-            disconnect_and_exit(1);
+            DisconnectConnection();
+            return false;
         }
         if (status != 0) {
             pg_log(PG_WARNING, _("child thread exited with error %u\n"), (unsigned int)status);
-            disconnect_and_exit(1);
+            DisconnectConnection();
+            return false;
         }
         /* Exited normally, we're happy */
 #endif
@@ -1447,22 +1702,46 @@ static void BaseBackup(const char* dirname, uint32 term)
         show_full_build_process("finish fsync all files.");
     }
 
+    bool backupDWFileSuccess = false;
     /* delete dw file if exists, recreate it and write a page of zero */
-    backup_dw_file(dirname);
+    if (g_is_obsmode) {
+        backupDWFileSuccess = backup_dw_file(basedir);
+    } else {
+        backupDWFileSuccess = backup_dw_file(dirname);
+    }
+
+    if (!backupDWFileSuccess) {
+        return false;
+    }
+    
     show_full_build_process("build dummy dw file success");
 
-    /* rename tag file to done */
-    RENAME_BUILD_FILE(buildstart_file, builddone_file);
-
-    show_full_build_process("rename build status file success");
-
+    if (!g_is_obsmode) {
+        /* rename tag file to done */
+        RENAME_BUILD_FILE(buildstart_file, builddone_file);
+        show_full_build_process("rename build status file success");
+    } else {
+        show_full_build_process("full backup to local success");
+    }
     nRet = snprintf_s(basePath, MAXPGPATH, MAXPGPATH, "%s/base", dirname);
     securec_check_ss_c(nRet, "\0", "\0");
-    DeleteAlreadyDropedFile(basePath, false);
+    bool deleteFilsSuccess = DeleteAlreadyDropedFile(basePath, false);
+    if (!deleteFilsSuccess) {
+        return false;
+    }
 
     nRet = snprintf_s(tblspcPath, MAXPGPATH, MAXPGPATH, "%s/pg_tblspc", dirname);
     securec_check_ss_c(nRet, "\0", "\0");
-    DeleteAlreadyDropedFile(tblspcPath, true);
+    deleteFilsSuccess = DeleteAlreadyDropedFile(tblspcPath, true);
+    if (!deleteFilsSuccess) {
+        return false;
+    }
+
+    if (isBuildFromStandby) {
+        return ModifyControlFile(dirname);
+    }
+
+    return true;
 }
 
 /*
@@ -1471,26 +1750,154 @@ static void BaseBackup(const char* dirname, uint32 term)
  * Description        :
  * Notes            :
  */
-void backup_main(char* dir, uint32 term)
+bool backup_main(const char* dir, uint32 term, bool isFromStandby)
 {
     if (dir == NULL) {
         pg_log(PG_PRINT, "%s: parameters dir is NULL.\n", progname);
         exit(1);
     } else {
-        basedir = dir;
+        basedir = g_is_obsmode ? xstrdup(dir) : (char*)dir;
+        isBuildFromStandby = isFromStandby;
     }
     /* program name */
     progname = "gs_ctl";
 
     /* start backup */
-    BaseBackup(dir, term);
+    return BaseBackup(dir, term);
+}
+
+/*
+ * @@GaussDB@@
+ * Brief            : the entry of copy secure files from remote
+ * Description      :
+ * Notes            :
+ */
+bool CopySecureFilesMain(char* dirname, uint32 term)
+{
+    PGresult* res = NULL;
+    char current_path[MAXPGPATH] = {0};
+    char secureFilesPath[MAXPGPATH] = {0};
+    int i;
+    int nRet = 0;
+    bool isNotEmpty = false;
+    DIR *dir = NULL;
+    struct dirent *de = NULL;
+    struct stat st;
+
+    basedir = dirname;
+    CONCAT_BUILD_CONF_FILE(dirname);
+    if (stat(dirname, &st) != 0) {
+        pg_log(PG_WARNING, _("could not stat directory or file: %s\n"), strerror(errno));
+        return false;
+    }
+
+    /* if it is a symnol, chmod will change the auth of the true file */
+    if (S_ISLNK(st.st_mode)) {
+        pg_log(PG_WARNING, _("the file being chmod is a symbol link\n"));
+        return false;
+    }
+
+    chmod(dirname, (mode_t)S_IRWXU);
+    pg_log(PG_PROGRESS, _("start copy remote files.\n"));
+    if (!need_copy_upgrade_file) {
+        nRet = snprintf_s(secureFilesPath, MAXPGPATH, MAXPGPATH - 1, "%s/gs_secure_files", dirname);
+        if (stat(secureFilesPath, &st) != 0) {
+            if (errno != ENOENT) {
+                pg_log(PG_WARNING, _("could not stat gs_secure_files: %s\n"), strerror(errno));
+                return false;
+            }
+            pg_log(PG_PROGRESS, _("old gs_secure_files dir not exist.\n"));
+        } else {
+            if (!rmtree(secureFilesPath, true)) {
+                pg_log(PG_WARNING, _("failed to remove dir %s.\n"), secureFilesPath);
+                return false;
+            }
+            pg_log(PG_PROGRESS, _("old gs_secure_files dir has been deleted.\n"));
+        }
+
+        if (mkdir(secureFilesPath, S_IRWXU) != 0) {
+            pg_log(PG_WARNING, _("failed to make dir %s.\n"), secureFilesPath);
+            return false;
+        }
+        pg_log(PG_PROGRESS, _("new gs_secure_files dir has been made.\n"));
+    }
+    get_conninfo(conf_file);
+    streamConn = check_and_conn(standby_connect_timeout, standby_recv_timeout, term);
+    if (streamConn == NULL) {
+            pg_log(PG_WARNING, _("could not connect to server.\n"));
+            DisconnectConnection();
+            return false;
+    }
+    pg_log(PG_PROGRESS, _("remote server connected.\n"));
+    nRet = snprintf_s(current_path, MAXPGPATH, sizeof(current_path) - 1, 
+        "BASE_BACKUP LABEL 'gs_ctl copy secure files' copysecurefile %s",
+        need_copy_upgrade_file ? "needupgradefile" : "");
+    securec_check_ss_c(nRet, "", "");
+
+    if (PQsendQuery(streamConn, current_path) == 0) {
+        pg_log(PG_WARNING, _("could not send backup command: %s\n"), PQerrorMessage(streamConn));
+        DisconnectConnection();
+        return false;
+    }
+    res = PQgetResult(streamConn);
+    if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+        pg_log(PG_WARNING, _("could not get backup header. Please check server's information. Error message: %s\n"),
+            PQerrorMessage(streamConn));
+        DisconnectConnection();
+        PQclear(res);
+        return false;
+    }
+    if (PQntuples(res) < 1) {
+        pg_log(PG_WARNING, _("no data returned from server\n"));
+        DisconnectConnection();
+        PQclear(res);
+        return false;
+    }
+    pg_log(PG_PROGRESS, _("begin receive tar files\n"));
+    for (i = 0; i < PQntuples(res); i++) {
+        bool getFileSuccess = ReceiveAndUnpackTarFile(streamConn, res, i);
+        if (!getFileSuccess) {
+            DisconnectConnection();
+            PQclear(res);
+            return false;
+        }
+    }
+    PQclear(res);
+    if (!need_copy_upgrade_file) {
+        dir = opendir(secureFilesPath);
+        if (dir == NULL) {
+            pg_log(PG_WARNING, _("could not open directory after copy : %s!\n"), secureFilesPath);
+            return false;
+        }
+        while (1) {
+            de = readdir(dir);
+            if (de <= 0) {
+                break;
+            }
+            if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0) {
+                continue;
+            }
+            if ((de->d_type == DT_DIR) || (de->d_type == DT_REG) || (de->d_type == DT_UNKNOWN)) {
+                isNotEmpty = true;
+                break;
+            }
+        }
+        if (!isNotEmpty) {
+            pg_log(PG_WARNING, _("the directory %s after copy is null.\n"), secureFilesPath);
+            (void)closedir(dir);
+            return false;
+        }
+        (void)closedir(dir);
+    }
+    pg_log(PG_PROGRESS, _("copy remote secure files completed\n"));
+    return true;
 }
 
 /*
  * scene for CN build DN,used after full backup
  * and cluster should be locked.
  */
-void backup_incremental_xlog(char* dir)
+bool backup_incremental_xlog(char* dir)
 {
     /* data dir cannot be NULL */
     if (dir == NULL) {
@@ -1503,7 +1910,7 @@ void backup_incremental_xlog(char* dir)
     basedir = dir;
 
     /* xlog backup */
-    xlog_streamer_backup(dir);
+    return xlog_streamer_backup(dir);
 }
 
 /* BuildReaper -- signal handler after wal receiver dies. */
@@ -1516,7 +1923,7 @@ static void BuildReaper(SIGNAL_ARGS)
  * Create a full backup_label file that check sysidentifier with
  * incremental backup.
  */
-static void create_backup_label(const char* dirname, const char* startsysid, TimeLineID starttli)
+static bool create_backup_label(const char* dirname, const char* startsysid, TimeLineID starttli)
 {
     char buf[1000];
     int len;
@@ -1534,12 +1941,14 @@ static void create_backup_label(const char* dirname, const char* startsysid, Tim
     securec_check_ss_c(len, "", "");
     if (len >= (int)sizeof(buf)) {
         pg_log(PG_WARNING, _(" full backup label buffer too small\n"));
-        disconnect_and_exit(1);
+        return false;
     }
     /* description: move old file out of the way, if any. */
     open_target_file("full_backup_label", true); /* BACKUP_LABEL_FILE */
     write_target_range(buf, 0, len, len);
     close_target_file();
+
+    return true;
 }
 
 /*
@@ -1572,7 +1981,7 @@ static XLogRecPtr read_full_backup_label(
     retVal = realpath(backup_file, Lrealpath);
     if (retVal == NULL && Lrealpath[0] == '\0') {
         pg_log(PG_WARNING, _("realpath failed : %s!\n"), strerror(errno));
-        disconnect_and_exit(1);
+        return InvalidXLogRecPtr;
     }
 
     /*
@@ -1583,7 +1992,7 @@ static XLogRecPtr read_full_backup_label(
     lfp = fopen(Lrealpath, "r");
     if (lfp == NULL) {
         pg_log(PG_WARNING, _(" could not read file \"%s\"\n"), BACKUP_LABEL_FILE);
-        disconnect_and_exit(1);
+        return InvalidXLogRecPtr;
     }
 
     if (fscanf_s(lfp,
@@ -1599,7 +2008,7 @@ static XLogRecPtr read_full_backup_label(
         pg_log(PG_WARNING, _(" invalid wal data in file \"%s\"\n"), BACKUP_LABEL_FILE);
         fclose(lfp);
         lfp = NULL;
-        disconnect_and_exit(1);
+        return InvalidXLogRecPtr;
     }
     xlogpos = (((uint64)hi) << 32) | lo;
 
@@ -1607,7 +2016,7 @@ static XLogRecPtr read_full_backup_label(
         pg_log(PG_WARNING, _(" close file hanler failed\"%s\"\n"), BACKUP_LABEL_FILE);
         fclose(lfp);
         lfp = NULL;
-        disconnect_and_exit(1);
+        return InvalidXLogRecPtr;
     }
 
     fclose(lfp);
@@ -1626,19 +2035,19 @@ static XLogRecPtr read_full_backup_label(
     retVal = realpath(backup_file, Lrealpath);
     if (retVal == NULL && Lrealpath[0] == '\0') {
         pg_log(PG_WARNING, _("realpath failed : %s!\n"), strerror(errno));
-        disconnect_and_exit(1);
+        return InvalidXLogRecPtr;
     }
     lfp = fopen(Lrealpath, "r");
     if (lfp == NULL) {
         pg_log(PG_WARNING, _(" could not read file \"%s\"\n"), FULL_BACKUP_LABEL_FILE);
-        disconnect_and_exit(1);
+        return InvalidXLogRecPtr;
     }
 
     if (fscanf_s(lfp, "START SYSIDENTIFER: %20s\n", sysid, sysid_len) != 1) {
         pg_log(PG_WARNING, _(" invalid sysidentifier data in file \"%s\"\n"), FULL_BACKUP_LABEL_FILE);
         fclose(lfp);
         lfp = NULL;
-        disconnect_and_exit(1);
+        return InvalidXLogRecPtr;
     }
     sysid[sysid_len - 1] = '\0';
 
@@ -1646,7 +2055,7 @@ static XLogRecPtr read_full_backup_label(
         pg_log(PG_WARNING, _(" invalid timeline data in file \"%s\"\n"), FULL_BACKUP_LABEL_FILE);
         fclose(lfp);
         lfp = NULL;
-        disconnect_and_exit(1);
+        return InvalidXLogRecPtr;
     }
     tline[tline_len - 1] = '\0';
 
@@ -1654,7 +2063,7 @@ static XLogRecPtr read_full_backup_label(
         pg_log(PG_WARNING, _(" close file hanler failed\"%s\"\n"), FULL_BACKUP_LABEL_FILE);
         fclose(lfp);
         lfp = NULL;
-        disconnect_and_exit(1);
+        return InvalidXLogRecPtr;
     }
 
     fclose(lfp);
@@ -1663,25 +2072,9 @@ static XLogRecPtr read_full_backup_label(
     return xlogpos;
 }
 
-/*
- * backup only xlog from full backup start lsn and current lsn.
- * after copy all there xlog to local directory,then startup database for redo.
- * before copy xlog should lock cluster
- */
-static void xlog_streamer_backup(const char* dirname)
+void CheckBackupDir(const char* dirname)
 {
-    char xlogstart[MAXFNAMELEN] = {0};
-    char xlogend[MAXFNAMELEN] = {0};
-    bool ret = 0;
-    char xlog_location[MAXPGPATH] = {0};
-    XLogRecPtr xlogpos;
-    char tline[MAXPGPATH] = {0};
-    char sysid[MAXPGPATH] = {0};
-    int nRet = 0;
     struct stat st;
-
-    (void)pqsignal(SIGCHLD, BuildReaper); /* handle child termination */
-
     if (stat(dirname, &st) != 0) {
         pg_log(PG_WARNING, _("could not stat directory or file: %s\n"), strerror(errno));
     }
@@ -1694,6 +2087,26 @@ static void xlog_streamer_backup(const char* dirname)
     if (chmod(dirname, (mode_t)S_IRWXU)) {
         pg_log(PG_WARNING, _("could not set permissions on data directory \"%s\": %s\n"), dirname, strerror(errno));
     }
+}
+
+/*
+ * backup only xlog from full backup start lsn and current lsn.
+ * after copy all there xlog to local directory,then startup database for redo.
+ * before copy xlog should lock cluster
+ */
+static bool xlog_streamer_backup(const char* dirname)
+{
+    char xlogstart[MAXFNAMELEN] = {0};
+    char xlogend[MAXFNAMELEN] = {0};
+    bool ret = 0;
+    char xlog_location[MAXPGPATH] = {0};
+    XLogRecPtr xlogpos;
+    char tline[MAXPGPATH] = {0};
+    char sysid[MAXPGPATH] = {0};
+    int nRet = 0;
+
+    (void)pqsignal(SIGCHLD, BuildReaper); /* handle child termination */
+    CheckBackupDir(dirname);
 
     CONCAT_BUILD_CONF_FILE(dirname);
 
@@ -1703,7 +2116,8 @@ static void xlog_streamer_backup(const char* dirname)
     ret = CreateBuildtagFile(buildstart_file);
     if (ret == FALSE) {
         pg_log(PG_WARNING, _("could not create file %s.\n"), buildstart_file);
-        disconnect_and_exit(1);
+        DisconnectConnection();
+        return false;
     }
 
     /*
@@ -1717,6 +2131,12 @@ static void xlog_streamer_backup(const char* dirname)
      * Get the starting xlog position
      */
     xlogpos = read_full_backup_label(dirname, sysid, MAXPGPATH, tline, MAXPGPATH);
+    if (xlogpos == InvalidXLogRecPtr) {
+        pg_log(PG_WARNING, _("get xlog postion failed.\n"));
+        DisconnectConnection();
+        return false;
+    }
+    
     nRet = snprintf_s(
         xlogstart, sizeof(xlogstart), sizeof(xlogstart) - 1, "%X/%X", (uint32)(xlogpos >> 32), (uint32)xlogpos);
     securec_check_ss_c(nRet, "", "");
@@ -1729,7 +2149,8 @@ static void xlog_streamer_backup(const char* dirname)
     streamConn = check_and_conn(standby_connect_timeout, standby_recv_timeout);
     if (streamConn == NULL) {
         pg_log(PG_WARNING, _("could not connect to server(%s).\n"), dirname);
-        disconnect_and_exit(1);
+        DisconnectConnection();
+        return false;
     }
     pg_log(PG_PROGRESS, _("connect to server, incremental build started.\n"));
 
@@ -1741,7 +2162,12 @@ static void xlog_streamer_backup(const char* dirname)
         if (verbose) {
             pg_log(PG_WARNING, _("starting background WAL receiver\n"));
         }
-        StartLogStreamer(xlogstart, (uint32)atoi(tline), sysid, (const char*)xlog_location);
+        bool startSuccess = StartLogStreamer(xlogstart, (uint32)atoi(tline), sysid, (const char*)xlog_location);
+        if (!startSuccess) {
+            pg_log(PG_WARNING, _("start log streamer failed \n"));
+            DisconnectConnection();
+            return false;
+        }
     }
 
     /*
@@ -1765,26 +2191,31 @@ static void xlog_streamer_backup(const char* dirname)
 
         if ((unsigned int)write(bgpipe[1], xlogend, strlen(xlogend)) != strlen(xlogend)) {
             pg_log(PG_WARNING, _("could not send command to background pipe: %s\n"), strerror(errno));
-            disconnect_and_exit(1);
+            DisconnectConnection();
+            return false;
         }
 
         /* Just wait for the background process to exit */
         r = waitpid(bgchild, &status, 0);
         if (r == -1) {
             pg_log(PG_WARNING, _("could not wait for child process: %s\n"), strerror(errno));
-            disconnect_and_exit(1);
+            DisconnectConnection();
+            return false;
         }
         if (r != bgchild) {
             pg_log(PG_WARNING, _("child %d died, expected %d\n"), r, (int)bgchild);
-            disconnect_and_exit(1);
+            DisconnectConnection();
+            return false;
         }
         if (!WIFEXITED(status)) {
             pg_log(PG_WARNING, _("child process did not exit normally\n"));
-            disconnect_and_exit(1);
+            DisconnectConnection();
+            return false;
         }
         if (WEXITSTATUS(status) != 0) {
             pg_log(PG_WARNING, _("child process exited with error %d\n"), WEXITSTATUS(status));
-            disconnect_and_exit(1);
+            DisconnectConnection();
+            return false;
         }
         /* Exited normally, we're happy! */
     }
@@ -1800,6 +2231,7 @@ static void xlog_streamer_backup(const char* dirname)
      * remove full backup label when incremental backup successful.
      */
     remove_target_file(FULL_BACKUP_LABEL_FILE, false);
+    return true;
 }
 
 /*
@@ -1864,7 +2296,7 @@ static void show_full_build_process(const char* errmg)
  * delete existing double write file if existed, recreate it and write one page of zero
  * @param target_dir data base root dir
  */
-static void backup_dw_file(const char* target_dir)
+static bool backup_dw_file(const char* target_dir)
 {
     int rc;
     int fd = -1;
@@ -1874,12 +2306,12 @@ static void backup_dw_file(const char* target_dir)
     char* unaligned_buf = NULL;
 
     /* Delete the dw file, if it exists. */
-    rc = snprintf_s(dw_file_path, PATH_MAX, PATH_MAX - 1, "%s/%s", target_dir, DW_FILE_NAME);
+    rc = snprintf_s(dw_file_path, PATH_MAX, PATH_MAX - 1, "%s/%s", target_dir, OLD_DW_FILE_NAME);
     securec_check_ss_c(rc, "\0", "\0");
     if (realpath(dw_file_path, real_file_path) == NULL) {
         if (real_file_path[0] == '\0') {
             pg_log(PG_WARNING, _("could not get canonical path for file %s: %s\n"), dw_file_path, gs_strerror(errno));
-            disconnect_and_exit(1);
+            return false;
         }
     }
     delete_target_file(real_file_path);
@@ -1893,7 +2325,7 @@ static void backup_dw_file(const char* target_dir)
     if (realpath(dw_file_path, real_file_path) == NULL) {
         if (real_file_path[0] == '\0') {
             pg_log(PG_WARNING, _("could not get canonical path for file %s: %s\n"), dw_file_path, gs_strerror(errno));
-            disconnect_and_exit(1);
+            return false;
         }
     }
 
@@ -1902,14 +2334,14 @@ static void backup_dw_file(const char* target_dir)
     /* Create the dw build file. */
     if ((fd = open(real_file_path, (DW_FILE_FLAG | O_CREAT), DW_FILE_PERM)) < 0) {
         pg_log(PG_WARNING, _("could not create file %s: %s\n"), real_file_path, gs_strerror(errno));
-        disconnect_and_exit(1);
+        return false;
     }
 
     unaligned_buf = (char*)malloc(BLCKSZ + BLCKSZ);
     if (unaligned_buf == NULL) {
         pg_log(PG_WARNING, _("out of memory"));
         close(fd);
-        disconnect_and_exit(1);
+        return false;
     }
 
     buf = (char*)TYPEALIGN(BLCKSZ, unaligned_buf);
@@ -1919,11 +2351,13 @@ static void backup_dw_file(const char* target_dir)
     if (write(fd, buf, BLCKSZ) != BLCKSZ) {
         pg_log(PG_WARNING, _("could not write data to file %s: %s\n"), real_file_path, gs_strerror(errno));
         close(fd);
-        disconnect_and_exit(1);
+        return false;
     }
 
     free(unaligned_buf);
     close(fd);
+
+    return true;
 }
 
 void get_xlog_location(char (&xlog_location)[MAXPGPATH])
@@ -1969,7 +2403,59 @@ void get_xlog_location(char (&xlog_location)[MAXPGPATH])
     xlog_location[MAXPGPATH - 1] = '\0';
 }
 
-static void DeleteAlreadyDropedFile(const char* path, bool is_table_space)
+static bool UpdatePaxosIndexFile(unsigned long long paxosIndex)
+{
+    int paxos_index_fd = -1;
+    int ret;
+    DCFData dcfData;
+    int len = sizeof(DCFData);
+    const int PAXOS_INDEX_FILE_NUM = 2;
+    char paxos_index_files[PAXOS_INDEX_FILE_NUM][MAXPGPATH] = {0};
+    ret = snprintf_s(paxos_index_files[0], MAXPGPATH, MAXPGPATH - 1, "%s.backup", paxos_index_file);
+    securec_check_ss_c(ret, "\0", "\0");
+    ret = strcpy_s(paxos_index_files[1], MAXPGPATH, paxos_index_file);
+    securec_check_ss_c(ret, "\0", "\0");
+
+    /* Init dcfData */
+    dcfData.dcfDataVersion = DCF_DATA_VERSION;
+    dcfData.appliedIndex = (paxosIndex > 0) ? (paxosIndex - 1) : 0;
+    dcfData.realMinAppliedIdx = paxosIndex;
+    INIT_CRC32C(dcfData.crc);
+    COMP_CRC32C(dcfData.crc, (char *)&dcfData, offsetof(DCFData, crc));
+    FIN_CRC32C(dcfData.crc);
+
+    for (int i = 0; i < PAXOS_INDEX_FILE_NUM; i++) {
+        char tmp_paxos_index_file[PATH_MAX + 1] = {0};
+        if ((strlen(paxos_index_files[i]) > PATH_MAX) ||
+            (realpath(paxos_index_files[i], tmp_paxos_index_file) == NULL)) {
+            pg_log(PG_ERROR, _("Canonicalize paxos index file %s failed!"), paxos_index_files[i]);
+            return false;
+        }
+        paxos_index_fd = open(tmp_paxos_index_file, O_CREAT | O_RDWR | PG_BINARY, S_IRUSR | S_IWUSR);
+        if (paxos_index_fd < 0) {
+            pg_log(PG_ERROR, _("Open paxos index file %s failed: %m\n"), tmp_paxos_index_file);
+            return false;
+        }
+        if ((write(paxos_index_fd, &dcfData, len)) != len) {
+            close(paxos_index_fd);
+            pg_log(PG_ERROR, _("Write paxos index file %s failed: %m\n"), tmp_paxos_index_file);
+            return false;
+        }
+        if (fsync(paxos_index_fd)) {
+            close(paxos_index_fd);
+            pg_log(PG_ERROR, _("could not fsync dcf paxos index file: %m\n"));
+            return false;
+        }
+
+        if (close(paxos_index_fd)) {
+            pg_log(PG_ERROR, _("could not close dcf paxos index file: %m\n"));
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool DeleteAlreadyDropedFile(const char* path, bool is_table_space)
 {
     char* fileName = NULL;
     char pathbuf[MAXPGPATH] = {0};
@@ -1977,13 +2463,18 @@ static void DeleteAlreadyDropedFile(const char* path, bool is_table_space)
     unsigned int spaceNode = 0;
     unsigned int SegNo = 0;
     unsigned int dbNode = 0;
+    DIR *dir = NULL;
     struct stat statbuf;
     struct dirent *de = NULL;
     int nmatch = 0;
     int res = -1;
     int rc = 0;
 
-    DIR *dir = opendir(path);
+    dir = opendir(path);
+    if (dir == NULL) {
+        pg_log(PG_ERROR, _("could not open directory : %s!\n"), path);
+        return false;
+    }
 
     while ((de = readdir(dir)) != NULL) {
         /* skip entries point current dir or parent dir */
@@ -1994,8 +2485,10 @@ static void DeleteAlreadyDropedFile(const char* path, bool is_table_space)
         if (lstat(pathbuf, &statbuf) != 0) {
             if (errno != ENOENT) {
                 pg_log(PG_WARNING, _("could not lstat file or directory : %s!\n"), de->d_name);
-                continue;
+                (void)closedir(dir);
+                return false;
             }
+            continue;
         }
         if (S_ISDIR(statbuf.st_mode)) {
             DeleteAlreadyDropedFile(pathbuf, is_table_space);
@@ -2008,7 +2501,7 @@ static void DeleteAlreadyDropedFile(const char* path, bool is_table_space)
                         res = DeleteUnusedFile(path, SegNo, fileNode);
                         if (res < 0) {
                             (void)closedir(dir);
-                            disconnect_and_exit(1);
+                            return false;
                         }
                     }
                 }
@@ -2019,7 +2512,7 @@ static void DeleteAlreadyDropedFile(const char* path, bool is_table_space)
                         res = DeleteUnusedFile(path, SegNo, fileNode);
                         if (res < 0) {
                             (void)closedir(dir);
-                            disconnect_and_exit(1);
+                            return false;
                         }
                     }
                 }
@@ -2027,6 +2520,8 @@ static void DeleteAlreadyDropedFile(const char* path, bool is_table_space)
         }
     }
     (void)closedir(dir);
+
+    return true;
 }
 
 static int DeleteUnusedFile(const char* path, unsigned int SegNo, unsigned int fileNode)
@@ -2059,17 +2554,15 @@ static int DeleteUnusedFile(const char* path, unsigned int SegNo, unsigned int f
             return 0;
         }
     }
-    if (statbuf.st_size == 0) {
-        while (SegNo > 1) {
-            SegNo -= 1;
-            rc = snprintf_s(beforeFileName, MAXPGPATH, MAXPGPATH - 1, "%s/%u.%u", path, fileNode, SegNo);
-            securec_check_ss_c(rc, "\0", "\0");
-            if (lstat(beforeFileName, &tmpStatBuf) != 0) {
-                if (errno == ENOENT) {
-                    pg_log(PG_DEBUG, _("the file %s before file does not exist\n"), currentFileName);
-                    unlink(currentFileName);
-                    break;
-                }
+    while (SegNo > 1) {
+        SegNo -= 1;
+        rc = snprintf_s(beforeFileName, MAXPGPATH, MAXPGPATH - 1, "%s/%u.%u", path, fileNode, SegNo);
+        securec_check_ss_c(rc, "\0", "\0");
+        if (lstat(beforeFileName, &tmpStatBuf) != 0) {
+            if (errno == ENOENT) {
+                pg_log(PG_DEBUG, _("the file %s before file does not exist\n"), currentFileName);
+                unlink(currentFileName);
+                break;
             }
         }
     }

@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2020 Huawei Technologies Co.,Ltd.
+ * Portions Copyright (c) 2021, openGauss Contributors
  *
  * openGauss is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
@@ -57,6 +58,8 @@ CATALOG(pg_object,9025)   BKI_WITHOUT_OIDS BKI_SCHEMA_MACRO
     Oid            creator;            /* Who create the object. */
     timestamptz    ctime;              /* When create the object. */
     timestamptz    mtime;              /* When modify the object. */
+    int8           createcsn;          /* When create relation */
+    int8           changecsn;          /* When modify the table structure or store properties */
 } FormData_pg_object;
 
 #ifdef new_timestamptz
@@ -75,12 +78,14 @@ typedef FormData_pg_object* Form_pg_object;
  *        compiler constants for pg_object
  *-------------------------------------------------------------------------
  */
-#define Natts_pg_object                          5
+#define Natts_pg_object                          7
 #define Anum_pg_object_oid                       1
 #define Anum_pg_object_type                      2
 #define Anum_pg_object_creator                   3
 #define Anum_pg_object_ctime                     4
 #define Anum_pg_object_mtime                     5
+#define Anum_pg_object_createcsn                 6
+#define Anum_pg_object_changecsn                 7
 
 #define PgObjectType char
 
@@ -90,14 +95,19 @@ typedef FormData_pg_object* Form_pg_object;
 #define OBJECT_TYPE_FOREIGN_TABLE 'f'
 #define OBJECT_TYPE_INDEX 'i'
 #define OBJECT_TYPE_SEQUENCE 's'
+#define OBJECT_TYPE_LARGE_SEQUENCE 'l'
 #define OBJECT_TYPE_VIEW 'v'
 #define OBJECT_TYPE_CONTQUERY 'o'
 #define OBJECT_TYPE_PROC 'P'
 #define OBJECT_TYPE_STREAM 'e'
+#define OBJECT_TYPE_PKGSPEC 'S'
+#define OBJECT_TYPE_PKGBODY 'B'
 
-extern void CreatePgObject(Oid objectOid, PgObjectType objectType, Oid creator, bool hasCtime, bool hasMtime);
+extern void CreatePgObject(Oid objectOid, PgObjectType objectType, Oid creator, const PgObjectOption objectOpt);
 extern void DeletePgObject(Oid objectOid, PgObjectType objectType);
-extern void UpdatePgObjectMtime(Oid objectOid, PgObjectType objectType);
+extern void GetObjectCSN(Oid objectOid, Relation userRel, PgObjectType objectType, ObjectCSN * const csnInfo);
+void UpdatePgObjectMtime(Oid objectOid, PgObjectType objectType);
+void UpdatePgObjectChangecsn(Oid objectOid, PgObjectType objectType);
 extern PgObjectType GetPgObjectTypePgClass(char relkind);
 extern void recordCommentObjectTime(ObjectAddress addr, Relation rel, ObjectType objType);
 extern void recordRelationMTime(Oid relOid, char relkind);

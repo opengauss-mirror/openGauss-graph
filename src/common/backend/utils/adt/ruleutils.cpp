@@ -6,6 +6,7 @@
  *
  * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
+ * Portions Copyright (c) 2021, openGauss Contributors
  *
  *
  * IDENTIFICATION
@@ -46,6 +47,9 @@
 #include "catalog/pg_trigger.h"
 #include "catalog/pg_type.h"
 #include "catalog/heap.h"
+#include "catalog/gs_encrypted_proc.h"
+#include "catalog/gs_encrypted_columns.h"
+#include "catalog/gs_package.h"
 #include "commands/comment.h"
 #include "commands/defrem.h"
 #include "commands/tablespace.h"
@@ -93,6 +97,11 @@
 #include "utils/xml.h"
 #include "vecexecutor/vecnodes.h"
 #include "db4ai/gd.h"
+#include "commands/sqladvisor.h"
+
+#ifdef GS_GRAPH
+#include "gs_const.h"
+#endif
 
 /* ----------
  * Pretty formatting constants
@@ -118,6 +127,9 @@
 #define MAXFLOATWIDTH 64
 #define MAXDOUBLEWIDTH 128
 
+#define atooid(x) ((Oid)strtoul((x), NULL, 10))
+
+
 /* ----------
  * Local data types
  * ----------
@@ -141,6 +153,11 @@ typedef struct {
     bool qrw_phase;       /* for qrw phase, we support more deparse rule */
     bool viewdef;         /* just for dump viewdef */
     bool is_fqs;          /* just for fqs query */
+    bool is_upsert_clause;  /* just for upsert clause */
+
+#ifdef GS_GRAPH
+    bool cypherexpr;		/* true if deparsing is for Cypher expr */
+#endif
 } deparse_context;
 
 /*
@@ -184,6 +201,29 @@ typedef struct {
 static const char* query_getrulebyoid = "SELECT * FROM pg_catalog.pg_rewrite WHERE oid = $1";
 static const char* query_getviewrule = "SELECT * FROM pg_catalog.pg_rewrite WHERE ev_class = $1 AND rulename = $2";
 
+typedef struct tableInfo {
+    int1 relcmpr;
+    char relkind;
+    char relpersistence;
+    char parttype;
+    bool relrowmovement;
+    bool hasindex;
+    bool hasPartialClusterKey;
+    Oid tablespace;
+    Oid spcid;
+    char* reloptions;
+    char* relname;
+} tableInfo;
+
+typedef struct SubpartitionInfo {
+    bool issubpartition;
+    char subparttype; /* subpartition type, 'r'/'l'/'h' */
+    Oid subparentid;
+    Oid subpartkeytype; /* the typeid of subpartkey */
+    AttrNumber attnum; /* the attribute number of subpartkey in the relation */
+    bool istypestring;
+} SubpartitionInfo;
+
 /* ----------
  * Local functions
  *
@@ -200,12 +240,14 @@ extern char* pg_get_functiondef_worker(Oid funcid, int* headerlines);
 static char* pg_get_triggerdef_worker(Oid trigid, bool pretty);
 static void decompile_column_index_array(Datum column_index_array, Oid relId, StringInfo buf);
 static char* pg_get_ruledef_worker(Oid ruleoid, int prettyFlags);
-static char* pg_get_indexdef_worker(
-    Oid indexrelid, int colno, const Oid* excludeOps, bool attrsOnly, bool showTblSpc, int prettyFlags);
-static void pg_get_indexdef_partitions(Oid indexrelid, Form_pg_index idxrec, bool showTblSpc, StringInfoData* buf);
+static char *pg_get_indexdef_worker(Oid indexrelid, int colno, const Oid *excludeOps, bool attrsOnly, bool showTblSpc,
+    int prettyFlags, bool dumpSchemaOnly = false, bool showPartitionLocal = true, bool showSubpartitionLocal = true);
+static void pg_get_indexdef_partitions(Oid indexrelid, Form_pg_index idxrec, bool showTblSpc, StringInfoData *buf,
+    bool dumpSchemaOnly, bool showPartitionLocal, bool showSubpartitionLocal);
 static char* pg_get_constraintdef_worker(Oid constraintId, bool fullCommand, int prettyFlags);
 static text* pg_get_expr_worker(text* expr, Oid relid, const char* relname, int prettyFlags);
 static int print_function_arguments(StringInfo buf, HeapTuple proctup, bool print_table_args, bool print_defaults);
+static void print_function_ora_arguments(StringInfo buf, HeapTuple proctup);
 static void print_function_rettype(StringInfo buf, HeapTuple proctup);
 static void set_deparse_planstate(deparse_namespace* dpns, PlanState* ps);
 #ifdef PGXC
@@ -235,7 +277,6 @@ static void get_update_query_targetlist_def(
 static void get_delete_query_def(Query* query, deparse_context* context);
 static void get_utility_query_def(Query* query, deparse_context* context);
 static void get_basic_select_query(Query* query, deparse_context* context, TupleDesc resultDesc);
-static void get_hint_string(HintState* hstate, StringInfo buf);
 static void get_target_list(Query* query, List* targetList, deparse_context* context, TupleDesc resultDesc);
 static void get_setop_query(Node* setOp, Query* query, deparse_context* context, TupleDesc resultDesc);
 static Node* get_rule_sortgroupclause(Index ref, List* tlist, bool force_colno, deparse_context* context);
@@ -270,11 +311,13 @@ static void get_sublink_expr(SubLink* sublink, deparse_context* context);
 static void get_from_clause(Query* query, const char* prefix, deparse_context* context, List* fromlist = NIL);
 static void get_from_clause_item(Node* jtnode, Query* query, deparse_context* context);
 static void get_from_clause_partition(RangeTblEntry* rte, StringInfo buf, deparse_context* context);
+static void get_from_clause_subpartition(RangeTblEntry* rte, StringInfo buf, deparse_context* context);
 static void get_from_clause_bucket(RangeTblEntry* rte, StringInfo buf, deparse_context* context);
 static void get_from_clause_alias(Alias* alias, RangeTblEntry* rte, deparse_context* context);
 static void get_from_clause_coldeflist(
     List* names, List* types, List* typmods, List* collations, deparse_context* context);
 static void get_tablesample_def(TableSampleClause* tablesample, deparse_context* context);
+static void GetTimecapsuleDef(const TimeCapsuleClause* timeCapsule, deparse_context* context);
 static void get_opclass_name(Oid opclass, Oid actual_datatype, StringInfo buf);
 static Node* processIndirection(Node* node, deparse_context* context, bool printit);
 static void printSubscripts(ArrayRef* aref, deparse_context* context);
@@ -286,6 +329,28 @@ static char* generate_operator_name(Oid operid, Oid arg1, Oid arg2);
 static text* string_to_text(char* str);
 static char* flatten_reloptions(Oid relid);
 static Oid SearchSysTable(const char* query);
+static void replace_cl_types_in_argtypes(Oid func_id, int numargs, Oid* argtypes, bool *is_client_logic);
+
+static void AppendSubPartitionByInfo(StringInfo buf, Oid tableoid, SubpartitionInfo *subpartinfo);
+static void AppendSubPartitionDetail(StringInfo buf, tableInfo tableinfo, SubpartitionInfo *subpartinfo);
+static void AppendRangeIntervalPartitionInfo(StringInfo buf, Oid tableoid, tableInfo tableinfo, int partkeynum,
+    Oid *iPartboundary, SubpartitionInfo *subpartinfo);
+static void AppendListPartitionInfo(StringInfo buf, Oid tableoid, tableInfo tableinfo, int partkeynum,
+    Oid *iPartboundary, SubpartitionInfo *subpartinfo);
+static void AppendHashPartitionInfo(StringInfo buf, Oid tableoid, tableInfo tableinfo, int partkeynum,
+    Oid *iPartboundary, SubpartitionInfo *subpartinfo);
+static void AppendTablespaceInfo(const char *spcname, StringInfo buf, tableInfo tableinfo);
+
+/* from pgxcship */
+Var* get_var_from_node(Node* node, bool (*func)(Oid) = func_oid_check_reject);
+
+#ifdef GS_GRAPH
+static bool get_access_arg_expr(Node *node, deparse_context *context,
+								bool showimplicit);
+static void get_pathelem_expr(Node *node, deparse_context *context,
+							  bool showimplicit);
+static bool is_ident(const char *str, const int len);
+#endif
 
 #define only_marker(rte) ((rte)->inh ? "" : "ONLY ")
 
@@ -329,6 +394,7 @@ static char* pg_get_ruledef_worker(Oid ruleoid, int prettyFlags)
     /*
      * Connect to SPI manager
      */
+    SPI_STACK_LOG("connect", NULL, NULL);
     if (SPI_connect() != SPI_OK_CONNECT)
         ereport(ERROR, (errcode(ERRCODE_SPI_CONNECTION_FAILURE), errmsg("SPI_connect failed")));
 
@@ -374,6 +440,7 @@ static char* pg_get_ruledef_worker(Oid ruleoid, int prettyFlags)
     /*
      * Disconnect from SPI manager
      */
+    SPI_STACK_LOG("finish", NULL, NULL);
     if (SPI_finish() != SPI_OK_FINISH)
         ereport(ERROR, (errcode(ERRCODE_SPI_FINISH_FAILURE), errmsg("SPI_finish failed")));
     return buf.data;
@@ -502,6 +569,7 @@ char* pg_get_viewdef_worker(Oid viewoid, int prettyFlags, int wrapColumn)
     /*
      * Connect to SPI manager
      */
+    SPI_STACK_LOG("connect", NULL, NULL);
     if (SPI_connect() != SPI_OK_CONNECT)
         ereport(ERROR, (errcode(ERRCODE_SPI_CONNECTION_FAILURE), errmsg("SPI_connect failed")));
 
@@ -550,25 +618,12 @@ char* pg_get_viewdef_worker(Oid viewoid, int prettyFlags, int wrapColumn)
     /*
      * Disconnect from SPI manager
      */
+    SPI_STACK_LOG("finish", NULL, NULL);
     if (SPI_finish() != SPI_OK_FINISH)
         ereport(ERROR, (errcode(ERRCODE_SPI_FINISH_FAILURE), errmsg("SPI_finish failed")));
 
     return buf.data;
 }
-
-typedef struct tableInfo {
-    int1 relcmpr;
-    char relkind;
-    char relpersistence;
-    char parttype;
-    bool relrowmovement;
-    bool hasindex;
-    bool hasPartialClusterKey;
-    Oid tablespace;
-    Oid spcid;
-    char* reloptions;
-    char* relname;
-} tableInfo;
 
 /*
  * @Description: if the type is a string type
@@ -922,20 +977,30 @@ static void GetListDistributionDef(StringInfo query, StringInfo buf, Oid tableoi
 static void get_table_partitiondef(StringInfo query, StringInfo buf, Oid tableoid, tableInfo tableinfo)
 {
     bool isnull = false;
-    int i;
-    bool first_flag = false;
     Relation relation = NULL;
     ScanKeyData key[2];
     SysScanDesc scan = NULL;
     HeapTuple tuple = NULL;
-    char relkind = 'r';
-    char partype = 'v';
-    bool is_interval = false;
-    bool is_part = false;
-    int spirc;
-    int proc;
+    char relkind = RELKIND_RELATION; /* set default */
+    char partstrategy = PART_STRATEGY_VALUE; /* set default */
+    char parttype = PARTTYPE_NON_PARTITIONED_RELATION; /* set default */
     int partkeynum = 0;
-    Oid* i_partboundary = NULL;
+    Oid* iPartboundary = NULL;
+    Form_pg_partition partition = NULL;
+
+    HeapTuple ctuple = SearchSysCache1(RELOID, ObjectIdGetDatum(tableoid));
+    if (!HeapTupleIsValid(ctuple)) {
+        ereport(ERROR,
+            (errcode(ERRCODE_CACHE_LOOKUP_FAILED),
+                errmsg("cache lookup failed for relid %u", tableoid)));
+    }
+    Form_pg_class reltuple = (Form_pg_class)GETSTRUCT(ctuple);
+    parttype = reltuple->parttype;
+    ReleaseSysCache(ctuple);
+
+    if (parttype == PARTTYPE_NON_PARTITIONED_RELATION) {
+        return;
+    }
 
     relation = heap_open(PartitionRelationId, AccessShareLock);
 
@@ -943,193 +1008,467 @@ static void get_table_partitiondef(StringInfo query, StringInfo buf, Oid tableoi
     ScanKeyInit(&key[1], Anum_pg_partition_parentid, BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(tableoid));
 
     scan = systable_beginscan(relation, PartitionParentOidIndexId, true, NULL, 2, key);
-    while (HeapTupleIsValid((tuple = systable_getnext(scan)))) {
+    if (HeapTupleIsValid(tuple = systable_getnext(scan))) {
         int2vector* partVec = NULL;
         Datum datum = SysCacheGetAttr(PARTRELID, tuple, Anum_pg_partition_partkey, &isnull);
-        Form_pg_partition partition = (Form_pg_partition)GETSTRUCT(tuple);
+        partition = (Form_pg_partition)GETSTRUCT(tuple);
 
-        is_part = true;
         appendStringInfo(buf, "\n");
 
         if (tableinfo.relkind == RELKIND_FOREIGN_TABLE || tableinfo.relkind == RELKIND_STREAM) {
             appendStringInfo(buf, "PARTITION BY (");
         } else {
+            partstrategy = partition->partstrategy;
             switch (partition->partstrategy) {
-                case PART_STRATEGY_INTERVAL:
-                    is_interval = true;
-                /* fall-through */
                 case PART_STRATEGY_RANGE:
-                    partype = 'r';
+                case PART_STRATEGY_INTERVAL:
+                    /* restructure range or interval partitioned table definition */
                     appendStringInfo(buf, "PARTITION BY RANGE (");
                     break;
                 case PART_STRATEGY_LIST:
-                    partype = 'l';
+                    /* restructure list partitioned table definition */
                     appendStringInfo(buf, "PARTITION BY LIST (");
                     break;
                 case PART_STRATEGY_HASH:
-                    partype = 'h';
+                    /* restructure hash partitioned table definition */
                     appendStringInfo(buf, "PARTITION BY HASH (");
                     break;
-                default:
+                case PART_STRATEGY_VALUE:
+                    /* restructure value partitioned table definition */
                     appendStringInfo(buf, "PARTITION BY VALUES (");
                     break;
+                default: /* PART_STRATEGY_INVALID */
+                    ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg(
+                        "unrecognized partition type %c for table %s", partition->partstrategy, tableinfo.relname)));
             }
         }
 
         if (isnull == false) {
             partVec = (int2vector*)DatumGetPointer(datum);
-
             partkeynum = partVec->dim1;
-            i_partboundary = (Oid*)palloc0(partkeynum * sizeof(Oid));
+            iPartboundary = (Oid*)palloc0(partkeynum * sizeof(Oid));
+            bool firstFlag = true;
             /* Build the partition list from the partVec stored in tuple. */
-            for (i = 0; i < partVec->dim1; i++) {
+            for (int i = 0; i < partVec->dim1; i++) {
                 char* attname = get_attname(tableoid, partVec->values[i]);
-                i_partboundary[i] = get_atttype(tableoid, partVec->values[i]);
-                if (!first_flag) {
-                    appendStringInfo(buf, "%s", quote_identifier(attname));
-                    first_flag = true;
-                } else {
-                    appendStringInfo(buf, ", %s", quote_identifier(attname));
+                iPartboundary[i] = get_atttype(tableoid, partVec->values[i]);
+                if (!firstFlag) {
+                    appendStringInfo(buf, ", ");
                 }
+                firstFlag = false;
+                appendStringInfo(buf, "%s", quote_identifier(attname));
+                pfree_ext(attname);
             }
         }
+        appendStringInfo(buf, ")");
     }
     systable_endscan(scan);
     heap_close(relation, AccessShareLock);
 
-    if (is_part)
-        appendStringInfo(buf, ")");
+    if (partstrategy == PART_STRATEGY_INTERVAL) {
+        resetStringInfo(query);
+        appendStringInfo(query,
+            "SELECT p.interval[1] AS interval FROM pg_partition p "
+            "WHERE p.parentid = %u AND p.parttype = '%c' AND p.partstrategy = '%c'",
+            tableoid, PART_OBJ_TYPE_PARTED_TABLE, PART_STRATEGY_INTERVAL);
+        (void)SPI_execute(query->data, true, INT_MAX);
+        Assert(SPI_processed == 1);
 
-    if (partype == 'v')
+        HeapTuple spiTuple = SPI_tuptable->vals[0];
+        TupleDesc spiTupdesc = SPI_tuptable->tupdesc;
+        char *ivalue = SPI_getvalue(spiTuple, spiTupdesc, SPI_fnumber(spiTupdesc, "interval"));
+        appendStringInfo(buf, "\nINTERVAL ('%s')", ivalue);
+    }
+
+    SubpartitionInfo *subpartinfo = (SubpartitionInfo *)palloc0(sizeof(SubpartitionInfo));
+    if (parttype == PARTTYPE_SUBPARTITIONED_RELATION) {
+        AppendSubPartitionByInfo(buf, tableoid, subpartinfo);
+    }
+
+    if (partstrategy == PART_STRATEGY_RANGE || partstrategy == PART_STRATEGY_INTERVAL) {
+        AppendRangeIntervalPartitionInfo(buf, tableoid, tableinfo, partkeynum, iPartboundary, subpartinfo);
+    } else if (partstrategy == PART_STRATEGY_LIST) {
+        AppendListPartitionInfo(buf, tableoid, tableinfo, partkeynum, iPartboundary, subpartinfo);
+    } else if (partstrategy == PART_STRATEGY_HASH) {
+        AppendHashPartitionInfo(buf, tableoid, tableinfo, partkeynum, iPartboundary, subpartinfo);
+    } else { /* If partstrategy is 'value' or other type, no slice info */
+        pfree_ext(iPartboundary);
+        pfree_ext(subpartinfo);
         return;
-
-    resetStringInfo(query);
-    /* get table partitions info */
-    appendStringInfo(query, "SELECT q.interval[1], /*+ hashjoin(p t) */p.relname AS partName, ");
-
-    if (partype == 'r') {
-        for (i = 1; i <= partkeynum; i++)
-            appendStringInfo(query, "p.boundaries[%d] AS partBoundary_%d, ", i, i);
-    } else {
-        appendStringInfo(query, "array_to_string(p.boundaries, ',') AS partBoundary_1, ");
     }
-    
 
+    if (tableinfo.relrowmovement) {
+        appendStringInfo(buf, "\n%s", "ENABLE ROW MOVEMENT");
+    }
+    pfree_ext(iPartboundary);
+    pfree_ext(subpartinfo);
+}
+
+static void AppendSubPartitionByInfo(StringInfo buf, Oid tableoid, SubpartitionInfo *subpartinfo)
+{
+    Relation partrel = NULL;
+    ScanKeyData key[2];
+    SysScanDesc scan = NULL;
+    HeapTuple parttuple = NULL;
+    ScanKeyData subkey[2];
+    SysScanDesc subscan = NULL;
+    HeapTuple subparttuple = NULL;
+    bool isnull = false;
+
+    partrel = heap_open(PartitionRelationId, AccessShareLock);
+    ScanKeyInit(&key[0], Anum_pg_partition_parttype, BTEqualStrategyNumber, F_CHAREQ,
+        CharGetDatum(PARTTYPE_PARTITIONED_RELATION));
+    ScanKeyInit(&key[1], Anum_pg_partition_parentid, BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(tableoid));
+    scan = systable_beginscan(partrel, PartitionParentOidIndexId, true, NULL, 2, key);
+    parttuple = systable_getnext(scan);
+
+    if (!HeapTupleIsValid(parttuple)) {
+        systable_endscan(scan);
+        heap_close(partrel, AccessShareLock);
+        ereport(ERROR, (errcode(ERRCODE_CACHE_LOOKUP_FAILED),
+            errmsg("could not find partition tuple for subpartition relation %u", tableoid)));
+    }
+
+    Datum datum = SysCacheGetAttr(PARTRELID, parttuple, Anum_pg_partition_partkey, &isnull);
+    Assert(!isnull);
+    int2vector *partVec = (int2vector *)DatumGetPointer(datum);
+    int partkeynum = partVec->dim1;
+    if (partkeynum != 1) {
+        systable_endscan(scan);
+        heap_close(partrel, AccessShareLock);
+        ereport(ERROR,
+            (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                errmsg("only support one partkey in subpartition table")));
+    }
+    char *attname = get_attname(tableoid, partVec->values[0]);
+    Oid subparentid = HeapTupleGetOid(parttuple);
+
+    ScanKeyInit(&subkey[0], Anum_pg_partition_parttype, BTEqualStrategyNumber, F_CHAREQ,
+        CharGetDatum(PARTTYPE_SUBPARTITIONED_RELATION));
+    ScanKeyInit(&subkey[1], Anum_pg_partition_parentid, BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(subparentid));
+    subscan = systable_beginscan(partrel, PartitionParentOidIndexId, true, NULL, 2, subkey);
+    subparttuple = systable_getnext(subscan);
+
+    if (!HeapTupleIsValid(subparttuple)) {
+        systable_endscan(scan);
+        systable_endscan(subscan);
+        heap_close(partrel, AccessShareLock);
+        ereport(ERROR, (errcode(ERRCODE_CACHE_LOOKUP_FAILED),
+            errmsg("could not find subpartition tuple for subpartition relation %u", tableoid)));
+    }
+
+    Form_pg_partition part = (Form_pg_partition)GETSTRUCT(subparttuple);
+    switch (part->partstrategy) {
+        case PART_STRATEGY_RANGE:
+            appendStringInfo(buf, " SUBPARTITION BY RANGE (");
+            break;
+        case PART_STRATEGY_LIST:
+            /* restructure list partitioned table definition */
+            appendStringInfo(buf, " SUBPARTITION BY LIST (");
+            break;
+        case PART_STRATEGY_HASH:
+            /* restructure hash partitioned table definition */
+            appendStringInfo(buf, " SUBPARTITION BY HASH (");
+            break;
+        default:
+            ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                errmsg("unrecognized subpartition type %c", part->partstrategy)));
+    }
+    appendStringInfo(buf, "%s", quote_identifier(attname));
+    appendStringInfo(buf, ")");
+    pfree_ext(attname);
+
+    subpartinfo->issubpartition = true;
+    subpartinfo->attnum = partVec->values[0];
+    subpartinfo->subparttype = part->partstrategy;
+    subpartinfo->subpartkeytype = get_atttype(tableoid, subpartinfo->attnum);
+    subpartinfo->istypestring = isTypeString(subpartinfo->subpartkeytype);
+
+    systable_endscan(scan);
+    systable_endscan(subscan);
+    heap_close(partrel, AccessShareLock);
+}
+
+static void AppendSubPartitionDetail(StringInfo buf, tableInfo tableinfo, SubpartitionInfo *subpartinfo)
+{
+    appendStringInfo(buf, "\n    (");
+
+    StringInfo query = makeStringInfo();
     appendStringInfo(query,
-        "t.spcname AS reltblspc FROM pg_partition q "
-        "LEFT JOIN pg_partition p ON q.parentid = p.parentid "
-        "LEFT JOIN pg_tablespace t ON p.reltablespace = t.oid "
-        "WHERE p.parentid = %u AND p.partstrategy = '%c' "
-        "AND p.parttype = '%c' AND q.parttype = '%c' ORDER BY ",
-        tableoid,
-        partype,
-        PART_OBJ_TYPE_TABLE_PARTITION,
-        PART_OBJ_TYPE_PARTED_TABLE
-        );
+        "SELECT /*+ hashjoin(p t) */ p.relname AS partName, "
+        "array_to_string(p.boundaries, ',') as partbound, "
+        "array_to_string(p.boundaries, ''',''') as partboundstr, "
+        "t.spcname AS reltblspc "
+        "FROM pg_partition p LEFT JOIN pg_tablespace t "
+        "ON p.reltablespace = t.oid "
+        "WHERE p.parentid = %u AND p.parttype = '%c' AND p.partstrategy = '%c' "
+        "ORDER BY p.boundaries[1]::%s ASC",
+        subpartinfo->subparentid, PART_OBJ_TYPE_TABLE_SUB_PARTITION, subpartinfo->subparttype,
+        get_typename(subpartinfo->subpartkeytype));
 
-    if (partype == 'r') {
-        for (i = 1; i <= partkeynum; i++) {
-            if (i == partkeynum)
-                appendStringInfo(query, "p.boundaries[%d]::%s ASC", i, get_typename(i_partboundary[i - 1]));
-            else
-                appendStringInfo(query, "p.boundaries[%d]::%s, ", i, get_typename(i_partboundary[i - 1]));
-        }
-    } else {
-        appendStringInfo(query, "p.boundaries ASC");
-    }
-
-    spirc = SPI_execute(query->data, true, INT_MAX);
-    proc = SPI_processed;
-
-    for (i = 0; i < proc; i++) {
-        HeapTuple spi_tuple = SPI_tuptable->vals[i];
-        TupleDesc spi_tupdesc = SPI_tuptable->tupdesc;
-
-        char* pname = SPI_getvalue(spi_tuple, spi_tupdesc, SPI_fnumber(spi_tupdesc, "partname"));
-
-        if (i == 0) {
-            if (is_interval) {
-                char* iname = SPI_getvalue(spi_tuple, spi_tupdesc, SPI_fnumber(spi_tupdesc, "interval"));
-                appendStringInfo(buf, "\nINTERVAL('%s')", iname);
-            }
-            appendStringInfo(buf, "\n( ");
-        } else {
+    (void)SPI_execute(query->data, true, INT_MAX);
+    int proc = SPI_processed;
+    SPITupleTable *spitup = SPI_tuptable;
+    for (int i = 0; i < proc; i++) {
+        if (i > 0) {
             appendStringInfo(buf, ",");
         }
-            
-        appendStringInfo(buf, "\n	 ");
+        HeapTuple spi_tuple = spitup->vals[i];
+        TupleDesc spi_tupdesc = spitup->tupdesc;
+        char *pname = SPI_getvalue(spi_tuple, spi_tupdesc, SPI_fnumber(spi_tupdesc, "partname"));
+        appendStringInfo(buf, "\n        SUBPARTITION %s", quote_identifier(pname));
 
-        switch (partype) {
-            case PART_STRATEGY_RANGE:
-            /* fall-through */
-            case PART_STRATEGY_INTERVAL:
-                appendStringInfo(buf, "PARTITION %s VALUES LESS THAN (", quote_identifier(pname));
-                break;
-            case PART_STRATEGY_LIST:
-                appendStringInfo(buf, "PARTITION %s VALUES (", quote_identifier(pname));
-                break;
-            default:
-                appendStringInfo(buf, "PARTITION %s", quote_identifier(pname));
-                break;
-        }
-
-        if (partype != 'h') {
-            for (int j = 0; j < partkeynum; j++) {
-                char* pvalue = NULL;
-                char checkRowName[32] = {0};
-                int rowNameLen = sizeof(checkRowName);
-
-                int nRet = 0;
-                nRet = snprintf_s(checkRowName, rowNameLen, rowNameLen - 1, "partboundary_%d", j + 1);
-                securec_check_ss(nRet, "\0", "\0");
-
-                pvalue = SPI_getvalue(spi_tuple, spi_tupdesc, SPI_fnumber(spi_tupdesc, checkRowName));
-
-                if (j > 0)
-                    appendStringInfo(buf, ", ");
-
-                if (pvalue == NULL) {
-                    appendStringInfo(buf, "MAXVALUE");
-                    continue;
-                } else {
-                    if (isTypeString(i_partboundary[j]))
-                        appendStringInfo(buf, "'%s'", pvalue);
-                    else
-                        appendStringInfo(buf, "%s", pvalue);
-                }
+        if (subpartinfo->subparttype == PART_STRATEGY_RANGE) {
+            appendStringInfo(buf, " VALUES LESS THAN (");
+            char *pvalue = SPI_getvalue(spi_tuple, spi_tupdesc, SPI_fnumber(spi_tupdesc, "partbound"));
+            if (pvalue == NULL || strlen(pvalue) == 0) {
+                appendStringInfo(buf, "MAXVALUE");
+            } else if (subpartinfo->istypestring) {
+                char *svalue = SPI_getvalue(spi_tuple, spi_tupdesc, SPI_fnumber(spi_tupdesc, "partboundstr"));
+                appendStringInfo(buf, "'%s'", svalue);
+                pfree_ext(svalue);
+            } else {
+                appendStringInfo(buf, "%s", pvalue);
             }
             appendStringInfo(buf, ")");
+            pfree_ext(pvalue);
+        } else if (subpartinfo->subparttype == PART_STRATEGY_LIST) {
+            appendStringInfo(buf, " VALUES (");
+            char *pvalue = SPI_getvalue(spi_tuple, spi_tupdesc, SPI_fnumber(spi_tupdesc, "partbound"));
+            if (pvalue == NULL || strlen(pvalue) == 0) {
+                appendStringInfo(buf, "DEFAULT");
+            } else if (subpartinfo->istypestring) {
+                char *svalue = SPI_getvalue(spi_tuple, spi_tupdesc, SPI_fnumber(spi_tupdesc, "partboundstr"));
+                appendStringInfo(buf, "'%s'", svalue);
+                pfree_ext(svalue);
+            } else {
+                appendStringInfo(buf, "%s", pvalue);
+            }
+            appendStringInfo(buf, ")");
+            pfree_ext(pvalue);
         }
-        
+
         /*
          * Append partition tablespace.
          * Skip it, if partition tablespace is the same as partitioned table.
          */
-
         int fno = SPI_fnumber(spi_tupdesc, "reltblspc");
-        char* spcname = SPI_getvalue(spi_tuple, spi_tupdesc, fno);
-        if (spcname != NULL) {
-            char* tbl_spcname = NULL;
-            if (OidIsValid(tableinfo.tablespace))
-                tbl_spcname = get_tablespace_name(tableinfo.tablespace);
-            else
-                tbl_spcname = "pg_default";
+        const char *spcname = SPI_getvalue(spi_tuple, spi_tupdesc, fno);
+        AppendTablespaceInfo(spcname, buf, tableinfo);
+    }
+    DestroyStringInfo(query);
 
-            Assert(tbl_spcname != NULL);
-            if (tbl_spcname == NULL) {
-                ereport(ERROR, (errcode(ERRCODE_UNDEFINED_OBJECT), errmsg("TABLESPACENAME NULL")));
-            }
-            if (strcmp(spcname, tbl_spcname) != 0)
-                appendStringInfo(buf, " TABLESPACE %s", quote_identifier(spcname));
+    appendStringInfo(buf, "\n    )");
+}
+
+static void AppendRangeIntervalPartitionInfo(StringInfo buf, Oid tableoid, tableInfo tableinfo, int partkeynum,
+    Oid *iPartboundary, SubpartitionInfo *subpartinfo)
+{
+    appendStringInfo(buf, "\n( ");
+
+    /* get table partitions info */
+    StringInfo query = makeStringInfo();
+    appendStringInfo(query, "SELECT /*+ hashjoin(p t) */p.relname AS partname, ");
+    for (int i = 1; i <= partkeynum; i++) {
+        appendStringInfo(query, "p.boundaries[%d] AS partboundary_%d, ", i, i);
+    }
+    appendStringInfo(query,
+        "p.oid AS partoid, "
+        "t.spcname AS reltblspc "
+        "FROM pg_partition p LEFT JOIN pg_tablespace t "
+        "ON p.reltablespace = t.oid "
+        "WHERE p.parentid = %u AND p.parttype = '%c' "
+        "AND p.partstrategy = '%c' ORDER BY ",
+        tableoid, PART_OBJ_TYPE_TABLE_PARTITION, PART_STRATEGY_RANGE);
+    for (int i = 1; i <= partkeynum; i++) {
+        if (i == partkeynum) {
+            appendStringInfo(query, "p.boundaries[%d]::%s ASC", i, get_typename(iPartboundary[i - 1]));
         } else {
-            appendStringInfo(buf, " TABLESPACE pg_default");
+            appendStringInfo(query, "p.boundaries[%d]::%s, ", i, get_typename(iPartboundary[i - 1]));
         }
     }
 
-    appendStringInfo(buf, "\n)");
+    (void)SPI_execute(query->data, true, INT_MAX);
+    int proc = SPI_processed;
+    SPITupleTable *spitup = SPI_tuptable;
+    for (int i = 0; i < proc; i++) {
+        if (i > 0) {
+            appendStringInfo(buf, ",");
+        }
+        HeapTuple spi_tuple = spitup->vals[i];
+        TupleDesc spi_tupdesc = spitup->tupdesc;
+        char *pname = SPI_getvalue(spi_tuple, spi_tupdesc, SPI_fnumber(spi_tupdesc, "partname"));
+        appendStringInfo(buf, "\n    PARTITION %s VALUES LESS THAN (", quote_identifier(pname));
 
-    if (tableinfo.relrowmovement) {
-        appendStringInfo(buf, "\n%s", "ENABLE ROW MOVEMENT");
+        for (int j = 0; j < partkeynum; j++) {
+            if (j > 0) {
+                appendStringInfo(buf, ", ");
+            }
+
+            char *pvalue = NULL;
+            char checkRowName[32] = {0};
+            int rowNameLen = sizeof(checkRowName);
+            int nRet = 0;
+            nRet = snprintf_s(checkRowName, rowNameLen, rowNameLen - 1, "partboundary_%d", j + 1);
+            securec_check_ss(nRet, "\0", "\0");
+
+            pvalue = SPI_getvalue(spi_tuple, spi_tupdesc, SPI_fnumber(spi_tupdesc, checkRowName));
+            if (pvalue == NULL) {
+                appendStringInfo(buf, "MAXVALUE");
+                continue;
+            } else {
+                if (isTypeString(iPartboundary[j])) {
+                    appendStringInfo(buf, "'%s'", pvalue);
+                } else {
+                    appendStringInfo(buf, "%s", pvalue);
+                }
+            }
+        }
+        appendStringInfo(buf, ")");
+
+        /*
+         * Append partition tablespace.
+         * Skip it, if partition tablespace is the same as partitioned table.
+         */
+        int fno = SPI_fnumber(spi_tupdesc, "reltblspc");
+        const char *spcname = SPI_getvalue(spi_tuple, spi_tupdesc, fno);
+        AppendTablespaceInfo(spcname, buf, tableinfo);
+
+        if (subpartinfo->issubpartition) {
+            subpartinfo->subparentid =
+                atooid(SPI_getvalue(spi_tuple, spi_tupdesc, SPI_fnumber(spi_tupdesc, "partoid")));
+            AppendSubPartitionDetail(buf, tableinfo, subpartinfo);
+        }
+    }
+    DestroyStringInfo(query);
+
+    appendStringInfo(buf, "\n)");
+}
+static void AppendListPartitionInfo(StringInfo buf, Oid tableoid, tableInfo tableinfo, int partkeynum,
+    Oid *iPartboundary, SubpartitionInfo *subpartinfo)
+{
+    appendStringInfo(buf, "\n( ");
+
+    /* we only support single partition key for list partition table */
+    Assert(partkeynum == 1);
+
+    /* get table partitions info */
+    StringInfo query = makeStringInfo();
+    appendStringInfo(query,
+        "SELECT /*+ hashjoin(p t) */p.relname AS partname, "
+        "array_to_string(p.boundaries, ',') as partbound, "
+        "array_to_string(p.boundaries, ''',''') as partboundstr, "
+        "p.oid AS partoid, "
+        "t.spcname AS reltblspc "
+        "FROM pg_partition p LEFT JOIN pg_tablespace t "
+        "ON p.reltablespace = t.oid "
+        "WHERE p.parentid = %u AND p.parttype = '%c' "
+        "AND p.partstrategy = '%c' ORDER BY p.boundaries[1]::%s ASC",
+        tableoid, PART_OBJ_TYPE_TABLE_PARTITION, PART_STRATEGY_LIST, get_typename(*iPartboundary));
+
+    (void)SPI_execute(query->data, true, INT_MAX);
+    int proc = SPI_processed;
+    SPITupleTable *spitup = SPI_tuptable;
+    for (int i = 0; i < proc; i++) {
+        if (i > 0) {
+            appendStringInfo(buf, ",");
+        }
+        HeapTuple spi_tuple = spitup->vals[i];
+        TupleDesc spi_tupdesc = spitup->tupdesc;
+        char *pname = SPI_getvalue(spi_tuple, spi_tupdesc, SPI_fnumber(spi_tupdesc, "partname"));
+        appendStringInfo(buf, "\n    PARTITION %s VALUES (", quote_identifier(pname));
+
+        char *pvalue = SPI_getvalue(spi_tuple, spi_tupdesc, SPI_fnumber(spi_tupdesc, "partbound"));
+        if (pvalue == NULL || strlen(pvalue) == 0) {
+            appendStringInfo(buf, "DEFAULT");
+        } else if (isTypeString(*iPartboundary)) {
+            char *svalue = SPI_getvalue(spi_tuple, spi_tupdesc, SPI_fnumber(spi_tupdesc, "partboundstr"));
+            appendStringInfo(buf, "'%s'", svalue);
+            pfree_ext(svalue);
+        } else {
+            appendStringInfo(buf, "%s", pvalue);
+        }
+        appendStringInfo(buf, ")");
+        pfree_ext(pvalue);
+
+        /*
+         * Append partition tablespace.
+         * Skip it, if partition tablespace is the same as partitioned table.
+         */
+        int fno = SPI_fnumber(spi_tupdesc, "reltblspc");
+        const char *spcname = SPI_getvalue(spi_tuple, spi_tupdesc, fno);
+        AppendTablespaceInfo(spcname, buf, tableinfo);
+
+        if (subpartinfo->issubpartition) {
+            subpartinfo->subparentid =
+                atooid(SPI_getvalue(spi_tuple, spi_tupdesc, SPI_fnumber(spi_tupdesc, "partoid")));
+            AppendSubPartitionDetail(buf, tableinfo, subpartinfo);
+        }
+    }
+    DestroyStringInfo(query);
+
+    appendStringInfo(buf, "\n)");
+}
+
+static void AppendHashPartitionInfo(StringInfo buf, Oid tableoid, tableInfo tableinfo, int partkeynum,
+    Oid *iPartboundary, SubpartitionInfo *subpartinfo)
+{
+    appendStringInfo(buf, "\n( ");
+
+    /* we only support single partition key for list partition table */
+    Assert(partkeynum == 1);
+
+    /* get table partitions info */
+    StringInfo query = makeStringInfo();
+    appendStringInfo(query,
+        "SELECT /*+ hashjoin(p t) */p.relname AS partname, "
+        "p.boundaries[1] AS partboundary, "
+        "p.oid AS partoid, "
+        "t.spcname AS reltblspc "
+        "FROM pg_partition p LEFT JOIN pg_tablespace t "
+        "ON p.reltablespace = t.oid "
+        "WHERE p.parentid = %u AND p.parttype = '%c' "
+        "AND p.partstrategy = '%c' ORDER BY ",
+        tableoid, PART_OBJ_TYPE_TABLE_PARTITION, PART_STRATEGY_HASH);
+    appendStringInfo(query, "p.boundaries[1]::%s ASC", get_typename(*iPartboundary));
+
+    (void)SPI_execute(query->data, true, INT_MAX);
+    int proc = SPI_processed;
+    SPITupleTable *spitup = SPI_tuptable;
+    for (int i = 0; i < proc; i++) {
+        if (i > 0) {
+            appendStringInfo(buf, ",");
+        }
+        HeapTuple spi_tuple = spitup->vals[i];
+        TupleDesc spi_tupdesc = spitup->tupdesc;
+        char *pname = SPI_getvalue(spi_tuple, spi_tupdesc, SPI_fnumber(spi_tupdesc, "partname"));
+        appendStringInfo(buf, "\n    PARTITION %s", quote_identifier(pname));
+
+        /*
+         * Append partition tablespace.
+         * Skip it, if partition tablespace is the same as partitioned table.
+         */
+        int fno = SPI_fnumber(spi_tupdesc, "reltblspc");
+        const char *spcname = SPI_getvalue(spi_tuple, spi_tupdesc, fno);
+        AppendTablespaceInfo(spcname, buf, tableinfo);
+
+        if (subpartinfo->issubpartition) {
+            subpartinfo->subparentid =
+                atooid(SPI_getvalue(spi_tuple, spi_tupdesc, SPI_fnumber(spi_tupdesc, "partoid")));
+            AppendSubPartitionDetail(buf, tableinfo, subpartinfo);
+        }
+    }
+    DestroyStringInfo(query);
+
+    appendStringInfo(buf, "\n)");
+}
+
+static void AppendTablespaceInfo(const char *spcname, StringInfo buf, tableInfo tableinfo)
+{
+    if (spcname != NULL) {
+        appendStringInfo(buf, " TABLESPACE %s", quote_identifier(spcname));
+    } else {
+        appendStringInfo(buf, " TABLESPACE pg_default");
     }
 }
 
@@ -1194,6 +1533,11 @@ static int get_table_attribute(
         HeapTuple tp = SearchSysCache2(ATTNUM, ObjectIdGetDatum(tableoid), Int16GetDatum(i + 1));
         if (HeapTupleIsValid(tp)) {
             Form_pg_attribute att_tup = (Form_pg_attribute)GETSTRUCT(tp);
+            if (att_tup->attkvtype == ATT_KV_HIDE) {
+                ReleaseSysCache(tp);
+                continue;
+            }
+
             char* result = NULL;
             Datum txt;
 
@@ -1209,12 +1553,17 @@ static int get_table_attribute(
 
             /* Format properly if not first attr */
             actual_atts == 0 ? appendStringInfo(buf, " (") : appendStringInfo(buf, ",");
-            appendStringInfo(buf, "\n	");
+            appendStringInfo(buf, "\n    ");
             actual_atts++;
 
             /* Attribute name */
             appendStringInfo(buf, "%s %s", quote_identifier(NameStr(att_tup->attname)), result);
-
+            if (att_tup->attkvtype == ATT_KV_TAG)
+                appendStringInfo(buf, " TSTag");
+            else if (att_tup->attkvtype == ATT_KV_FIELD)
+                appendStringInfo(buf, " TSField");
+            else if (att_tup->attkvtype == ATT_KV_TIMETAG)
+                appendStringInfo(buf, " TSTime");
             /* Compression mode */
             get_compression_mode(att_tup, buf);
 
@@ -1280,6 +1629,45 @@ static int get_table_attribute(
     }
 
     return actual_atts;
+}
+
+bool IsHideTagDistribute(Oid relOid)
+{
+    Relation pcrel = NULL;
+    ScanKeyData skey;
+    SysScanDesc pcscan = NULL;
+    HeapTuple htup = NULL;
+    Form_pgxc_class pgxc_class;
+    bool hide = false;
+
+    ScanKeyInit(&skey, Anum_pgxc_class_pcrelid, BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(relOid));
+
+    pcrel = heap_open(PgxcClassRelationId, AccessShareLock);
+    pcscan = systable_beginscan(pcrel, PgxcClassPgxcRelIdIndexId, true, NULL, 1, &skey);
+    htup = systable_getnext(pcscan);
+
+    if (!HeapTupleIsValid(htup)) {
+        systable_endscan(pcscan);
+        heap_close(pcrel, AccessShareLock);
+        ereport(ERROR,
+            (errcode(ERRCODE_UNDEFINED_OBJECT),
+                errmsg("could not open relation with OID %u", relOid),
+                errdetail("Cannot open pgxcclass."),
+                errcause("Cannot open pgxcclass."),
+                erraction("Retry."),
+                errmodule(MOD_OPT)));
+    }
+
+    pgxc_class = (Form_pgxc_class)GETSTRUCT(htup);
+
+    if (pgxc_class->pcattnum.dim1 == 1 && get_kvtype(relOid, pgxc_class->pcattnum.values[0]) == ATT_KV_HIDE) {
+        hide = true;
+    }
+    
+    systable_endscan(pcscan);
+    heap_close(pcrel, AccessShareLock);
+
+    return hide;
 }
 
 /*
@@ -1758,7 +2146,9 @@ static bool append_table_info(tableInfo tableinfo, const char* srvname, StringIn
         if (IsLocatorColumnDistributed(locator_type) || IsLocatorReplicated(locator_type)) {
             appendStringInfo(buf, "\nDISTRIBUTE BY");
 
-            if (locator_type == LOCATOR_TYPE_HASH) {
+            if (IsHideTagDistribute(tableoid)) {
+                appendStringInfo(buf, " hidetag");
+            } else if (locator_type == LOCATOR_TYPE_HASH) {
                 char* distribute_key = printDistributeKey(tableoid);
                 appendStringInfo(buf, " HASH(%s)", distribute_key);
             } else if (locator_type == LOCATOR_TYPE_REPLICATED) {
@@ -1994,6 +2384,7 @@ static Oid SearchSysTable(const char* query)
     /*
      * Connect to SPI manager
      */
+    SPI_STACK_LOG("connect", NULL, NULL);
     if (SPI_connect() != SPI_OK_CONNECT) {
         ereport(ERROR, (errcode(ERRCODE_SPI_CONNECTION_FAILURE), errmsg("SPI_connect failed")));
     }
@@ -2013,6 +2404,7 @@ static Oid SearchSysTable(const char* query)
     /*
      * Disconnect from SPI manager
      */
+    SPI_STACK_LOG("finish", NULL, NULL);
     if (SPI_finish() != SPI_OK_FINISH) {
         ereport(ERROR, (errcode(ERRCODE_SPI_FINISH_FAILURE), errmsg("SPI_finish failed")));
     }
@@ -2127,6 +2519,7 @@ static char* pg_get_tabledef_worker(Oid tableoid)
     /*
      * Connect to SPI manager
      */
+    SPI_STACK_LOG("connect", NULL, NULL);
     if (SPI_connect() != SPI_OK_CONNECT)
         ereport(ERROR, (errcode(ERRCODE_SPI_CONNECTION_FAILURE), errmsg("SPI_connect failed")));
 
@@ -2305,6 +2698,7 @@ static char* pg_get_tabledef_worker(Oid tableoid)
     /*
      * Disconnect from SPI manager
      */
+    SPI_STACK_LOG("finish", NULL, NULL);
     if (SPI_finish() != SPI_OK_FINISH)
         ereport(ERROR, (errcode(ERRCODE_SPI_FINISH_FAILURE), errmsg("SPI_finish failed")));
 
@@ -2511,6 +2905,7 @@ static char* pg_get_triggerdef_worker(Oid trigid, bool pretty)
         context.wrapColumn = WRAP_COLUMN_DEFAULT;
         context.indentLevel = PRETTYINDENT_STD;
         context.qrw_phase = false;
+        context.is_upsert_clause = false;
 
         get_rule_expr(qual, &context, false);
 
@@ -2569,6 +2964,22 @@ Datum pg_get_indexdef(PG_FUNCTION_ARGS)
     PG_RETURN_TEXT_P(string_to_text(pg_get_indexdef_worker(indexrelid, 0, NULL, false, true, 0)));
 }
 
+/**
+ * @Description: Get he definition of an index for dump scene.
+ * If the table is an interval partitioned table and the index is a local index and dumpSchemaOnly is true, 
+ * only output indexes of range partitions, else the output is the same as pg_get_indexdef.
+ * @in The index table Oid and dump scheme only flag.
+ * @return Returns a palloc'd C string; no pretty-printing.
+ */
+Datum pg_get_indexdef_for_dump(PG_FUNCTION_ARGS)
+{
+    Oid indexrelid = PG_GETARG_OID(0);
+    bool dumpSchemaOnly = PG_GETARG_BOOL(1);
+
+    PG_RETURN_TEXT_P(string_to_text(pg_get_indexdef_worker(indexrelid, 0, NULL, false, true, 0, dumpSchemaOnly,
+                                                           true, false)));
+}
+
 Datum pg_get_indexdef_ext(PG_FUNCTION_ARGS)
 {
     Oid indexrelid = PG_GETARG_OID(0);
@@ -2577,7 +2988,8 @@ Datum pg_get_indexdef_ext(PG_FUNCTION_ARGS)
     int prettyFlags;
 
     prettyFlags = pretty ? (PRETTYFLAG_PAREN | PRETTYFLAG_INDENT) : 0;
-    PG_RETURN_TEXT_P(string_to_text(pg_get_indexdef_worker(indexrelid, colno, NULL, colno != 0, true, prettyFlags)));
+    PG_RETURN_TEXT_P(string_to_text(pg_get_indexdef_worker(indexrelid, colno, NULL, colno != 0, true, prettyFlags,
+                                                           false, false, false)));
 }
 
 /**
@@ -2600,7 +3012,63 @@ char* pg_get_indexdef_columns(Oid indexrelid, bool pretty)
     return pg_get_indexdef_worker(indexrelid, 0, NULL, true, false, prettyFlags);
 }
 
-static void pg_get_indexdef_partitions(Oid indexrelid, Form_pg_index idxrec, bool showTblSpc, StringInfoData* buf)
+static void AppendOnePartitionIndex(Oid indexRelId, Oid partOid, bool showTblSpc, bool *isFirst,
+                                    StringInfoData *buf, bool isSub = false)
+{
+    Oid partIdxOid = getPartitionIndexOid(indexRelId, partOid);
+
+    HeapTuple partIdxHeapTuple = SearchSysCache1(PARTRELID, partIdxOid);
+
+    if (!HeapTupleIsValid(partIdxHeapTuple)) {
+        ereport(ERROR, (errcode(ERRCODE_CACHE_LOOKUP_FAILED), errmsg("cache lookup failed for index %u", partIdxOid)));
+    }
+
+    Form_pg_partition partIdxTuple = (Form_pg_partition)GETSTRUCT(partIdxHeapTuple);
+
+    if (*isFirst) {
+        *isFirst = false;
+    } else {
+        appendStringInfo(buf, ", ");
+    }
+
+    if (isSub) {
+        appendStringInfo(buf, "\n    ");
+    }
+
+    appendStringInfo(buf, "PARTITION %s", quote_identifier(partIdxTuple->relname.data));
+    if (showTblSpc && OidIsValid(partIdxTuple->reltablespace)) {
+        char *tblspacName = get_tablespace_name(partIdxTuple->reltablespace);
+        if (tblspacName != NULL)
+            appendStringInfo(buf, " TABLESPACE %s", quote_identifier(tblspacName));
+        else
+            ereport(ERROR, (errcode(ERRCODE_UNDEFINED_OBJECT),
+                            errmsg("tablespace with OID %u does not exist", partIdxTuple->reltablespace)));
+    }
+
+    ReleaseSysCache(partIdxHeapTuple);
+}
+
+static void GetIndexdefForIntervalPartTabDumpSchemaOnly(Oid indexrelid, RangePartitionMap *partMap, bool showTblSpc,
+                                                            StringInfoData *buf)
+{
+    bool isFirst = true;
+
+    appendStringInfo(buf, " LOCAL");
+    appendStringInfoChar(buf, '(');
+
+    for (int i = 0; i < partMap->rangeElementsNum; ++i) {
+        RangeElement &elem = partMap->rangeElements[i];
+        /* for dummp schema only scene, don]t dump indexes of interval paritions */
+        if (elem.isInterval) {
+            continue;
+        }
+        AppendOnePartitionIndex(indexrelid, elem.partitionOid, showTblSpc, &isFirst, buf);
+    }
+    appendStringInfo(buf, ") ");
+}
+
+static void pg_get_indexdef_partitions(Oid indexrelid, Form_pg_index idxrec, bool showTblSpc, StringInfoData *buf,
+                                       bool dumpSchemaOnly, bool showPartitionLocal, bool showSubpartitionLocal)
 {
     Oid relid = idxrec->indrelid;
     /*
@@ -2608,47 +3076,45 @@ static void pg_get_indexdef_partitions(Oid indexrelid, Form_pg_index idxrec, boo
      * Second, gs_dump supports option '--non-lock-table', in which case we should not add lock.
      */
     Relation rel = heap_open(relid, NoLock);
-    HeapTuple partIdxHeapTuple = NULL;
-    Form_pg_partition partIdxTuple = NULL;
-    List* partList = relationGetPartitionOidList(rel);
-    ListCell* lc = NULL;
-    int isFirst = true;
+    if (dumpSchemaOnly && rel->partMap->type == PART_TYPE_INTERVAL) {
+        GetIndexdefForIntervalPartTabDumpSchemaOnly(indexrelid, (RangePartitionMap *)rel->partMap, showTblSpc, buf);
+        heap_close(rel, NoLock);
+        return;
+    }
 
     appendStringInfo(buf, " LOCAL");
+    /*
+     * The LOCAL index information of the partition and subpartition table is more.
+     * And the meta-statements (e.g. \d \d+ \dS) are used more.
+     * Therefore, when the meta-statement is called, the LOCAL index information is not displayed.
+     */
+    bool isSub = RelationIsSubPartitioned(rel);
+    if ((!isSub && !showPartitionLocal) || (isSub && !showSubpartitionLocal)) {
+        heap_close(rel, NoLock);
+        return;
+    }
 
+    List *partList = NIL;
+    ListCell *lc = NULL;
+    bool isFirst = true;
+    if (isSub) {
+        /* reserve this code, oneday we will support it */
+        partList = RelationGetSubPartitionOidList(rel);
+    } else {
+        partList = relationGetPartitionOidList(rel);
+    }
+
+    if (isSub) {
+        appendStringInfo(buf, "\n");
+    }
     appendStringInfoChar(buf, '(');
 
     foreach (lc, partList) {
         Oid partOid = DatumGetObjectId(lfirst(lc));
-        Oid partIdxOid = getPartitionIndexOid(indexrelid, partOid);
-
-        partIdxHeapTuple = SearchSysCache1(PARTRELID, partIdxOid);
-
-        if (!HeapTupleIsValid(partIdxHeapTuple)) {
-            ereport(
-                ERROR, (errcode(ERRCODE_CACHE_LOOKUP_FAILED), errmsg("cache lookup failed for index %u", partIdxOid)));
-        }
-
-        partIdxTuple = (Form_pg_partition)GETSTRUCT(partIdxHeapTuple);
-
-        if (isFirst) {
-            isFirst = false;
-        } else {
-            appendStringInfo(buf, ", ");
-        }
-
-        appendStringInfo(buf, "PARTITION %s", quote_identifier(partIdxTuple->relname.data));
-        if (showTblSpc && OidIsValid(partIdxTuple->reltablespace)) {
-            char* tblspacName = get_tablespace_name(partIdxTuple->reltablespace);
-            if (tblspacName != NULL)
-                appendStringInfo(buf, " TABLESPACE %s", quote_identifier(tblspacName));
-            else
-                ereport(ERROR,
-                    (errcode(ERRCODE_UNDEFINED_OBJECT),
-                        errmsg("tablespace with OID %u does not exist", partIdxTuple->reltablespace)));
-        }
-
-        ReleaseSysCache(partIdxHeapTuple);
+        AppendOnePartitionIndex(indexrelid, partOid, showTblSpc, &isFirst, buf, isSub);
+    }
+    if (isSub) {
+        appendStringInfo(buf, "\n");
     }
     appendStringInfo(buf, ") ");
 
@@ -2662,8 +3128,8 @@ static void pg_get_indexdef_partitions(Oid indexrelid, Form_pg_index idxrec, boo
  * This is now used for exclusion constraints as well: if excludeOps is not
  * NULL then it points to an array of exclusion operator OIDs.
  */
-static char* pg_get_indexdef_worker(
-    Oid indexrelid, int colno, const Oid* excludeOps, bool attrsOnly, bool showTblSpc, int prettyFlags)
+static char *pg_get_indexdef_worker(Oid indexrelid, int colno, const Oid *excludeOps, bool attrsOnly, bool showTblSpc,
+    int prettyFlags, bool dumpSchemaOnly, bool showPartitionLocal, bool showSubpartitionLocal)
 {
     /* might want a separate isConstraint parameter later */
     bool isConstraint = (excludeOps != NULL);
@@ -2867,7 +3333,8 @@ static char* pg_get_indexdef_worker(
 
         if (idxrelrec->parttype == PARTTYPE_PARTITIONED_RELATION &&
             idxrelrec->relkind != RELKIND_GLOBAL_INDEX) {
-            pg_get_indexdef_partitions(indexrelid, idxrec, showTblSpc, &buf);
+            pg_get_indexdef_partitions(indexrelid, idxrec, showTblSpc, &buf, dumpSchemaOnly,
+                showPartitionLocal, showSubpartitionLocal);
         }
 
         /*
@@ -3500,7 +3967,7 @@ Datum pg_get_serial_sequence(PG_FUNCTION_ARGS)
          * can also have auto dependencies on columns.)
          */
         if (deprec->classid == RelationRelationId && deprec->objsubid == 0 && deprec->deptype == DEPENDENCY_AUTO &&
-            get_rel_relkind(deprec->objid) == RELKIND_SEQUENCE) {
+            RELKIND_IS_SEQUENCE(get_rel_relkind(deprec->objid))) {
             sequenceId = deprec->objid;
             break;
         }
@@ -3693,7 +4160,8 @@ char* pg_get_functiondef_worker(Oid funcid, int* headerlines)
     float4 procost;
     int oldlen;
     char* p = NULL;
-
+    bool isOraFunc = false;
+    NameData* pkgname = NULL;
     initStringInfo(&buf);
 
     /* Look up the function */
@@ -3727,20 +4195,59 @@ char* pg_get_functiondef_worker(Oid funcid, int* headerlines)
         proIsProcedure = isnull ? false : PROC_IS_PRO(CharGetDatum(datum));
     }
  
+    Datum packageOidDatum = SysCacheGetAttr(PROCOID, proctup, Anum_pg_proc_packageid, &isnull);
+    if (!isnull)
+    {
+        Oid packageoid = DatumGetObjectId(packageOidDatum);
+        if (OidIsValid(packageoid)) {
+            pkgname = GetPackageName(packageoid);
+        }
+    } 
+
     if (proIsProcedure) {
-        appendStringInfo(&buf, "CREATE OR REPLACE PROCEDURE %s(", quote_qualified_identifier(nsp, name));
+        if (pkgname != NULL) {
+            appendStringInfo(&buf, "CREATE OR REPLACE PROCEDURE %s(",
+                                quote_qualified_identifier(nsp, pkgname->data, name));
+        } else {
+            appendStringInfo(&buf, "CREATE OR REPLACE PROCEDURE %s(", 
+                                quote_qualified_identifier(nsp, name));
+        }
     } else {
-        appendStringInfo(&buf, "CREATE OR REPLACE FUNCTION %s(", quote_qualified_identifier(nsp, name));
+        if (pkgname != NULL) {
+            appendStringInfo(&buf, "CREATE OR REPLACE FUNCTION %s(", 
+                                quote_qualified_identifier(nsp, pkgname->data, name));
+        } else {
+            appendStringInfo(&buf, "CREATE OR REPLACE FUNCTION %s(", 
+                                quote_qualified_identifier(nsp, name));
+        }
     }
-    (void)print_function_arguments(&buf, proctup, false, true);
+
+    if (t_thrd.proc->workingVersionNum >= COMMENT_PROC_VERSION_NUM) {
+        tmp = SysCacheGetAttr(PROCOID, proctup, Anum_pg_proc_proargsrc, &isnull);
+        if (isnull) {
+            (void)print_function_arguments(&buf, proctup, false, true);
+        } else {
+            print_function_ora_arguments(&buf, proctup);
+            isOraFunc = true;
+        }
+    } else {
+        (void)print_function_arguments(&buf, proctup, false, true);
+    }
+
     if (!proIsProcedure) {
-        appendStringInfoString(&buf, ")\n RETURNS ");
+        if (!isOraFunc) {
+            appendStringInfoString(&buf, ")\n RETURNS ");
+        } else {
+            appendStringInfoString(&buf, ")\n RETURN ");
+        }
     } else {
         appendStringInfoString(&buf, ")\n");
     }
     if (!proIsProcedure) {
         print_function_rettype(&buf, proctup);
-        appendStringInfo(&buf, "\n LANGUAGE %s\n", quote_identifier(NameStr(lang->lanname)));
+        if (!isOraFunc) {
+            appendStringInfo(&buf, "\n LANGUAGE %s\n", quote_identifier(NameStr(lang->lanname)));
+        }
     }
     /* Emit some miscellaneous options on one line */
     oldlen = buf.len;
@@ -3757,11 +4264,19 @@ char* pg_get_functiondef_worker(Oid funcid, int* headerlines)
             break;
         default:
             break;
-    }   
+    }  
     if (proc->proisstrict)
-        appendStringInfoString(&buf, " STRICT");
-    if (proc->prosecdef)
-        appendStringInfoString(&buf, " SECURITY DEFINER");
+        appendStringInfoString(&buf, " STRICT"); 
+    if (PLSQL_SECURITY_DEFINER) {
+        if (proc->prosecdef) {
+            appendStringInfoString(&buf, " AUTHID DEFINER");
+        } else {
+            appendStringInfoString(&buf, " AUTHID CURRENT_USER");
+        }
+    } else {
+        if (proc->prosecdef)
+            appendStringInfoString(&buf, " SECURITY DEFINER");
+    }
     if (proc->proleakproof)
         appendStringInfoString(&buf, " LEAKPROOF");
 
@@ -3862,7 +4377,7 @@ char* pg_get_functiondef_worker(Oid funcid, int* headerlines)
      * with.  Hence prefer "$function$", but extend if needed.
      */
     initStringInfo(&dq);
-    if (!proIsProcedure) {
+    if ((!proIsProcedure) && (!isOraFunc)) {
         appendStringInfoString(&dq, "$function");
   
         while (strstr(prosrc, dq.data) != NULL)
@@ -3878,7 +4393,7 @@ char* pg_get_functiondef_worker(Oid funcid, int* headerlines)
 
     appendStringInfoString(&buf, prosrc);
     appendStringInfoString(&buf, dq.data);
-    if (proIsProcedure) {
+    if (proIsProcedure || isOraFunc) {
         appendStringInfoString(&buf, ";\n/");
     } else {
         appendStringInfoString(&buf, ";");
@@ -3902,6 +4417,7 @@ static void print_function_rettype(StringInfo buf, HeapTuple proctup)
     Form_pg_proc proc = (Form_pg_proc)GETSTRUCT(proctup);
     int ntabargs = 0;
     StringInfoData rbuf;
+    bool is_client_logic = false;
 
     initStringInfo(&rbuf);
 
@@ -3914,15 +4430,48 @@ static void print_function_rettype(StringInfo buf, HeapTuple proctup)
         else
             resetStringInfo(&rbuf);
     }
-
+    Oid ret_type_id = proc->prorettype;
     if (ntabargs == 0) {
         /* Not a table function, so do the normal thing */
         if (proc->proretset)
             appendStringInfoString(&rbuf, "SETOF ");
-        appendStringInfoString(&rbuf, format_type_be(proc->prorettype));
+        if (IsClientLogicType(proc->prorettype)) {
+            /* replace with original type */
+            HeapTuple gs_oldtup = SearchSysCache1(GSCLPROCID, ObjectIdGetDatum(HeapTupleGetOid(proctup)));
+            if (HeapTupleIsValid(gs_oldtup)) {
+                bool isnull = false;
+                Datum rettype_orig =
+                    SysCacheGetAttr(GSCLPROCID, gs_oldtup, Anum_gs_encrypted_proc_prorettype_orig, &isnull);
+                if (!isnull) {
+                    ret_type_id = DatumGetObjectId(rettype_orig);
+                    is_client_logic = true;
+                }
+                ReleaseSysCache(gs_oldtup);
+            }
+        }
+        appendStringInfoString(&rbuf, format_type_be(ret_type_id));
+        if (is_client_logic) {
+            appendStringInfoString(&rbuf, " encrypted");
+        }
     }
 
     appendStringInfoString(buf, rbuf.data);
+}
+
+/*
+ * get param string from pg_proc_proargsrc.
+ */
+static void print_function_ora_arguments(StringInfo buf, HeapTuple proctup)
+{
+    Datum tmp;
+    bool isnull = false;
+    const char* proargsrc = NULL;
+
+    tmp = SysCacheGetAttr(PROCOID, proctup, Anum_pg_proc_proargsrc, &isnull);
+    Assert(!isnull);
+    proargsrc = TextDatumGetCString(tmp);
+
+    appendStringInfoString(buf, proargsrc);
 }
 
 /*
@@ -3947,8 +4496,13 @@ static int print_function_arguments(StringInfo buf, HeapTuple proctup, bool prin
     Datum defposdatum;
     int2vector* defpos = NULL;
     int counter = 0;
+    bool *is_client_logic = NULL;
 
     numargs = get_func_arg_info(proctup, &argtypes, &argnames, &argmodes);
+    if (numargs) {
+        is_client_logic = (bool*)palloc0(numargs * sizeof(bool));
+    }
+    replace_cl_types_in_argtypes(HeapTupleGetOid(proctup), numargs, argtypes, is_client_logic);
 
     if (print_defaults && proc->pronargdefaults > 0) {
         Datum proargdefaults;
@@ -3965,9 +4519,15 @@ static int print_function_arguments(StringInfo buf, HeapTuple proctup, bool prin
         nextargdefault = list_head(argdefaults);
         /* nlackdefaults counts only *input* arguments lacking defaults */
 
-        defposdatum = SysCacheGetAttr(PROCOID, proctup, Anum_pg_proc_prodefaultargpos, &isnull);
-        Assert(!isnull);
-        defpos = (int2vector*)DatumGetPointer(defposdatum);
+        if (proc->pronargs <= FUNC_MAX_ARGS_INROW) {
+            defposdatum = SysCacheGetAttr(PROCOID, proctup, Anum_pg_proc_prodefaultargpos, &isnull);
+            Assert(!isnull);
+            defpos = (int2vector*)DatumGetPointer(defposdatum);
+        } else {
+            defposdatum = SysCacheGetAttr(PROCOID, proctup, Anum_pg_proc_prodefaultargposext, &isnull);
+            Assert(!isnull);
+            defpos = (int2vector*)PG_DETOAST_DATUM(defposdatum);
+        }
     }
 
     /* Check for special treatment of ordered-set aggregates */
@@ -4039,6 +4599,9 @@ static int print_function_arguments(StringInfo buf, HeapTuple proctup, bool prin
         if ((argname != NULL) && argname[0])
             appendStringInfo(buf, "%s ", quote_identifier(argname));
         appendStringInfoString(buf, format_type_be(argtype));
+        if (is_client_logic[i]) {
+            appendStringInfoString(buf, " encrypted");
+        }
 
         /*
          * fetch default value for some argument
@@ -4065,7 +4628,7 @@ static int print_function_arguments(StringInfo buf, HeapTuple proctup, bool prin
             print_defaults = false;
         }
     }
-
+    pfree_ext(is_client_logic);
     return argsprinted;
 }
 
@@ -4120,6 +4683,7 @@ static char* deparse_expression_pretty(
     context.wrapColumn = WRAP_COLUMN_DEFAULT;
     context.indentLevel = startIndent;
     context.qrw_phase = false;
+    context.is_upsert_clause = false;
     get_rule_expr(expr, &context, showimplicit, no_alias);
 
     return buf.data;
@@ -4271,22 +4835,35 @@ static void set_deparse_planstate(deparse_namespace* dpns, PlanState* ps)
          * reference sourceTargetList, which comes from outer plan of the join (source table)
          */
         if (mps->operation == CMD_MERGE) {
-            dpns->inner_planstate = dpns->outer_planstate->lefttree;
+            PlanState* jplanstate = dpns->outer_planstate;
+            if (IsA(jplanstate, StreamState) || IsA(jplanstate, VecStreamState))
+                jplanstate = jplanstate->lefttree;
+            if (jplanstate->plan != NULL && IsJoinPlan((Node*)jplanstate->plan) &&
+                ((Join*)jplanstate->plan)->jointype == JOIN_RIGHT) {
+                dpns->inner_planstate = innerPlanState(jplanstate);
+            } else {
+                dpns->inner_planstate = outerPlanState(jplanstate);
+            }
         }
     } else
         dpns->inner_planstate = innerPlanState(ps);
 
-#ifdef ENABLE_MULTIPLE_NODES
-    if (IsA(ps, ModifyTableState))
-#else
-    if (IsA(ps, ModifyTableState) && ((ModifyTableState*)ps)->mt_upsert != NULL &&
-        ((ModifyTableState*)ps)->mt_upsert->us_action != UPSERT_NONE)
-#endif
+    if (IsA(ps, ModifyTableState) && ((ModifyTableState*)ps)->mt_upsert->us_excludedtlist != NIL) {
+        /* For upsert deparse state. The second condition is somewhat ad-hoc but there's no flag to
+         * mark upsert clause under PlanState.
+         */
         dpns->inner_tlist = ((ModifyTableState*)ps)->mt_upsert->us_excludedtlist;
-    else if (dpns->inner_planstate != NULL)
-        dpns->inner_tlist = dpns->inner_planstate->plan->targetlist;
-    else
+    } else if (dpns->inner_planstate != NULL) {
+        if ((IsA(ps, ModifyTableState) || IsA(ps, VecModifyTableState) || IsA(ps, DistInsertSelectState)) &&
+            ((ModifyTableState *)ps)->operation == CMD_MERGE) {
+            /* For merge into statements, source relation is always the inner one. */
+            dpns->inner_tlist = ((ModifyTable*)(ps->plan))->mergeSourceTargetList;
+        } else {
+            dpns->inner_tlist = dpns->inner_planstate->plan->targetlist;
+        }
+    } else {
         dpns->inner_tlist = NIL;
+    }
 
     /* index_tlist is set only if it's an IndexOnlyScan */
     if (IsA(ps->plan, IndexOnlyScan))
@@ -4631,6 +5208,7 @@ static void make_ruledef(StringInfo buf, HeapTuple ruletup, TupleDesc rulettc, i
         context.viewdef = false;
         context.is_fqs = false;
 #endif /* PGXC */
+        context.is_upsert_clause = false;
 
         errno_t rc = memset_s(&dpns, sizeof(dpns), 0, sizeof(dpns));
         securec_check(rc, "\0", "\0");
@@ -4791,6 +5369,11 @@ static void make_viewdef(StringInfo buf, HeapTuple ruletup, TupleDesc rulettc, i
  * The query generated has all object names schema-qualified. This is
  * done by temporarily setting search_path to NIL.
  * It calls get_query_def without pretty print flags.
+ *
+ * Caution: get_query_def calls AcquireRewriteLocks, which might modify the RTEs
+ * in place. So it is generally appropriate for the caller of this routine to
+ * have first done a copyObject() to make a writable copy of the querytree in
+ * the current memory context.
  * ----------
  */
 void deparse_query(Query* query, StringInfo buf, List* parentnamespace, bool finalise_aggs, bool sortgroup_colno,
@@ -4907,6 +5490,7 @@ static void get_query_def(Query* query, StringInfo buf, List* parentnamespace, T
     context.qrw_phase = qrw_phase;
     context.viewdef = viewdef;
     context.is_fqs = is_fqs;
+    context.is_upsert_clause = false;
 
     errno_t rc = memset_s(&dpns, sizeof(dpns), 0, sizeof(dpns));
     securec_check(rc, "", "");
@@ -5035,7 +5619,23 @@ static void get_with_clause(Query* query, deparse_context* context)
             }
             appendStringInfoChar(buf, ')');
         }
-        appendStringInfoString(buf, " AS (");
+        appendStringInfoString(buf, " AS ");
+        switch (cte->ctematerialized)
+        {
+            case CTEMaterializeDefault:
+                break;
+            case CTEMaterializeAlways:
+                appendStringInfoString(buf, "MATERIALIZED ");
+                break;
+            case CTEMaterializeNever:
+                appendStringInfoString(buf, "NOT MATERIALIZED ");
+                break;
+            default:
+                ereport(ERROR,
+                    (errcode(ERRCODE_UNRECOGNIZED_NODE_TYPE),
+                        errmsg("unrecognized materialization option: %d", (int)cte->ctematerialized)));
+        }
+        appendStringInfoChar(buf, '(');
         if (PRETTY_INDENT(context))
             appendContextKeyword(context, "", 0, 0, 0);
         get_query_def((Query*)cte->ctequery,
@@ -5124,7 +5724,7 @@ static void get_select_query_def(Query* query, deparse_context* context, TupleDe
             get_rule_expr(query->limitCount, context, false);
     }
 
-    /* Add FOR UPDATE/SHARE clauses if present */
+    /* Add FOR [KEY] UPDATE/SHARE clauses if present */
     if (query->hasForUpdate) {
         foreach (l, query->rowMarks) {
             RowMarkClause* rc = (RowMarkClause*)lfirst(l);
@@ -5134,13 +5734,33 @@ static void get_select_query_def(Query* query, deparse_context* context, TupleDe
             if (rc->pushedDown)
                 continue;
 
-            if (rc->forUpdate)
-                appendContextKeyword(context, " FOR UPDATE", -PRETTYINDENT_STD, PRETTYINDENT_STD, 0);
-            else
-                appendContextKeyword(context, " FOR SHARE", -PRETTYINDENT_STD, PRETTYINDENT_STD, 0);
+#ifndef ENABLE_MULTIPLE_NODES
+            switch (rc->strength) {
+                case LCS_FORKEYSHARE:
+                    appendContextKeyword(context, " FOR KEY SHARE", -PRETTYINDENT_STD, PRETTYINDENT_STD, 0);
+                    break;
+                case LCS_FORSHARE:
+                    appendContextKeyword(context, " FOR SHARE", -PRETTYINDENT_STD, PRETTYINDENT_STD, 0);
+                    break;
+                case LCS_FORNOKEYUPDATE:
+                    appendContextKeyword(context, " FOR NO KEY UPDATE", -PRETTYINDENT_STD, PRETTYINDENT_STD, 0);
+                    break;
+                case LCS_FORUPDATE:
+                    appendContextKeyword(context, " FOR UPDATE", -PRETTYINDENT_STD, PRETTYINDENT_STD, 0);
+                    break;
+                default:
+                    ereport(ERROR, (errmsg("unknown lock type: %d", rc->strength)));
+                    break;
+            }
+#else
+            appendContextKeyword(context, rc->forUpdate ? " FOR UPDATE" : " FOR SHARE",
+                -PRETTYINDENT_STD, PRETTYINDENT_STD, 0);
+#endif
             appendStringInfo(buf, " OF %s", quote_identifier(rte->eref->aliasname));
             if (rc->noWait)
                 appendStringInfo(buf, " NOWAIT");
+            if (rc->waitSec > 0)
+                appendStringInfo(buf, " WAIT %d", rc->waitSec);
         }
     }
 
@@ -5203,12 +5823,22 @@ static RangeTblEntry* get_simple_values_rte(Query* query)
     return result;
 }
 
+static inline void get_hint_string_internal(const List* list, StringInfo buf)
+{
+    ListCell* lc = NULL;
+    Hint* hint = NULL;
+    foreach (lc, list) {
+        hint = (Hint*)lfirst(lc);
+        appendStringInfo(buf, "%s", descHint(hint));
+    }
+}
+
 /*
  * @Description: Convert hint to string
  * @in hstate: hint state.
  * @out buf: String buf.
  */
-static void get_hint_string(HintState* hstate, StringInfo buf)
+void get_hint_string(HintState* hstate, StringInfo buf)
 {
     if (hstate == NULL) {
         return;
@@ -5219,37 +5849,20 @@ static void get_hint_string(HintState* hstate, StringInfo buf)
 
     Assert(buf != NULL);
     appendStringInfo(buf, "/*+");
-
-    foreach (lc, hstate->join_hint) {
-        hint = (Hint*)lfirst(lc);
-        appendStringInfo(buf, "%s", descHint(hint));
-    }
-
-    foreach (lc, hstate->leading_hint) {
-        hint = (Hint*)lfirst(lc);
-        appendStringInfo(buf, "%s", descHint(hint));
-    }
-
-    foreach (lc, hstate->row_hint) {
-        hint = (Hint*)lfirst(lc);
-        appendStringInfo(buf, "%s", descHint(hint));
-    }
-
-    foreach (lc, hstate->stream_hint) {
-        hint = (Hint*)lfirst(lc);
-        appendStringInfo(buf, "%s", descHint(hint));
-    }
-
-    foreach (lc, hstate->block_name_hint) {
-        hint = (Hint*)lfirst(lc);
-        appendStringInfo(buf, "%s", descHint(hint));
-    }
-
-    foreach (lc, hstate->scan_hint) {
-        hint = (Hint*)lfirst(lc);
-        appendStringInfo(buf, "%s", descHint(hint));
-    }
-
+    get_hint_string_internal(hstate->join_hint, buf);
+    get_hint_string_internal(hstate->leading_hint, buf);
+    get_hint_string_internal(hstate->row_hint, buf);
+    get_hint_string_internal(hstate->stream_hint, buf);
+    get_hint_string_internal(hstate->block_name_hint, buf);
+    get_hint_string_internal(hstate->scan_hint, buf);
+    get_hint_string_internal(hstate->predpush_hint, buf);
+    get_hint_string_internal(hstate->predpush_same_level_hint, buf);
+    get_hint_string_internal(hstate->rewrite_hint, buf);
+    get_hint_string_internal(hstate->gather_hint, buf);
+    get_hint_string_internal(hstate->cache_plan_hint, buf);
+    get_hint_string_internal(hstate->set_hint, buf);
+    get_hint_string_internal(hstate->no_expand_hint, buf);
+    get_hint_string_internal(hstate->no_gpc_hint, buf);
     foreach (lc, hstate->skew_hint) {
         hint = (Hint*)lfirst(lc);
         if (IsA(hint, SkewHintTransf)) {
@@ -5259,11 +5872,9 @@ static void get_hint_string(HintState* hstate, StringInfo buf)
 
         appendStringInfo(buf, "%s", descHint(hint));
     }
-
     if (hstate->multi_node_hint) {
         appendStringInfo(buf, " multinode ");
     }
-
     appendStringInfo(buf, "*/");
 }
 
@@ -5425,6 +6036,11 @@ static void get_target_list(Query* query, List* targetList, deparse_context* con
 
         if (tle->resjunk)
             continue; /* ignore junk entries */
+
+        /* Ignore junk columns from the targetlist in start with */
+        if (query->hasRecursive && IsPseudoReturnColumn(tle->resname)) {
+            continue;
+        }
 
 #ifdef PGXC
         /* Found at least one element in the target list */
@@ -6159,7 +6775,20 @@ static void get_insert_query_def(Query* query, deparse_context* context)
         context->indentLevel += PRETTYINDENT_STD;
         appendStringInfoChar(buf, ' ');
     }
-    appendStringInfo(buf, "INSERT INTO %s ", generate_relation_name(rte->relid, NIL));
+    appendStringInfo(buf, "INSERT ");
+    get_hint_string(query->hintState, buf);
+    appendStringInfo(buf, "INTO %s ", generate_relation_name(rte->relid, NIL));
+
+    /* During gray scale upgrade, do not deparse alias since old node cannot parse it. */
+    if (t_thrd.proc->workingVersionNum >= UPSERT_WHERE_VERSION_NUM) {
+        if (rte->alias != NULL) {
+            /* Deparse alias if given */
+            appendStringInfo(buf, "AS %s ", quote_identifier(rte->alias->aliasname));
+        } else if (rte->eref != NULL && query->upsertClause != NULL) {
+            /* Deparse synonym as alias for upsert statement's target table */
+            appendStringInfo(buf, "AS %s ", quote_identifier(rte->eref->aliasname));
+        }
+    }
 
     /*
      * Add the insert-column-names list.  To handle indirection properly, we
@@ -6204,7 +6833,7 @@ static void get_insert_query_def(Query* query, deparse_context* context)
             pos++;
             foreach (ll, query->targetList) {
                 TargetEntry* tmptle = (TargetEntry*)lfirst(ll);
-                Var* var = get_var_from_node((Node*)(tmptle->expr));
+                Var* var = get_var_from_node((Node*)(tmptle->expr), func_oid_check_pass);
                 if (var == NULL)
                     continue;
                 if (std_varno == 0)
@@ -6350,7 +6979,21 @@ static void get_insert_query_def(Query* query, deparse_context* context)
         if (upsertClause->upsertAction == UPSERT_NOTHING) {
             appendStringInfoString(buf, "NOTHING");
         } else {
+            Assert(!context->is_upsert_clause); /* upsert clause cannot be nested */
+            context->is_upsert_clause = true;
             get_update_query_targetlist_def(query, upsertClause->updateTlist, rte, context);
+            context->is_upsert_clause = false;
+            /* Add WHERE clause for UPDATE clause in UPSERT statement if given */
+            if (upsertClause->upsertWhere != NULL) {
+                appendContextKeyword(context, " WHERE ", PRETTYINDENT_STD, PRETTYINDENT_STD, 1);
+                if (IsA(upsertClause->upsertWhere, List)) {
+                    /* Need to revert flattened ands */
+                    Expr* expr = make_ands_explicit((List*)upsertClause->upsertWhere);
+                    get_rule_expr((Node*)expr, context, false);
+                } else {
+                    get_rule_expr(upsertClause->upsertWhere, context, false);
+                }
+            }
         }
     }
 
@@ -6383,7 +7026,9 @@ static void get_update_query_def(Query* query, deparse_context* context)
         appendStringInfoChar(buf, ' ');
         context->indentLevel += PRETTYINDENT_STD;
     }
-    appendStringInfo(buf, "UPDATE %s%s", only_marker(rte), generate_relation_name(rte->relid, NIL));
+    appendStringInfo(buf, "UPDATE ");
+    get_hint_string(query->hintState, buf);
+    appendStringInfo(buf, "%s%s", only_marker(rte), generate_relation_name(rte->relid, NIL));
     if (rte->alias != NULL) {
         appendStringInfo(buf, " %s", quote_identifier(rte->alias->aliasname));
     }
@@ -6519,7 +7164,9 @@ static void get_delete_query_def(Query* query, deparse_context* context)
         appendStringInfoChar(buf, ' ');
         context->indentLevel += PRETTYINDENT_STD;
     }
-    appendStringInfo(buf, "DELETE FROM %s%s", only_marker(rte), generate_relation_name(rte->relid, NIL));
+    appendStringInfo(buf, "DELETE ");
+    get_hint_string(query->hintState, buf);
+    appendStringInfo(buf, "FROM %s%s", only_marker(rte), generate_relation_name(rte->relid, NIL));
     if (rte->alias != NULL)
         appendStringInfo(buf, " %s", quote_identifier(rte->alias->aliasname));
 
@@ -6931,11 +7578,17 @@ static void get_utility_query_def(Query* query, deparse_context* context)
             if (IsA(node, ColumnDef)) {
                 ColumnDef* coldef = (ColumnDef*)node;
                 TypeName* tpname = coldef->typname;
+                ClientLogicColumnRef *coldef_enc = coldef->clientLogicColumnRef;
 
                 /* error out if we have no recourse at all */
                 if (!OidIsValid(tpname->typeOid))
                     ereport(
                         ERROR, (errcode(ERRCODE_SYNTAX_ERROR), errmsg("improper type oid: \"%u\"", tpname->typeOid)));
+
+                /* if the column is encrypted, we should convert its data type */
+                if (coldef_enc != NULL && coldef_enc->dest_typname != NULL) {
+                    tpname = coldef_enc->dest_typname;
+                }
 
                 /* get typename from the oid */
                 appendStringInfo(buf,
@@ -6944,7 +7597,6 @@ static void get_utility_query_def(Query* query, deparse_context* context)
                     format_type_with_typemod(tpname->typeOid, tpname->typemod));
 
                 // add the compress mode for this column
-                //
                 switch (coldef->cmprs_mode) {
                     case ATT_CMPR_NOCOMPRESS:
                         appendStringInfoString(buf, " NOCOMPRESS ");
@@ -7681,7 +8333,7 @@ static const char* get_name_for_var_field(Var* var, int fieldno, int levelsup, d
     switch (rte->rtekind) {
         case RTE_RELATION:
         case RTE_VALUES:
-
+        case RTE_RESULT:
             /*
              * This case should not occur: a column of a table or values list
              * shouldn't have type RECORD.  Fall through and fail (most
@@ -7918,8 +8570,9 @@ static RangeTblEntry* find_rte_by_refname(const char* refname, deparse_context* 
 
         foreach (rtlist, dpns->rtable) {
             RangeTblEntry* rte = (RangeTblEntry*)lfirst(rtlist);
-
-            if (strcmp(rte->eref->aliasname, refname) == 0) {
+            /* duplicately named pulled-up rtable in upsert clause will not lead to ambiguity */
+            if (!(context->is_upsert_clause && rte->pulled_from_subquery) &&
+                strcmp(rte->eref->aliasname, refname) == 0) {
                 if (result != NULL)
                     return NULL; /* it's ambiguous */
                 result = rte;
@@ -9129,18 +9782,41 @@ static void get_rule_expr(Node* node, deparse_context* context, bool showimplici
             if (!PRETTY_PAREN(context))
                 appendStringInfoChar(buf, '(');
             get_rule_expr_paren((Node*)ntest->arg, context, true, node, no_alias);
-            switch (ntest->nulltesttype) {
-                case IS_NULL:
-                    appendStringInfo(buf, " IS NULL");
-                    break;
-                case IS_NOT_NULL:
-                    appendStringInfo(buf, " IS NOT NULL");
-                    break;
-                default:
-                    ereport(ERROR,
-                        (errcode(ERRCODE_UNRECOGNIZED_NODE_TYPE),
-                            errmsg("unrecognized nulltesttype: %d", (int)ntest->nulltesttype)));
-            }
+            /*
+             * For scalar inputs, we prefer to print as IS [NOT] NULL,
+             * which is shorter and traditional.  If it's a rowtype input
+             * but we're applying a scalar test, must print IS [NOT]
+             * DISTINCT FROM NULL to be semantically correct.
+             */
+            if (ntest->argisrow || !type_is_rowtype(exprType((Node *) ntest->arg))) {
+                switch (ntest->nulltesttype)
+                {
+                    case IS_NULL:
+                        appendStringInfoString(buf, " IS NULL");
+                        break;
+                    case IS_NOT_NULL:
+                        appendStringInfoString(buf, " IS NOT NULL");
+                        break;
+                    default:
+                        ereport(ERROR,
+                            (errcode(ERRCODE_UNRECOGNIZED_NODE_TYPE),
+                                errmsg("unrecognized nulltesttype: %d", (int)ntest->nulltesttype)));
+                }
+            } else {
+                switch (ntest->nulltesttype)
+                {
+                    case IS_NULL:
+                        appendStringInfoString(buf, " IS NOT DISTINCT FROM NULL");
+                        break;
+                    case IS_NOT_NULL:
+                        appendStringInfoString(buf, " IS DISTINCT FROM NULL");
+                        break;
+                    default:
+                        ereport(ERROR,
+                            (errcode(ERRCODE_UNRECOGNIZED_NODE_TYPE),
+                                errmsg("unrecognized nulltesttype: %d", (int)ntest->nulltesttype)));
+                }
+            }   
             if (!PRETTY_PAREN(context))
                 appendStringInfoChar(buf, ')');
         } break;
@@ -9240,10 +9916,142 @@ static void get_rule_expr(Node* node, deparse_context* context, bool showimplici
             }
         } break;
 
-        case T_GradientDescentExpr: {
-            GradientDescentExpr* gdnode = (GradientDescentExpr*)node;
-            appendStringInfo(buf, "GD(%s)", gd_get_expr_name(gdnode->field));
-        } break;
+#ifdef GS_GRAPH
+        case T_CypherTypeCast:
+			{
+				CypherTypeCast *tc = (CypherTypeCast *) node;
+
+				switch (tc->cform)
+				{
+					case COERCE_IMPLICIT_CAST:
+						get_rule_expr_paren((Node *) tc->arg, context,
+											showimplicit, node);
+						break;
+
+					case COERCE_EXPLICIT_CAST:
+						get_coercion_expr((Node *) tc->arg, context, tc->type,
+										  -1, node);
+						break;
+
+					case COERCE_EXPLICIT_CALL:
+					default:
+						elog(ERROR, "unexpected CoercionForm: %d", tc->cform);
+						break;
+				}
+			}
+			break;
+
+		case T_CypherMapExpr:
+			{
+				CypherMapExpr *m = (CypherMapExpr *) node;
+				char	   *sep = "";
+				ListCell   *le;
+
+				appendStringInfoChar(buf, '{');
+				le = list_head(m->keyvals);
+				while (le != NULL)
+				{
+					Node	   *e;
+
+					appendStringInfoString(buf, sep);
+
+					e = (Node*) lfirst(le);
+					le = lnext(le);
+
+					get_rule_expr((Node *) e, context, false);
+
+					appendBinaryStringInfo(buf, ": ", 2);
+
+					e = (Node*) lfirst(le);
+					le = lnext(le);
+
+					get_rule_expr((Node *) e, context, false);
+
+					sep = ", ";
+				}
+				appendStringInfoChar(buf, '}');
+			}
+			break;
+
+		case T_CypherListExpr:
+			{
+				CypherListExpr *cl = (CypherListExpr *) node;
+
+				appendStringInfoChar(buf, '[');
+				get_rule_expr((Node *) cl->elems, context, false);
+				appendStringInfoChar(buf, ']');
+			}
+			break;
+
+		case T_CypherListCompExpr:
+			{
+				CypherListCompExpr *clc = (CypherListCompExpr *) node;
+
+				appendStringInfoChar(buf, '[');
+				appendStringInfo(buf, "%s IN ", clc->varname);
+				get_rule_expr((Node *) clc->list, context, false);
+				if (clc->cond != NULL)
+				{
+					appendBinaryStringInfo(buf, " WHERE ", 7);
+					get_rule_expr((Node *) clc->cond, context, false);
+				}
+				if (clc->elem != NULL)
+				{
+					appendBinaryStringInfo(buf, " | ", 3);
+					get_rule_expr((Node *) clc->elem, context, false);
+				}
+				appendStringInfoChar(buf, ']');
+			}
+			break;
+
+		case T_CypherListCompVar:
+			{
+				CypherListCompVar *clcvar = (CypherListCompVar *) node;
+
+				appendStringInfoString(buf, clcvar->varname);
+			}
+			break;
+
+		case T_CypherAccessExpr:
+			{
+				CypherAccessExpr *a = (CypherAccessExpr *) node;
+				bool		dot;
+				ListCell   *le;
+
+				dot = get_access_arg_expr((Node *) a->arg, context, false);
+
+				foreach(le, a->path)
+				{
+					Node	   *e = (Node*) lfirst(le);
+
+					if (IsA(e, CypherIndices))
+					{
+						CypherIndices *cind = (CypherIndices *) e;
+
+						appendStringInfoChar(buf, '[');
+
+						if (cind->is_slice)
+						{
+							get_rule_expr((Node *) cind->lidx, context, false);
+							appendBinaryStringInfo(buf, "..", 2);
+						}
+						get_pathelem_expr((Node *) cind->uidx, context, false);
+
+						appendStringInfoChar(buf, ']');
+					}
+					else
+					{
+						if (dot)
+							appendStringInfoChar(buf, '.');
+						else
+							dot = true;
+
+						get_pathelem_expr(e, context, false);
+					}
+				}
+			}
+			break;
+#endif
 
         default:
             if (context->qrw_phase)
@@ -9255,6 +10063,100 @@ static void get_rule_expr(Node* node, deparse_context* context, bool showimplici
             break;
     }
 }
+
+#ifdef GS_GRAPH
+
+static bool
+get_access_arg_expr(Node *node, deparse_context *context, bool showimplicit)
+{
+	StringInfoData si;
+	StringInfo	buf;
+
+	if (!context->cypherexpr)
+	{
+		get_rule_expr(node, context, showimplicit);
+		return true;
+	}
+
+	initStringInfo(&si);
+
+	buf = context->buf;
+	context->buf = &si;
+
+	get_rule_expr(node, context, showimplicit);
+
+	context->buf = buf;
+
+	if (strcmp(si.data, quote_identifier(GS_ELEM_PROP_MAP)) != 0)
+	{
+		appendBinaryStringInfo(buf, si.data, si.len);
+		return true;
+	}
+
+	return false;
+}
+
+static void
+get_pathelem_expr(Node *node, deparse_context *context, bool showimplicit)
+{
+	StringInfoData si;
+	StringInfo	buf;
+
+	if (!context->cypherexpr)
+	{
+		get_rule_expr(node, context, showimplicit);
+		return;
+	}
+
+	initStringInfo(&si);
+
+	buf = context->buf;
+	context->buf = &si;
+
+	get_rule_expr(node, context, showimplicit);
+
+	context->buf = buf;
+
+	if (si.len > 2 && si.data[0] == '\'' && si.data[si.len - 1] == '\'')
+	{
+		si.data[si.len - 1] = '\0';
+		if (is_ident(si.data + 1, si.len - 2))
+		{
+			appendBinaryStringInfo(buf, si.data + 1, si.len - 2);
+			return;
+		}
+		else
+		{
+			si.data[si.len -1] = '\'';
+		}
+	}
+
+	appendBinaryStringInfo(buf, si.data, si.len);
+}
+
+
+static bool
+is_ident(const char *str, const int len)
+{
+	int			i;
+
+	for (i = 0; i < len; i++)
+	{
+		char		c = str[i];
+
+		if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+			IS_HIGHBIT_SET(c) || c == '_')
+			continue;
+
+		if (i > 0 && ((c >= '0' && c <= '9') || c == '$'))
+			continue;
+
+		return false;
+	}
+
+	return true;
+}
+#endif
 
 /*
  * @Description:
@@ -10251,6 +11153,32 @@ static void get_from_clause_partition(RangeTblEntry* rte, StringInfo buf, depars
     }
 }
 
+static void get_from_clause_subpartition(RangeTblEntry* rte, StringInfo buf, deparse_context* context)
+{
+    Assert(rte->ispartrel);
+
+    if (rte->pname) {
+        /* get the newest subpartition name from oid given */
+        pfree(rte->pname->aliasname);
+        rte->pname->aliasname = getPartitionName(rte->subpartitionOid, false);
+        appendStringInfo(buf, " SUBPARTITION(%s)", quote_identifier(rte->pname->aliasname));
+    } else {
+        ListCell* cell = NULL;
+        char* semicolon = "";
+
+        Assert(rte->plist);
+        appendStringInfo(buf, " SUBPARTITION FOR(");
+        foreach (cell, rte->plist) {
+            Node* col = (Node*)lfirst(cell);
+
+            appendStringInfoString(buf, semicolon);
+            get_rule_expr(processIndirection(col, context, false), context, false);
+            semicolon = " ,";
+        }
+        appendStringInfo(buf, ")");
+    }
+}
+
 static void get_from_clause_item(Node* jtnode, Query* query, deparse_context* context)
 {
     StringInfo buf = context->buf;
@@ -10318,6 +11246,9 @@ static void get_from_clause_item(Node* jtnode, Query* query, deparse_context* co
 
         if (rte->isContainPartition) {
             get_from_clause_partition(rte, buf, context);
+        }
+        if (rte->isContainSubPartition) {
+            get_from_clause_subpartition(rte, buf, context);
         }
         if (rte->isbucket) {
             get_from_clause_bucket(rte, buf, context);
@@ -10392,6 +11323,9 @@ static void get_from_clause_item(Node* jtnode, Query* query, deparse_context* co
         if (rte->rtekind == RTE_RELATION && rte->tablesample) {
             get_tablesample_def(rte->tablesample, context);
         }
+        if (rte->rtekind == RTE_RELATION && rte->timecapsule) {
+            GetTimecapsuleDef(rte->timecapsule, context);
+        }
     } else if (IsA(jtnode, JoinExpr)) {
         JoinExpr* j = (JoinExpr*)jtnode;
         bool need_paren_on_right = false;
@@ -10420,6 +11354,14 @@ static void get_from_clause_item(Node* jtnode, Query* query, deparse_context* co
                 case JOIN_RIGHT:
                     appendContextKeyword(context, "NATURAL RIGHT JOIN ", -PRETTYINDENT_JOIN, PRETTYINDENT_JOIN, 0);
                     break;
+#ifdef GS_GRAPH
+                case JOIN_CYPHER_MERGE:
+                    appendContextKeyword(context, " CYPHER MERGE JOIN ", -PRETTYINDENT_JOIN, PRETTYINDENT_JOIN, 2);
+				    break;
+			    case JOIN_CYPHER_DELETE:
+				    appendContextKeyword(context, " CYPHER DELETE JOIN ", -PRETTYINDENT_JOIN, PRETTYINDENT_JOIN, 2);
+				    break;
+#endif
                 default:
                     ereport(ERROR,
                         (errcode(ERRCODE_UNRECOGNIZED_NODE_TYPE),
@@ -10466,7 +11408,15 @@ static void get_from_clause_item(Node* jtnode, Query* query, deparse_context* co
                         appendContextKeyword(
                             context, " RIGHT ANTI FULL JOIN ", -PRETTYINDENT_JOIN, PRETTYINDENT_JOIN, 0);
                         break;
-                    }
+                    }  
+#ifdef GS_GRAPH
+                case JOIN_CYPHER_MERGE:
+                    appendContextKeyword(context, " CYPHER MERGE JOIN ", -PRETTYINDENT_JOIN, PRETTYINDENT_JOIN, 2);
+				    break;
+			    case JOIN_CYPHER_DELETE:
+				    appendContextKeyword(context, " CYPHER DELETE JOIN ", -PRETTYINDENT_JOIN, PRETTYINDENT_JOIN, 2);
+				    break;
+#endif
                     /* fall through */
                 default:
                     ereport(ERROR,
@@ -10565,9 +11515,8 @@ static void get_from_clause_alias(Alias* alias, RangeTblEntry* rte, deparse_cont
 /*
  * Description: Print a TableSampleClause.
  *
- * Parameters:
- *	@in tablesample: TableSampleClause node.
- *	@out context: rewrite sql.
+ * Parameters: @in tablesample: TableSampleClause node.
+ *             @out context: rewrite sql.
  *
  * Return: void
  */
@@ -10599,6 +11548,28 @@ static void get_tablesample_def(TableSampleClause* tablesample, deparse_context*
         get_rule_expr((Node*)tablesample->repeatable, context, false);
         appendStringInfoChar(buf, ')');
     }
+}
+
+/*
+ * Description: Print a TimeCapsuleClause.
+ *
+ * Parameters:
+ *	@in timecapsule: TimeCapsuleClause node.
+ *	@out context: rewrite sql.
+ *
+ * Return: void
+ */
+static void GetTimecapsuleDef(const TimeCapsuleClause* timeCapsule, deparse_context* context)
+{
+    StringInfo buf = context->buf;
+
+    /*
+     * We should qualify the handler's function name if it wouldn't be
+     * resolved by lookup in the current search path.
+     */
+    appendStringInfo(buf, " TIMECAPSULE %s ", (timeCapsule->tvtype == TV_VERSION_CSN) ? "CSN" : "TIMESTAMP");
+
+    get_rule_expr(timeCapsule->tvver, context, false);
 }
 
 /*
@@ -10844,15 +11815,20 @@ const char* quote_identifier(const char* ident)
  * Return a name of the form qualifier.ident, or just ident if qualifier
  * is NULL, quoting each component if necessary.  The result is palloc'd.
  */
-char* quote_qualified_identifier(const char* qualifier, const char* ident)
+char* quote_qualified_identifier(const char* qualifier, const char* ident1, const char* ident2)
 {
     StringInfoData buf;
 
     initStringInfo(&buf);
     if (qualifier != NULL)
         appendStringInfo(&buf, "%s.", quote_identifier(qualifier));
-    if (ident != NULL)
-        appendStringInfoString(&buf, quote_identifier(ident));
+    if (ident1 != NULL)
+        appendStringInfoString(&buf, quote_identifier(ident1));
+    if (ident2 != NULL && ident1 != NULL) {
+        appendStringInfo(&buf, ".%s", quote_identifier(ident2));
+    } else if (ident1 == NULL && ident2 != NULL) {
+        appendStringInfoString(&buf, quote_identifier(ident2));
+    }
     return buf.data;
 }
 
@@ -10956,13 +11932,20 @@ static char* generate_function_name(
     int p_nvargs;
     Oid* p_true_typeids = NULL;
     Oid p_vatype;
-
+    NameData* pkgname = NULL;
+    Datum pkgOiddatum;
+    Oid pkgOid = InvalidOid;
+    bool isnull = true;
     proctup = SearchSysCache1(PROCOID, ObjectIdGetDatum(funcid));
     if (!HeapTupleIsValid(proctup))
         ereport(ERROR, (errcode(ERRCODE_CACHE_LOOKUP_FAILED), errmsg("cache lookup failed for function %u", funcid)));
     procform = (Form_pg_proc)GETSTRUCT(proctup);
     proname = NameStr(procform->proname);
-
+    pkgOiddatum = SysCacheGetAttr(PROCOID, proctup, Anum_pg_proc_packageid, &isnull);
+    if (!isnull) {
+        pkgOid = DatumGetObjectId(pkgOiddatum);
+        pkgname = GetPackageName(pkgOid);
+    }
     /*
      * If this function's element type of variadic array is not ANY
      * or it was used originally, we should print VARIADIC.  We must do
@@ -11004,9 +11987,11 @@ static char* generate_function_name(
         nspname = NULL;
     else
         nspname = get_namespace_name(procform->pronamespace);
-
-    result = quote_qualified_identifier(nspname, proname);
-
+    if (OidIsValid(pkgOid)) {
+        result = quote_qualified_identifier(nspname, pkgname->data, proname);
+    } else {
+        result = quote_qualified_identifier(nspname, proname);
+    }
     ReleaseSysCache(proctup);
 
     return result;
@@ -11385,4 +12370,77 @@ char* deparse_alter_sequence(Node* stmt, bool owned_by_none)
     appendStringInfo(&str, ";");
 
     return str.data;
+}
+
+/*
+ * Replace column managed type with original type for proper print
+ * via proallargtypes
+ */
+static void replace_cl_types_in_argtypes(Oid func_id, int numargs, Oid* argtypes, bool* is_client_logic)
+{
+    HeapTuple gs_oldtup = NULL;
+    Oid* vec_gs_all_types_orig = NULL;
+    oidvector* proargcachedcol = NULL;
+    int n_gs_args = 0;
+    bool use_all_arg_types = false;
+    for (int i = 0; i < numargs; i++) {
+        if (IsClientLogicType(argtypes[i])) {
+            if (!HeapTupleIsValid(gs_oldtup)) {
+                /*
+                 * check if use proallargtypes for substitution
+                 */
+                gs_oldtup = SearchSysCache1(GSCLPROCID, ObjectIdGetDatum(func_id));
+                if (!HeapTupleIsValid(gs_oldtup)) {
+                    break;
+                }
+                bool isnull = false;
+                Datum gs_all_types_orig =
+                    SysCacheGetAttr(GSCLPROCID, gs_oldtup, Anum_gs_encrypted_proc_proallargtypes_orig, &isnull);
+                if (!isnull) {
+                    ArrayType* arr_gs_all_types_orig = DatumGetArrayTypeP(gs_all_types_orig);
+                    vec_gs_all_types_orig = (Oid*)ARR_DATA_PTR(arr_gs_all_types_orig);
+                    n_gs_args = ARR_DIMS(arr_gs_all_types_orig)[0];
+                    if (n_gs_args <= numargs) {
+                        use_all_arg_types = true;
+                    }
+                }
+                if (!use_all_arg_types) {
+                    proargcachedcol = (oidvector*)DatumGetPointer(
+                        SysCacheGetAttr(GSCLPROCID, gs_oldtup, Anum_gs_encrypted_proc_proargcachedcol, &isnull));
+                    n_gs_args = proargcachedcol->dim1;
+                }
+            }
+            if (i >= n_gs_args) {
+                break;
+            }
+            if (use_all_arg_types) {
+                /*
+                 * For output parameter if origin type is -1
+                 * use return value instead
+                 */
+                if (vec_gs_all_types_orig[i] != (Oid)-1) {
+                    argtypes[i] = vec_gs_all_types_orig[i];
+                } else {
+                    bool isnull = false;
+                    Datum rettype_orig =
+                        SysCacheGetAttr(GSCLPROCID, gs_oldtup, Anum_gs_encrypted_proc_prorettype_orig, &isnull);
+                    if (!isnull) {
+                        argtypes[i] = DatumGetObjectId(rettype_orig);
+                    }
+                }
+            } else {
+                Oid cachedColId = proargcachedcol->values[i];
+                HeapTuple tup = SearchSysCache1(CEOID, ObjectIdGetDatum(cachedColId));
+                if (HeapTupleIsValid(tup)) {
+                    Form_gs_encrypted_columns gs_cl_columns = (Form_gs_encrypted_columns)GETSTRUCT(tup);
+                    argtypes[i] = gs_cl_columns->data_type_original_oid;
+                    ReleaseSysCache(tup);
+                }
+            }
+            is_client_logic[i] = true;
+        }
+    }
+    if (HeapTupleIsValid(gs_oldtup)) {
+        ReleaseSysCache(gs_oldtup);
+    }
 }

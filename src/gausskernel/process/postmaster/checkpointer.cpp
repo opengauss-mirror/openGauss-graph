@@ -44,13 +44,15 @@
 #include "miscadmin.h"
 #include "pgstat.h"
 #include "postmaster/bgwriter.h"
+#include "postmaster/pagewriter.h"
 #include "replication/syncrep.h"
 #include "storage/buf/bufmgr.h"
 #include "storage/ipc.h"
 #include "storage/lock/lwlock.h"
+#include "storage/smgr/knl_usync.h"
 #include "storage/proc.h"
 #include "storage/shmem.h"
-#include "storage/smgr.h"
+#include "storage/smgr/smgr.h"
 #include "storage/spin.h"
 #include "utils/guc.h"
 #include "utils/memutils.h"
@@ -112,18 +114,13 @@
  * is truncated solely by checkpointer through its smgrsync.
  * ----------
  */
-typedef struct {
-    RelFileNode rnode;
-    ForkNumber forknum;
-    BlockNumber segno; /* see md.c for special values */
-                       /* might add a real request-type field later; not needed yet */
-} CheckpointerRequest;
 
 typedef struct CheckpointerShmemStruct {
     ThreadId checkpointer_pid; /* PID (0 if not started) */
     slock_t ckpt_lck;          /* protects all the ckpt_* fields */
     int64 fsync_start;
     int64 fsync_done;
+    int64 fsync_request;
 
     int ckpt_started; /* advances when checkpoint starts */
     int ckpt_done;    /* advances when checkpoint done */
@@ -180,7 +177,7 @@ void CheckpointerMain(void)
 
     t_thrd.checkpoint_cxt.CheckpointerShmem->checkpointer_pid = t_thrd.proc_cxt.MyProcPid;
 
-    u_sess->attr.attr_storage.CheckPointTimeout = g_instance.attr.attr_storage.enableIncrementalCheckpoint
+    u_sess->attr.attr_storage.CheckPointTimeout = ENABLE_INCRE_CKPT
                                                       ? u_sess->attr.attr_storage.incrCheckPointTimeout
                                                       : u_sess->attr.attr_storage.fullCheckPointTimeout;
     ereport(
@@ -226,7 +223,8 @@ void CheckpointerMain(void)
      * Create a resource owner to keep track of our resources (currently only
      * buffer pins).
      */
-    t_thrd.utils_cxt.CurrentResourceOwner = ResourceOwnerCreate(NULL, "Checkpointer", MEMORY_CONTEXT_STORAGE);
+    t_thrd.utils_cxt.CurrentResourceOwner = ResourceOwnerCreate(NULL, "Checkpointer",
+        THREAD_GET_MEM_CXT_GROUP(MEMORY_CONTEXT_STORAGE));
 
     /*
      * Create a memory context that we will do all our work in.  We do this so
@@ -250,9 +248,16 @@ void CheckpointerMain(void)
     int* oldTryCounter = NULL;
     if (sigsetjmp(local_sigjmp_buf, 1) != 0) {
         gstrace_tryblock_exit(true, oldTryCounter);
+        /*
+         * Close all open files after any error.  This is helpful on Windows,
+         * where holding deleted files open causes various strange errors.
+         * It's not clear we need it elsewhere, but shouldn't hurt.
+         */
 
         /* Since not using PG_TRY, must reset error stack by hand */
         t_thrd.log_cxt.error_context_stack = NULL;
+
+        t_thrd.log_cxt.call_stack = NULL;
 
         /* Prevent interrupts while cleaning up */
         HOLD_INTERRUPTS();
@@ -268,6 +273,8 @@ void CheckpointerMain(void)
         CallCheckpointCallback(EVENT_CHECKPOINT_ABORT, 0);
 #endif
 
+        /* release resource held by lsc */
+        AtEOXact_SysDBCache(false);
         /*
          * These operations are really just a minimal subset of
          * AbortTransaction().	We don't have very many resources to worry
@@ -318,13 +325,6 @@ void CheckpointerMain(void)
          * fast as we can.
          */
         pg_usleep(1000000L);
-
-        /*
-         * Close all open files after any error.  This is helpful on Windows,
-         * where holding deleted files open causes various strange errors.
-         * It's not clear we need it elsewhere, but shouldn't hurt.
-         */
-        smgrcloseall();
     }
     oldTryCounter = gstrace_tryblock_entry(&curTryCounter);
 
@@ -363,7 +363,7 @@ void CheckpointerMain(void)
      */
     for (;;) {
         bool do_checkpoint = false;
-        bool do_filesync = false;
+        bool do_dirty_flush = false;
         int flags = 0;
         pg_time_t now;
         int elapsed_secs;
@@ -378,15 +378,14 @@ void CheckpointerMain(void)
         /*
          * Process any requests or signals received recently.
          */
-        AbsorbFsyncRequests();
+        CkptAbsorbFsyncRequests();
 
         if (t_thrd.checkpoint_cxt.got_SIGHUP) {
             t_thrd.checkpoint_cxt.got_SIGHUP = false;
             ProcessConfigFile(PGC_SIGHUP);
-            u_sess->attr.attr_storage.CheckPointTimeout = g_instance.attr.attr_storage.enableIncrementalCheckpoint
+            u_sess->attr.attr_storage.CheckPointTimeout = ENABLE_INCRE_CKPT
                                                               ? u_sess->attr.attr_storage.incrCheckPointTimeout
                                                               : u_sess->attr.attr_storage.fullCheckPointTimeout;
-            most_available_sync = (volatile bool)u_sess->attr.attr_storage.guc_most_available_sync;
 
             /*
              * Checkpointer is the last process to shut down, so we ask it to
@@ -421,6 +420,7 @@ void CheckpointerMain(void)
              * control back to the sigsetjmp block above
              */
             u_sess->attr.attr_common.ExitOnAnyError = true;
+            
             /* Close down the database */
             ShutdownXLOG(0, 0);
             /* Normal exit from the checkpointer is here */
@@ -480,11 +480,6 @@ void CheckpointerMain(void)
                 do_restartpoint = false;
             }
 
-            /* timed checkpoint request and force checkpoint have higher priority than file-sync-only request */
-            if ((flags & CHECKPOINT_FILE_SYNC) && !(flags & CHECKPOINT_CAUSE_TIME) && !(flags & CHECKPOINT_FORCE)) {
-                do_filesync = true;
-            }
-
             /*
              * We will warn if (a) too soon since last checkpoint (whatever
              * caused it) and (b) somebody set the CHECKPOINT_CAUSE_XLOG flag
@@ -513,14 +508,26 @@ void CheckpointerMain(void)
             t_thrd.checkpoint_cxt.ckpt_start_time = now;
             t_thrd.checkpoint_cxt.ckpt_cached_elapsed = 0;
 
+            if (flags & CHECKPOINT_FLUSH_DIRTY) {
+                do_dirty_flush = true;
+            }
             /*
-             * Do a normal checkpoint/restartpoint or just do file sync.
+             * Do a normal checkpoint/restartpoint.
              */
-            if (do_filesync) {
-                if (u_sess->attr.attr_common.log_checkpoints) {
-                    ereport(LOG, (errmsg("file sync checkpoint is trigger.")));
+            if (do_dirty_flush) {
+                ereport(LOG, (errmsg("[file repair] request checkpoint, flush all dirty page.")));
+                Assert(RecoveryInProgress());
+                if (ENABLE_INCRE_CKPT) {
+                    g_instance.ckpt_cxt_ctl->full_ckpt_expected_flush_loc = get_dirty_page_queue_tail();
+                    pg_memory_barrier();
+                    if (get_dirty_page_num() > 0) {
+                        g_instance.ckpt_cxt_ctl->flush_all_dirty_page = true;
+                        ereport(LOG, (errmsg("[file repair] need flush %ld pages.", get_dirty_page_num())));
+                        CheckPointBuffers(flags, true);
+                    }
+                } else {
+                    CheckPointBuffers(flags, true);
                 }
-                smgrsync_with_absorption();
             } else if (!do_restartpoint) {
                 CreateCheckPoint(flags);
                 ckpt_performed = true;
@@ -551,7 +558,7 @@ void CheckpointerMain(void)
                  * checkpoints happen at a predictable spacing.
                  */
                 t_thrd.checkpoint_cxt.last_checkpoint_time = now;
-            } else if (!do_filesync) {
+            } else if (!do_dirty_flush) {
                 /*
                  * We were not able to perform the restartpoint (checkpoints
                  * throw an ERROR in case of error).  Most likely because we
@@ -582,11 +589,7 @@ void CheckpointerMain(void)
          */
         now = (pg_time_t)time(NULL);
         elapsed_secs = now - t_thrd.checkpoint_cxt.last_checkpoint_time;
-
-        if (elapsed_secs < 0) {
-            elapsed_secs = 0;
-        }
-
+        elapsed_secs = (elapsed_secs < 0) ? 0 : elapsed_secs;
         if (elapsed_secs >= u_sess->attr.attr_storage.CheckPointTimeout)
             continue; /* no sleep for us ... */
 
@@ -717,13 +720,12 @@ void CheckpointWriteDelay(int flags, double progress)
         if (t_thrd.checkpoint_cxt.got_SIGHUP) {
             t_thrd.checkpoint_cxt.got_SIGHUP = false;
             ProcessConfigFile(PGC_SIGHUP);
-            most_available_sync = (volatile bool)u_sess->attr.attr_storage.guc_most_available_sync;
             /* update shmem copies of config variables */
             UpdateSharedMemoryConfig();
         }
 
-        AbsorbFsyncRequests();
-        t_thrd.checkpoint_cxt.absorb_counter = WRITES_PER_ABSORB;
+        CkptAbsorbFsyncRequests();
+        t_thrd.checkpoint_cxt.absorbCounter = WRITES_PER_ABSORB;
 
         CheckArchiveTimeout();
 
@@ -739,14 +741,14 @@ void CheckpointWriteDelay(int flags, double progress)
          * Sleep.
          */
         pg_usleep(100000L);
-    } else if (--t_thrd.checkpoint_cxt.absorb_counter <= 0) {
+    } else if (--t_thrd.checkpoint_cxt.absorbCounter <= 0) {
         /*
          * Absorb pending fsync requests after each WRITES_PER_ABSORB write
          * operations even when we don't sleep, to prevent overflow of the
          * fsync request queue.
          */
-        AbsorbFsyncRequests();
-        t_thrd.checkpoint_cxt.absorb_counter = WRITES_PER_ABSORB;
+        CkptAbsorbFsyncRequests();
+        t_thrd.checkpoint_cxt.absorbCounter = WRITES_PER_ABSORB;
     }
 }
 
@@ -765,7 +767,7 @@ static bool IsCheckpointOnSchedule(double progress)
     double elapsed_xlogs, elapsed_time;
 
     Assert(t_thrd.checkpoint_cxt.ckpt_active);
-    u_sess->attr.attr_storage.CheckPointTimeout = g_instance.attr.attr_storage.enableIncrementalCheckpoint
+    u_sess->attr.attr_storage.CheckPointTimeout = ENABLE_INCRE_CKPT
                                                       ? u_sess->attr.attr_storage.incrCheckPointTimeout
                                                       : u_sess->attr.attr_storage.fullCheckPointTimeout;
 
@@ -910,6 +912,7 @@ static void ReqShutdownHandler(SIGNAL_ARGS)
  * CheckpointerShmemSize
  *		Compute space needed for checkpointer-related shared memory
  */
+const uint DDL_REQUEST_MAX = 100000;
 Size CheckpointerShmemSize(void)
 {
     Size size;
@@ -919,7 +922,12 @@ Size CheckpointerShmemSize(void)
      * NBuffers.  This may prove too large or small ...
      */
     size = offsetof(CheckpointerShmemStruct, requests);
-    size = add_size(size, mul_size(g_instance.attr.attr_storage.NBuffers, sizeof(CheckpointerRequest)));
+    if (ENABLE_INCRE_CKPT) {
+        /* incremental checkpoint, the checkpoint thread only handle the drop table request and drop db request */
+        size = add_size(size, mul_size(DDL_REQUEST_MAX, sizeof(CheckpointerRequest)));
+    } else {
+        size = add_size(size, mul_size(TOTAL_BUFFER_NUM, sizeof(CheckpointerRequest)));
+    }
 
     return size;
 }
@@ -942,18 +950,10 @@ void CheckpointerShmemInit(void)
          * requests array; this is so that CompactCheckpointerRequestQueue
          * can assume that any pad bytes in the request structs are zeroes.
          */
-        MemsetHugeMem((char*)t_thrd.checkpoint_cxt.CheckpointerShmem, size);
+        /* The memory of the memset sometimes exceeds 2 GB. so, memset_s cannot be used. */
+        MemSet((char*)t_thrd.checkpoint_cxt.CheckpointerShmem, 0, size);
         SpinLockInit(&t_thrd.checkpoint_cxt.CheckpointerShmem->ckpt_lck);
-        t_thrd.checkpoint_cxt.CheckpointerShmem->max_requests = g_instance.attr.attr_storage.NBuffers;
-    }
-}
-
-void set_flag_checkpoint_file_sync(int flags, volatile CheckpointerShmemStruct* cps)
-{
-    if (flags & CHECKPOINT_FILE_SYNC) {
-    } else {
-        /* normal checkpoint request also includes file sync, so unset this bit */
-        cps->ckpt_flags &= ~CHECKPOINT_FILE_SYNC;
+        t_thrd.checkpoint_cxt.CheckpointerShmem->max_requests = ENABLE_INCRE_CKPT ? DDL_REQUEST_MAX : TOTAL_BUFFER_NUM;
     }
 }
 
@@ -1024,7 +1024,6 @@ void RequestCheckpoint(int flags)
     old_failed = cps->ckpt_failed;
     old_started = cps->ckpt_started;
     cps->ckpt_flags |= flags;
-    set_flag_checkpoint_file_sync(flags, cps);
     SpinLockRelease(&cps->ckpt_lck);
 
     /*
@@ -1117,8 +1116,8 @@ void RequestCheckpoint(int flags)
 }
 
 /*
- * ForwardFsyncRequest
- *		Forward a file-fsync request from a backend to the checkpointer
+ * ForwardSyncRequest
+ *      Forward a file-fsync request from a backend to the checkpointer
  *
  * Whenever a backend is compelled to write directly to a relation
  * (which should be seldom, if the background writer is getting its job done),
@@ -1126,43 +1125,37 @@ void RequestCheckpoint(int flags)
  * is dirty and must be fsync'd before next checkpoint.  We also use this
  * opportunity to count such writes for statistical purposes.
  *
- * This functionality is only supported for regular (not backend-local)
- * relations, so the rnode argument is intentionally RelFileNode not
- * RelFileNodeBackend.
- *
- * segno specifies which segment (not block!) of the relation needs to be
- * fsync'd.  (Since the valid range is much less than BlockNumber, we can
- * use high values for special flags; that's all internal to md.c, which
- * see for details.)
- *
  * To avoid holding the lock for longer than necessary, we normally write
  * to the requests[] queue without checking for duplicates.  The checkpointer
  * will have to eliminate dups internally anyway.  However, if we discover
  * that the queue is full, we make a pass over the entire queue to compact
- * it.	This is somewhat expensive, but the alternative is for the backend
+ * it.  This is somewhat expensive, but the alternative is for the backend
  * to perform its own fsync, which is far more expensive in practice.  It
  * is theoretically possible a backend fsync might still be necessary, if
  * the queue is full and contains no duplicate entries.  In that case, we
  * let the backend know by returning false.
  */
-bool ForwardFsyncRequest(const RelFileNode rnode, ForkNumber forknum, BlockNumber segno)
+bool CkptForwardSyncRequest(const FileTag *ftag, SyncRequestType type)
 {
     CheckpointerRequest* request = NULL;
     bool too_full = false;
 
-    if (!IsUnderPostmaster)
-        return false; /* probably shouldn't even get here */
+    if (!IsUnderPostmaster) {
+        return false;           /* probably shouldn't even get here */
+    }
 
-    if (AmCheckpointerProcess())
+    if (AmCheckpointerProcess()) {
         ereport(ERROR,
             (errcode(ERRCODE_WITH_CHECK_OPTION_VIOLATION),
                 errmsg("ForwardFsyncRequest must not be called in checkpointer")));
+    }
 
     LWLockAcquire(CheckpointerCommLock, LW_EXCLUSIVE);
 
     /* Count all backend writes regardless of if they fit in the queue */
-    if (!AmBackgroundWriterProcess())
+    if (!AmBackgroundWriterProcess() && !AmPageWriterProcess()) {
         t_thrd.checkpoint_cxt.CheckpointerShmem->num_backend_writes++;
+    }
 
     /*
      * If the checkpointer isn't running or the request queue is full, the
@@ -1171,14 +1164,15 @@ bool ForwardFsyncRequest(const RelFileNode rnode, ForkNumber forknum, BlockNumbe
      */
     if (t_thrd.checkpoint_cxt.CheckpointerShmem->checkpointer_pid == 0 ||
         (t_thrd.checkpoint_cxt.CheckpointerShmem->num_requests >=
-                t_thrd.checkpoint_cxt.CheckpointerShmem->max_requests &&
-            !CompactCheckpointerRequestQueue())) {
+        t_thrd.checkpoint_cxt.CheckpointerShmem->max_requests &&
+        !CompactCheckpointerRequestQueue())) {
         /*
          * Count the subset of writes where backends have to do their own
          * fsync
          */
-        if (!AmBackgroundWriterProcess())
+        if (!AmBackgroundWriterProcess() && !AmPageWriterProcess()) {
             t_thrd.checkpoint_cxt.CheckpointerShmem->num_backend_fsync++;
+        }
 
         LWLockRelease(CheckpointerCommLock);
         return false;
@@ -1187,9 +1181,8 @@ bool ForwardFsyncRequest(const RelFileNode rnode, ForkNumber forknum, BlockNumbe
     /* OK, insert request */
     request =
         &t_thrd.checkpoint_cxt.CheckpointerShmem->requests[t_thrd.checkpoint_cxt.CheckpointerShmem->num_requests++];
-    request->rnode = rnode;
-    request->forknum = forknum;
-    request->segno = segno;
+    request->ftag = *ftag;
+    request->type = type;
 
     /* If queue is more than half full, nudge the checkpointer to empty it */
     too_full = (t_thrd.checkpoint_cxt.CheckpointerShmem->num_requests >=
@@ -1198,10 +1191,84 @@ bool ForwardFsyncRequest(const RelFileNode rnode, ForkNumber forknum, BlockNumbe
     LWLockRelease(CheckpointerCommLock);
 
     /* ... but not till after we release the lock */
-    if (too_full && g_instance.proc_base->checkpointerLatch)
+    if (too_full && g_instance.proc_base->checkpointerLatch) {
         SetLatch(g_instance.proc_base->checkpointerLatch);
+    }
 
     return true;
+}
+
+int getDuplicateRequest(CheckpointerRequest *requests, int num_requests, bool *skip_slot)
+{
+    struct CheckpointerSlotMapping {
+        CheckpointerRequest request;
+        int slot;
+    };
+
+    int n;
+    int num_skipped = 0;
+    HASHCTL ctl;
+    HTAB* htab = NULL;
+
+    /* Initialize temporary hash table */
+    errno_t rc = memset_s(&ctl, sizeof(ctl), 0, sizeof(ctl));
+    securec_check(rc, "\0", "\0");
+    ctl.keysize = sizeof(CheckpointerRequest);
+    ctl.entrysize = sizeof(struct CheckpointerSlotMapping);
+    ctl.hash = tag_hash;
+    ctl.hcxt = CurrentMemoryContext;
+
+    htab = hash_create("CompactRequestQueue", num_requests, &ctl,
+        HASH_ELEM | HASH_FUNCTION | HASH_CONTEXT);
+
+    /*
+     * The basic idea here is that a request can be skipped if it's followed
+     * by a later, identical request.  It might seem more sensible to work
+     * backwards from the end of the queue and check whether a request is
+     * *preceded* by an earlier, identical request, in the hopes of doing less
+     * copying.  But that might change the semantics, if there's an
+     * intervening FORGET_RELATION_FSYNC or FORGET_DATABASE_FSYNC request, so
+     * we do it this way.  It would be possible to be even smarter if we made
+     * the code below understand the specific semantics of such requests (it
+     * could blow away preceding entries that would end up being canceled
+     * anyhow), but it's not clear that the extra complexity would buy us
+     * anything.
+     */
+
+    for (n = 0; n < num_requests; n++) {
+        CheckpointerRequest* request = NULL;
+        struct CheckpointerSlotMapping* slotmap;
+        bool found = false;
+
+        /*
+         * We use the request struct directly as a hashtable key.  This
+         * assumes that any padding bytes in the structs are consistently the
+         * same, which should be okay because we zeroed them in
+         * CheckpointerShmemInit.  Note also that RelFileNode had better
+         * contain no pad bytes.
+         */
+        request = &requests[n];
+        slotmap = (CheckpointerSlotMapping*)hash_search(htab, request, HASH_ENTER, &found);
+
+        if (found) {
+            /* Duplicate, so mark the previous occurrence as skippable */
+            skip_slot[slotmap->slot] = true;
+            num_skipped++;
+        }
+
+        /* Remember slot containing latest occurrence of this request value */
+        slotmap->slot = n;
+    }
+
+    /* Done with the hash table. */
+    hash_destroy(htab);
+
+    /* If no duplicates, we're out of luck. */
+    if (!num_skipped) {
+        return 0;
+    }
+
+    return num_skipped;
 }
 
 /*
@@ -1222,16 +1289,9 @@ bool ForwardFsyncRequest(const RelFileNode rnode, ForkNumber forknum, BlockNumbe
  */
 static bool CompactCheckpointerRequestQueue(void)
 {
-    struct CheckpointerSlotMapping {
-        CheckpointerRequest request;
-        int slot;
-    };
-
-    int n, preserve_count;
-    int num_skipped = 0;
-    HASHCTL ctl;
-    HTAB* htab = NULL;
+    int preserve_count;
     bool* skip_slot = NULL;
+    int num_skipped = 0;
 
     /* must hold CheckpointerCommLock in exclusive mode */
     Assert(LWLockHeldByMe(CheckpointerCommLock));
@@ -1239,62 +1299,11 @@ static bool CompactCheckpointerRequestQueue(void)
     /* Initialize skip_slot array */
     skip_slot = (bool*)palloc0(sizeof(bool) * t_thrd.checkpoint_cxt.CheckpointerShmem->num_requests);
 
-    /* Initialize temporary hash table */
-    errno_t ret = memset_s(&ctl, sizeof(ctl), 0, sizeof(ctl));
-    securec_check(ret, "\0", "\0");
-    ctl.keysize = sizeof(CheckpointerRequest);
-    ctl.entrysize = sizeof(struct CheckpointerSlotMapping);
-    ctl.hash = tag_hash;
-    ctl.hcxt = CurrentMemoryContext;
-
-    htab = hash_create("CompactCheckpointerRequestQueue",
-        t_thrd.checkpoint_cxt.CheckpointerShmem->num_requests,
-        &ctl,
-        HASH_ELEM | HASH_FUNCTION | HASH_CONTEXT);
-
-    /*
-     * The basic idea here is that a request can be skipped if it's followed
-     * by a later, identical request.  It might seem more sensible to work
-     * backwards from the end of the queue and check whether a request is
-     * *preceded* by an earlier, identical request, in the hopes of doing less
-     * copying.  But that might change the semantics, if there's an
-     * intervening FORGET_RELATION_FSYNC or FORGET_DATABASE_FSYNC request, so
-     * we do it this way.  It would be possible to be even smarter if we made
-     * the code below understand the specific semantics of such requests (it
-     * could blow away preceding entries that would end up being canceled
-     * anyhow), but it's not clear that the extra complexity would buy us
-     * anything.
-     */
-    for (n = 0; n < t_thrd.checkpoint_cxt.CheckpointerShmem->num_requests; n++) {
-        CheckpointerRequest* request = NULL;
-        struct CheckpointerSlotMapping* slotmap;
-        bool found = false;
-
-        /*
-         * We use the request struct directly as a hashtable key.  This
-         * assumes that any padding bytes in the structs are consistently the
-         * same, which should be okay because we zeroed them in
-         * CheckpointerShmemInit.  Note also that RelFileNode had better
-         * contain no pad bytes.
-         */
-        request = &t_thrd.checkpoint_cxt.CheckpointerShmem->requests[n];
-        slotmap = (CheckpointerSlotMapping*)hash_search(htab, request, HASH_ENTER, &found);
-
-        if (found) {
-            /* Duplicate, so mark the previous occurrence as skippable */
-            skip_slot[slotmap->slot] = true;
-            num_skipped++;
-        }
-
-        /* Remember slot containing latest occurrence of this request value */
-        slotmap->slot = n;
-    }
-
-    /* Done with the hash table. */
-    hash_destroy(htab);
+    num_skipped = getDuplicateRequest(t_thrd.checkpoint_cxt.CheckpointerShmem->requests,
+        t_thrd.checkpoint_cxt.CheckpointerShmem->num_requests, skip_slot);
 
     /* If no duplicates, we're out of luck. */
-    if (!num_skipped) {
+    if (num_skipped == 0) {
         pfree(skip_slot);
         return false;
     }
@@ -1302,7 +1311,7 @@ static bool CompactCheckpointerRequestQueue(void)
     /* We found some duplicates; remove them. */
     preserve_count = 0;
 
-    for (n = 0; n < t_thrd.checkpoint_cxt.CheckpointerShmem->num_requests; n++) {
+    for (int n = 0; n < t_thrd.checkpoint_cxt.CheckpointerShmem->num_requests; n++) {
         if (skip_slot[n])
             continue;
 
@@ -1330,7 +1339,7 @@ static bool CompactCheckpointerRequestQueue(void)
  * we start fsync'ing.  Since CreateCheckPoint sometimes runs in
  * non-checkpointer processes, do nothing if not checkpointer.
  */
-void AbsorbFsyncRequests(void)
+void CkptAbsorbFsyncRequests(void)
 {
     CheckpointerRequest* requests = NULL;
     CheckpointerRequest* request = NULL;
@@ -1378,12 +1387,12 @@ void AbsorbFsyncRequests(void)
 
     LWLockRelease(CheckpointerCommLock);
 
-    for (request = requests; n > 0; request++, n--)
-        RememberFsyncRequest(request->rnode, request->forknum, request->segno);
-
-    if (requests != NULL)
+    for (request = requests; n > 0; request++, n--) {
+        RememberSyncRequest(&request->ftag, request->type);
+    }
+    if (requests != NULL) {
         pfree(requests);
-
+    }
     END_CRIT_SECTION();
 }
 
@@ -1449,78 +1458,3 @@ void CallCheckpointCallback(CheckpointEvent checkpointEvent, XLogRecPtr lsn)
     }
 }
 #endif
-
-/*
- * smgrsync_for_dw() -- File sync before dw file can be truncated or recycled.
- * Normally, file sync operation is solely handled by checkpointer process. When pagewriter finds short of
- * dw file space, it simply requests a 'fake' file-sync checkpoint.
- * For standalone backends, as well as for startup process performing dw init, they can handle fsync request
- * themselves since no other concurrent pagewriter process should be present.
- */
-void smgrsync_for_dw(void)
-{
-    if (u_sess->storage_cxt.pendingOpsTable) {
-        Assert(!IsUnderPostmaster || AmStartupProcess() || AmCheckpointerProcess());
-        smgrsync();
-    } else {
-        int64 old_fsync_start = 0;
-        int64 new_fsync_start = 0;
-        int64 new_fsync_done = 0;
-        volatile CheckpointerShmemStruct* cps = t_thrd.checkpoint_cxt.CheckpointerShmem;
-        SpinLockAcquire(&cps->ckpt_lck);
-        old_fsync_start = cps->fsync_start;
-        SpinLockRelease(&cps->ckpt_lck);
-
-        RequestCheckpoint(CHECKPOINT_IMMEDIATE | CHECKPOINT_FILE_SYNC);
-
-        /* Wait for a new checkpoint to start. */
-        for (;;) {
-            SpinLockAcquire(&cps->ckpt_lck);
-            new_fsync_start = cps->fsync_start;
-            SpinLockRelease(&cps->ckpt_lck);
-
-            if (new_fsync_start != old_fsync_start) {
-                break;
-            }
-
-            CHECK_FOR_INTERRUPTS();
-            pg_usleep(100000L);
-        }
-
-        /*
-         * We are waiting for ckpt_done >= new_started, in a modulo sense.
-         */
-        for (;;) {
-            SpinLockAcquire(&cps->ckpt_lck);
-            new_fsync_done = cps->fsync_done;
-            SpinLockRelease(&cps->ckpt_lck);
-
-            if (new_fsync_done - new_fsync_start >= 0) {
-                break;
-            }
-
-            CHECK_FOR_INTERRUPTS();
-            pg_usleep(100000L);
-        }
-    }
-
-    return;
-}
-
-/*
- *	smgrsync_with_absorption() -- Sync files to disk and reset fsync flags.
- */
-void smgrsync_with_absorption(void)
-{
-    volatile CheckpointerShmemStruct* cps = t_thrd.checkpoint_cxt.CheckpointerShmem;
-
-    SpinLockAcquire(&cps->ckpt_lck);
-    cps->fsync_start++;
-    SpinLockRelease(&cps->ckpt_lck);
-
-    smgrsync();
-
-    SpinLockAcquire(&cps->ckpt_lck);
-    cps->fsync_done = cps->fsync_start;
-    SpinLockRelease(&cps->ckpt_lck);
-}

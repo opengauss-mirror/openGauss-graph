@@ -16,6 +16,10 @@
 #include "mb/pg_wchar.h"
 #include <cxxabi.h>
 
+#ifdef ENABLE_UT
+#define static
+#endif
+
 #if defined(USE_ASSERT_CHECKING) || defined(FASTCHECK)
 bool isSlashEnd(const char* strLine)
 {
@@ -150,7 +154,9 @@ int MainLoop(FILE* source, char* querystring)
 
     if (pset.cur_cmd_interactive) {
         const char* val = GetVariable(pset.vars, "HISTSIZE");
-        setHistSize("HISTSIZE", val, val == NULL);
+        if (val != NULL) {
+            setHistSize("HISTSIZE", val, false);
+        }
     }
 
     /* Create working state */
@@ -228,9 +234,6 @@ int MainLoop(FILE* source, char* querystring)
                     setbuffer(source, file_buffer, sizeof(file_buffer) - 1);
                 }
                 line = gets_fromFile(source);
-                if (source != stdin) {
-                    setbuffer(source, NULL, 0);
-                }
             } else {
                 /* only assign line the first time in querystring situation. */
                 if (source_flag) {

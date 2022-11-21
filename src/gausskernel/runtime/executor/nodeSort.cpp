@@ -16,14 +16,17 @@
 #include "postgres.h"
 #include "knl/knl_variable.h"
 
-#include "executor/execdebug.h"
-#include "executor/nodeSort.h"
+#include "executor/exec/execdebug.h"
+#include "executor/node/nodeSort.h"
 #include "miscadmin.h"
 #include "optimizer/streamplan.h"
 #include "pgstat.h"
 #include "instruments/instr_unique_sql.h"
 #include "utils/tuplesort.h"
 #include "workload/workload.h"
+
+#include "optimizer/var.h"
+#include "optimizer/tlist.h"
 
 #ifdef PGXC
 #include "pgxc/pgxc.h"
@@ -51,7 +54,6 @@ TupleTableSlot* ExecSort(SortState* node)
      * get state info from node
      */
     SO1_printf("ExecSort: %s\n", "entering routine");
-    WaitState old_status = pgstat_report_waitstatus(STATE_EXEC_SORT);
 
     EState* estate = node->ss.ps.state;
     ScanDirection dir = estate->es_direction;
@@ -102,11 +104,22 @@ TupleTableSlot* ExecSort(SortState* node)
             plan_node->plan.plan_node_id,
             SET_DOP(plan_node->plan.dop));
 
+        /*
+         * Here used for start with order siblings by
+         * We need to set our customized sort function for siblings key
+         */
+        if (IsA(outer_node->plan, RecursiveUnion)) {
+            RecursiveUnion *ru = (RecursiveUnion *)outer_node->plan;
+
+            tuplesort_set_siblings(tuple_sortstate, plan_node->numCols, ru->internalEntryList);
+        }
+
         if (node->bounded) {
             tuplesort_set_bound(tuple_sortstate, node->bound);
         }
 
         node->tuplesortstate = (void*)tuple_sortstate;
+        WaitState old_status = pgstat_report_waitstatus(STATE_EXEC_SORT_FETCH_TUPLE);
 
         /*
          * Scan the subplan and feed all the tuples to tuplesort.
@@ -122,6 +135,9 @@ TupleTableSlot* ExecSort(SortState* node)
 #endif /* PGXC */
                 tuplesort_puttupleslot(tuple_sortstate, slot);
         }
+        
+        pgstat_report_waitstatus(STATE_EXEC_SORT);
+
         sort_count(tuple_sortstate);
 
         /*
@@ -147,6 +163,7 @@ TupleTableSlot* ExecSort(SortState* node)
          * Complete the sort.
          */
         tuplesort_performsort(tuple_sortstate);
+        (void)pgstat_report_waitstatus(old_status);
 
         /*
          * restore to user specified direction
@@ -179,7 +196,6 @@ TupleTableSlot* ExecSort(SortState* node)
                 &(plan_state->instrument->sorthashinfo.spaceUsed));
         }
         SO1_printf("ExecSort: %s\n", "sorting done");
-        (void)pgstat_report_waitstatus(old_status);
     }
 
     SO1_printf("ExecSort: %s\n", "retrieving tuple from tuplesort");
@@ -243,7 +259,6 @@ SortState* ExecInitSort(Sort* node, EState* estate, int eflags)
      * MARK/RESTORE.
      */
     eflags &= ~(EXEC_FLAG_REWIND | EXEC_FLAG_BACKWARD | EXEC_FLAG_MARK);
-
     outerPlanState(sortstate) = ExecInitNode(outerPlan(node), estate, eflags);
 
     /*

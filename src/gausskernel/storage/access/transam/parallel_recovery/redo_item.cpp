@@ -66,7 +66,7 @@ RedoItem *CreateRedoItem(XLogReaderState *record, uint32 shareCount, uint32 desi
         item = GetRedoItemPtr(NewReaderState(record, true));
     }
 
-    item->oldVersion = t_thrd.xlog_cxt.redo_oldversion_xlog;
+    item->replay_undo = false;
     item->sharewithtrxn = false;
     item->blockbytrxn = false;
     item->imcheckpoint = false;
@@ -81,6 +81,7 @@ RedoItem *CreateRedoItem(XLogReaderState *record, uint32 shareCount, uint32 desi
     item->RecentXmin = u_sess->utils_cxt.RecentXmin;
     item->syncServerMode = GetServerMode();
     pg_atomic_init_u32(&item->refCount, 0);
+    pg_atomic_init_u32(&item->trueRefCount, 0);
     pg_atomic_init_u32(&item->replayed, 0);
     item->nextByWorker = (RedoItem **)(((uintptr_t)item) + MAXALIGN(sizeof(RedoItem)));
     pg_atomic_init_u32(&item->freed, 0);
@@ -99,7 +100,7 @@ RedoItem *CreateLSNMarker(XLogReaderState *record, List *expectedTLIs, bool buse
         /* don't need to copy data, only need copy state */
         item = GetRedoItemPtr(NewReaderState(record, false));
     }
-    item->oldVersion = t_thrd.xlog_cxt.redo_oldversion_xlog;
+
     item->sharewithtrxn = false;
     item->blockbytrxn = false;
     item->imcheckpoint = false;
@@ -111,6 +112,7 @@ RedoItem *CreateLSNMarker(XLogReaderState *record, List *expectedTLIs, bool buse
     item->syncXLogReceiptSource = t_thrd.xlog_cxt.XLogReceiptSource;
     item->RecentXmin = u_sess->utils_cxt.RecentXmin;
     item->syncServerMode = GetServerMode();
+    item->replay_undo = false;
 
     item->nextByWorker = (RedoItem **)(((uintptr_t)item) + MAXALIGN(sizeof(RedoItem)));
     pg_atomic_init_u32(&item->freed, 0);
@@ -121,23 +123,6 @@ RedoItem *CreateLSNMarker(XLogReaderState *record, List *expectedTLIs, bool buse
 bool IsLSNMarker(const RedoItem *item)
 {
     return item->shareCount == LSN_MARKER;
-}
-
-void ApplyRedoRecord(XLogReaderState *record, bool bOld)
-{
-    t_thrd.xlog_cxt.redo_oldversion_xlog = bOld;
-    ErrorContextCallback errContext;
-    errContext.callback = rm_redo_error_callback;
-    errContext.arg = (void *)record;
-    errContext.previous = t_thrd.log_cxt.error_context_stack;
-    t_thrd.log_cxt.error_context_stack = &errContext;
-    if (module_logging_is_on(MOD_REDO)) {
-        DiagLogRedoRecord(record, "ApplyRedoRecord");
-    }
-    RmgrTable[XLogRecGetRmid(record)].rm_redo(record);
-
-    t_thrd.log_cxt.error_context_stack = errContext.previous;
-    t_thrd.xlog_cxt.redo_oldversion_xlog = false;
 }
 
 }  // namespace parallel_recovery

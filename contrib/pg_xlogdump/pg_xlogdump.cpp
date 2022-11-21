@@ -31,6 +31,7 @@
 #include "lib/stringinfo.h"
 #include "replication/replicainternal.h"
 #include "rmgrdesc.h"
+#include "storage/smgr/segment.h"
 
 static const char* progname;
 
@@ -40,6 +41,8 @@ typedef struct XLogDumpPrivate {
     XLogRecPtr startptr;
     XLogRecPtr endptr;
     bool endptr_reached;
+    char* shareStorageXlogFilePath;
+    long shareStorageXlogSize;
 } XLogDumpPrivate;
 
 typedef struct XLogDumpConfig {
@@ -75,7 +78,7 @@ typedef struct XLogDumpStats {
 static void XLogDumpTablePage(XLogReaderState* record, int block_id, RelFileNode rnode, BlockNumber blk);
 static void XLogDumpXLogRead(const char* directory, TimeLineID timeline_id, XLogRecPtr startptr, char* buf, Size count);
 static int XLogDumpReadPage(XLogReaderState* state, XLogRecPtr targetPagePtr, int reqLen, XLogRecPtr targetPtr,
-    char* readBuff, TimeLineID* curFileTLI);
+    char* readBuff, TimeLineID* curFileTLI, char* xlog_path = NULL);
 static void XLogDumpCountRecord(XLogDumpConfig* config, XLogDumpStats* stats, XLogReaderState* record);
 static void XLogDumpDisplayRecord(XLogDumpConfig* config, XLogReaderState* record);
 static void XLogDumpStatsRow(const char* name, uint64 n, uint64 total_count, uint64 rec_len, uint64 total_rec_len,
@@ -253,6 +256,71 @@ static void XLogDumpTablePage(XLogReaderState* record, int block_id, RelFileNode
     printf(" write FPW page %s to disk", block_path);
 }
 
+// for dorado storage
+static void XLogDumpReadSharedStorage(char* directory, XLogRecPtr startptr, long xlogSize, char* buf, Size count)
+{
+    char* p = buf;
+    XLogRecPtr recptr;
+    Size nbytes;
+
+    static int sendFile = -1;
+    static uint64 sendOff = 0;
+
+    recptr = startptr;
+    nbytes = count;
+
+    while (nbytes > 0) {
+        int segbytes;
+        int readbytes;
+
+        uint64 startoff = (recptr % xlogSize) + XLogSegSize;
+
+        if (sendFile < 0) {
+            canonicalize_path(directory);
+            sendFile = open(directory, O_RDONLY | PG_BINARY, 0);
+
+            if (sendFile < 0) {
+                fatal_error("could not find file \"%s\": %s", directory, strerror(errno));
+            }
+            sendOff = 0;
+        }
+
+        /* Need to seek in the file? */
+        if (sendOff != startoff) {
+            if (lseek(sendFile, (off_t)startoff, SEEK_SET) < 0) {
+                int err = errno;
+                fatal_error("could not seek in log segment %s to offset %lu: %s", directory, startoff, strerror(err));
+            }
+            sendOff = startoff;
+        }
+
+        /* How many bytes are within this segment? */
+        if (nbytes > (xlogSize - startoff)) {
+            segbytes = xlogSize - startoff;
+        } else {
+            segbytes = nbytes;
+        }
+        readbytes = read(sendFile, p, segbytes);
+        if (readbytes <= 0) {
+            int err = errno;
+
+            fatal_error("could not read from log segment %s, offset %ld, length %d: %s",
+                directory,
+                sendOff,
+                segbytes,
+                strerror(err));
+        }
+
+        /* Update state for read */
+        XLByteAdvance(recptr, readbytes);
+
+        sendOff += readbytes;
+        nbytes -= readbytes;
+        p += readbytes;
+    }
+}
+
+
 /*
  * Read count bytes from a segment file in the specified directory, for the
  * given timeline, containing the specified record pointer; store the data in
@@ -288,7 +356,7 @@ static void XLogDumpXLogRead(const char* directory, TimeLineID timeline_id, XLog
 
             XLByteToSeg(recptr, sendSegNo);
 
-            XLogFileName(fname, timeline_id, sendSegNo);
+            XLogFileName(fname, MAXFNAMELEN, timeline_id, sendSegNo);
 
             sendFile = fuzzy_open_file(directory, fname);
 
@@ -303,7 +371,7 @@ static void XLogDumpXLogRead(const char* directory, TimeLineID timeline_id, XLog
                 int err = errno;
                 char fname[MAXPGPATH];
 
-                XLogFileName(fname, timeline_id, sendSegNo);
+                XLogFileName(fname, MAXFNAMELEN, timeline_id, sendSegNo);
 
                 fatal_error("could not seek in log segment %s to offset %u: %s", fname, startoff, strerror(err));
             }
@@ -321,7 +389,7 @@ static void XLogDumpXLogRead(const char* directory, TimeLineID timeline_id, XLog
             int err = errno;
             char fname[MAXPGPATH];
 
-            XLogFileName(fname, timeline_id, sendSegNo);
+            XLogFileName(fname, MAXFNAMELEN, timeline_id, sendSegNo);
 
             fatal_error("could not read from log segment %s, offset %d, length %d: %s",
                 fname,
@@ -343,14 +411,13 @@ static void XLogDumpXLogRead(const char* directory, TimeLineID timeline_id, XLog
  * XLogReader read_page callback
  */
 static int XLogDumpReadPage(XLogReaderState* state, XLogRecPtr targetPagePtr, int reqLen, XLogRecPtr targetPtr,
-    char* readBuff, TimeLineID* curFileTLI)
+    char* readBuff, TimeLineID* curFileTLI, char* xlog_path)
 {
     XLogDumpPrivate* dumpprivate = (XLogDumpPrivate*)state->private_data;
     int count = XLOG_BLCKSZ;
 
     if (!XLByteEQ(dumpprivate->endptr, InvalidXLogRecPtr)) {
         int recptrdiff = XLByteDifference(dumpprivate->endptr, targetPagePtr);
-
         if (XLOG_BLCKSZ <= recptrdiff)
             count = XLOG_BLCKSZ;
         else if (reqLen <= recptrdiff)
@@ -361,7 +428,12 @@ static int XLogDumpReadPage(XLogReaderState* state, XLogRecPtr targetPagePtr, in
         }
     }
 
-    XLogDumpXLogRead(dumpprivate->inpath, dumpprivate->timeline, targetPagePtr, readBuff, count);
+    if (dumpprivate->shareStorageXlogFilePath == NULL) {
+        XLogDumpXLogRead(dumpprivate->inpath, dumpprivate->timeline, targetPagePtr, readBuff, count);
+    } else {
+        XLogDumpReadSharedStorage(dumpprivate->shareStorageXlogFilePath, targetPagePtr,
+            dumpprivate->shareStorageXlogSize, readBuff, count);
+    }
 
     return count;
 }
@@ -416,6 +488,24 @@ static void XLogDumpCountRecord(XLogDumpConfig* config, XLogDumpStats* stats, XL
     stats->record_stats[rmid][recid].fpi_len += fpi_len;
 }
 
+const char* storage_type_names[] = {
+    "HEAP DISK", /* Heap Disk */
+    "SEGMENT PAGE", /* Segment Page */
+    "Invalid Storage" /* Invalid Storage */
+};
+
+const char* virtual_fork_names[] = {
+    "SEGMENT_EXT_8", /* segment extent 8 */
+    "SEGMENT_EXT_128", /* segment extent 128 */
+    "SEGMENT_EXT_1024", /* segment extent 1024 */
+    "SEGMENT_EXT_8192"  /* segment extent 8192 */
+};
+
+static const char* XLogGetForkNames(ForkNumber forknum)
+{
+    return forkNames[forknum];
+}
+
 /*
  * Print a record to stdout
  */
@@ -447,106 +537,56 @@ static void XLogDumpDisplayRecord(XLogDumpConfig* config, XLogReaderState* recor
     /* the desc routine will printf the description directly to stdout */
     desc->rm_desc(NULL, record);
 
-    if (!config->bkp_details) {
-        /* print block references (short format) */
-        for (block_id = 0; block_id <= record->max_block_id; block_id++) {
-            if (!XLogRecHasBlockRef(record, block_id))
-                continue;
 
-            XLogRecGetBlockTag(record, block_id, &rnode, &forknum, &blk);
-            XLogRecGetBlockLastLsn(record, block_id, &lsn);
-            if (forknum != MAIN_FORKNUM) {
-                if (rnode.bucketNode != -1) {
-                    printf(", blkref #%u: rel %u/%u/%u/%d fork %s blk %u lastlsn %X/%X",
-                        block_id,
-                        rnode.spcNode,
-                        rnode.dbNode,
-                        rnode.relNode,
-                        rnode.bucketNode,
-                        forkNames[forknum],
-                        blk,
-                        (uint32)(lsn >> 32),
-                        (uint32)lsn);
-               } else {
-                    printf(", blkref #%u: rel %u/%u/%u fork %s blk %u lastlsn %X/%X",
-                        block_id,
-                        rnode.spcNode,
-                        rnode.dbNode,
-                        rnode.relNode,
-                        forkNames[forknum],
-                        blk,
-                        (uint32)(lsn >> 32),
-                        (uint32)lsn);
-                }
-            } else {
-                if (rnode.bucketNode != -1) {
-                    printf(", blkref #%u: rel %u/%u/%u/%d blk %u lastlsn %X/%X",
-                        block_id,
-                        rnode.spcNode,
-                        rnode.dbNode,
-                        rnode.relNode,
-                        rnode.bucketNode,
-                        blk,
-                        (uint32)(lsn >> 32),
-                        (uint32)lsn);
-                } else {
-                    printf(", blkref #%u: rel %u/%u/%u blk %u lastlsn %X/%X",
-                        block_id,
-                        rnode.spcNode,
-                        rnode.dbNode,
-                        rnode.relNode,
-                        blk,
-                        (uint32)(lsn >> 32),
-                        (uint32)lsn);
-                }
-            }
-            if (XLogRecHasBlockImage(record, block_id))
-                printf(" FPW");
+    /* print block references */
+    for (block_id = 0; block_id <= record->max_block_id; block_id++) {
+        if (!XLogRecHasBlockRef(record, block_id))
+            continue;
+
+        XLogRecGetBlockTag(record, block_id, &rnode, &forknum, &blk);
+        XLogRecGetBlockLastLsn(record, block_id, &lsn);
+
+        uint8 seg_fileno;
+        BlockNumber seg_blockno;
+        XLogRecGetPhysicalBlock(record, block_id, &seg_fileno, &seg_blockno);
+        
+        // output format: ", blkref #%u: rel %u/%u/%u/%d storage %s fork %s blk %u (phy loc %u/%u) lastlsn %X/%X"
+        printf(", blkref #%u: rel %u/%u/%u", block_id, rnode.spcNode, rnode.dbNode, rnode.relNode);
+        if (IsBucketFileNode(rnode)) {
+            printf("/%d", rnode.bucketNode);
         }
-        putchar('\n');
-    } else {
-        /* print block references (detailed format) */
-        putchar('\n');
-        for (block_id = 0; block_id <= record->max_block_id; block_id++) {
-            if (!XLogRecHasBlockRef(record, block_id))
-                continue;
-
-            XLogRecGetBlockTag(record, block_id, &rnode, &forknum, &blk);
-            XLogRecGetBlockLastLsn(record, block_id, &lsn);
-            if (rnode.bucketNode != -1) {
-                printf("\tblkref #%u: rel %u/%u/%u/%d fork %s blk %u lastlsn %X/%X",
-                    block_id,
-                    rnode.spcNode,
-                    rnode.dbNode,
-                    rnode.relNode,
-                    rnode.bucketNode,
-                    forkNames[forknum],
-                    blk,
-                    (uint32)(lsn >> 32),
-                    (uint32)lsn);
-            } else {
-                printf("\tblkref #%u: rel %u/%u/%u fork %s blk %u lastlsn %X/%X",
-                    block_id,
-                    rnode.spcNode,
-                    rnode.dbNode,
-                    rnode.relNode,
-                    forkNames[forknum],
-                    blk,
-                    (uint32)(lsn >> 32),
-                    (uint32)lsn);
+        StorageType storage_type = HEAP_DISK;
+        if (IsSegmentFileNode(rnode)) {
+            storage_type = SEGMENT_PAGE;
+        }
+        printf(" storage %s", storage_type_names[storage_type]);
+        if (forknum != MAIN_FORKNUM) {
+            printf(" fork %s", XLogGetForkNames(forknum));
+        }
+        printf(" blk %u", blk);
+        if (seg_fileno != EXTENT_INVALID) {
+            printf(" (phy loc %u/%u)", EXTENT_TYPE_TO_SIZE(BKPBLOCK_GET_SEGFILENO(seg_fileno)), seg_blockno);
+            if (record->blocks[block_id].has_vm_loc) {
+                printf(" (vm phy loc %u/%u)", EXTENT_TYPE_TO_SIZE(record->blocks[block_id].vm_seg_fileno),
+                    record->blocks[block_id].vm_seg_blockno);
             }
-            if (XLogRecHasBlockImage(record, block_id)) {
+        }
+        printf(" lastlsn %X/%X", (uint32)(lsn >> 32), (uint32)lsn);
+        if (XLogRecHasBlockImage(record, block_id)) {
+            if (config->bkp_details) {
                 printf(" (FPW); hole: offset: %u, length: %u",
                     record->blocks[block_id].hole_offset,
                     record->blocks[block_id].hole_length);
 
                 if (config->write_fpw)
                     XLogDumpTablePage(record, block_id, rnode, blk);
+            } else {
+                printf(" FPW");
             }
-
-            putchar('\n');
         }
     }
+    putchar('\n');
+    
 
     if (config->verbose) {
         printf("\tSYSID " UINT64_FORMAT "; record_origin %u; max_block_id %u; readSegNo " UINT64_FORMAT "; readOff %u; "
@@ -746,6 +786,8 @@ static void usage(void)
     printf("  -r, --rmgr=RMGR        only show records generated by resource manager RMGR\n");
     printf("                         use --rmgr=list to list valid resource manager names\n");
     printf("  -s, --start=RECPTR     start reading at log position RECPTR\n");
+    printf("  -S, --size=n           for share storage, the length of xlog file size(not include ctl info length)\n"); 
+    printf("                         default: 512*1024*1024*1024(512GB)\n");
     printf("  -t, --timeline=TLI     timeline from which to read log records\n");
     printf("                         (default: 1 or the value used in STARTSEG)\n");
     printf("  -V, --version          output version information, then exit\n");
@@ -779,6 +821,7 @@ int main(int argc, char** argv)
         {"timeline", required_argument, NULL, 't'},
         {"write-fpw", no_argument, NULL, 'w'},
         {"xid", required_argument, NULL, 'x'},
+        {"size", required_argument, NULL, 'S'},
         {"version", no_argument, NULL, 'V'},
         {"verbose", no_argument, NULL, 'v'},
         {"stats", no_argument, NULL, 'z'},
@@ -797,6 +840,9 @@ int main(int argc, char** argv)
     dumpprivate.startptr = InvalidXLogRecPtr;
     dumpprivate.endptr = InvalidXLogRecPtr;
     dumpprivate.endptr_reached = false;
+    dumpprivate.shareStorageXlogFilePath = NULL;
+    const long defaultShareStorageXlogSize = 512 * 1024 * 1024 * 1024L;
+    dumpprivate.shareStorageXlogSize = defaultShareStorageXlogSize;
 
     config.bkp_details = false;
     config.write_fpw = false;
@@ -814,7 +860,7 @@ int main(int argc, char** argv)
         goto bad_argument;
     }
 
-    while ((option = getopt_long(argc, argv, "be:?fn:p:r:s:t:Vvwx:z", long_options, &optindex)) != -1) {
+    while ((option = getopt_long(argc, argv, "be:?fn:p:r:s:S:t:Vvwx:z", long_options, &optindex)) != -1) {
         switch (option) {
             case 'b':
                 config.bkp_details = true;
@@ -869,6 +915,13 @@ int main(int argc, char** argv)
                 }
                 dumpprivate.startptr = (((uint64)hi) << 32) | lo;
                 break;
+            case 'S':
+                dumpprivate.shareStorageXlogSize = atol(optarg);
+                if (dumpprivate.shareStorageXlogSize == 0) {
+                    fprintf(stderr, "%s: could not parse share storage xlog size \"%s\"\n", progname, optarg);
+                    goto bad_argument;
+                }
+                break;
             case 't':
                 if (sscanf(optarg, "%d", &dumpprivate.timeline) != 1) {
                     fprintf(stderr, "%s: could not parse timeline \"%s\"\n", progname, optarg);
@@ -921,6 +974,11 @@ int main(int argc, char** argv)
         XLogSegNo targetsegno;
 
         split_path(argv[optind], &directory, &fname);
+
+        if (strspn(fname, "0123456789ABCDEFabcdef") != strlen(fname)) {
+            dumpprivate.shareStorageXlogFilePath = strdup(argv[optind]);
+            goto begin_read;
+        }
 
         if (dumpprivate.inpath == NULL && directory != NULL) {
             dumpprivate.inpath = directory;
@@ -980,7 +1038,9 @@ int main(int argc, char** argv)
             targetsegno = endsegno;
         }
 
-        if (!XLByteInSeg(dumpprivate.endptr, targetsegno) && dumpprivate.endptr != (targetsegno + 1) * XLogSegSize) {
+        bool reachEnd = !XLByteInSeg(dumpprivate.endptr, targetsegno) &&
+            (dumpprivate.endptr != (targetsegno + 1) * XLogSegSize);
+        if (reachEnd) {
             fprintf(stderr,
                 "%s: end log position %X/%X is not inside file \"%s\"\n",
                 progname,
@@ -991,6 +1051,7 @@ int main(int argc, char** argv)
         }
     }
 
+begin_read:
     /* we don't know what to print */
     if (XLogRecPtrIsInvalid(dumpprivate.startptr)) {
         fprintf(stderr, "%s: no start log position given.\n", progname);
@@ -1027,7 +1088,7 @@ int main(int argc, char** argv)
 
     for (;;) {
         /* try to read the next record */
-        record = XLogReadRecord(xlogreader_state, first_record, &errormsg, false);
+        record = XLogReadRecord(xlogreader_state, first_record, &errormsg);
         if (!record) {
             if (!config.follow || dumpprivate.endptr_reached)
                 break;

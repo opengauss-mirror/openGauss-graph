@@ -1,7 +1,7 @@
 /* -------------------------------------------------------------------------
  *
  * elog.h
- *	  POSTGRES error reporting/logging definitions.
+ *	  openGauss error reporting/logging definitions.
  *
  *
  * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
@@ -123,6 +123,9 @@
 #define ereport_domain(elevel, domain, rest) \
     (errstart(elevel, __FILE__, __LINE__, PG_FUNCNAME_MACRO, domain) ? (errfinish rest) : (void)0)
 
+extern THR_LOCAL int log_min_messages;
+extern THR_LOCAL int client_min_messages;
+
 #ifdef PC_LINT
 #define ereport(elevel, rest)  \
     do {                       \
@@ -131,8 +134,10 @@
     } while (0)
 
 #else
-#define ereport(elevel, rest) ereport_domain(elevel, TEXTDOMAIN, rest)
-#endif /*PCLINT_CHECK*/
+#define ereport(elevel, rest)   \
+    (((elevel) > DEBUG1 || (elevel) < DEBUG5 || log_min_messages <= (elevel) || client_min_messages <= (elevel)) ?   \
+        ereport_domain(elevel, TEXTDOMAIN, rest) : (void)0)
+#endif
 
 #define TEXTDOMAIN NULL
 
@@ -206,6 +211,16 @@ extern int errhint(const char* fmt, ...)
        the supplied arguments. */
     __attribute__((format(PG_PRINTF_ATTRIBUTE, 1, 2)));
 
+extern int errcause(const char* fmt, ...)
+    /* This extension allows gcc to check the format string for consistency with
+ *        the supplied arguments. */
+    __attribute__((format(printf, 1, 2)));
+
+extern int erraction(const char* fmt, ...)
+    /* This extension allows gcc to check the format string for consistency with
+ *  *        the supplied arguments. */
+    __attribute__((format(printf, 1, 2)));
+
 extern int errquery(const char* fmt, ...)
     /* This extension allows gcc to check the format string for consistency with
        the supplied arguments. */
@@ -224,7 +239,7 @@ extern int errposition(int cursorpos);
 
 extern int internalerrposition(int cursorpos);
 extern int internalerrquery(const char* query);
-
+extern int ErrOutToClient(bool outToClient);
 extern int geterrcode(void);
 extern int geterrposition(void);
 extern int getinternalerrposition(void);
@@ -248,7 +263,7 @@ extern int ignore_interrupt(bool ignore);
     } while (0)
 #else
 #define elog elog_start(__FILE__, __LINE__, PG_FUNCNAME_MACRO), elog_finish
-#endif /* PCLINT_CHECK */
+#endif
 
 extern void elog_start(const char* filename, int lineno, const char* funcname);
 extern void elog_finish(int elevel, const char* fmt, ...)
@@ -271,6 +286,12 @@ typedef struct ErrorContextCallback {
     void (*callback)(void* arg);
     void* arg;
 } ErrorContextCallback;
+
+typedef struct FormatCallStack {
+    struct FormatCallStack* prev;
+    void* elem;
+} FormatCallStack;
+
 
 #ifndef FRONTEND
 #define securec_check(errno, charList, ...)                                                                            \
@@ -407,7 +428,11 @@ typedef struct ErrorContextCallback {
     while (0)
 
 // ADIO means async direct io
+#ifndef ENABLE_LITE_MODE
 #define ADIO_RUN() if (g_instance.attr.attr_storage.enable_adio_function) {
+#else
+#define ADIO_RUN() if (false) {
+#endif
 
 #define ADIO_ELSE() \
     }               \
@@ -415,6 +440,7 @@ typedef struct ErrorContextCallback {
     {
 
 #define ADIO_END() }
+
 
 // BFIO means buffer io
 #define BFIO_RUN() if (!g_instance.attr.attr_storage.enable_adio_function) {
@@ -478,6 +504,8 @@ typedef struct ErrorData {
     int internalerrcode;   /* mppdb internal encoded */
     bool verbose;          /* the flag to indicate VACUUM FULL VERBOSE/ANALYZE VERBOSE message */
     bool ignore_interrupt; /* true to ignore interrupt when writing server log */
+    char* cause;
+    char* action;
 } ErrorData;
 
 /* The error data from remote */
@@ -490,6 +518,7 @@ typedef struct RemoteErrorData {
 } RemoteErrorData;
 
 extern int combiner_errdata(RemoteErrorData* pErrData);
+extern char *Geterrmsg(void);
 extern void EmitErrorReport(void);
 extern void stream_send_message_to_server_log(void);
 extern void stream_send_message_to_consumer(void);
@@ -500,6 +529,7 @@ extern void FlushErrorState(void);
 extern void FlushErrorStateWithoutDeleteChildrenContext(void);
 extern void ReThrowError(ErrorData* edata) __attribute__((noreturn));
 extern void pg_re_throw(void) __attribute__((noreturn));
+extern void PgRethrowAsFatal(void);
 
 /* GUC-configurable parameters */
 
@@ -519,7 +549,8 @@ typedef enum {
 
 /* Other exported functions */
 extern void DebugFileOpen(void);
-extern char* unpack_sql_state(int sql_state);
+extern const char* unpack_sql_state(int sql_state);
+extern const char *plpgsql_get_sqlstate(int sqlcode);
 extern bool in_error_recursion_trouble(void);
 
 #ifdef HAVE_SYSLOG
@@ -586,6 +617,15 @@ extern void SimpleLogToServer(int elevel, bool silent, const char* fmt, ...)
             (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),                                   \
                 errmsg("Un-support feature"),                                          \
                 errdetail("The distributed capability is not supported currently."))); \
+    } while (0)
+
+/* This Macro reports an error when touching on the lite mode */
+#define FEATURE_ON_LITE_MODE_NOT_SUPPORTED()                                            \
+    do {                                                                               \
+        ereport(ERROR,                                                                 \
+            (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),                                   \
+                errmsg("Un-support feature"),                                          \
+                errdetail("The feature is not supported on lite mode currently."))); \
     } while (0)
 
 #define IPC_PERFORMANCE_LOG_OUTPUT(errorMessage) \

@@ -10,6 +10,7 @@
  * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  * Portions Copyright (c) 2010-2012 Postgres-XC Development Group
+ * Portions Copyright (c) 2021, openGauss Contributors
  *
  * src/include/nodes/primnodes.h
  *
@@ -21,6 +22,7 @@
 #include "access/attnum.h"
 #include "nodes/pg_list.h"
 #include "nodes/params.h"
+
 
 /* ----------------------------------------------------------------
  *						node definitions
@@ -80,12 +82,15 @@ typedef struct RangeVar {
     char* schemaname;    /* the schema name, or NULL */
     char* relname;       /* the relation/sequence name */
     char* partitionname; /* partition name, if is a partition */
+    char* subpartitionname; /* partition name, if is a subpartition */
     InhOption inhOpt;    /* expand rel by inheritance? recursively act
                           * on children? */
+    
     char relpersistence; /* see RELPERSISTENCE_* in pg_class.h */
     Alias* alias;        /* table alias & optional column aliases */
     int location;        /* token location, or -1 if unknown */
     bool ispartition;    /* for partition action */
+    bool issubpartition;    /* for subpartition action */
     List* partitionKeyValuesList;
     bool isbucket;       /* is the RangeVar means a hash bucket id ? */
     List* buckets;       /* the corresponding bucketid list */
@@ -93,7 +98,10 @@ typedef struct RangeVar {
 #ifdef ENABLE_MOT
     Oid foreignOid;
 #endif
+    bool withVerExpr;
 } RangeVar;
+
+
 
 /*
  * IntoClause - target information for SELECT INTO, CREATE TABLE AS, and
@@ -111,6 +119,7 @@ typedef struct IntoClause {
     bool skipData;           /* true for WITH NO DATA */
     bool ivm;                /* true for WITH IVM */
     char relkind;     /* RELKIND_RELATION or RELKIND_MATVIEW */
+    Node	   *viewQuery;		/* materialized view's SELECT query */
 #ifdef PGXC
     struct DistributeBy* distributeby; /* distribution to use, or NULL */
     struct PGXCSubCluster* subcluster; /* subcluster node members */
@@ -132,6 +141,7 @@ typedef struct IntoClause {
  */
 typedef struct Expr {
     NodeTag type;
+    double selec;
 } Expr;
 
 /*
@@ -221,7 +231,7 @@ typedef struct Const {
  * any typmod info.
  * ----------------
  */
-typedef enum ParamKind { PARAM_EXTERN, PARAM_EXEC, PARAM_SUBLINK } ParamKind;
+typedef enum ParamKind { PARAM_EXTERN, PARAM_EXEC, PARAM_SUBLINK, PARAM_MULTIEXPR } ParamKind;
 
 typedef struct Param {
     Expr xpr;
@@ -231,6 +241,8 @@ typedef struct Param {
     int32 paramtypmod;   /* typmod value, if known */
     Oid paramcollid;     /* OID of collation, or InvalidOid if none */
     int location;        /* token location, or -1 if unknown */
+    Oid tableOfIndexType; /* type Oid of table of */
+    Oid recordVarTypOid; /* package record var's composite type oid */
 } Param;
 
 /*
@@ -406,6 +418,7 @@ typedef struct FuncExpr {
     Expr xpr;
     Oid funcid;              /* PG_PROC OID of the function */
     Oid funcresulttype;      /* PG_TYPE OID of result value */
+    int32 funcresulttype_orig; /* PG_TYPE OID of original result value */
     bool funcretset;         /* true if function returns set */
     /* true if variadic arguments have been  combined into an array last argument */
     bool funcvariadic;     
@@ -576,6 +589,7 @@ typedef enum SubLinkType {
 typedef struct SubLink {
     Expr xpr;
     SubLinkType subLinkType; /* see above */
+    int			subLinkId;		/* ID (1..n); 0 if not MULTIEXPR */
     Node* testexpr;          /* outer-query test for ALL/ANY/ROWCOMPARE */
     List* operName;          /* originally specified operator name */
     Node* subselect;         /* subselect as Query* or parsetree */
@@ -980,6 +994,45 @@ typedef struct MinMaxExpr {
 } MinMaxExpr;
 
 /*
+ * SQLValueFunction - parameterless functions with special grammar productions
+ *
+ * The SQL standard categorizes some of these as <datetime value function>
+ * and others as <general value specification>.  We call 'em SQLValueFunctions
+ * for lack of a better term.  We store type and typmod of the result so that
+ * some code doesn't need to know each function individually, and because
+ * we would need to store typmod anyway for some of the datetime functions.
+ * Note that currently, all variants return non-collating datatypes, so we do
+ * not need a collation field; also, all these functions are stable.
+ */
+typedef enum SQLValueFunctionOp
+{
+	SVFOP_CURRENT_DATE,
+	SVFOP_CURRENT_TIME,
+	SVFOP_CURRENT_TIME_N,
+	SVFOP_CURRENT_TIMESTAMP,
+	SVFOP_CURRENT_TIMESTAMP_N,
+	SVFOP_LOCALTIME,
+	SVFOP_LOCALTIME_N,
+	SVFOP_LOCALTIMESTAMP,
+	SVFOP_LOCALTIMESTAMP_N,
+	SVFOP_CURRENT_ROLE,
+	SVFOP_CURRENT_USER,
+	SVFOP_USER,
+	SVFOP_SESSION_USER,
+	SVFOP_CURRENT_CATALOG,
+	SVFOP_CURRENT_SCHEMA
+} SQLValueFunctionOp;
+
+typedef struct SQLValueFunction
+{
+	Expr		xpr;
+	SQLValueFunctionOp op;		/* which function this is */
+	Oid			type;			/* result type/typmod */
+	int32		typmod;
+	int			location;		/* token location, or -1 if unknown */
+} SQLValueFunction;
+
+/*
  * XmlExpr - various SQL/XML functions requiring special grammar productions
  *
  * 'name' carries the "NAME foo" argument (already XML-escaped).
@@ -1023,8 +1076,16 @@ typedef struct XmlExpr {
  * NullTest represents the operation of testing a value for NULLness.
  * The appropriate test is performed and returned as a boolean Datum.
  *
- * NOTE: the semantics of this for rowtype inputs are noticeably different
- * from the scalar case.  We provide an "argisrow" flag to reflect that.
+ * When argisrow is false, this simply represents a test for the null value.
+ *
+ * When argisrow is true, the input expression must yield a rowtype, and
+ * the node implements "row IS [NOT] NULL" per the SQL standard.  This
+ * includes checking individual fields for NULLness when the row datum
+ * itself isn't NULL.
+ *
+ * NOTE: the combination of a rowtype input and argisrow==false does NOT
+ * correspond to the SQL notation "row IS [NOT] NULL"; instead, this case
+ * represents the SQL notation "row IS [NOT] DISTINCT FROM NULL".
  * ----------------
  */
 typedef enum NullTestType { IS_NULL, IS_NOT_NULL } NullTestType;
@@ -1033,7 +1094,7 @@ typedef struct NullTest {
     Expr xpr;
     Expr* arg;                 /* input expression */
     NullTestType nulltesttype; /* IS NULL, IS NOT NULL */
-    bool argisrow;             /* T if input is of a composite type */
+    bool argisrow;             /* T to perform field-by-field null checks */
 } NullTest;
 
 /*
@@ -1150,6 +1211,35 @@ typedef struct CurrentOfExpr {
     int cursor_param;  /* refcursor parameter number, or 0 */
 } CurrentOfExpr;
 
+/*
+ * NextValueExpr - get next value from sequence
+ *
+ * This has the same effect as calling the nextval() function, but it does not
+ * check permissions on the sequence.  This is used for identity columns,
+ * where the sequence is an implicit dependency without its own permissions.
+ */
+typedef struct NextValueExpr
+{
+	Expr		xpr;
+	Oid			seqid;
+	Oid			typeId;
+} NextValueExpr;
+
+/*
+ * InferenceElem - an element of a unique index inference specification
+ *
+ * This mostly matches the structure of IndexElems, but having a dedicated
+ * primnode allows for a clean separation between the use of index parameters
+ * by utility commands, and this node.
+ */
+typedef struct InferenceElem
+{
+	Expr		xpr;
+	Node	   *expr;			/* expression to infer from, or NULL */
+	Oid			infercollid;	/* OID of collation, or InvalidOid */
+	Oid			inferopclass;	/* OID of att opclass, or InvalidOid */
+} InferenceElem;
+
 /* --------------------
  * TargetEntry -
  *	   a target entry (used in query target lists)
@@ -1216,6 +1306,13 @@ typedef struct TargetEntry {
     bool resjunk;          /* set to true to eliminate the attribute from
                             * final target list */
 } TargetEntry;
+
+/* mainly support Start with */
+typedef struct PseudoTargetEntry {
+    NodeTag      type;
+    TargetEntry *tle;
+    TargetEntry *srctle;
+} PseudoTargetEntry;
 
 /* ----------------------------------------------------------------
  *					node types for join trees
@@ -1292,6 +1389,10 @@ typedef struct JoinExpr {
     Node* quals;       /* qualifiers on join, if any */
     Alias* alias;      /* user-written alias clause, if any */
     int rtindex;       /* RT index assigned for join, or 0 */
+#ifdef GS_GRAPH
+    int minHops;
+	int maxHops;
+#endif
 } JoinExpr;
 
 /* ----------
@@ -1397,46 +1498,134 @@ typedef struct UpsertExpr {
     /* DUPLICATE KEY UPDATE */
     List* updateTlist;        /* List of UPDATE TargetEntrys */
     List* exclRelTlist;       /* tlist of the 'EXCLUDED' pseudo relation */
-    int exclRelIndex;        /* RT index of 'EXCLUDED' relation */
-    bool partKeyUpsert;      /* we allow upsert index key and partition key in B_FORMAT */
+    int exclRelIndex;         /* RT index of 'EXCLUDED' relation */
+    Node* upsertWhere;        /* Qualifiers for upsert's update clause to check */
 } UpsertExpr;
 
 /*
  * DB4AI
-*/
+ */
 #define DB4AI_SNAPSHOT_VERSION_DELIMITER 1
 #define DB4AI_SNAPSHOT_VERSION_SEPARATOR 2
 
+typedef enum MetricML{
+    // classifier
+    METRIC_ML_ACCURACY,
+    METRIC_ML_F1,
+    METRIC_ML_PRECISION,
+    METRIC_ML_RECALL,
+    // General purpouse
+    METRIC_ML_LOSS,
+    // regression
+    METRIC_ML_MSE,
+    // distance
+    METRIC_ML_DISTANCE_L1,
+    METRIC_ML_DISTANCE_L2,
+    METRIC_ML_DISTANCE_L2_SQUARED,
+    METRIC_ML_DISTANCE_L_INF,
+    // xgboost
+    METRIC_ML_AUC,    // area under curve
+    METRIC_ML_AUC_PR, // area under pr curve
+    METRIC_ML_MAP,    // mean avg. precision
+    METRIC_ML_RMSE,   // root mean square err
+    METRIC_ML_RMSLE,  // root mean square log err
+    METRIC_ML_MAE,    // mean abs. value
+    METRIC_ML_INVALID,
+} MetricML;
+
 typedef enum {
-    LOGISTIC_REGRESSION,
+   TYPE_BOOL = 0,
+   TYPE_BYTEA,
+   TYPE_INT32,
+   TYPE_INT64,
+   TYPE_FLOAT32,
+   TYPE_FLOAT64,
+   TYPE_FLOAT64ARRAY,
+   TYPE_NUMERIC,
+   TYPE_TEXT,
+   TYPE_VARCHAR,
+   TYPE_INVALID_PREDICTION,
+} PredictionType;
+
+typedef enum {
+    // algorithms implememted through the generic API
+    LOGISTIC_REGRESSION = 0,
     SVM_CLASSIFICATION,
-    KMEANS,
     LINEAR_REGRESSION,
+    PCA,
+    KMEANS,
+    XG_REG_LOGISTIC,
+    XG_BIN_LOGISTIC,
+    XG_REG_SQE, // regression with squared error
+    XG_REG_GAMMA,
+    MULTICLASS,
+
+    // for internal use
     INVALID_ALGORITHM_ML,
+
+
 } AlgorithmML;
 
-typedef enum GradientDescentExprField {
-    // generic
-    GD_EXPR_ALGORITHM,
-    GD_EXPR_OPTIMIZER,
-    GD_EXPR_RESULT_TYPE,
-    GD_EXPR_NUM_ITERATIONS,
-    GD_EXPR_EXEC_TIME_MSECS,
-    GD_EXPR_PROCESSED_TUPLES,
-   GD_EXPR_DISCARDED_TUPLES,
-    GD_EXPR_WEIGHTS,
-    GD_EXPR_CATEGORIES,
-    // scores
-    GD_EXPR_SCORE = 0x10000, // or-ed with the score id
-} GradientDescentExprField;
 
-#define makeGradientDescentExprFieldScore(_SCORE) (GradientDescentExprField)((int)GD_EXPR_SCORE | _SCORE)
+/*
+ * Cypher Query Language
+ */
+typedef struct CypherTypeCast
+{
+	Expr		xpr;
+	Oid			type;
+	/* add coercion context and type category for runtime type casting */
+	CoercionContext cctx;
+	CoercionForm cform;
+	char		typcategory;
+	Expr	   *arg;
+	int			location;
+} CypherTypeCast;
 
-typedef struct GradientDescentExpr {
-    Expr                        xpr;
-    GradientDescentExprField    field;
-    Oid fieldtype;      /* pg_type OID of the datatype */
-} GradientDescentExpr;
+typedef struct CypherMapExpr
+{
+	Expr		xpr;
+	List	   *keyvals;		/* key, value, key, value, ... */
+	int			location;
+} CypherMapExpr;
 
+typedef struct CypherListExpr
+{
+	Expr		xpr;
+	List	   *elems;
+	int 		location;
+} CypherListExpr;
+
+typedef struct CypherListCompExpr
+{
+	Expr		xpr;
+	Expr	   *list;
+	char	   *varname;
+	Expr	   *cond;
+	Expr	   *elem;
+	int			location;
+} CypherListCompExpr;
+
+typedef struct CypherListCompVar
+{
+	Expr		xpr;
+	char	   *varname;
+	int			location;
+} CypherListCompVar;
+
+typedef struct CypherAccessExpr
+{
+	Expr		xpr;
+	Expr	   *arg;
+	List	   *path;
+} CypherAccessExpr;
+
+typedef struct CypherIndices
+{
+	NodeTag		type;
+	bool		is_slice;
+	Expr	   *lidx;
+	Expr	   *uidx;
+} CypherIndices;
 
 #endif /* PRIMNODES_H */

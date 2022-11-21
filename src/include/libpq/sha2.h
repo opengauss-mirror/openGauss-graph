@@ -51,10 +51,15 @@
 /*** SHA-256 Context Structures *******************************/
 #define K_LENGTH 32
 #define ITERATION_COUNT 10000
+#ifdef ENABLE_LITE_MODE
+#define ITERATION_COUNT_V1 2048
+#endif
 #define CLIENT_STRING_LENGTH 11
 #define SEVER_STRING_LENGTH 10
 #define SEVER_STRING_LENGTH_SM3 11
 #define HMAC_LENGTH 32
+#define ENCRY_LENGTH_DOUBLE 2
+
 #define HMAC_BYTES_LENGTH 32
 #define HMAC_STRING_LENGTH (HMAC_LENGTH * 2)
 #define STORED_KEY_LENGTH 32
@@ -94,10 +99,13 @@
 #define PLAIN_PASSWORD 0
 #define MD5_PASSWORD 1
 #define SHA256_PASSWORD 2
-#define ERROR_PASSWORD 3
-#define BAD_MEM_ADDR 4
-#define COMBINED_PASSWORD 5
-#define SM3_PASSWORD 6
+#define SM3_PASSWORD 3
+#define ERROR_PASSWORD 4
+#define BAD_MEM_ADDR 5
+#ifdef ENABLE_LITE_MODE
+#define SHA256_PASSWORD_RFC 6
+#endif
+#define COMBINED_PASSWORD 7
 
 typedef struct _SHA256_CTX2 {
     uint32 state[8];
@@ -112,13 +120,16 @@ void SHA256_Final2(uint8[SHA256_DIGEST_LENGTH], SHA256_CTX2*);
 /* Use the old iteration ITERATION_COUNT as the default iteraion count. */
 extern bool pg_sha256_encrypt(const char* passwd, const char* salt_s, size_t salt_len, char* buf, char* client_key_buf,
     int iteration_count = ITERATION_COUNT);
+#ifdef ENABLE_LITE_MODE
+extern bool pg_sha256_encrypt_v1(const char* passwd, const char* salt_s, size_t salt_len, char* buf, char* client_key_buf);
+#endif
 extern int XOR_between_password(const char* password1, const char* password2, char* r, int length);
 extern void sha_hex_to_bytes32(char* s, const char b[64]);
 extern void sha_hex_to_bytes4(char* s, const char b[8]);
 extern void sha_bytes_to_hex8(uint8 b[4], char* s);
 extern void sha_bytes_to_hex64(uint8 b[32], char* s);
 extern bool pg_sha256_encrypt_for_md5(const char* passwd, const char* salt, size_t salt_len, char* buf);
-extern bool gs_sm3_encrypt(const char* passwd, const char* salt_s, size_t salt_len, char* buf, char* client_key_buf,
+extern bool GsSm3Encrypt(const char* passwd, const char* salt_s, size_t salt_len, char* buf, char* client_key_buf,
     int iteration_count = ITERATION_COUNT);
 
 #endif /* _SHA2_H */

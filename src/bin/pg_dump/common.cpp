@@ -6,6 +6,7 @@
  *
  * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
+ * Portions Copyright (c) 2021, openGauss Contributors
  *
  *
  * IDENTIFICATION
@@ -46,16 +47,19 @@ static int numCatalogIds = 0;
 static TableInfo* tblinfo;
 static TypeInfo* typinfo;
 static FuncInfo* funinfo;
+static PkgInfo* packageinfo;
 static OprInfo* oprinfo;
 static NamespaceInfo* nspinfo;
 static int numTables;
 static int numTypes;
+static int numPackages;
 static int numFuncs;
 static int numOperators;
 static int numCollations;
 static int numNamespaces;
 static DumpableObject** tblinfoindex;
 static DumpableObject** typinfoindex;
+static DumpableObject** packageinfoindex;
 static DumpableObject** funinfoindex;
 static DumpableObject** oprinfoindex;
 static DumpableObject** collinfoindex;
@@ -246,6 +250,28 @@ TableInfo* getSchemaData(Archive* fout, int* numTablesPtr)
         write_msg(NULL, "reading row level security policies\n");
     getRlsPolicies(fout, tblinfo, numTables);
 
+    if (g_verbose)
+        write_msg(NULL, "reading user-defined packages\n");
+    packageinfo = getPackages(fout, &numPackages);
+    if (packageinfo!=NULL) {
+        packageinfoindex = buildIndexArray(packageinfo, numPackages, sizeof(PkgInfo));
+    }
+
+    if (g_verbose) {
+        write_msg(NULL, "reading publications\n");
+    }
+    getPublications(fout);
+
+    if (g_verbose) {
+        write_msg(NULL, "reading publication membership\n");
+    }
+    getPublicationTables(fout, tblinfo, numTables);
+
+    if (g_verbose) {
+        write_msg(NULL, "reading subscriptions\n");
+    }
+    getSubscriptions(fout);
+
     *numTablesPtr = numTables;
     GS_FREE(inhinfo);
     return tblinfo;
@@ -269,7 +295,7 @@ static void flagInhTables(TableInfo* ptblinfo, int inumTables, InhInfo* inhinfo,
 
     for (i = 0; i < inumTables; i++) {
         /* Sequences, contqueries and views never have parents */
-        if (ptblinfo[i].relkind == RELKIND_SEQUENCE || ptblinfo[i].relkind == RELKIND_VIEW || 
+        if (RELKIND_IS_SEQUENCE(ptblinfo[i].relkind) || ptblinfo[i].relkind == RELKIND_VIEW || 
             ptblinfo[i].relkind == RELKIND_CONTQUERY)
             continue;
 
@@ -310,8 +336,8 @@ static void flagInhAttrs(TableInfo* ptblinfo, int inumTables)
         TableInfo** parents;
 
         /* Sequences, contqueries and views never have parents */
-        if (tbinfo->relkind == RELKIND_SEQUENCE || tbinfo->relkind == RELKIND_VIEW || 
-            tbinfo->relkind == RELKIND_CONTQUERY)
+        if (RELKIND_IS_SEQUENCE(tbinfo->relkind) || tbinfo->relkind == RELKIND_VIEW || 
+            tbinfo->relkind == RELKIND_MATVIEW || tbinfo->relkind == RELKIND_CONTQUERY)
             continue;
 
         /* Don't bother computing anything for non-target tables, either */
@@ -592,7 +618,7 @@ static int DOCatalogIdCompare(const void* p1, const void* p2)
 
 /*
  * Build an array of pointers to all known dumpable objects
- *
+ * 
  * This simply creates a modifiable copy of the internal map.
  */
 void getDumpableObjects(DumpableObject*** objs, int* numObjs)

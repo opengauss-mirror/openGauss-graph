@@ -18,7 +18,7 @@
 #include "access/xlogdefs.h"
 #include "access/xlog_internal.h"
 #include "storage/buf/block.h"
-#include "storage/relfilenode.h"
+#include "storage/smgr/relfilenode.h"
 #include "bin/elog.h"
 
 #define TAG_START "build_completed.start"
@@ -53,7 +53,8 @@ extern char divergeXlogFileName[MAXFNAMELEN];
 /* in parsexlog.c */
 extern void extractPageMap(const char* datadir, XLogRecPtr startpoint, TimeLineID tli);
 extern XLogRecPtr readOneRecord(const char* datadir, XLogRecPtr ptr, TimeLineID tli);
-extern XLogRecPtr FindMaxLSN(char* workingpath, char* returnmsg, pg_crc32 *maxLsnCrc);
+extern XLogRecPtr FindMaxLSN(char* workingpath, char* returnmsg, pg_crc32 *maxLsnCrc, uint32 *maxLsnLen = NULL, 
+    TimeLineID *returnTli = NULL);
 BuildErrorCode findCommonCheckpoint(const char* datadir, TimeLineID tli, XLogRecPtr startrec, XLogRecPtr* lastchkptrec,
     TimeLineID* lastchkpttli, XLogRecPtr *lastchkptredo, uint32 term);
 extern int find_gucoption(const char** optlines, const char* opt_name, int* name_offset, int* name_len, 

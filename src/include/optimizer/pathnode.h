@@ -51,6 +51,7 @@ extern bool add_path_precheck(
     RelOptInfo* parent_rel, Cost startup_cost, Cost total_cost, List* pathkeys, Relids required_outer);
 
 extern Path* create_seqscan_path(PlannerInfo* root, RelOptInfo* rel, Relids required_outer, int dop = 1);
+extern Path *create_resultscan_path(PlannerInfo *root, RelOptInfo *rel, Relids required_outer);
 extern Path* create_cstorescan_path(PlannerInfo* root, RelOptInfo* rel, int dop = 1);
 #ifdef ENABLE_MULTIPLE_NODES
 extern Path *create_tsstorescan_path(PlannerInfo * root,RelOptInfo * rel, int dop = 1);
@@ -61,6 +62,7 @@ extern IndexPath* create_index_path(PlannerInfo* root, IndexOptInfo* index, List
 extern Path* build_seqScanPath_by_indexScanPath(PlannerInfo* root, Path* index_path);
 extern bool CheckBitmapQualIsGlobalIndex(Path* bitmapqual);
 extern bool CheckBitmapHeapPathContainGlobalOrLocal(Path* bitmapqual);
+extern bool CheckBitmapHeapPathIsCrossbucket(Path* bitmapqual);
 extern bool check_bitmap_heap_path_index_unusable(Path* bitmapqual, RelOptInfo* baserel);
 extern bool is_partitionIndex_Subpath(Path* subpath);
 extern bool is_pwj_path(Path* pwjpath);
@@ -86,17 +88,27 @@ extern ForeignPath* create_foreignscan_path(PlannerInfo* root, RelOptInfo* rel, 
 extern Relids calc_nestloop_required_outer(Path* outer_path, Path* inner_path);
 extern Relids calc_non_nestloop_required_outer(Path* outer_path, Path* inner_path);
 
+#ifdef GS_GRAPH
+extern NestPath* create_nestloop_path(PlannerInfo* root, RelOptInfo* joinrel, JoinType jointype, JoinCostWorkspace* workspace, 
+    JoinPathExtraData* extra, SpecialJoinInfo* sjinfo, SemiAntiJoinFactors* semifactors, Path* outer_path,
+    Path* inner_path, List* restrict_clauses, List* pathkeys, Relids required_outer, int dop = 1);
+extern MergePath* create_mergejoin_path(PlannerInfo* root, RelOptInfo* joinrel, JoinType jointype,
+    JoinCostWorkspace* workspace, SpecialJoinInfo* sjinfo, Path* outer_path, Path* inner_path, List* restrict_clauses,
+    List* pathkeys, Relids required_outer, List* mergeclauses, JoinPathExtraData* extra, List* outersortkeys, List* innersortkeys);
+extern HashPath* create_hashjoin_path(PlannerInfo* root, RelOptInfo* joinrel, JoinType jointype, JoinCostWorkspace* workspace, 
+    JoinPathExtraData *extra, SpecialJoinInfo* sjinfo, SemiAntiJoinFactors* semifactors, Path* outer_path, Path* inner_path,
+    List* restrict_clauses, Relids required_outer, List* hashclauses, int dop = 1);
+#else
 extern NestPath* create_nestloop_path(PlannerInfo* root, RelOptInfo* joinrel, JoinType jointype,
     JoinCostWorkspace* workspace, SpecialJoinInfo* sjinfo, SemiAntiJoinFactors* semifactors, Path* outer_path,
     Path* inner_path, List* restrict_clauses, List* pathkeys, Relids required_outer, int dop = 1);
-
 extern MergePath* create_mergejoin_path(PlannerInfo* root, RelOptInfo* joinrel, JoinType jointype,
     JoinCostWorkspace* workspace, SpecialJoinInfo* sjinfo, Path* outer_path, Path* inner_path, List* restrict_clauses,
     List* pathkeys, Relids required_outer, List* mergeclauses, List* outersortkeys, List* innersortkeys);
-
-extern HashPath* create_hashjoin_path(PlannerInfo* root, RelOptInfo* joinrel, JoinType jointype,
-    JoinCostWorkspace* workspace, SpecialJoinInfo* sjinfo, SemiAntiJoinFactors* semifactors, Path* outer_path,
-    Path* inner_path, List* restrict_clauses, Relids required_outer, List* hashclauses, int dop = 1);
+extern HashPath* create_hashjoin_path(PlannerInfo* root, RelOptInfo* joinrel, JoinType jointype, JoinCostWorkspace* workspace,
+    SpecialJoinInfo* sjinfo, SemiAntiJoinFactors* semifactors, Path* outer_path, Path* inner_path,
+    List* restrict_clauses, Relids required_outer, List* hashclauses, int dop = 1);
+#endif
 
 extern Path* reparameterize_path(PlannerInfo* root, Path* path, Relids required_outer, double loop_count);
 
@@ -122,13 +134,21 @@ extern void get_distribute_keys(PlannerInfo* root, List* joinclauses, Path* oute
 extern bool is_distribute_need_on_joinclauses(PlannerInfo* root, List* side_distkeys, List* joinclauses,
     const RelOptInfo* side_rel, const RelOptInfo* other_rel, List** rrinfo);
 
+#ifdef GS_GRAPH
 extern void add_hashjoin_path(PlannerInfo* root, RelOptInfo* joinrel, JoinType jointype, JoinType save_jointype,
-    JoinCostWorkspace* workspace, SpecialJoinInfo* sjinfo, SemiAntiJoinFactors* semifactors, Path* outer_path,
-    Path* inner_path, List* restrictlist, Relids required_outer, List* hashclauses, Distribution* target_distribution);
-
+    JoinCostWorkspace* workspace, JoinPathExtraData *extra, SpecialJoinInfo* sjinfo, SemiAntiJoinFactors* semifactors, 
+    Path* outer_path, Path* inner_path, List* restrictlist, Relids required_outer, List* hashclauses, Distribution* target_distribution);
 extern void add_nestloop_path(PlannerInfo* root, RelOptInfo* joinrel, JoinType jointype, JoinType save_jointype,
     JoinCostWorkspace* workspace, SpecialJoinInfo* sjinfo, SemiAntiJoinFactors* semifactors, Path* outer_path,
     Path* inner_path, List* restrict_clauses, List* pathkeys, Relids required_outer, Distribution* target_distribution);
+#else
+extern void add_hashjoin_path(PlannerInfo* root, RelOptInfo* joinrel, JoinType jointype, JoinType save_jointype, JoinCostWorkspace* workspace, 
+    JoinPathExtraData *extra, SpecialJoinInfo* sjinfo, SemiAntiJoinFactors* semifactors, Path* outer_path,
+    Path* inner_path, List* restrictlist, Relids required_outer, List* hashclauses, Distribution* target_distribution);
+extern void add_nestloop_path(PlannerInfo* root, RelOptInfo* joinrel, JoinType jointype, JoinType save_jointype,
+    JoinCostWorkspace* workspace, SpecialJoinInfo* sjinfo, SemiAntiJoinFactors* semifactors, Path* outer_path,
+    Path* inner_path, List* restrict_clauses, List* pathkeys, Relids required_outer, Distribution* target_distribution);
+#endif
 
 extern void add_mergejoin_path(PlannerInfo* root, RelOptInfo* joinrel, JoinType jointype, JoinType save_jointype,
     JoinCostWorkspace* workspace, SpecialJoinInfo* sjinfo, Path* outer_path, Path* inner_path, List* restrict_clauses,
@@ -206,6 +226,24 @@ extern Path* get_redist_unique_redist_unique(PlannerInfo* root, Path* path, Stre
 extern bool equivalence_class_overlap(PlannerInfo* root, Relids outer_relids, Relids inner_relids);
 
 extern void debug3_print_two_relids(Relids first_relids, Relids second_relids, PlannerInfo* root, StringInfoData* buf);
+
+extern RemoteQueryExecType SetExectypeForJoinPath(Path* inner_path, Path* outer_path);
+extern bool CheckJoinExecType(PlannerInfo *root, Path *outer_path, Path *inner_path);
+extern bool IsSameJoinExecType(PlannerInfo *root, Path *outer_path, Path *inner_path);
+
+extern bool is_diskey_and_joinkey_compatible(Node* diskey, Node* joinkey);
+
+#ifdef GS_GRAPH
+#define RINFO_IS_PUSHED_DOWN(rinfo, joinrelids) \
+	((rinfo)->is_pushed_down || \
+	 !bms_is_subset((rinfo)->required_relids, joinrelids))
+extern ModifyGraphPath* create_modifygraph_path(PlannerInfo *root,
+						RelOptInfo *rel, bool canSetTag, GraphWriteOp operation,
+						bool last, bool detach, Path *subpath, List *pattern, 
+						List *targets, List *exprs, List *sets);
+// extern bool add_partial_path_precheck(RelOptInfo *parent_rel,
+// 									  Cost total_cost, List *pathkeys);
+#endif /* GS_GRAPH */
 
 #endif
 #endif /* PATHNODE_H */

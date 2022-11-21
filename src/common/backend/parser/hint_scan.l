@@ -39,9 +39,16 @@ static const hintKeyword parsers[] =
 	{HINT_MULTI_NODE, HINT_MULTI_NODE_P},
 	{HINT_NULL, NULL_P},
 	{HINT_TRUE, TRUE_P},
-    	{HINT_FALSE, FALSE_P},
-    	{HINT_PRED_PUSH, Predpush_P},
+	{HINT_FALSE, FALSE_P},
+	{HINT_PRED_PUSH, Predpush_P},
+	{HINT_PRED_PUSH_SAME_LEVEL, PredpushSameLevel_P},
 	{HINT_REWRITE, Rewrite_P},
+	{HINT_GATHER, Gather_P},
+	{HINT_SET, Set_P},
+	{HINT_CPLAN, USE_CPLAN_P},
+	{HINT_GPLAN, USE_GPLAN_P},
+	{HINT_NO_EXPAND, No_expand_P},
+	{HINT_NO_GPC, NO_GPC_P},
 };
 
 static const hintKeyword* HintKeywordLookup(const char *str);

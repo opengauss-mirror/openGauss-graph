@@ -58,6 +58,17 @@
 typedef enum { PGC_INTERNAL, PGC_POSTMASTER, PGC_SIGHUP, PGC_BACKEND, PGC_SUSET, PGC_USERSET } GucContext;
 
 /*
+ * The following type represents the application environment of the
+ * parameter.
+ * 
+ * NODE_ALL: general parameters, suitable for centralized and distributed
+ * scenarios.
+ * NODE_SINGLENODE: centralized parameters, suitable for centralized scenarios.
+ * NODE_DISTRIBUTE: distributed parameters, suitable for distributed scenarios.
+ */
+typedef enum { NODE_ALL, NODE_SINGLENODE, NODE_DISTRIBUTE } GucNodeType;
+
+/*
  * The following type records the source of the current setting.  A
  * new setting can only take effect if the previous setting had the
  * same or lower level.  (E.g, changing the config file doesn't
@@ -259,7 +270,6 @@ extern int GetNumConfigOptions(void);
 extern void SetPGVariable(const char* name, List* args, bool is_local);
 extern void GetPGVariable(const char* name, const char* likename, DestReceiver* dest);
 extern TupleDesc GetPGVariableResultDesc(const char* name);
-
 #ifdef PGXC
 extern char* RewriteBeginQuery(char* query_string, const char* name, List* args);
 #endif
@@ -316,7 +326,6 @@ extern bool check_asp_flush_mode(char** newval, void** extra, GucSource source);
 
 /* in access/transam/xlog.c */
 extern bool check_wal_buffers(int* newval, void** extra, GucSource source);
-extern bool check_wal_insert_status_entries(int* newval, void** extra, GucSource source);
 extern void assign_xlog_sync_method(int new_sync_method, void* extra);
 
 /* in tcop/stmt_retry.cpp */
@@ -357,8 +366,23 @@ typedef enum {
     PARAM_PATH_GEN = 4, /* Parametrized Path Generation */
     RAND_COST_OPT = 8,  /* Optimizing sc_random_page_cost */
     PARAM_PATH_OPT = 16, /* Parametrized Path Optimization. */
-    PAGE_EST_OPT = 32   /* More accurate (rowstored) index pages estimation */
+    PAGE_EST_OPT = 32,   /* More accurate (rowstored) index pages estimation */
+    NO_UNIQUE_INDEX_FIRST = 64, /* use unique index first rule in path generation */
+    JOIN_SEL_WITH_CAST_FUNC = 128, /* support cast function while calculating join selectivity */
+    CANONICAL_PATHKEY = 256, /* Use canonicalize pathkeys directly */
+    INDEX_COST_WITH_LEAF_PAGES_ONLY = 512, /* compute index cost with consideration of leaf-pages-only */
+    PARTITION_OPFUSION = 1024, /* Enable partition opfusion */
+    A_STYLE_COERCE = 2048,
+    PLPGSQL_STREAM_FETCHALL = 4096, /* fetch all tuple when has stream sql under plpgsql's for-loop */
+    PREDPUSH_SAME_LEVEL = 8192, /* predpush same level */
+    PARTITION_FDW_ON = 16384 /* support create foreign table on partitioned table */
 } sql_beta_param;
+
+typedef enum {
+    OFF_VECTOR_ENGINE,
+    FORCE_VECTOR_ENGINE,
+    OPT_VECTOR_ENGINE
+} TryVectorEngineStrategy;
 
 #define ENABLE_PRED_PUSH(root) \
     ((PRED_PUSH & (uint)u_sess->attr.attr_sql.rewrite_rule) && permit_predpush(root))
@@ -375,6 +399,11 @@ typedef enum {
 #define ENABLE_SQL_BETA_FEATURE(feature) \
     ((bool)((uint)u_sess->attr.attr_sql.sql_beta_feature & feature))
 
+#define PARTITION_OPFUSION_MAX_NUMA_NODE 4
+#define PARTITION_ENABLE_CACHE_OPFUSION             \
+    (ENABLE_SQL_BETA_FEATURE(PARTITION_OPFUSION) && \
+        g_instance.shmem_cxt.numaNodeNum <= PARTITION_OPFUSION_MAX_NUMA_NODE)
+
 typedef enum {
     SUMMARY = 0, /* not collect multi column statistics info */
     DETAIL = 1,  /* collect multi column statistics info */
@@ -386,6 +415,9 @@ typedef struct {
 } ConfFileLock;
 
 #define PG_LOCKFILE_SIZE 1024
+
+#define CONFIG_BAK_FILENAME "postgresql.conf.bak"
+
 extern void* pg_malloc(size_t size);
 extern char* xstrdup(const char* s);
 
@@ -395,6 +427,7 @@ extern int find_guc_option(char** optlines, const char* opt_name,
     int* name_offset, int* name_len, int* value_offset, int* value_len, bool ignore_case);
 
 extern void modify_guc_lines(char*** optlines, const char** opt_name, char** copy_from_line);
+extern void modify_guc_one_line(char*** guc_optlines, const char* opt_name, const char* copy_from_line);
 extern ErrCode copy_guc_lines(char** copy_to_line, char** optlines, const char** opt_name);
 extern ErrCode copy_asyn_lines(char* path, char** copy_to_line, const char** opt_name);
 
@@ -433,6 +466,24 @@ extern void set_qunit_case_number_hook(int newval, void* extra);
 #endif
 
 extern GucContext get_guc_context();
-extern void InitializeNumLwLockPartitions(void);
+
+extern bool check_double_parameter(double* newval, void** extra, GucSource source);
+extern bool CheckReplChannel(const char* ChannelInfo);
+extern bool logging_module_check(char** newval, void** extra, GucSource source);
+extern void logging_module_guc_assign(const char* newval, void* extra);
+extern bool check_directory(char** newval, void** extra, GucSource source);
+extern bool transparent_encrypt_kms_url_region_check(char** newval, void** extra, GucSource source);
+extern bool check_canonical_path(char** newval, void** extra, GucSource source);
+
+#ifdef ENABLE_MULTIPLE_NODES
+extern const char* show_nodegroup_mode(void);
+#endif
+
+extern THR_LOCAL GucContext currentGucContext;
+
+#ifdef GS_GRAPH
+/* in catalog/gs_graph.cpp */
+extern bool check_graph_path(char **newval, void **extra, GucSource source);
+#endif
 
 #endif /* GUC_H */

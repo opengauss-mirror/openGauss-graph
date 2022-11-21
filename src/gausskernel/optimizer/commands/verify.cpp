@@ -57,7 +57,7 @@ static List* GetVerifyRelidList(VacuumStmt* stmt);
 static void DoGlobalVerifyRowRel(VacuumStmt* stmt, Oid relid, bool isDatabase);
 static void DoGlobalVerifyColRel(VacuumStmt* stmt, Oid relid, bool isDatabase);
 static void DoVerifyIndexRel(VacuumStmt* stmt, Oid indexRelid);
-static void VerifyPartRel(VacuumStmt* stmt, Relation rel, Oid partOid, bool isRowTable);
+static void VerifyPartRel(VacuumStmt* stmt, Relation rel, Oid partOid, bool isRowTable, bool issubpartition = false);
 static void VerifyPartIndexRels(VacuumStmt* stmt, Relation rel, Relation partitionRel);
 static void VerifyPartIndexRel(VacuumStmt* stmt, Relation rel, Relation partitionRel, Oid indexOid);
 static void VerifyIndexRels(VacuumStmt* stmt, Relation rel, VerifyDesc* checkCudesc = NULL);
@@ -695,7 +695,7 @@ static List* GetVerifyRelidList(VacuumStmt* stmt)
          * Scan pg_class to build a list of the relations we need to reindex.
          *
          * We only consider plain relations here (toast rels will be processed
-         * indirectly by reindex_relation).
+         * indirectly by ReindexRelation).
          */
         relationRelation = heap_open(RelationRelationId, AccessShareLock);
         scan = tableam_scan_begin(relationRelation, GetActiveSnapshot(), 0, NULL);
@@ -774,14 +774,36 @@ static void DoGlobalVerifyRowRel(VacuumStmt* stmt, Oid relid, bool isDatabase)
                 NULL,
                 NULL,
                 NoLock);
-            VerifyPartRel(stmt, rel, partOid, true);
+            Partition part = partitionOpen(rel, partOid, AccessShareLock);
+            if (PartitionHasSubpartition(part)) {
+                Relation partrel = partitionGetRelation(rel, part);
+                Oid subpartOid;
+                ListCell* cell = NULL;
+                List* partOidList = relationGetPartitionOidList(partrel);
+                foreach (cell, partOidList) {
+                    subpartOid = lfirst_oid(cell);
+                    VerifyPartRel(stmt, rel, subpartOid, true, true);
+                }
+                releaseDummyRelation(&partrel);
+            } else {
+                VerifyPartRel(stmt, rel, partOid, true);
+            }
 
+            partitionClose(rel, part, AccessShareLock);
             relation_close(rel, AccessShareLock);
             return;
         }
     }
 
-    if (RELATION_IS_PARTITIONED(rel)) {
+    if (RelationIsSubPartitioned(rel)) {
+        Oid partOid;
+        ListCell* cell = NULL;
+        List* partOidList = RelationGetSubPartitionOidList(rel);
+        foreach (cell, partOidList) {
+            partOid = lfirst_oid(cell);
+            VerifyPartRel(stmt, rel, partOid, true, true);
+        }
+    } else if (RELATION_IS_PARTITIONED(rel)) {
         Oid partOid;
         ListCell* cell = NULL;
         List* partOidList = relationGetPartitionOidList(rel);
@@ -914,10 +936,23 @@ static void DoVerifyIndexRel(VacuumStmt* stmt, Oid indexRelid)
  * @in isRowTable - judge the table is row table or column table
  * @return: void
  */
-static void VerifyPartRel(VacuumStmt* stmt, Relation rel, Oid partOid, bool isRowTable)
+static void VerifyPartRel(VacuumStmt* stmt, Relation rel, Oid partOid, bool isRowTable, bool issubpartition)
 {
-    Partition part = partitionOpen(rel, partOid, AccessShareLock);
-    Relation partitionRel = partitionGetRelation(rel, part);
+    Partition part = NULL;
+    Relation partitionRel = NULL;
+    Oid subparentid = InvalidOid;
+    Partition parentpart = NULL;
+    Relation parentpartitionRel = NULL;
+    if (!issubpartition) {
+        part = partitionOpen(rel, partOid, AccessShareLock);
+        partitionRel = partitionGetRelation(rel, part);
+    } else {
+        subparentid = partid_get_parentid(partOid);
+        parentpart = partitionOpen(rel, subparentid, AccessShareLock);
+        parentpartitionRel = partitionGetRelation(rel, parentpart);
+        part = partitionOpen(parentpartitionRel, partOid, AccessShareLock);
+        partitionRel = partitionGetRelation(parentpartitionRel, part);
+    }
 
     /* check the main partition table. */
     PG_TRY();
@@ -947,8 +982,15 @@ static void VerifyPartRel(VacuumStmt* stmt, Relation rel, Oid partOid, bool isRo
         }
     }
     PG_END_TRY();
-    partitionClose(rel, part, AccessShareLock);
-    releaseDummyRelation(&partitionRel);
+    if (!issubpartition) {
+        releaseDummyRelation(&partitionRel);
+        partitionClose(rel, part, AccessShareLock);
+    } else {
+        releaseDummyRelation(&partitionRel);
+        partitionClose(parentpartitionRel, part, AccessShareLock);
+        releaseDummyRelation(&parentpartitionRel);
+        partitionClose(rel, parentpart, AccessShareLock);
+    }
     return;
 }
 
@@ -1223,7 +1265,6 @@ static bool VerifyRowRelFast(Relation rel, VerifyDesc* checkCudesc)
     char* buf = (char*)palloc(BLCKSZ);
     BlockNumber nblocks;
     BlockNumber blkno;
-    Page page = (Page)buf;
     ForkNumber forkNum = MAIN_FORKNUM;
     bool isValidRelationPage = true;
 
@@ -1237,9 +1278,19 @@ static bool VerifyRowRelFast(Relation rel, VerifyDesc* checkCudesc)
     for (blkno = 0; blkno < nblocks; blkno++) {
         /* If we got a cancel signal during the copy of the data, quit */
         CHECK_FOR_INTERRUPTS();
-        smgrread(src, forkNum, blkno, buf);
+        SMGR_READ_STATUS rdStatus = smgrread(src, forkNum, blkno, buf);
         /* check the page & crc */
-        if (!PageIsVerified(page, blkno)) {
+        if (rdStatus == SMGR_RD_CRC_ERROR) {
+            // Retry 5 times to increase program reliability.
+            for (int retryTimes = 1; retryTimes < FAIL_RETRY_MAX_NUM && rdStatus == SMGR_RD_CRC_ERROR; ++retryTimes) {
+                /* If we got a cancel signal during the copy of the data, quit */
+                CHECK_FOR_INTERRUPTS();
+                rdStatus = smgrread(src, forkNum, blkno, buf);
+            }
+            if (rdStatus != SMGR_RD_CRC_ERROR) {
+                continue;
+            }
+
             isValidRelationPage = false;
             /*
              * check the cudesc table|cudesc-toast| cudesc_index. If one of them is damaged, we will have to
@@ -1259,6 +1310,8 @@ static bool VerifyRowRelFast(Relation rel, VerifyDesc* checkCudesc)
                         RelationGetRelationName(rel),
                         relpathbackend(src->smgr_rnode.node, src->smgr_rnode.backend, forkNum)),
                         handle_in_client(true)));
+            /* Add the wye page to the global variable and try to fix it. */
+            addGlobalRepairBadBlockStat(src->smgr_rnode, forkNum, blkno);
         }
     }
 
@@ -1282,7 +1335,7 @@ static bool VerifyRowRelComplete(Relation rel, VerifyDesc* checkCudesc)
     }
 
     TableScanDesc scandesc;
-    HeapTuple tuple;
+    Tuple tuple;
     TupleDesc tupleDesc;
     Datum* values = NULL;
     bool* nulls = NULL;
@@ -1314,7 +1367,7 @@ static bool VerifyRowRelComplete(Relation rel, VerifyDesc* checkCudesc)
 
     NEXT_TUPLE:
         CHECK_FOR_INTERRUPTS();
-        tuple = heapGetNextForVerify(scandesc, ForwardScanDirection, isValidRelationPageComplete);
+        tuple = tableam_scan_gettuple_for_verify(scandesc, ForwardScanDirection, isValidRelationPageComplete);
         if (tuple == NULL) {
             tableam_scan_end(scandesc);
             pfree_ext(values);
@@ -1323,14 +1376,14 @@ static bool VerifyRowRelComplete(Relation rel, VerifyDesc* checkCudesc)
             (void)MemoryContextSwitchTo(oldMemContext);
             MemoryContextDelete(verifyRowMemContext);
             return (isValidRelationPageFast && isValidRelationPageComplete);
-        } else if (tuple != NULL && tuple->t_data != NULL) {
+        } else if (tuple != NULL && ((HeapTuple)tuple)->t_data != NULL) {
             PG_TRY();
             {
                 /*
                  * deform the passed heap tuple. call heap_deform_tuple() if it's not compressed,
                  * otherwise call heap_deform_cmprs_tuple().
                  */
-                if (!HEAP_TUPLE_IS_COMPRESSED(tuple->t_data)) {
+                if (!HEAP_TUPLE_IS_COMPRESSED(((HeapTuple)tuple)->t_data)) {
                     tableam_tops_deform_tuple(tuple, tupleDesc, values, nulls);
                 } else {
                     Page page = BufferGetPage(scandesc->rs_cbuf);

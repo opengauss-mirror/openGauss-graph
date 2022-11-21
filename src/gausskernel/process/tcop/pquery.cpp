@@ -6,6 +6,7 @@
  * Portions Copyright (c) 2020 Huawei Technologies Co.,Ltd.
  * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
+ * Portions Copyright (c) 2021, openGauss Contributors
  *
  * IDENTIFICATION
  *	  src/gausskernel/process/tcop/pquery.cpp
@@ -65,6 +66,10 @@ static void PortalRunMulti(
     Portal portal, bool isTopLevel, DestReceiver* dest, DestReceiver* altdest, char* completionTag);
 static long DoPortalRunFetch(Portal portal, FetchDirection fdirection, long count, DestReceiver* dest);
 static void DoPortalRewind(Portal portal);
+static void appendGraphWriteTag(char *tagbuf, GraphWriteStats *graphwrstats);
+static void appendSparqlLoadTag(char* tagbuf, SparqlLoadStats* stats);
+static int appendAnyTag(char *tagbuf, int pos, const char *tag,
+						uint32 nprocessed, bool delim);
 
 extern bool StreamTopConsumerAmI();
 
@@ -290,6 +295,8 @@ static void ProcessQuery(
      */
     ExecutorRun(queryDesc, ForwardScanDirection, 0L);
 
+    u_sess->ledger_cxt.resp_tag = completionTag;
+
     /*
      * Build command completion status string, if caller wants one.
      */
@@ -305,6 +312,8 @@ static void ProcessQuery(
                     "SELECT %lu",
                     queryDesc->estate->es_processed);
                 securec_check_ss(ret, "\0", "\0");
+                appendGraphWriteTag(completionTag,
+									&queryDesc->estate->es_graphwrstats);
                 break;
             case CMD_INSERT:
                 if (queryDesc->estate->es_processed == 1)
@@ -343,6 +352,13 @@ static void ProcessQuery(
                     queryDesc->estate->es_processed);
                 securec_check_ss(ret, "\0", "\0");
                 break;
+            case CMD_SPARQLLOAD:
+                appendSparqlLoadTag(completionTag, queryDesc->estate->es_sparqlloadstats);
+                break;
+            case CMD_GRAPHWRITE:
+				appendGraphWriteTag(completionTag,
+									&queryDesc->estate->es_graphwrstats);
+				break;
             default:
                 ret = strcpy_s(completionTag, COMPLETION_TAG_BUFSIZE, "?\?\?");
                 securec_check(ret, "\0", "\0");
@@ -745,7 +761,7 @@ void PortalStart(Portal portal, ParamListInfo params, int eflags, Snapshot snaps
                     u_sess->exec_cxt.need_track_resource = WLMNeedTrackResource(queryDesc);
 
                 if (IS_PGXC_COORDINATOR || IS_SINGLE_NODE) {
-                    if (u_sess->exec_cxt.need_track_resource) {
+                    if (queryDesc->plannedstmt != NULL && u_sess->exec_cxt.need_track_resource) {
                         queryDesc->instrument_options |= instrument_option;
                         queryDesc->plannedstmt->instrument_option = instrument_option;
                     }
@@ -1093,12 +1109,15 @@ bool PortalRun(
      * CurrentMemoryContext has a similar problem, but the other pointers we
      * save here will be NULL or pointing to longer-lived objects.
      */
+
     saveTopTransactionResourceOwner = t_thrd.utils_cxt.TopTransactionResourceOwner;
     saveTopTransactionContext = u_sess->top_transaction_mem_cxt;
     saveActivePortal = ActivePortal;
     saveResourceOwner = t_thrd.utils_cxt.CurrentResourceOwner;
     savePortalContext = t_thrd.mem_cxt.portal_mem_cxt;
     saveMemoryContext = CurrentMemoryContext;
+
+    u_sess->attr.attr_sql.create_index_concurrently = false;
 
     PotalSetIoState(portal);
 
@@ -1108,11 +1127,23 @@ bool PortalRun(
         WLMInitQueryPlan(queryDesc);
         dywlm_client_manager(queryDesc);
     }
+    /* save flag for nest plpgsql compile */
+    PLpgSQL_compile_context* save_compile_context = u_sess->plsql_cxt.curr_compile_context;
+    int save_compile_list_length = list_length(u_sess->plsql_cxt.compile_context_list);
+    int save_compile_status = u_sess->plsql_cxt.compile_status;
+    int savePortalDepth = u_sess->plsql_cxt.portal_depth;
+    bool savedisAllowCommitRollback = false;
+    bool needResetErrMsg = false;
 
     PG_TRY();
     {
         ActivePortal = portal;
         t_thrd.utils_cxt.CurrentResourceOwner = portal->resowner;
+        u_sess->plsql_cxt.portal_depth++;
+        if (u_sess->plsql_cxt.portal_depth > 1) {
+            /* commit rollback procedure not support in multi-layer portal called */
+            needResetErrMsg = stp_disable_xact_and_set_err_msg(&savedisAllowCommitRollback, STP_XACT_TOO_MANY_PORTAL);
+        }
         t_thrd.mem_cxt.portal_mem_cxt = PortalGetHeapMemory(portal);
 
         MemoryContextSwitchTo(t_thrd.mem_cxt.portal_mem_cxt);
@@ -1153,7 +1184,16 @@ bool PortalRun(
                             "SELECT %lu",
                             nprocessed);
                         securec_check_ss(errorno, "\0", "\0");
-                    } else {
+                    } else if (strcmp(portal->commandTag, "CYPHER") == 0)
+					{
+						QueryDesc *qd = PortalGetQueryDesc(portal);
+
+						snprintf(completionTag, COMPLETION_TAG_BUFSIZE,
+								 "SELECT " UINT64_FORMAT, nprocessed);
+						appendGraphWriteTag(completionTag,
+											&qd->estate->es_graphwrstats);
+					} 
+                    else {
                         errorno = strcpy_s(completionTag, COMPLETION_TAG_BUFSIZE,
                             portal->commandTag);
                         securec_check(errorno, "\0", "\0");
@@ -1191,40 +1231,38 @@ bool PortalRun(
     {
         /* Uncaught error while executing portal: mark it dead */
         MarkPortalFailed(portal);
+        u_sess->plsql_cxt.portal_depth = savePortalDepth;
+        stp_reset_xact_state_and_err_msg(savedisAllowCommitRollback, needResetErrMsg);
 
         /* Restore global vars and propagate error */
-        if (saveMemoryContext == saveTopTransactionContext)
+        if (saveMemoryContext == saveTopTransactionContext ||
+            saveTopTransactionContext != u_sess->top_transaction_mem_cxt) {
             MemoryContextSwitchTo(u_sess->top_transaction_mem_cxt);
-        else
+        } else if (ResourceOwnerIsValid(saveResourceOwner)) {
             MemoryContextSwitchTo(saveMemoryContext);
+        }
         ActivePortal = saveActivePortal;
-        if (saveResourceOwner == saveTopTransactionResourceOwner)
+        if (saveResourceOwner == saveTopTransactionResourceOwner ||
+            saveTopTransactionResourceOwner != t_thrd.utils_cxt.TopTransactionResourceOwner) {
             t_thrd.utils_cxt.CurrentResourceOwner = t_thrd.utils_cxt.TopTransactionResourceOwner;
-        else
+        } else if (ResourceOwnerIsValid(saveResourceOwner)) {
             t_thrd.utils_cxt.CurrentResourceOwner = saveResourceOwner;
+        }
         t_thrd.mem_cxt.portal_mem_cxt = savePortalContext;
 
-        if (ENABLE_WORKLOAD_CONTROL) {
-            /* save error to history info */
-            save_error_message();
-            if (g_instance.wlm_cxt->dynamic_workload_inited) {
-                t_thrd.wlm_cxt.parctl_state.errjmp = 1;
-                if (t_thrd.wlm_cxt.parctl_state.simple == 0)
-                    dywlm_client_release(&t_thrd.wlm_cxt.parctl_state);
-                else
-                    WLMReleaseGroupActiveStatement();
-                dywlm_client_max_release(&t_thrd.wlm_cxt.parctl_state);
-            } else
-                WLMParctlRelease(&t_thrd.wlm_cxt.parctl_state);
-
-            if (IS_PGXC_COORDINATOR && t_thrd.wlm_cxt.collect_info->sdetail.msg) {
-                pfree_ext(t_thrd.wlm_cxt.collect_info->sdetail.msg);
-            }
-        }
+        ereport(DEBUG3, (errmodule(MOD_NEST_COMPILE), errcode(ERRCODE_LOG),
+            errmsg("%s clear curr_compile_context because of error.", __func__)));
+        /* reset nest plpgsql compile */
+        u_sess->plsql_cxt.curr_compile_context = save_compile_context;
+        u_sess->plsql_cxt.compile_status = save_compile_status;
+        clearCompileContextList(save_compile_list_length);
 
         PG_RE_THROW();
     }
     PG_END_TRY();
+
+    u_sess->plsql_cxt.portal_depth = savePortalDepth;
+    stp_reset_xact_state_and_err_msg(savedisAllowCommitRollback, needResetErrMsg);
 
     if (ENABLE_WORKLOAD_CONTROL) {
         t_thrd.wlm_cxt.parctl_state.except = 0;
@@ -1240,15 +1278,23 @@ bool PortalRun(
         }
     }
 
-    if (saveMemoryContext == saveTopTransactionContext)
+    /*
+     * switch to topTransaction if (1) it is TopTransactionContext, (2) Top transaction was changed.
+     * While subtransaction was terminated inside statement running, its ResourceOwner should be reserved.
+     */
+    if (saveMemoryContext == saveTopTransactionContext ||
+        saveTopTransactionContext != u_sess->top_transaction_mem_cxt) {
         MemoryContextSwitchTo(u_sess->top_transaction_mem_cxt);
-    else
+    } else if (ResourceOwnerIsValid(saveResourceOwner)) {
         MemoryContextSwitchTo(saveMemoryContext);
+    }
     ActivePortal = saveActivePortal;
-    if (saveResourceOwner == saveTopTransactionResourceOwner)
+    if (saveResourceOwner == saveTopTransactionResourceOwner ||
+        saveTopTransactionResourceOwner != t_thrd.utils_cxt.TopTransactionResourceOwner) {
         t_thrd.utils_cxt.CurrentResourceOwner = t_thrd.utils_cxt.TopTransactionResourceOwner;
-    else
+    } else if (ResourceOwnerIsValid(saveResourceOwner)) {
         t_thrd.utils_cxt.CurrentResourceOwner = saveResourceOwner;
+    }
     t_thrd.mem_cxt.portal_mem_cxt = savePortalContext;
 
     if (portal->strategy != PORTAL_MULTI_QUERY) {
@@ -1771,9 +1817,11 @@ static void PortalRunMulti(
     combine.data[0] = '\0';
 #endif
 
+    AssertEreport(PortalIsValid(portal), MOD_EXECUTOR, "portal not valid");
+
     bool force_local_snapshot = false;
     
-    if ((portal!= NULL) && (portal->cplan != NULL)) {
+    if (portal->cplan != NULL) {
         /* copy over the single_shard_stmt into local variable force_local_snapshot */
         force_local_snapshot = portal->cplan->single_shard_stmt;
     }
@@ -2306,4 +2354,84 @@ static void DoPortalRewind(Portal portal)
     portal->atEnd = false;
     portal->portalPos = 0;
     portal->posOverflow = false;
+}
+
+static void
+appendSparqlLoadTag(char* tagbuf, SparqlLoadStats* stats){
+    int pos = strlen(tagbuf);
+    if (pos < COMPLETION_TAG_BUFSIZE)
+        pos += snprintf(tagbuf + pos, COMPLETION_TAG_BUFSIZE - pos,
+                        (pos > 0)? ", SPARQL LOAD(": "SPARQL LOAD(");
+    int opn = pos;
+    if (stats->newVLabel)
+        pos = appendAnyTag(tagbuf, pos, "CREATE VLABE", stats->newVLabel, pos > opn);
+    
+    if (stats->newELabel)
+        pos = appendAnyTag(tagbuf, pos, "CREATE ELABEL", stats->newELabel, pos > opn);
+    
+    if (pos < COMPLETION_TAG_BUFSIZE - 1)
+	{
+		tagbuf[pos] = ')';
+		tagbuf[pos + 1] = '\0';
+	}
+}
+
+static void
+appendGraphWriteTag(char *tagbuf, GraphWriteStats *graphwrstats)
+{
+	int			pos = strlen(tagbuf);
+	int			opn;
+
+	if (graphwrstats->insertVertex == UINT_MAX &&
+		graphwrstats->insertEdge == UINT_MAX &&
+		graphwrstats->deleteVertex == UINT_MAX &&
+		graphwrstats->deleteEdge == UINT_MAX &&
+		graphwrstats->updateProperty == UINT_MAX)
+		return;
+
+	if (pos < COMPLETION_TAG_BUFSIZE)
+		pos += snprintf(tagbuf + pos, COMPLETION_TAG_BUFSIZE - pos,
+						(pos > 0) ? ", GRAPH WRITE(" : "GRAPH WRITE(");
+	opn = pos;
+
+    if(graphwrstats->insertVertex)
+        pos = appendAnyTag(tagbuf, pos, "INSERT VERTEX",
+					   graphwrstats->insertVertex, pos > opn);
+	if(graphwrstats->insertEdge)
+	    pos = appendAnyTag(tagbuf, pos, "INSERT EDGE",
+					   graphwrstats->insertEdge, pos > opn);
+    if(graphwrstats->deleteVertex)
+	    pos = appendAnyTag(tagbuf, pos, "DELETE VERTEX",
+					   graphwrstats->deleteVertex, pos > opn);
+	if(graphwrstats->deleteEdge)
+        pos = appendAnyTag(tagbuf, pos, "DELETE EDGE",
+					   graphwrstats->deleteEdge, pos > opn);
+    if(graphwrstats->updateProperty)
+	    pos = appendAnyTag(tagbuf, pos, "UPDATE PROPERTY",
+					   graphwrstats->updateProperty, pos > opn);
+
+	if (pos < COMPLETION_TAG_BUFSIZE - 1)
+	{
+		tagbuf[pos] = ')';
+		tagbuf[pos + 1] = '\0';
+	}
+}
+
+static int
+appendAnyTag(char *tagbuf, int pos, const char *tag, uint32 nprocessed,
+			 bool delim)
+{
+	const char *fmt = delim ? ", %s %u" : "%s %u";
+	int			len;
+
+	if (pos >= COMPLETION_TAG_BUFSIZE)
+		return pos;
+
+	if (nprocessed == UINT_MAX)
+		return pos;
+
+	len = snprintf(tagbuf + pos, COMPLETION_TAG_BUFSIZE - pos, fmt,
+				   tag, nprocessed);
+
+	return pos + len;
 }

@@ -1,7 +1,7 @@
 /* -------------------------------------------------------------------------
  *
  * lmgr.cpp
- *	  POSTGRES lock manager code
+ *	  openGauss lock manager code
  *
  * Portions Copyright (c) 2020 Huawei Technologies Co.,Ltd.
  * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
@@ -36,7 +36,6 @@ void RelationInitLockInfo(Relation relation)
 {
     Assert(RelationIsValid(relation));
     Assert(OidIsValid(RelationGetRelid(relation)));
-
     relation->rd_lockInfo.lockRelId.relId = RelationGetRelid(relation);
 
     if (relation->rd_rel->relisshared)
@@ -86,7 +85,7 @@ void LockRelationOid(Oid relid, LOCKMODE lockmode)
      * modifies the rel, the relcache update happens via
      * CommandCounterIncrement, not here.)
      */
-    if (res != LOCKACQUIRE_ALREADY_HELD || u_sess->inval_cxt.deepthInAcceptInvalidationMessage > 0)
+    if (res != LOCKACQUIRE_ALREADY_HELD || DeepthInAcceptInvalidationMessageNotZero())
         AcceptInvalidationMessages();
 }
 
@@ -115,7 +114,7 @@ bool ConditionalLockRelationOid(Oid relid, LOCKMODE lockmode)
      * Now that we have the lock, check for invalidation messages; see notes
      * in LockRelationOid.
      */
-    if (res != LOCKACQUIRE_ALREADY_HELD || u_sess->inval_cxt.deepthInAcceptInvalidationMessage > 0)
+    if (res != LOCKACQUIRE_ALREADY_HELD || DeepthInAcceptInvalidationMessageNotZero())
         AcceptInvalidationMessages();
 
     return true;
@@ -169,7 +168,7 @@ void LockRelation(Relation relation, LOCKMODE lockmode)
      * Now that we have the lock, check for invalidation messages; see notes
      * in LockRelationOid.
      */
-    if (res != LOCKACQUIRE_ALREADY_HELD || u_sess->inval_cxt.deepthInAcceptInvalidationMessage > 0)
+    if (res != LOCKACQUIRE_ALREADY_HELD || DeepthInAcceptInvalidationMessageNotZero())
         AcceptInvalidationMessages();
 }
 
@@ -195,7 +194,7 @@ bool ConditionalLockRelation(Relation relation, LOCKMODE lockmode)
      * Now that we have the lock, check for invalidation messages; see notes
      * in LockRelationOid.
      */
-    if (res != LOCKACQUIRE_ALREADY_HELD || u_sess->inval_cxt.deepthInAcceptInvalidationMessage > 0)
+    if (res != LOCKACQUIRE_ALREADY_HELD || DeepthInAcceptInvalidationMessageNotZero())
         AcceptInvalidationMessages();
 
     return true;
@@ -220,7 +219,7 @@ void LockRelFileNode(const RelFileNode &rnode, LOCKMODE lockmode)
 {
     LOCKTAG tag;
 
-    SET_LOCKTAG_RELATION(tag, rnode.dbNode, rnode.relNode);
+    SET_LOCKTAG_RELFILENODE(tag, rnode.spcNode, rnode.dbNode, rnode.relNode);
 
     (void)LockAcquire(&tag, lockmode, false, false);
 }
@@ -229,7 +228,7 @@ void UnlockRelFileNode(const RelFileNode &rnode, LOCKMODE lockmode)
 {
     LOCKTAG tag;
 
-    SET_LOCKTAG_RELATION(tag, rnode.dbNode, rnode.relNode);
+    SET_LOCKTAG_RELFILENODE(tag, rnode.spcNode, rnode.dbNode, rnode.relNode);
 
     (void)LockRelease(&tag, lockmode, false);
 }
@@ -257,7 +256,7 @@ bool ConditionalLockCStoreFreeSpace(Relation relation)
      * Now that we have the lock, check for invalidation messages; see notes
      * in LockRelationOid.
      */
-    if (res != LOCKACQUIRE_ALREADY_HELD || u_sess->inval_cxt.deepthInAcceptInvalidationMessage > 0)
+    if (res != LOCKACQUIRE_ALREADY_HELD || DeepthInAcceptInvalidationMessageNotZero())
         AcceptInvalidationMessages();
 
     return true;
@@ -286,6 +285,17 @@ bool LockHasWaitersRelation(Relation relation, LOCKMODE lockmode)
 
     return LockHasWaiters(&tag, lockmode, false);
 }
+
+bool LockHasWaitersPartition(Relation relation, LOCKMODE lockmode)
+{
+    LOCKTAG tag;
+    Assert(RelationIsPartition(relation));
+
+    SET_LOCKTAG_PARTITION(tag, relation->rd_lockInfo.lockRelId.dbId, relation->parentId, relation->rd_id);
+
+    return LockHasWaiters(&tag, lockmode, false);
+}
+
 
 /*
  *		LockRelationIdForSession
@@ -471,7 +481,7 @@ void UnlockPage(Relation relation, BlockNumber blkno, LOCKMODE lockmode)
  * because we can't afford to keep a separate lock in shared memory for every
  * tuple.  See heap_lock_tuple before using this!
  */
-void LockTuple(Relation relation, ItemPointer tid, LOCKMODE lockmode, bool allow_con_update)
+void LockTuple(Relation relation, ItemPointer tid, LOCKMODE lockmode, bool allow_con_update, int waitSec)
 {
     LOCKTAG tag;
 
@@ -482,7 +492,28 @@ void LockTuple(Relation relation, ItemPointer tid, LOCKMODE lockmode, bool allow
                       ItemPointerGetBlockNumber(tid),
                       ItemPointerGetOffsetNumber(tid));
 
-    (void)LockAcquire(&tag, lockmode, false, false, allow_con_update);
+    (void)LockAcquire(&tag, lockmode, false, false, allow_con_update, waitSec);
+}
+
+#define UID_LOW_BIT (32)
+void LockTupleUid(Relation relation, uint64 uid, LOCKMODE lockmode, bool allow_con_update, bool lockTuple)
+{
+    LOCKTAG tag;
+
+    SET_LOCKTAG_UID(tag, relation->rd_lockInfo.lockRelId.dbId, relation->rd_lockInfo.lockRelId.relId,
+        (uint32)((uint64)uid >> UID_LOW_BIT), (uint32)uid);
+
+    if (allow_con_update) {
+        (void)LockAcquire(&tag, lockmode, false, false, allow_con_update);
+    } else if (LockAcquire(&tag, lockmode, false, true) != LOCKACQUIRE_NOT_AVAIL) {
+        if (lockTuple) {
+            ereport(ERROR, (errcode(ERRCODE_LOCK_NOT_AVAILABLE),
+                errmsg("could not obtain lock on row in relation \"%s\"", RelationGetRelationName(relation))));
+        } else {
+            ereport(ERROR,
+                (errcode(ERRCODE_T_R_SERIALIZATION_FAILURE), errmsg("abort transaction due to concurrent update")));
+        }
+    }
 }
 
 /*
@@ -566,7 +597,7 @@ void XactLockTableDelete(TransactionId xid)
  * successfully or unsuccessfully.	So we have to check if it's "still running"
  * and if so wait for its parent.
  */
-void XactLockTableWait(TransactionId xid, bool allow_con_update)
+void XactLockTableWait(TransactionId xid, bool allow_con_update, int waitSec)
 {
     LOCKTAG tag;
     CLogXidStatus status = CLOG_XID_STATUS_IN_PROGRESS;
@@ -580,7 +611,7 @@ void XactLockTableWait(TransactionId xid, bool allow_con_update)
 
         SET_LOCKTAG_TRANSACTION(tag, xid);
 
-        (void)LockAcquire(&tag, ShareLock, false, false, allow_con_update);
+        (void)LockAcquire(&tag, ShareLock, false, false, allow_con_update, waitSec);
 
         (void)LockRelease(&tag, ShareLock, false);
 
@@ -635,6 +666,117 @@ bool ConditionalXactLockTableWait(TransactionId xid, bool waitparent, bool bcare
 }
 
 /*
+ *              SubXactLockTableInsert
+ *
+ * Insert a lock showing that the current subtransaction is running ---
+ * this is done when a subtransaction performs the operation.  The lock can
+ * then be used to wait for the subtransaction to finish.
+ */
+void
+SubXactLockTableInsert(SubTransactionId subxid)
+{
+        LOCKTAG         tag;
+        TransactionId xid;
+        ResourceOwner currentOwner;
+
+        /* Acquire lock only if we doesn't already hold that lock. */
+        if (HasCurrentSubTransactionLock())
+                return;
+
+        xid = GetTopTransactionId();
+
+        /*
+         * Acquire lock on the transaction XID.  (We assume this cannot block.) We
+         * have to ensure that the lock is assigned to the transaction's own
+         * ResourceOwner.
+         */
+        currentOwner = t_thrd.utils_cxt.CurrentResourceOwner;
+        t_thrd.utils_cxt.CurrentResourceOwner = GetCurrentTransactionResOwner();
+
+        SET_LOCKTAG_SUBTRANSACTION(tag, xid, subxid);
+        (void) LockAcquire(&tag, ExclusiveLock, false, false);
+
+        t_thrd.utils_cxt.CurrentResourceOwner = currentOwner;
+
+        SetCurrentSubTransactionLocked();
+}
+
+/*
+ *  SubXactLockTableDelete
+ *
+ * Delete the lock showing that the given subtransaction is running.
+ * (This is never used for main transaction IDs; those locks are only
+ * released implicitly at transaction end.  But we do use it for
+ * subtransactions in UStore.)
+ */
+void
+SubXactLockTableDelete(SubTransactionId subxid)
+{
+    LOCKTAG         tag;
+    TransactionId xid = GetTopTransactionId();
+
+    SET_LOCKTAG_SUBTRANSACTION(tag, xid, subxid);
+
+    LockRelease(&tag, ExclusiveLock, false);
+}
+
+/*
+ *              SubXactLockTableWait
+ *
+ * Wait for the specified subtransaction to commit or abort.  Here, instead of
+ * waiting on xid, we wait on xid + subTransactionId.  Whenever any concurrent
+ * transaction finds conflict then it will create a lock tag by (slot xid +
+ * subtransaction id from the undo) and wait on that.
+ *
+ * Unlike XactLockTableWait, we don't need to wait for topmost transaction to
+ * finish as we release the lock only when the transaction (committed/aborted)
+ * is recorded in clog.  This has some overhead in terms of maintianing unique
+ * xid locks for subtransactions during commit, but that shouldn't be much as
+ * we release the locks immediately after transaction is recorded in clog.
+ * This function is designed for Ustore where we don't have xids assigned for
+ * subtransaction, so we can't really figure out if the subtransaction is
+ * still in progress.
+ */
+void
+SubXactLockTableWait(TransactionId xid, SubTransactionId subxid, int waitSec)
+{
+    LOCKTAG         tag;
+    Assert(TransactionIdIsValid(xid));
+    Assert(!TransactionIdEquals(xid, GetTopTransactionIdIfAny()));
+    Assert(subxid != InvalidSubTransactionId);
+
+    SET_LOCKTAG_SUBTRANSACTION(tag, xid, subxid);
+
+    (void) LockAcquire(&tag, ShareLock, false, false, waitSec);
+
+    LockRelease(&tag, ShareLock, false);
+}
+
+/*
+ *              ConditionalSubXactLockTableWait
+ *
+ * As above, but only lock if we can get the lock without blocking.
+ * Returns true if the lock was acquired.
+ */
+bool
+ConditionalSubXactLockTableWait(TransactionId xid, SubTransactionId subxid)
+{
+    LOCKTAG         tag;
+
+    Assert(TransactionIdIsValid(xid));
+    Assert(!TransactionIdEquals(xid, GetTopTransactionIdIfAny()));
+
+    SET_LOCKTAG_SUBTRANSACTION(tag, xid, subxid);
+
+    if (LockAcquire(&tag, ShareLock, false, true) == LOCKACQUIRE_NOT_AVAIL)
+            return false;
+
+    LockRelease(&tag, ShareLock, false);
+
+    return true;
+}
+
+/*
  *		LockDatabaseObject
  *
  * Obtain a lock on a general object of the current database.  Don't use
@@ -652,6 +794,23 @@ void LockDatabaseObject(Oid classid, Oid objid, uint16 objsubid, LOCKMODE lockmo
 
     /* Make sure syscaches are up-to-date with any changes we waited for */
     AcceptInvalidationMessages();
+}
+
+bool ConditionalLockDatabaseObject(Oid classid, Oid objid, uint16 objsubid, LOCKMODE lockmode)
+{
+    LOCKTAG tag;
+    LockAcquireResult res;
+
+    SET_LOCKTAG_OBJECT(tag, u_sess->proc_cxt.MyDatabaseId, classid, objid, objsubid);
+
+    res = LockAcquire(&tag, lockmode, false, true);
+    if (res == LOCKACQUIRE_NOT_AVAIL)
+        return false;
+
+    /* Make sure syscaches are up-to-date with any changes we waited for */
+    AcceptInvalidationMessages();
+
+    return true;
 }
 
 /*
@@ -739,6 +898,10 @@ void DescribeLockTag(StringInfo buf, const LOCKTAG *tag)
             appendStringInfo(buf, _("extension of relation %u of database %u"), tag->locktag_field2,
                              tag->locktag_field1);
             break;
+        case LOCKTAG_RELFILENODE:
+            appendStringInfo(buf, _("relation %u of database %u of tablespace %u"), tag->locktag_field3,
+                tag->locktag_field2, tag->locktag_field1);
+            break;
         case LOCKTAG_CSTORE_FREESPACE:
             appendStringInfo(buf, _("freespace of cstore relation %u of database %u"), tag->locktag_field2,
                              tag->locktag_field1);
@@ -759,11 +922,20 @@ void DescribeLockTag(StringInfo buf, const LOCKTAG *tag)
                              tag->locktag_field5,
                              tag->locktag_field1);
             break;
+        case LOCKTAG_UID:
+            appendStringInfo(buf,
+                             _("tuple uid %lu of (relation %u) of database %u"),
+                             (((uint64)tag->locktag_field3) << UID_LOW_BIT) + tag->locktag_field4,
+                             tag->locktag_field2,
+                             tag->locktag_field1);
         case LOCKTAG_TRANSACTION:
             appendStringInfo(buf, _("transaction %u"), tag->locktag_field1);
             break;
         case LOCKTAG_VIRTUALTRANSACTION:
             appendStringInfo(buf, _("virtual transaction %u/%u"), tag->locktag_field1, tag->locktag_field2);
+            break;
+        case LOCKTAG_SUBTRANSACTION:
+            appendStringInfo(buf, _("transaction %u, Sub-transaction %u"), tag->locktag_field1, tag->locktag_field3);
             break;
         case LOCKTAG_OBJECT:
             appendStringInfo(buf,
@@ -879,7 +1051,7 @@ void LockPartitionOid(Oid relid, uint32 seq, LOCKMODE lockmode)
      * modifies the rel, the relcache update happens via
      * CommandCounterIncrement, not here.)
      */
-    if (res != LOCKACQUIRE_ALREADY_HELD || u_sess->inval_cxt.deepthInAcceptInvalidationMessage > 0)
+    if (res != LOCKACQUIRE_ALREADY_HELD || DeepthInAcceptInvalidationMessageNotZero())
         AcceptInvalidationMessages();
 }
 
@@ -898,7 +1070,7 @@ bool ConditionalLockPartitionOid(Oid relid, uint32 seq, LOCKMODE lockmode)
      * Now that we have the lock, check for invalidation messages; see notes
      * in LockRelationOid.
      */
-    if (res != LOCKACQUIRE_ALREADY_HELD || u_sess->inval_cxt.deepthInAcceptInvalidationMessage > 0)
+    if (res != LOCKACQUIRE_ALREADY_HELD || DeepthInAcceptInvalidationMessageNotZero())
         AcceptInvalidationMessages();
 
     return true;
@@ -942,7 +1114,7 @@ void LockPartitionSeq(Oid relid, uint32 seq, LOCKMODE lockmode)
      * modifies the rel, the relcache update happens via
      * CommandCounterIncrement, not here.)
      */
-    if (res != LOCKACQUIRE_ALREADY_HELD || u_sess->inval_cxt.deepthInAcceptInvalidationMessage > 0)
+    if (res != LOCKACQUIRE_ALREADY_HELD || DeepthInAcceptInvalidationMessageNotZero())
         AcceptInvalidationMessages();
 }
 
@@ -961,7 +1133,7 @@ bool ConditionalLockPartitionSeq(Oid relid, uint32 seq, LOCKMODE lockmode)
      * Now that we have the lock, check for invalidation messages; see notes
      * in LockRelationOid.
      */
-    if (res != LOCKACQUIRE_ALREADY_HELD || u_sess->inval_cxt.deepthInAcceptInvalidationMessage > 0)
+    if (res != LOCKACQUIRE_ALREADY_HELD || DeepthInAcceptInvalidationMessageNotZero())
         AcceptInvalidationMessages();
 
     return true;
@@ -974,6 +1146,15 @@ void UnlockPartitionSeq(Oid relid, uint32 seq, LOCKMODE lockmode)
     SetLocktagPartitionSeq(&tag, relid, seq);
 
     (void)LockRelease(&tag, lockmode, false);
+}
+
+void UnlockPartitionSeqIfHeld(Oid relid, uint32 seq, LOCKMODE lockmode)
+{
+    LOCKTAG tag;
+
+    SetLocktagPartitionSeq(&tag, relid, seq);
+
+    ReleaseLockIfHeld(&tag, lockmode, false);
 }
 
 void LockPartitionVacuum(Relation prel, Oid partId, LOCKMODE lockmode)

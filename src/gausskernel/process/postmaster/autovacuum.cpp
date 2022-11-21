@@ -2,7 +2,7 @@
  *
  * autovacuum.cpp
  *
- * PostgreSQL Integrated Autovacuum Daemon
+ * openGauss Integrated Autovacuum Daemon
  *
  * The autovacuum system is structured in two different kinds of processes: the
  * autovacuum launcher and the autovacuum worker.  The launcher is an
@@ -53,6 +53,7 @@
  * Portions Copyright (c) 2020 Huawei Technologies Co.,Ltd.
  * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
+ * Portions Copyright (c) 2021, openGauss Contributors
  *
  *
  * IDENTIFICATION
@@ -81,6 +82,7 @@
 #include "access/twophase.h"
 #include "access/transam.h"
 #include "access/xact.h"
+#include "access/multixact.h"
 #include "catalog/dependency.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_database.h"
@@ -124,12 +126,6 @@
 #include "catalog/pg_namespace.h"
 #include "storage/lmgr.h"
 
-/* how long to keep pgstat data in the launcher, in milliseconds */
-#define STATS_READ_DELAY 1000
-
-/* the minimum allowed time between two awakenings of the launcher */
-#define MIN_AUTOVAC_SLEEPTIME 100.0 /* milliseconds */
-
 /* struct to keep tuples stat that fetchs from DataNode */
 typedef struct avw_info {
     PgStat_StatTabKey tabkey;
@@ -138,142 +134,14 @@ typedef struct avw_info {
     int64 changes_since_analyze;
 } avw_info;
 
-/* struct to keep track of databases in launcher */
-typedef struct avl_dbase {
-    Oid adl_datid; /* hash key -- must be first */
-    TimestampTz adl_next_worker;
-    int adl_score;
-} avl_dbase;
-
 /* struct to keep track of databases in worker */
 typedef struct avw_dbase {
     Oid adw_datid;
     char* adw_name;
     TransactionId adw_frozenxid;
+    MultiXactId	adw_frozenmulti;
     PgStat_StatDBEntry* adw_entry;
 } avw_dbase;
-
-typedef struct av_toastid_mainid {
-    Oid at_toastrelid; /* hash key - must be first */
-    Oid at_relid;      /* it is a partiton id if at_parentid is a valid oid, or it is an ordinary table oid */
-    Oid at_parentid;   /* parent oid if at_relid is a partitioned table oid */
-
-    /*
-     * main table's autovac state
-     * 1. if at_relid is an ordinary table, it is at_relid's autovac state
-     * 2. if at_relid is a partition, it is partitoned table's autovac state
-     */
-    bool at_allowvacuum; /* main table is allowed to do autovaccum */
-    bool at_dovacuum;    /* main table will do vacuum */
-    bool at_doanalyze;   /* main table will do analyze */
-    bool at_needfreeze;  /* main table need freeze the old tuple to recycle clog */
-    bool at_internal;    /* main table is internal relation */
-} av_toastid_mainid;
-
-/* struct to keep track of tables to vacuum and/or analyze, in 1st pass */
-typedef struct av_relation {
-    Oid ar_relid; /* hash key - must be first */
-    bool ar_hasrelopts;
-    AutoVacOpts ar_reloptions; /* copy of AutoVacOpts from the main table's
-                                * reloptions, or NULL if none */
-} av_relation;
-
-/* struct to keep track of tables to vacuum and/or analyze, after rechecking */
-typedef struct autovac_table {
-    Oid at_relid;
-    int at_flags;
-    bool at_dovacuum;
-    bool at_doanalyze;
-    bool at_needfreeze;
-    bool at_sharedrel;
-    int at_freeze_min_age;
-    int at_freeze_table_age;
-    int at_vacuum_cost_delay;
-    int at_vacuum_cost_limit;
-    char* at_partname;
-    char* at_relname;
-    char* at_nspname;
-    char* at_datname;
-    bool at_is_toast;
-} autovac_table;
-
-/* partitioned table's autovac state */
-typedef struct at_partitioned_table {
-    Oid at_relid;        /* partitioned table's oid, it is hash-key - must be first */
-    bool at_allowvacuum; /* partitioned table is allowed to do autovaccum */
-    bool at_dovacuum;    /* partitioned table will do vacuum */
-    bool at_doanalyze;   /* partitioned table will do analyze */
-    bool at_needfreeze;  /* partitioned table need freeze old tuple to recycle clog */
-} at_partitioned_table;
-
-/* -------------
- * This struct holds information about a single worker's whereabouts.  We keep
- * an array of these in shared memory, sized according to
- * autovacuum_max_workers.
- *
- * wi_links		entry into free list or running list
- * wi_dboid		OID of the database this worker is supposed to work on
- * wi_tableoid	OID of the table currently being vacuumed, if any
- * wi_parentoid	OID of the paritioned table, if wi_tableoid is a partition id
- * wi_sharedrel	flag indicating whether table is marked relisshared
- * wi_proc		pointer to PGPROC of the running worker, NULL if not started
- * wi_launchtime Time at which this worker was launched
- * wi_cost_*	Vacuum cost-based delay parameters current in this worker
- *
- * All fields are protected by AutovacuumLock, except for wi_tableoid which is
- * protected by AutovacuumScheduleLock (which is read-only for everyone except
- * that worker itself).
- * -------------
- */
-typedef struct WorkerInfoData {
-    SHM_QUEUE wi_links;
-    Oid wi_dboid;
-    Oid wi_tableoid;
-    Oid wi_parentoid;
-    bool wi_ispartition;
-    bool wi_sharedrel;
-    PGPROC* wi_proc;
-    TimestampTz wi_launchtime;
-    int wi_cost_delay;
-    int wi_cost_limit;
-    int wi_cost_limit_base;
-} WorkerInfoData;
-
-typedef struct WorkerInfoData* WorkerInfo;
-
-/*
- * Possible signals received by the launcher from remote processes.  These are
- * stored atomically in shared memory so that other processes can set them
- * without locking.
- */
-typedef enum {
-    AutoVacForkFailed, /* failed trying to start a worker */
-    AutoVacRebalance,  /* rebalance the cost limits */
-    AutoVacNumSignals  /* must be last */
-} AutoVacuumSignal;
-
-/* -------------
- * The main autovacuum shmem struct.  On shared memory we store this main
- * struct and the array of WorkerInfo structs.	This struct keeps:
- *
- * av_signal		set by other processes to indicate various conditions
- * av_launcherpid	the PID of the autovacuum launcher
- * av_freeWorkers	the WorkerInfo freelist
- * av_runningWorkers the WorkerInfo non-free queue
- * av_startingWorker pointer to WorkerInfo currently being started (cleared by
- *					the worker itself as soon as it's up and running)
- *
- * This struct is protected by AutovacuumLock, except for av_signal and parts
- * of the worker list (see above).
- * -------------
- */
-typedef struct AutoVacuumShmemStruct {
-    sig_atomic_t av_signal[AutoVacNumSignals];
-    ThreadId av_launcherpid;
-    WorkerInfo av_freeWorkers;
-    SHM_QUEUE av_runningWorkers;
-    WorkerInfo av_startingWorker;
-} AutoVacuumShmemStruct;
 
 NON_EXEC_STATIC void AutoVacWorkerMain();
 NON_EXEC_STATIC void AutoVacLauncherMain();
@@ -433,6 +301,8 @@ NON_EXEC_STATIC void AutoVacLauncherMain()
         /* since not using PG_TRY, must reset error stack by hand */
         t_thrd.log_cxt.error_context_stack = NULL;
 
+        t_thrd.log_cxt.call_stack = NULL;
+
         /* Prevents interrupts while cleaning up */
         HOLD_INTERRUPTS();
 
@@ -446,6 +316,9 @@ NON_EXEC_STATIC void AutoVacLauncherMain()
 
         /* Abort the current transaction in order to recover */
         AbortCurrentTransaction();
+
+        /* release resource held by lsc */
+        AtEOXact_SysDBCache(false);
 
         /*
          * Now return to normal top-level context and clear ErrorContext for
@@ -998,7 +871,11 @@ static Oid do_start_worker(void)
     List* dblist = NIL;
     ListCell* cell = NULL;
     TransactionId xidForceLimit;
+#ifndef ENABLE_MULTIPLE_NODES
+    MultiXactId multiForceLimit;
+#endif
     bool for_xid_wrap = false;
+    bool for_multi_wrap = false;
     avw_dbase* avdb = NULL;
     TimestampTz current_time;
     bool skipit = false;
@@ -1036,10 +913,22 @@ static Oid do_start_worker(void)
      */
     t_thrd.autovacuum_cxt.recentXid = ReadNewTransactionId();
     if (t_thrd.autovacuum_cxt.recentXid >
-        FirstNormalTransactionId + g_instance.attr.attr_storage.autovacuum_freeze_max_age)
-        xidForceLimit = t_thrd.autovacuum_cxt.recentXid - g_instance.attr.attr_storage.autovacuum_freeze_max_age;
+        FirstNormalTransactionId + (uint64)g_instance.attr.attr_storage.autovacuum_freeze_max_age)
+        xidForceLimit = t_thrd.autovacuum_cxt.recentXid -
+            (uint64)g_instance.attr.attr_storage.autovacuum_freeze_max_age;
     else
         xidForceLimit = FirstNormalTransactionId;
+
+#ifndef ENABLE_MULTIPLE_NODES
+    /* Also determine the oldest datminmxid we will consider. */
+    t_thrd.autovacuum_cxt.recentMulti = ReadNextMultiXactId();
+    if (t_thrd.autovacuum_cxt.recentMulti >
+        FirstMultiXactId + (uint64)g_instance.attr.attr_storage.autovacuum_freeze_max_age)
+        multiForceLimit = t_thrd.autovacuum_cxt.recentMulti -
+            (uint64)g_instance.attr.attr_storage.autovacuum_freeze_max_age;
+    else
+        multiForceLimit = FirstMultiXactId;
+#endif
 
     /*
      * Choose a database to connect to.  We pick the database that was least
@@ -1058,6 +947,7 @@ static Oid do_start_worker(void)
      */
     avdb = NULL;
     for_xid_wrap = false;
+    for_multi_wrap = false;
     current_time = GetCurrentTimestamp();
     foreach (cell, dblist) {
         avw_dbase* tmp = (avw_dbase*)lfirst(cell);
@@ -1071,6 +961,15 @@ static Oid do_start_worker(void)
             continue;
         } else if (for_xid_wrap)
             continue; /* ignore not-at-risk DBs */
+#ifndef ENABLE_MULTIPLE_NODES
+        else if (MultiXactIdPrecedes(tmp->adw_frozenmulti, multiForceLimit)) {
+            if (avdb == NULL || MultiXactIdPrecedes(tmp->adw_frozenmulti, avdb->adw_frozenmulti))
+                avdb = tmp;
+            for_multi_wrap = true;
+            continue;
+        } else if (for_multi_wrap)
+            continue; /* ignore not-at-risk DBs */
+#endif
 
         /* Find pgstat entry if any */
         tmp->adw_entry = pgstat_fetch_stat_dbentry(tmp->adw_datid);
@@ -1293,7 +1192,6 @@ NON_EXEC_STATIC void AutoVacWorkerMain()
     t_thrd.proc_cxt.MyStartTime = time(NULL);
 
     t_thrd.proc_cxt.MyProgName = "AutoVacWorker";
-    u_sess->attr.attr_common.application_name = pstrdup(AUTO_VACUUM_WORKER);
 
     /* Identify myself via ps */
     init_ps_display("autovacuum worker process", "", "", "");
@@ -1354,6 +1252,9 @@ NON_EXEC_STATIC void AutoVacWorkerMain()
 
         /* Report the error to the server log */
         EmitErrorReport();
+
+        /* release resource held by lsc */
+        AtEOXact_SysDBCache(false);
 
         /*
          * We can now go away.	Note that because we called InitProcess, a
@@ -1436,7 +1337,7 @@ NON_EXEC_STATIC void AutoVacWorkerMain()
 
         /*
          * Report autovac startup to the stats collector.  We deliberately do
-         * this before InitPostgres, so that the last_autovac_time will get
+         * this before Init openGauss, so that the last_autovac_time will get
          * updated even if the connection attempt fails.  This is to prevent
          * autovac from getting "stuck" repeatedly selecting an unopenable
          * database, rather than making any progress on stuff it can connect
@@ -1478,7 +1379,8 @@ NON_EXEC_STATIC void AutoVacWorkerMain()
          * Create a resource owner to keep track of our resources (currently only
          * buffer pins).
          */
-        t_thrd.utils_cxt.CurrentResourceOwner = ResourceOwnerCreate(NULL, "AutoVacuumWorker", MEMORY_CONTEXT_STORAGE);
+        t_thrd.utils_cxt.CurrentResourceOwner = ResourceOwnerCreate(NULL, "AutoVacuumWorker",
+            THREAD_GET_MEM_CXT_GROUP(MEMORY_CONTEXT_STORAGE));
 
         oldcontext = MemoryContextSwitchTo(SESS_GET_MEM_CXT_GROUP(MEMORY_CONTEXT_STORAGE));
         if (u_sess->proc_cxt.MyProcPort->database_name)
@@ -1494,6 +1396,7 @@ NON_EXEC_STATIC void AutoVacWorkerMain()
 
         /* And do an appropriate amount of work */
         t_thrd.autovacuum_cxt.recentXid = ReadNewTransactionId();
+        t_thrd.autovacuum_cxt.recentMulti = ReadNextMultiXactId();
         do_autovacuum();
     }
 
@@ -1711,7 +1614,11 @@ static List* get_database_list(void)
                 datfrozenxid = FirstNormalTransactionId;
         } else
             datfrozenxid = DatumGetTransactionId(xid64datum);
-
+#ifndef ENABLE_MULTIPLE_NODES
+        Datum mxidDatum = heap_getattr(tup, Anum_pg_database_datminmxid, RelationGetDescr(rel), &isNull);
+        MultiXactId datminmxid = isNull ? FirstMultiXactId : DatumGetTransactionId(mxidDatum);
+        avdb->adw_frozenmulti = datminmxid;
+#endif
         avdb->adw_frozenxid = datfrozenxid;
         /* this gets set later: */
         avdb->adw_entry = NULL;
@@ -1814,7 +1721,23 @@ bool allow_autoanalyze(HeapTuple tuple)
     return enable_analyze;
 }
 
-#define isPartitionedRelation(classForm) (PARTTYPE_PARTITIONED_RELATION == (classForm)->parttype)
+static void AddApplicationNameToPoolerParams()
+{
+    if (IS_PGXC_COORDINATOR && !IsConnFromCoord() && IsAutoVacuumWorkerProcess()) {
+        StringInfoData str;
+        initStringInfo(&str);
+        appendStringInfo(&str, "SET application_name = '%s';", AUTO_VACUUM_WORKER);
+        (void)register_pooler_session_param("application_name", str.data, POOL_CMD_GLOBAL_SET);
+        pfree_ext(str.data);
+    }
+}
+
+static void DeleteApplicationNameFromPoolerParams()
+{
+    if (IS_PGXC_COORDINATOR && !IsConnFromCoord() && IsAutoVacuumWorkerProcess()) {
+        delete_pooler_session_params("application_name");
+    }
+}
 
 static void fetch_global_autovac_info()
 {
@@ -1839,9 +1762,8 @@ static void fetch_global_autovac_info()
             "t as(SELECT c.oid as relid,n.nspname AS nspname, c.relname AS relname, "
             "case when p.parttype = 'r' then null else p.oid end as partid, "
             "case when p.parttype = 'r' then null else p.relname end as partname, x.pclocatortype as locatortype "
-            "FROM pg_class c "
-            "INNER JOIN pg_namespace n ON n.oid = c.relnamespace INNER JOIN pgxc_class x on x.pcrelid = c.oid "
-            "LEFT JOIN pg_partition p on c.oid = p.parentid "
+            "FROM pg_class c INNER JOIN pg_namespace n ON n.oid = c.relnamespace INNER JOIN pgxc_class x "
+            "on x.pcrelid = c.oid LEFT JOIN pg_partition p on c.oid = p.parentid "
             "WHERE c.relkind = 'r' and n.nspname not in ('pg_toast','cstore'))"
             "select t.relid, t.partid, (case when locatortype = 'R' then (f.n_dead_tuples/f.count) else "
             "f.n_dead_tuples end)::bigint as n_dead_tuples, "
@@ -1851,12 +1773,10 @@ static void fetch_global_autovac_info()
             "from t inner join f on (t.nspname = f.nspname and t.relname = f.relname "
             "and (t.partname = f.partname or (t.partname is null and f.partname is null))) ", "false");
     } else {
-        appendStringInfo(&buf,
-            "with f as (select nspname, relname, sum(n_dead_tuples) as n_dead_tuples, "
+        appendStringInfo(&buf, "with f as (select nspname, relname, sum(n_dead_tuples) as n_dead_tuples, "
             "sum(changes_since_analyze) as changes_since_analyze, count(1) as count "
-            "from pg_total_autovac_tuples(%s) group by nspname, relname), "
-            "t as(SELECT c.oid as relid, n.nspname AS nspname, c.relname AS relname, x.pclocatortype as locatortype "
-            "FROM pg_class c "
+            "from pg_total_autovac_tuples(%s) group by nspname, relname), t as(SELECT c.oid as relid, "
+            "n.nspname AS nspname, c.relname AS relname, x.pclocatortype as locatortype FROM pg_class c "
             "INNER JOIN pg_namespace n ON n.oid = c.relnamespace INNER JOIN pgxc_class x on x.pcrelid = c.oid "
             "WHERE c.relkind = 'r' and c.relpersistence = 'p' and n.nspname not in ('pg_toast','cstore'))"
             "select t.relid, NULL AS partid, "
@@ -1870,9 +1790,11 @@ static void fetch_global_autovac_info()
     AUTOVAC_LOG(DEBUG2, "FETCH GLOABLE AUTOVAC INFO STRING: %s", buf.data);
 
     PushActiveSnapshot(GetTransactionSnapshot());
+    AddApplicationNameToPoolerParams();
     PG_TRY();
     {
         DEBUG_MOD_START_TIMER(MOD_AUTOVAC);
+        SPI_STACK_LOG("connect", NULL, NULL);
         if (SPI_OK_CONNECT != SPI_connect()) {
             ereport(ERROR, (errcode(ERRCODE_OPERATE_FAILED), errmsg("Unable to connect to execute internal query.")));
         }
@@ -1920,6 +1842,7 @@ static void fetch_global_autovac_info()
         DEBUG_MOD_STOP_TIMER(MOD_AUTOVAC, "AUTOVAC TIMER: process %u SPI tuples", SPI_processed);
 
         connected = false;
+        SPI_STACK_LOG("finish", NULL, NULL);
         if (SPI_OK_FINISH != SPI_finish()) {
             ereport(ERROR, (errcode(ERRCODE_OPERATE_FAILED), errmsg("SPI_finish failed")));
         }
@@ -1928,8 +1851,11 @@ static void fetch_global_autovac_info()
     }
     PG_CATCH(); /* Clean up in case of error. */
     {
-        if (connected)
+        DeleteApplicationNameFromPoolerParams();
+        if (connected) {
+            SPI_STACK_LOG("finish", NULL, NULL);
             SPI_finish();
+        }
 
         /* Carry on with error handling. */
         PopActiveSnapshot();
@@ -1937,6 +1863,7 @@ static void fetch_global_autovac_info()
         u_sess->debug_query_id = 0;
     }
     PG_END_TRY();
+    DeleteApplicationNameFromPoolerParams();
 }
 
 /*
@@ -2143,6 +2070,25 @@ static void do_autovacuum(void)
             continue;
         }
 
+        /* Here we skipped relation_support_autoavac() and relation_needs_vacanalyze() checks
+         * for Ustore partitioned tables
+         */
+        bytea *rawRelopts = extractRelOptions(tuple, pg_class_desc, InvalidOid);
+        if (rawRelopts != NULL && RelationIsTableAccessMethodUStoreType(rawRelopts) &&
+            isPartitionedRelation(classForm)) {
+            vacObj = (vacuum_object*)palloc(sizeof(vacuum_object));
+            vacObj->tab_oid = relid;
+            vacObj->parent_oid = InvalidOid;
+            vacObj->dovacuum = true;
+            vacObj->dovacuum_toast = false;
+            vacObj->doanalyze = false;
+            vacObj->need_freeze = false;
+            vacObj->is_internal_relation = false;
+            vacObj->flags = VACFLG_MAIN_PARTITION;
+            table_oids = lappend(table_oids, vacObj);
+            continue;
+        }
+
         /* Fetch reloptions for this table */
         relopts = extract_autovac_opts(tuple, pg_class_desc);
 
@@ -2249,7 +2195,6 @@ static void do_autovacuum(void)
             pfree_ext(relopts);
         }
     }
-
     tableam_scan_end(relScan);
     DEBUG_MOD_STOP_TIMER(MOD_AUTOVAC, "AUTOVAC TIMER: Scan pg_class to determine which tables to vacuum");
 
@@ -2350,7 +2295,6 @@ static void do_autovacuum(void)
             }
         }
     }
-
     /* Close the pg_partition */
     tableam_scan_end(partScan);
     heap_close(partRel, AccessShareLock);
@@ -2449,7 +2393,6 @@ static void do_autovacuum(void)
             pfree_ext(relopts);
         }
     }
-
     tableam_scan_end(relScan);
     heap_close(classRel, AccessShareLock);
     DEBUG_MOD_STOP_TIMER(MOD_AUTOVAC, "AUTOVAC TIMER: Scan pg_class to determine which toast tables to vacuum");
@@ -2524,12 +2467,12 @@ static void do_autovacuum(void)
              * 2. other worker handle the part table, need check the worker's parentoid not equal the parentid;
              */
             if (parentid == InvalidOid && (worker->wi_tableoid == relid || worker->wi_parentoid == relid)) {
-                AUTOVAC_LOG(LOG, "parentoid = %u, tableoid = %u is is on autovac, just skip it", parentid, relid);
+                AUTOVAC_LOG(DEBUG1, "parentoid = %u, tableoid = %u is on autovac, just skip it", parentid, relid);
                 skipit = true;
                 break;
             }
             if (parentid != InvalidOid && (worker->wi_tableoid == parentid || worker->wi_parentoid == parentid)) {
-                AUTOVAC_LOG(LOG, "parentoid = %u, tableoid = %u is is on autovac, just skip it", parentid, relid);
+                AUTOVAC_LOG(DEBUG1, "parentoid = %u, tableoid = %u is on autovac, just skip it", parentid, relid);
                 skipit = true;
                 break;
             }
@@ -2660,8 +2603,10 @@ static void do_autovacuum(void)
             (void)MemoryContextSwitchTo(t_thrd.mem_cxt.portal_mem_cxt);
 
             if ((IS_PGXC_COORDINATOR || IS_SINGLE_NODE) && u_sess->attr.attr_storage.autoanalyze_timeout > 0 &&
-                tab->at_doanalyze && !tab->at_dovacuum)
+                tab->at_doanalyze && !tab->at_dovacuum) {
+                t_thrd.storage_cxt.timeIsPausing = false;
                 enable_sig_alarm(u_sess->attr.attr_storage.autoanalyze_timeout * 1000, true);
+            }
 
             if (local_autovacuum || vacObj->is_internal_relation)
                 autovacuum_local_vac_analyze(tab, bstrategy);
@@ -2693,6 +2638,10 @@ static void do_autovacuum(void)
             t_thrd.int_cxt.QueryCancelPending = false;
             (void)disable_sig_alarm(true);
             t_thrd.int_cxt.QueryCancelPending = false; /* again in case timeout occurred */
+
+            /* Erase time counter pause info */
+            t_thrd.storage_cxt.timeIsPausing = false;
+            t_thrd.storage_cxt.restimems = -1;
 
             if (tab->at_dovacuum)
                 errcontext("automatic vacuum of table \"%s.%s.%s\"", tab->at_datname, tab->at_nspname, tab->at_relname);
@@ -2789,6 +2738,12 @@ AutoVacOpts* extract_autovac_opts(HeapTuple tup, TupleDesc pg_class_desc)
     av = (AutoVacOpts*)palloc(sizeof(AutoVacOpts));
     rc = memcpy_s(av, sizeof(AutoVacOpts), &(((StdRdOptions*)relopts)->autovacuum), sizeof(AutoVacOpts));
     securec_check(rc, "\0", "\0");
+
+    /* autovacuum for ustore unpartitioned table is disabled */
+    if (RelationIsTableAccessMethodUStoreType(relopts)) {
+        av->enabled = isPartitionedRelation((Form_pg_class)GETSTRUCT(tup));
+    }
+
     pfree_ext(relopts);
 
     return av;
@@ -2911,6 +2866,19 @@ static autovac_table* table_recheck_autovac(
     if (!HeapTupleIsValid(classTup))
         return NULL;
     classForm = (Form_pg_class)GETSTRUCT(classTup);
+    bytea *rawRelopts = extractRelOptions(classTup, pg_class_desc, InvalidOid);
+    /* this is Ustore partitioned table, use another bypass */
+    if (rawRelopts != NULL && RelationIsTableAccessMethodUStoreType(rawRelopts) &&
+        isPartitionedRelation(classForm)) {
+        avopts = extract_autovac_opts(classTup, pg_class_desc);
+        tab = calculate_vacuum_cost_and_freezeages(avopts, false, false);
+        if (tab != NULL) {
+            tab->at_relid = relid;
+            tab->at_sharedrel = classForm->relisshared;
+            tab->at_dovacuum = true;
+        }
+        return tab;
+    }
 
     /*
      * Get the applicable reloptions.  If it is a TOAST table, try to get the
@@ -2978,7 +2946,7 @@ static autovac_table* table_recheck_autovac(
  */
 static void determine_vacuum_params(float4& vac_scale_factor, int& vac_base_thresh, float4& anl_scale_factor,
     int& anl_base_thresh, int64& freeze_max_age, bool& av_enabled, TransactionId& xidForceLimit,
-    const AutoVacOpts* relopts)
+    MultiXactId& multiForceLimit, const AutoVacOpts* relopts)
 {
     /* -1 in autovac setting means use plain vacuum_cost_delay */
     vac_scale_factor = (relopts && relopts->vacuum_scale_factor >= 0) ? relopts->vacuum_scale_factor
@@ -3004,7 +2972,17 @@ static void determine_vacuum_params(float4& vac_scale_factor, int& vac_base_thre
         xidForceLimit = t_thrd.autovacuum_cxt.recentXid - freeze_max_age;
     else
         xidForceLimit = FirstNormalTransactionId;
+
+#ifndef ENABLE_MULTIPLE_NODES
+    if (t_thrd.autovacuum_cxt.recentMulti >
+        FirstMultiXactId + (uint64)g_instance.attr.attr_storage.autovacuum_freeze_max_age)
+        multiForceLimit = t_thrd.autovacuum_cxt.recentMulti -
+            (uint64)g_instance.attr.attr_storage.autovacuum_freeze_max_age;
+    else
+        multiForceLimit = FirstMultiXactId;
+#endif
 }
+
 /*
  * relation_needs_vacanalyze
  *
@@ -3051,6 +3029,7 @@ static void relation_needs_vacanalyze(Oid relid, AutoVacOpts* relopts, Form_pg_c
     bool found = false;
     bool force_vacuum = false;
     bool av_enabled = false;
+    bool userEnabled = true;
     /* pg_class.reltuples */
     float4 reltuples;
 
@@ -3071,18 +3050,18 @@ static void relation_needs_vacanalyze(Oid relid, AutoVacOpts* relopts, Form_pg_c
     /* freeze parameters */
     int64 freeze_max_age = 0;
     TransactionId xidForceLimit = InvalidTransactionId;
+    MultiXactId	multiForceLimit = InvalidMultiXactId;
 
     AssertArg(classForm != NULL);
     AssertArg(OidIsValid(relid));
 
     determine_vacuum_params(vac_scale_factor, vac_base_thresh, anl_scale_factor, anl_base_thresh, freeze_max_age,
-        av_enabled, xidForceLimit, relopts);
+        av_enabled, xidForceLimit, multiForceLimit, relopts);
 
     bool isNull = false;
     TransactionId relfrozenxid = InvalidTransactionId;
     Relation rel = heap_open(RelationRelationId, AccessShareLock);
     Datum xid64datum = heap_getattr(tuple, Anum_pg_class_relfrozenxid64, RelationGetDescr(rel), &isNull);
-    heap_close(rel, AccessShareLock);
 
     if (isNull) {
         relfrozenxid = classForm->relfrozenxid;
@@ -3096,14 +3075,20 @@ static void relation_needs_vacanalyze(Oid relid, AutoVacOpts* relopts, Form_pg_c
     }
 
     force_vacuum = (TransactionIdIsNormal(relfrozenxid) && TransactionIdPrecedes(relfrozenxid, xidForceLimit));
+#ifndef ENABLE_MULTIPLE_NODES
+    if (!force_vacuum) {
+        Datum mxidDatum = heap_getattr(tuple, Anum_pg_class_relminmxid, RelationGetDescr(rel), &isNull);
+        MultiXactId relminmxid = isNull ? FirstMultiXactId : DatumGetTransactionId(mxidDatum);
+        force_vacuum = (MultiXactIdIsValid(relminmxid) && MultiXactIdPrecedes(relminmxid, multiForceLimit));
+    }
+#endif
+    heap_close(rel, AccessShareLock);
     *need_freeze = force_vacuum;
     AUTOVAC_LOG(DEBUG2, "vac \"%s\": need freeze is %s", NameStr(classForm->relname), force_vacuum ? "true" : "false");
 
     /* User disabled it in pg_class.reloptions?  (But ignore if at risk) */
     if (!force_vacuum && (!av_enabled || !u_sess->attr.attr_storage.autovacuum_start_daemon)) {
-        *doanalyze = false;
-        *dovacuum = false;
-        return;
+        userEnabled = false;
     }
 
     if (NULL != t_thrd.autovacuum_cxt.pgStatAutoVacInfo) {
@@ -3147,13 +3132,20 @@ static void relation_needs_vacanalyze(Oid relid, AutoVacOpts* relopts, Form_pg_c
             *doanalyze = ((float4)anltuples > anlthresh);
     }
 
+    *dovacuum = *dovacuum && userEnabled;
+
     if (*dovacuum || *doanalyze) {
-        AUTOVAC_LOG(DEBUG2, "vac \"%s\": recheck = %s need_freeze = %s"
-            "dovacuum = %s (dead tuples %ld vacuum threshold %.0f) "
-            "doanalyze = %s (changed tuples %ld analyze threshold %.0f)",
+        AUTOVAC_LOG(DEBUG2, "vac \"%s\": recheck = %s need_freeze = %s dovacuum = %s (dead tuples %ld "
+            "vacuum threshold %.0f) doanalyze = %s (changed tuples %ld analyze threshold %.0f)",
             NameStr(classForm->relname), is_recheck ? "true" : "false", *need_freeze ? "true" : "false",
             *dovacuum ? "true" : "false", vactuples, vacthresh, *doanalyze ? "true" : "false", anltuples, anlthresh);
     }
+
+    DEBUG_VACUUM_LOG(relid, classForm->relnamespace, LOG, "vac \"%s\": recheck = %s need_freeze = %s dovacuum = %s "
+        "(dead tuples %ld vacuum threshold %.0f) doanalyze = %s (changed tuples %ld analyze threshold %.0f) reltuples "
+        "= %.0f", NameStr(classForm->relname), is_recheck ? "true" : "false", *need_freeze ? "true" : "false",
+        *dovacuum ? "true" : "false", vactuples, vacthresh, *doanalyze ? "true" : "false",
+        anltuples, anlthresh, reltuples);
 }
 
 /*
@@ -3464,13 +3456,15 @@ static void partition_needs_vacanalyze(Oid partid, AutoVacOpts* relopts, Form_pg
     /* freeze parameters */
     int64 freeze_max_age = 0;
     TransactionId xidForceLimit = InvalidTransactionId;
+    MultiXactId multiForceLimit = InvalidMultiXactId;
 
     char* relname = NULL;
+    Oid nameSpaceOid = InvalidOid;
     char* partname = NULL;
 
     AssertArg(partForm != NULL && OidIsValid(partid));
     determine_vacuum_params(vac_scale_factor, vac_base_thresh, anl_scale_factor, anl_base_thresh, freeze_max_age,
-        av_enabled, xidForceLimit, relopts);
+        av_enabled, xidForceLimit, multiForceLimit, relopts);
     /* Force vacuum if table need freeze the old tuple to recycle clog */
     if (t_thrd.autovacuum_cxt.recentXid > FirstNormalTransactionId + freeze_max_age)
         xidForceLimit = t_thrd.autovacuum_cxt.recentXid - freeze_max_age;
@@ -3481,7 +3475,6 @@ static void partition_needs_vacanalyze(Oid partid, AutoVacOpts* relopts, Form_pg
     TransactionId relfrozenxid = InvalidTransactionId;
     Relation rel = heap_open(PartitionRelationId, AccessShareLock);
     Datum xid64datum = heap_getattr(partTuple, Anum_pg_partition_relfrozenxid64, RelationGetDescr(rel), &isNull);
-    heap_close(rel, AccessShareLock);
 
     if (isNull) {
         relfrozenxid = partForm->relfrozenxid;
@@ -3493,6 +3486,15 @@ static void partition_needs_vacanalyze(Oid partid, AutoVacOpts* relopts, Form_pg
     } else {
         relfrozenxid = DatumGetTransactionId(xid64datum);
     }
+
+#ifndef ENABLE_MULTIPLE_NODES
+    if (!force_vacuum) {
+        Datum mxidDatum = heap_getattr(partTuple, Anum_pg_partition_relminmxid, RelationGetDescr(rel), &isNull);
+        MultiXactId relminmxid = isNull ? FirstMultiXactId : DatumGetTransactionId(mxidDatum);
+        force_vacuum = (MultiXactIdIsValid(relminmxid) && MultiXactIdPrecedes(relminmxid, multiForceLimit));
+    }
+#endif
+    heap_close(rel, AccessShareLock);
 
     force_vacuum = (TransactionIdIsNormal(relfrozenxid) && TransactionIdPrecedes(relfrozenxid, xidForceLimit));
     *need_freeze = force_vacuum;
@@ -3511,6 +3513,7 @@ static void partition_needs_vacanalyze(Oid partid, AutoVacOpts* relopts, Form_pg
     }
 
     relname = get_rel_name(partForm->parentid);
+    nameSpaceOid = get_rel_namespace(partForm->parentid);
     partname = NameStr(partForm->relname);
 
     reltuples = partForm->reltuples;
@@ -3540,9 +3543,8 @@ static void partition_needs_vacanalyze(Oid partid, AutoVacOpts* relopts, Form_pg
             anltuples = avwentry->changes_since_analyze;
             vactuples = avwentry->n_dead_tuples;
 
-            AUTOVAC_LOG(DEBUG2, "fetch local stat info: vac \"%s\" partition(\"%s\") "
-                "changes_since_analyze = %ld  n_dead_tuples = %ld ",
-                relname, partname, avwentry->changes_since_analyze, avwentry->n_dead_tuples);
+            AUTOVAC_LOG(DEBUG2, "fetch local stat info: vac \"%s\" partition(\"%s\") changes_since_analyze = %ld "
+                "n_dead_tuples = %ld ", relname, partname, avwentry->changes_since_analyze, avwentry->n_dead_tuples);
 
             /*
              * refresh partition's vacthresh/anlthresh with n_live_tuples because we
@@ -3572,6 +3574,11 @@ static void partition_needs_vacanalyze(Oid partid, AutoVacOpts* relopts, Form_pg
             relname, partname, is_recheck ? "true" : "false", *need_freeze ? "true" : "false",
             *dovacuum ? "true" : "false", vactuples, vacthresh);
     }
+
+    DEBUG_VACUUM_LOG(partForm->parentid, nameSpaceOid, LOG, "vac table \"%s\" partition(\"%s\"): recheck = %s "
+        "need_freeze = %s dovacuum = %s (dead tuples %ld vacuum threshold %.0f) reltuple = %.0f",
+        relname, partname, is_recheck ? "true" : "false", *need_freeze ? "true" : "false",
+        *dovacuum ? "true" : "false", vactuples, vacthresh, reltuples);
 }
 
 static autovac_table* partition_recheck_autovac(

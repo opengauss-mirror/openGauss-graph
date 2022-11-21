@@ -10,6 +10,7 @@
  * Portions Copyright (c) 2020 Huawei Technologies Co.,Ltd.
  * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
+ * Portions Copyright (c) 2021, openGauss Contributors
  *
  *
  * IDENTIFICATION
@@ -79,43 +80,43 @@
 #include "knl/knl_variable.h"
 
 #include "executor/executor.h"
-#include "executor/nodeAgg.h"
-#include "executor/nodeAppend.h"
-#include "executor/nodeBitmapAnd.h"
-#include "executor/nodeBitmapHeapscan.h"
-#include "executor/nodeBitmapIndexscan.h"
-#include "executor/nodeBitmapOr.h"
-#include "executor/nodeCtescan.h"
-#include "executor/nodeExtensible.h"
-#include "executor/nodeForeignscan.h"
-#include "executor/nodeFunctionscan.h"
-#include "executor/nodeGroup.h"
-#include "executor/nodeHash.h"
-#include "executor/nodeHashjoin.h"
-#include "executor/nodeIndexonlyscan.h"
-#include "executor/nodeIndexscan.h"
-#include "executor/nodeLimit.h"
-#include "executor/nodeLockRows.h"
-#include "executor/nodeMaterial.h"
-#include "executor/nodeMergeAppend.h"
-#include "executor/nodeMergejoin.h"
-#include "executor/nodeModifyTable.h"
-#include "executor/nodeNestloop.h"
-#include "executor/nodePartIterator.h"
-#include "executor/nodeRecursiveunion.h"
-#include "executor/nodeResult.h"
-#include "executor/nodeSeqscan.h"
-#include "executor/nodeSetOp.h"
-#include "executor/nodeSort.h"
-#include "executor/nodeStub.h"
-#include "executor/nodeSubplan.h"
-#include "executor/nodeSubqueryscan.h"
-#include "executor/nodeTidscan.h"
-#include "executor/nodeUnique.h"
-#include "executor/nodeValuesscan.h"
-#include "executor/nodeWindowAgg.h"
-#include "executor/nodeWorktablescan.h"
-#include "executor/execStream.h"
+#include "executor/node/nodeAgg.h"
+#include "executor/node/nodeAppend.h"
+#include "executor/node/nodeBitmapAnd.h"
+#include "executor/node/nodeBitmapHeapscan.h"
+#include "executor/node/nodeBitmapIndexscan.h"
+#include "executor/node/nodeBitmapOr.h"
+#include "executor/node/nodeCtescan.h"
+#include "executor/node/nodeExtensible.h"
+#include "executor/node/nodeForeignscan.h"
+#include "executor/node/nodeFunctionscan.h"
+#include "executor/node/nodeGroup.h"
+#include "executor/node/nodeHash.h"
+#include "executor/node/nodeHashjoin.h"
+#include "executor/node/nodeIndexonlyscan.h"
+#include "executor/node/nodeIndexscan.h"
+#include "executor/node/nodeLimit.h"
+#include "executor/node/nodeLockRows.h"
+#include "executor/node/nodeMaterial.h"
+#include "executor/node/nodeMergeAppend.h"
+#include "executor/node/nodeMergejoin.h"
+#include "executor/node/nodeModifyTable.h"
+#include "executor/node/nodeNestloop.h"
+#include "executor/node/nodePartIterator.h"
+#include "executor/node/nodeRecursiveunion.h"
+#include "executor/node/nodeResult.h"
+#include "executor/node/nodeSeqscan.h"
+#include "executor/node/nodeSetOp.h"
+#include "executor/node/nodeSort.h"
+#include "executor/node/nodeStub.h"
+#include "executor/node/nodeSubplan.h"
+#include "executor/node/nodeSubqueryscan.h"
+#include "executor/node/nodeTidscan.h"
+#include "executor/node/nodeUnique.h"
+#include "executor/node/nodeValuesscan.h"
+#include "executor/node/nodeWindowAgg.h"
+#include "executor/node/nodeWorktablescan.h"
+#include "executor/exec/execStream.h"
 #include "optimizer/clauses.h"
 #include "optimizer/encoding.h"
 #include "optimizer/ml_model.h"
@@ -162,9 +163,12 @@
 #include "securec.h"
 #include "gstrace/gstrace_infra.h"
 #include "gstrace/executer_gstrace.h"
-#include "executor/nodeGD.h"
-#include "executor/nodeKMeans.h"
-
+#include "executor/node/nodeTrainModel.h"
+#ifdef GS_GRAPH
+#include "executor/nodeModifyGraph.h"
+#include "executor/node/nodeSparqlLoad.h"
+#include "executor/node/nodeNestloopVle.h"
+#endif
 #define NODENAMELEN 64
 
 /*
@@ -266,6 +270,8 @@ PlanState* ExecInitNodeByType(Plan* node, EState* estate, int eflags)
             return (PlanState*)ExecInitMergeAppend((MergeAppend*)node, estate, eflags);
         case T_RecursiveUnion:
             return (PlanState*)ExecInitRecursiveUnion((RecursiveUnion*)node, estate, eflags);
+        case T_StartWithOp:
+            return (PlanState*)ExecInitStartWithOp((StartWithOp*)node, estate, eflags);
         case T_BitmapAnd:
             return (PlanState*)ExecInitBitmapAnd((BitmapAnd*)node, estate, eflags);
         case T_BitmapOr:
@@ -298,6 +304,10 @@ PlanState* ExecInitNodeByType(Plan* node, EState* estate, int eflags)
             return (PlanState*)ExecInitExtensiblePlan((ExtensiblePlan*)node, estate, eflags);
         case T_NestLoop:
             return (PlanState*)ExecInitNestLoop((NestLoop*)node, estate, eflags);
+#ifdef GS_GRAPH
+        case T_NestLoopVLE:
+            return (PlanState*)ExecInitNestLoopVLE((NestLoopVLE*)node, estate, eflags);
+#endif
         case T_MergeJoin:
             return (PlanState*)ExecInitMergeJoin((MergeJoin*)node, estate, eflags);
         case T_HashJoin:
@@ -393,10 +403,14 @@ PlanState* ExecInitNodeByType(Plan* node, EState* estate, int eflags)
             return (PlanState*)ExecInitVecMergeJoin((VecMergeJoin*)node, estate, eflags);
         case T_VecWindowAgg:
             return (PlanState*)ExecInitVecWindowAgg((VecWindowAgg*)node, estate, eflags);
-        case T_GradientDescent:
-            return (PlanState*)ExecInitGradientDescent((GradientDescent*)node, estate, eflags);
-        case T_KMeans:
-            return (PlanState*)ExecInitKMeans((KMeans*)node, estate, eflags);
+        case T_TrainModel:
+            return (PlanState*)ExecInitTrainModel((TrainModel*)node, estate, eflags);
+#ifdef GS_GRAPH
+        case T_ModifyGraph:
+			return (PlanState*)ExecInitModifyGraph((ModifyGraph *) node, estate, eflags);
+        case T_SparqlLoadPlan:
+            return (PlanState*)ExecInitSparqlLoad((SparqlLoadPlan*) node, estate, eflags);
+#endif
         default:
             ereport(ERROR,
                 (errmodule(MOD_EXECUTOR),
@@ -622,6 +636,8 @@ TupleTableSlot* ExecProcNodeByType(PlanState* node)
             return ExecMergeAppend((MergeAppendState*)node);
         case T_RecursiveUnionState:
             return ExecRecursiveUnion((RecursiveUnionState*)node);
+        case T_StartWithOpState:
+            return ExecStartWithOp((StartWithOpState*)node);
         case T_SeqScanState:
             return ExecSeqScan((SeqScanState*)node);
         case T_IndexScanState:
@@ -651,6 +667,10 @@ TupleTableSlot* ExecProcNodeByType(PlanState* node)
              */
         case T_NestLoopState:
             return ExecNestLoop((NestLoopState*)node);
+#ifdef GS_GRAPH
+        case T_NestLoopVLEState:
+            return ExecNestLoopVLE((NestLoopVLEState*)node);
+#endif
         case T_MergeJoinState:
             return ExecMergeJoin((MergeJoinState*)node);
         case T_HashJoinState:
@@ -698,10 +718,8 @@ TupleTableSlot* ExecProcNodeByType(PlanState* node)
             result = ExecStream((StreamState*)node);
             t_thrd.pgxc_cxt.GlobalNetInstr = NULL;
             return result;
-        case T_GradientDescentState:
-            return ExecGradientDescent((GradientDescentState*)node);
-        case T_KMeansState:
-            return ExecKMeans((KMeansState*)node);
+        case T_TrainModelState:
+            return ExecTrainModel((TrainModelState*)node);
         default:
             ereport(ERROR,
                 (errmodule(MOD_EXECUTOR),
@@ -739,6 +757,16 @@ void ExecProcNodeInstr(PlanState* node, TupleTableSlot* result)
             node->state->es_last_processed = node->state->es_processed;
             node->instrument->firsttuple = INSTR_TIME_GET_DOUBLE(first_tuple);
             break;
+        case T_SeqScanState:
+            if (((SeqScanState*) node)->scanBatchMode) {
+                if (!TupIsNull(result)) {
+                    /* Batch mode does not collect memory info as it takes too much CPU resources. */
+                    InstrStopNode(node->instrument, ((SeqScanState*)node)->scanBatchState->scanBatch.rows, false);
+                } else {
+                    InstrStopNode(node->instrument, 0.0);
+                }
+                break;
+            }
         default:
             InstrStopNode(node->instrument, TupIsNull(result) ? 0.0 : 1.0);
             break;
@@ -748,6 +776,262 @@ void ExecProcNodeInstr(PlanState* node, TupleTableSlot* result)
     if (TupIsNull(result))
         node->instrument->status = true;
 }
+
+typedef TupleTableSlot* (*ExecProcFuncType)(PlanState* node);
+
+static inline TupleTableSlot *DefaultExecProc(PlanState *node)
+{
+    ereport(ERROR,
+        (errmodule(MOD_EXECUTOR),
+            errcode(ERRCODE_UNRECOGNIZED_NODE_TYPE),
+            errmsg("unrecognized node type: %d when executing executor node.", (int)nodeTag(node))));
+    return NULL;
+}
+
+static inline TupleTableSlot *ExecResultWrap(PlanState *node)
+{
+    return ExecResult((ResultState*)node);
+};
+
+static inline TupleTableSlot *ExecVecToRowWrap(PlanState *node)
+{
+    return ExecVecToRow((VecToRowState*)node);
+}
+
+static inline TupleTableSlot *ExecModifyTableWrap(PlanState *node)
+{
+    return ExecModifyTable((ModifyTableState*)node);
+};
+
+static inline TupleTableSlot *ExecModifyGraphWrap(PlanState *node)
+{
+    return ExecModifyGraph((ModifyGraphState*) node);
+};
+
+static inline TupleTableSlot *ExecSparqlLoadWrap(PlanState *node)
+{
+    return ExecSparqlLoad((SparqlLoadState*) node);
+};
+
+static inline TupleTableSlot *ExecAppendWrap(PlanState *node)
+{
+    return ExecAppend((AppendState*)node);
+};
+
+static inline TupleTableSlot *ExecPartIteratorWrap(PlanState *node)
+{
+    return ExecPartIterator((PartIteratorState*)node);
+};
+
+static inline TupleTableSlot *ExecMergeAppendWrap(PlanState *node)
+{
+    return ExecMergeAppend((MergeAppendState*)node);
+};
+
+static inline TupleTableSlot *ExecRecursiveUnionWrap(PlanState *node)
+{
+    return ExecRecursiveUnion((RecursiveUnionState*)node);
+};
+
+static inline TupleTableSlot *ExecStartWithOpWrap(PlanState *node)
+{
+    return ExecStartWithOp((StartWithOpState*)node);
+};
+
+static inline TupleTableSlot *ExecSeqScanWrap(PlanState *node)
+{
+    return ExecSeqScan((SeqScanState *)node);
+};
+
+static inline TupleTableSlot *ExecIndexScanWrap(PlanState *node)
+{
+    return ExecIndexScan((IndexScanState *)node);
+};
+
+static inline TupleTableSlot *ExecIndexOnlyScanWrap(PlanState *node)
+{
+    return ExecIndexOnlyScan((IndexOnlyScanState *)node);
+};
+
+static inline TupleTableSlot *ExecBitmapHeapScanWrap(PlanState *node)
+{
+    return ExecBitmapHeapScan((BitmapHeapScanState *)node);
+};
+
+static inline TupleTableSlot *ExecTidScanWrap(PlanState *node)
+{
+    return ExecTidScan((TidScanState *)node);
+};
+
+static inline TupleTableSlot *ExecSubqueryScanWrap(PlanState *node)
+{
+    return ExecSubqueryScan((SubqueryScanState *)node);
+};
+
+static inline TupleTableSlot *ExecFunctionScanWrap(PlanState *node)
+{
+    return ExecFunctionScan((FunctionScanState *)node);
+};
+
+static inline TupleTableSlot *ExecValuesScanWrap(PlanState *node)
+{
+    return ExecValuesScan((ValuesScanState *)node);
+};
+
+static inline TupleTableSlot *ExecCteScanWrap(PlanState *node)
+{
+    return ExecCteScan((CteScanState *)node);
+};
+
+static inline TupleTableSlot *ExecWorkTableScanWrap(PlanState *node)
+{
+    return ExecWorkTableScan((WorkTableScanState *)node);
+};
+
+static inline TupleTableSlot *ExecForeignScanWrap(PlanState *node)
+{
+    return ExecForeignScan((ForeignScanState *)node);
+};
+
+static inline TupleTableSlot *ExecExtensiblePlanWrap(PlanState *node)
+{
+    return ExecExtensiblePlan((ExtensiblePlanState *)node);
+};
+
+static inline TupleTableSlot *ExecNestLoopWrap(PlanState *node)
+{
+    return ExecNestLoop((NestLoopState *)node);
+};
+
+static inline TupleTableSlot *ExecNestLoopVLEWrap(PlanState *node)
+{
+    return ExecNestLoopVLE((NestLoopVLEState *)node);
+};
+
+static inline TupleTableSlot *ExecMergeJoinWrap(PlanState *node)
+{
+    return ExecMergeJoin((MergeJoinState *)node);
+};
+
+static inline TupleTableSlot *ExecHashJoinWrap(PlanState *node)
+{
+    return ExecHashJoin((HashJoinState *)node);
+};
+
+static inline TupleTableSlot *ExecMaterialWrap(PlanState *node)
+{
+    return ExecMaterial((MaterialState *)node);
+};
+
+static inline TupleTableSlot *ExecSortWrap(PlanState *node)
+{
+    return ExecSort((SortState *)node);
+};
+
+static inline TupleTableSlot *ExecGroupWrap(PlanState *node)
+{
+    return ExecGroup((GroupState *)node);
+};
+
+static inline TupleTableSlot *ExecAggWrap(PlanState *node)
+{
+    return ExecAgg((AggState *)node);
+};
+
+static inline TupleTableSlot *ExecWindowAggWrap(PlanState *node)
+{
+    return ExecWindowAgg((WindowAggState *)node);
+};
+
+static inline TupleTableSlot *ExecUniqueWrap(PlanState *node)
+{
+    return ExecUnique((UniqueState *)node);
+};
+
+static inline TupleTableSlot *ExecHashWrap(PlanState *node)
+{
+    return ExecHash();
+};
+
+static inline TupleTableSlot *ExecSetOpWrap(PlanState *node)
+{
+    return ExecSetOp((SetOpState *)node);
+};
+
+static TupleTableSlot *ExecLockRowsWrap(PlanState *node)
+{
+    return ExecLockRows((LockRowsState *)node);
+};
+
+static inline TupleTableSlot *ExecLimitWrap(PlanState *node)
+{
+    return ExecLimit((LimitState *)node);
+};
+
+static inline TupleTableSlot *ExecRemoteQueryWrap(PlanState *node)
+{
+    return ExecRemoteQuery((RemoteQueryState *)node);
+};
+
+static inline TupleTableSlot *ExecTrainModelWrap(PlanState *node)
+{
+   return ExecTrainModel((TrainModelState*)node);
+}
+
+static inline TupleTableSlot *ExecStreamWrap(PlanState *node)
+{
+    return ExecStream((StreamState *)node);
+};
+
+ExecProcFuncType g_execProcFuncTable[] = {
+    ExecResultWrap,
+    ExecVecToRowWrap,
+    DefaultExecProc,
+    ExecModifyTableWrap,
+    ExecModifyGraphWrap,
+    ExecSparqlLoadWrap,
+    ExecModifyTableWrap,
+    ExecAppendWrap,
+    ExecPartIteratorWrap,
+    ExecMergeAppendWrap,
+    ExecRecursiveUnionWrap,
+    ExecStartWithOpWrap,
+    DefaultExecProc,
+    DefaultExecProc,
+    DefaultExecProc,
+    ExecSeqScanWrap,
+    ExecIndexScanWrap,
+    ExecIndexOnlyScanWrap,
+    DefaultExecProc,
+    ExecBitmapHeapScanWrap,
+    ExecTidScanWrap,
+    ExecSubqueryScanWrap,
+    ExecFunctionScanWrap,
+    ExecValuesScanWrap,
+    ExecCteScanWrap,
+    ExecWorkTableScanWrap,
+    ExecForeignScanWrap,
+    ExecExtensiblePlanWrap,
+    DefaultExecProc,
+    ExecNestLoopWrap,
+    ExecNestLoopVLEWrap,
+    ExecMergeJoinWrap,
+    ExecHashJoinWrap,
+    ExecMaterialWrap,
+    ExecSortWrap,
+    ExecGroupWrap,
+    ExecAggWrap,
+    ExecWindowAggWrap,
+    ExecUniqueWrap,
+    ExecHashWrap,
+    ExecSetOpWrap,
+    ExecLockRowsWrap,
+    ExecLimitWrap,
+    ExecRemoteQueryWrap,
+    ExecTrainModelWrap,
+    ExecStreamWrap
+};
+
 /* ----------------------------------------------------------------
  *		ExecProcNode
  *
@@ -762,9 +1046,11 @@ TupleTableSlot* ExecProcNode(PlanState* node)
     MemoryContext old_context;
 
     /* Response to stop or cancel signal. */
+#ifdef ENABLE_MULTIPLE_NODES
     if (unlikely(executorEarlyStop())) {
         return NULL;
     }
+#endif
 
     /* Switch to Node Level Memory Context */
     old_context = MemoryContextSwitchTo(node->nodeContext);
@@ -777,10 +1063,15 @@ TupleTableSlot* ExecProcNode(PlanState* node)
         InstrStartNode(node->instrument);
     }
 
+#ifdef ENABLE_MULTIPLE_NODES
     if (unlikely(planstate_need_stub(node))) {
         result = ExecProcNodeStub(node);
-    } else {
-        result = ExecProcNodeByType(node);
+    } else
+#endif
+    {
+        int index = (int)(nodeTag(node))-T_ResultState;
+        Assert(index >= 0 && index <= T_StreamState - T_ResultState);
+        result = g_execProcFuncTable[index](node);
     }
 
     if (node->instrument != NULL) {
@@ -1041,18 +1332,25 @@ void cleanup_sensitive_information()
     extern THR_LOCAL unsigned char derive_vector_saved[RANDOM_LEN];
     extern THR_LOCAL unsigned char mac_vector_saved[RANDOM_LEN];
     extern THR_LOCAL unsigned char input_saved[RANDOM_LEN];
+    errno_t errorno = EOK;
 
     if (encryption_function_call == true) {
-        CleanupBuffer(derive_vector_saved, RANDOM_LEN);
-        CleanupBuffer(input_saved, RANDOM_LEN);
-        CleanupBuffer(mac_vector_saved, RANDOM_LEN);
+        errorno = memset_s(derive_vector_saved, RANDOM_LEN, 0, RANDOM_LEN);
+        securec_check(errorno, "", "");
+        errorno = memset_s(input_saved, RANDOM_LEN, 0, RANDOM_LEN);
+        securec_check(errorno, "", "");
+        errorno = memset_s(mac_vector_saved, RANDOM_LEN, 0, RANDOM_LEN);
+        securec_check(errorno, "", "");
         encryption_function_call = false;
     }
     if (decryption_function_call == true) {
         for (int i = 0; i < NUMBER_OF_SAVED_DERIVEKEYS; ++i) {
-            CleanupBuffer(derive_vector_used[i], RANDOM_LEN);
-            CleanupBuffer(user_input_used[i], RANDOM_LEN);
-            CleanupBuffer(mac_vector_used[i], RANDOM_LEN);
+            errorno = memset_s(derive_vector_used[i], RANDOM_LEN, 0, RANDOM_LEN);
+            securec_check(errorno, "", "");
+            errorno = memset_s(user_input_used[i], RANDOM_LEN, 0, RANDOM_LEN);
+            securec_check(errorno, "", "");
+            errorno = memset_s(mac_vector_used[i], RANDOM_LEN, 0, RANDOM_LEN);
+            securec_check(errorno, "", "");
         }
         decryption_function_call = false;
     }
@@ -1104,6 +1402,10 @@ static void ExecEndNodeByType(PlanState* node)
 
         case T_RecursiveUnionState:
             ExecEndRecursiveUnion((RecursiveUnionState*)node);
+            break;
+
+        case T_StartWithOpState:
+            ExecEndStartWithOp((StartWithOpState*)node);
             break;
 
         case T_BitmapAndState:
@@ -1198,6 +1500,12 @@ static void ExecEndNodeByType(PlanState* node)
         case T_NestLoopState:
             ExecEndNestLoop((NestLoopState*)node);
             break;
+
+#ifdef GS_GRAPH
+        case T_NestLoopVLEState:
+			ExecEndNestLoopVLE((NestLoopVLEState *) node);
+			break;
+#endif
 
         case T_MergeJoinState:
             ExecEndMergeJoin((MergeJoinState*)node);
@@ -1352,14 +1660,15 @@ static void ExecEndNodeByType(PlanState* node)
             ExecEndVecWindowAgg((VecWindowAggState*)node);
             break;
 
-        case T_GradientDescentState:
-            ExecEndGradientDescent((GradientDescentState*)node);
+        case T_TrainModelState:
+            ExecEndTrainModel((TrainModelState*)node);
             break;
-    
-        case T_KMeansState:
-            ExecEndKMeans((KMeansState*)node);
+        case T_ModifyGraphState:
+			ExecEndModifyGraph((ModifyGraphState *)node);
+			break;
+        case T_SparqlLoadState:
+            ExecEndSparqlLoad((SparqlLoadState*)node);
             break;
-            
         default:
             ereport(ERROR,
                 (errmodule(MOD_EXECUTOR),

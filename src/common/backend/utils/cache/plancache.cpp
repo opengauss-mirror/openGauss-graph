@@ -39,6 +39,7 @@
  *
  * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
+ * Portions Copyright (c) 2021, openGauss Contributors
  *
  * IDENTIFICATION
  *	  src/backend/utils/cache/plancache.c
@@ -65,6 +66,7 @@
 #include "parser/analyze.h"
 #include "parser/parsetree.h"
 #include "storage/lmgr.h"
+#include "parser/parse_hint.h"
 #include "tcop/pquery.h"
 #include "tcop/utility.h"
 #include "utils/hotkey.h"
@@ -75,6 +77,7 @@
 #include "utils/globalplancache.h"
 #include "instruments/instr_unique_sql.h"
 #include "instruments/instr_slow_query.h"
+#include "commands/sqladvisor.h"
 
 #ifdef ENABLE_MOT
 #include "storage/mot/jit_exec.h"
@@ -99,6 +102,7 @@ static void ReleaseGenericPlan(CachedPlanSource* plansource);
 static bool CheckCachedPlan(CachedPlanSource* plansource);
 static CachedPlan* BuildCachedPlan(CachedPlanSource* plansource, List* qlist, ParamListInfo boundParams,
                                            bool isBuildingCustomPlan);
+static void ReportReasonForPlanChoose(PlanChooseReason reason);
 static bool ChooseCustomPlan(CachedPlanSource* plansource, ParamListInfo boundParams);
 static bool IsForceCustomplan(CachedPlanSource *plansource);
 static bool IsDeleteLimit(CachedPlanSource* plansource, ParamListInfo boundParams);
@@ -129,12 +133,12 @@ bool IsStreamSupport()
  */
 void InitPlanCache(void)
 {
-    CacheRegisterRelcacheCallback(PlanCacheRelCallback, (Datum)0);
-    CacheRegisterPartcacheCallback(PlanCacheRelCallback, (Datum)0);
-    CacheRegisterSyscacheCallback(PROCOID, PlanCacheFuncCallback, (Datum)0);
-    CacheRegisterSyscacheCallback(NAMESPACEOID, PlanCacheSysCallback, (Datum)0);
-    CacheRegisterSyscacheCallback(OPEROID, PlanCacheSysCallback, (Datum)0);
-    CacheRegisterSyscacheCallback(AMOPOPID, PlanCacheSysCallback, (Datum)0);
+    CacheRegisterSessionRelcacheCallback(PlanCacheRelCallback, (Datum)0);
+    CacheRegisterSessionPartcacheCallback(PlanCacheRelCallback, (Datum)0);
+    CacheRegisterSessionSyscacheCallback(PROCOID, PlanCacheFuncCallback, (Datum)0);
+    CacheRegisterSessionSyscacheCallback(NAMESPACEOID, PlanCacheSysCallback, (Datum)0);
+    CacheRegisterSessionSyscacheCallback(OPEROID, PlanCacheSysCallback, (Datum)0);
+    CacheRegisterSessionSyscacheCallback(AMOPOPID, PlanCacheSysCallback, (Datum)0);
 }
 
 /* ddl no need to global it */
@@ -143,14 +147,22 @@ static bool IsSupportGPCStmt(const Node* node)
     bool isSupportGPC = false;
     switch (nodeTag(node)) {
         case T_InsertStmt:
+            isSupportGPC = !has_no_gpc_hint(((InsertStmt*)node)->hintState);
+            break;
         case T_DeleteStmt:
+            isSupportGPC = !has_no_gpc_hint(((DeleteStmt*)node)->hintState);
+            break;
         case T_UpdateStmt:
+            isSupportGPC = !has_no_gpc_hint(((UpdateStmt*)node)->hintState);
+            break;
         case T_MergeStmt:
+            isSupportGPC = !has_no_gpc_hint(((MergeStmt*)node)->hintState);
+            break;
         case T_SelectStmt:
-            isSupportGPC = false;
+            isSupportGPC = !has_no_gpc_hint(((SelectStmt*)node)->hintState);
             break;
         default:
-            isSupportGPC = true;
+            isSupportGPC = false;
             break;
     }
     return isSupportGPC;
@@ -192,7 +204,7 @@ CachedPlanSource* CreateCachedPlan(Node* raw_parse_tree, const char* query_strin
 
     Assert(query_string != NULL); /* required as of 8.4 */
     bool isSupportGPC = raw_parse_tree && IsSupportGPCStmt(raw_parse_tree);
-    bool enable_pbe_gpc = ENABLE_GPC && stmt_name != NULL && stmt_name[0] != '\0' && !isSupportGPC;
+    bool enable_pbe_gpc = ENABLE_GPC && stmt_name != NULL && stmt_name[0] != '\0' && isSupportGPC;
 
     if(!enable_pbe_gpc && !(ENABLE_CN_GPC && enable_spi_gpc)) {
        /*
@@ -418,8 +430,8 @@ CachedPlanSource* CreateOneShotCachedPlan(Node* raw_parse_tree, const char* quer
  * fixed_result: TRUE to disallow future changes in query's result tupdesc
  */
 void CompleteCachedPlan(CachedPlanSource* plansource, List* querytree_list, MemoryContext querytree_context,
-    Oid* param_types, int num_params, ParserSetupHook parserSetup, void* parserSetupArg, int cursor_options,
-    bool fixed_result, const char* stmt_name, ExecNodes* single_exec_node, bool is_read_only)
+    Oid* param_types, const char* paramModes, int num_params, ParserSetupHook parserSetup, void* parserSetupArg, 
+    int cursor_options, bool fixed_result, const char* stmt_name, ExecNodes* single_exec_node, bool is_read_only)
 {
     MemoryContext source_context = plansource->context;
     MemoryContext oldcxt = CurrentMemoryContext;
@@ -505,6 +517,15 @@ void CompleteCachedPlan(CachedPlanSource* plansource, List* querytree_list, Memo
         securec_check(rc, "", "");
     } else
         plansource->param_types = NULL;
+	
+    if (num_params > 0 && paramModes != NULL) {
+        plansource->param_modes = (char*)palloc(num_params * sizeof(char));
+        rc = memcpy_s(plansource->param_modes, num_params * sizeof(char), paramModes, num_params * sizeof(char));
+        securec_check(rc, "", "");
+    } else {
+        plansource->param_modes = NULL;
+    }
+
     plansource->num_params = num_params;
     plansource->parserSetup = parserSetup;
     plansource->parserSetupArg = parserSetupArg;
@@ -823,6 +844,13 @@ List* RevalidateCachedQuery(CachedPlanSource* plansource, bool has_lp)
         PushActiveSnapshot(GetTransactionSnapshot(GTM_LITE_MODE));
         snapshot_set = true;
     }
+
+    /*
+     * Query Tree is about to be rebuilt, reset is_top_unique_sql, otherwise, unique sql id
+     * can not be set.
+     */
+    if (IS_UNIQUE_SQL_TRACK_TOP)
+        SetIsTopUniqueSQL(false);
 
     /*
      * Run parse analysis and rule rewriting.  The parser tends to scribble on
@@ -1152,6 +1180,7 @@ static CachedPlan* BuildCachedPlan(CachedPlanSource* plansource, List* qlist, Pa
      * do SPI_push whenever a replan could happen, it seems best to take care
      * of the case here.
      */
+    SPI_STACK_LOG("push cond", NULL, NULL);
     spi_pushed = SPI_push_conditional();
     u_sess->pcache_cxt.query_has_params = (plansource->num_params > 0);
     /*
@@ -1163,10 +1192,8 @@ static CachedPlan* BuildCachedPlan(CachedPlanSource* plansource, List* qlist, Pa
         /* Save stream supported info since it will be reset when generate the plan. */
         outer_is_stream = u_sess->opt_cxt.is_stream;
         outer_is_stream_support = u_sess->opt_cxt.is_stream_support;
-#ifndef ENABLE_MULTIPLE_NODES
         /* opengaussdb:jdbc to create vecplan */
         set_default_stream();
-#endif
         plist = pg_plan_queries(qlist, plansource->cursor_options, boundParams);
     }
     PG_CATCH();
@@ -1180,6 +1207,7 @@ static CachedPlan* BuildCachedPlan(CachedPlanSource* plansource, List* qlist, Pa
     ResetStream(outer_is_stream, outer_is_stream_support);
 
     /* Clean up SPI state */
+    SPI_STACK_LOG("pop cond", NULL, NULL);
     SPI_pop_conditional(spi_pushed);
 
     /* Release snapshot if we got one */
@@ -1341,6 +1369,7 @@ static void GPCFillPlanCache(CachedPlanSource* plansource, bool isBuildingCustom
         plansource->gpc.key->spi_signature = plansource->spi_signature;
         GlobalPlanCache::EnvFill(&plansource->gpc.key->env, plansource->dependsOnRole);
         plansource->gpc.key->env.search_path = plansource->search_path;
+        plansource->gpc.key->env.param_types = plansource->param_types;
         plansource->gpc.key->env.num_params = plansource->num_params;
         (void)MemoryContextSwitchTo(oldcxt);
     }
@@ -1443,6 +1472,53 @@ static bool is_upsert_query_with_update_param(Node* raw_parse_tree)
     return false;
 }
 
+static bool choose_by_hint(const CachedPlanSource* plansource, bool* choose_cplan)
+{
+    if (list_length(plansource->query_list) != 1) {
+        return false;
+    }
+    Query *parse = (Query*)linitial(plansource->query_list);
+    HintState *hint = parse->hintState;
+    if (hint != NULL && hint->cache_plan_hint != NIL) {
+        PlanCacheHint* pchint = (PlanCacheHint*)llast(hint->cache_plan_hint);
+        if (pchint == NULL) {
+            return false;
+        }
+        pchint->base.state = HINT_STATE_USED;
+        *choose_cplan = pchint->chooseCustomPlan;
+        return true;
+    }
+    return false;
+}
+
+/* report the reason why we choose this plan, corresponding to enum PlanChooseReason */
+static void ReportReasonForPlanChoose(PlanChooseReason reason)
+{
+    char* msg[MAX_PLANCHOOSEREASON] =
+        {"GPlan, reason: shared plancache need choose gplan.",
+         "CPlan, reason: Upsert with update query can't choose gplan.",
+#ifdef ENABLE_MOT
+         "GPlan, reason: Don't choose custom plan if using pbe optimization and MOT engine.",
+#endif
+         "CPlan, reason: For PBE, such as col=$1+$2, generate cplan.",
+         "CPlan, reason: One-shot plans will always be considered custom.",
+         "GPlan, reason: No parameters.",
+         "GPlan, reason: Transaction control statements.",
+         "GPlan, reason: Caller wants to force the decision.",
+         "CPlan, reason: Caller wants to force the decision.",
+         "CPlan, reason: Contains cstore table.",
+         "Choose by hint.",
+         "GPlan, reason: Using pbe optimization.",
+         "GPlan, reason: Settings force the decision.",
+         "CPlan, reason: Settings force the decision.",
+         "CPlan, reason: First 5 times using CPlan.",
+         "GPlan, reason: GPlan's cost is less than 10% more expensive than average custom plan.",
+         "CPlan, reason: Default choosing."};
+    int elevel = (log_min_messages <= DEBUG2 && module_logging_is_on(MOD_OPT_CHOICE)) ? NOTICE : DEBUG2;
+    ereport(elevel, (errmodule(MOD_OPT_CHOICE), errmsg("[Choosing C/G Plan]: %s", msg[reason])));
+    return;
+}
+
 /*
  * ChooseCustomPlan: choose whether to use custom or generic plan
  *
@@ -1451,74 +1527,102 @@ static bool is_upsert_query_with_update_param(Node* raw_parse_tree)
 static bool ChooseCustomPlan(CachedPlanSource* plansource, ParamListInfo boundParams)
 {
     double avg_custom_cost;
+    bool ret = false;
 
     /*
      * Note: shared plancache need choose gplan, and shared plancache already has shared gplan.
      * DO NOT create cachedplan for shared plancache. Only create cachedplan for plancache not in GPC.
      */
     if (plansource->gpc.status.InShareTable()) {
+        ReportReasonForPlanChoose(SHARED_PLANCACHE);
         return false;
     }
 
     /* upsert with update query can't choose gplan */
     if (is_upsert_query_with_update_param(plansource->raw_parse_tree)) {
+        ReportReasonForPlanChoose(UPSERT_UPDATE_QUERY);
         return true;
     }
 
 #ifdef ENABLE_MOT
     /* Don't choose custom plan if using pbe optimization and MOT engine. */
     if (u_sess->attr.attr_sql.enable_pbe_optimization && IsMOTEngineUsed()) {
+        ReportReasonForPlanChoose(PBE_OPT_AND_MOT_ENGINE);
         return false;
     }
 #endif
 
     /* For PBE, such as col=$1+$2, generate cplan. */
     if (IsDeleteLimit(plansource, boundParams) == true) {
+        ReportReasonForPlanChoose(PARAM_EXPR);
         return true;
     }
 
     /* One-shot plans will always be considered custom */
-    if (plansource->is_oneshot)
+    if (plansource->is_oneshot) {
+        ReportReasonForPlanChoose(ONE_SHOT_PLAN);
         return true;
+    }
 
     /* Otherwise, never any point in a custom plan if there's no parameters */
-    if (boundParams == NULL)
+    if (boundParams == NULL) {
+        ReportReasonForPlanChoose(NO_BOUND_PARAM);
         return false;
+    }
 
     /* ... nor for transaction control statements */
     if (IsTransactionStmtPlan(plansource)) {
+        ReportReasonForPlanChoose(TRANSACTION_STAT);
         return false;
     }
 
     /* See if caller wants to force the decision */
-    if (plansource->cursor_options & CURSOR_OPT_GENERIC_PLAN)
+    if (plansource->cursor_options & CURSOR_OPT_GENERIC_PLAN) {
+        ReportReasonForPlanChoose(CALLER_FORCE_GPLAN);
         return false;
-    if (plansource->cursor_options & CURSOR_OPT_CUSTOM_PLAN)
-        return true;
-
-    /* If we contains cstore table, always custom except fqs on CN */
-    if (IsForceCustomplan(plansource) == true) {
+    }
+    if (plansource->cursor_options & CURSOR_OPT_CUSTOM_PLAN) {
+        ReportReasonForPlanChoose(CALLER_FORCE_CPLAN);
         return true;
     }
 
-    /* Don't choose custom plan if using pbe optimization */
-    if (u_sess->attr.attr_sql.enable_pbe_optimization && plansource->gplan_is_fqs)
-        return false;
+    /* If we contains cstore table, always custom except fqs on CN */
+    if (IsForceCustomplan(plansource) == true) {
+        ReportReasonForPlanChoose(CSTORE_TABLE);
+        return true;
+    }
+
+    /* Make decision according to hint */
+    if (choose_by_hint(plansource, &ret)) {
+        ReportReasonForPlanChoose(CHOOSE_BY_HINT);
+        return ret;
+    }
 
     /* Let settings force the decision */
     if (unlikely(PLAN_CACHE_MODE_AUTO != u_sess->attr.attr_sql.g_planCacheMode)) {
         if (PLAN_CACHE_MODE_FORCE_GENERIC_PLAN == u_sess->attr.attr_sql.g_planCacheMode) {
+            ReportReasonForPlanChoose(SETTING_FORCE_GPLAN);
             return false;
         }
 
         if (PLAN_CACHE_MODE_FORCE_CUSTOM_PLAN  == u_sess->attr.attr_sql.g_planCacheMode) {
+            ReportReasonForPlanChoose(SETTING_FORCE_CPLAN);
             return true;
         }
     }
 
+    /* Don't choose custom plan if using pbe optimization */
+    bool isPbeAndFqs = u_sess->attr.attr_sql.enable_pbe_optimization && plansource->gplan_is_fqs;
+    if (isPbeAndFqs) {
+        ReportReasonForPlanChoose(PBE_OPTIMIZATION);
+        return false;
+    }
+
     /* Generate custom plans until we have done at least 5 (arbitrary) */
-    if (plansource->num_custom_plans < 5)
+    if (plansource->num_custom_plans < 5) {
+        ReportReasonForPlanChoose(TRY_CPLAN);
         return true;
+    }
 
     avg_custom_cost = plansource->total_custom_cost / plansource->num_custom_plans;
 
@@ -1530,10 +1634,16 @@ static bool ChooseCustomPlan(CachedPlanSource* plansource, ParamListInfo boundPa
      *
      * Note that if generic_cost is -1 (indicating we've not yet determined
      * the generic plan cost), we'll always prefer generic at this point.
+     *
+     * If the cost of generic plan and custom plan are both 0, in case of
+     * FQS/remotelimit, we prefer generic plan.
      */
-    if (plansource->generic_cost < avg_custom_cost * 1.1)
+    if (plansource->generic_cost <= avg_custom_cost * 1.1) {
+        ReportReasonForPlanChoose(COST_PREFER_GPLAN);
         return false;
+    }
 
+    ReportReasonForPlanChoose(DEFAULT_CHOOSE);
     return true;
 }
 
@@ -1882,6 +1992,178 @@ void ReleaseCachedPlan(CachedPlan* plan, bool useResOwner)
             MemoryContextDelete(plan->context);
         }
     }
+}
+
+/*
+ * CachedPlanIsSimplyValid: quick check for plan still being valid
+ *
+ * This function must not be used unless CachedPlanAllowsSimpleValidityCheck
+ * previously said it was OK.
+ *
+ * If the plan is valid, and "owner" is not NULL, record a refcount on
+ * the plan in that resowner before returning.  It is caller's responsibility
+ * to be sure that a refcount is held on any plan that's being actively used.
+ * long
+ * The code here is unconditionally safe as  as the only use of this
+ * CachedPlanSource is in connection with the particular CachedPlan pointer
+ * that's passed in.  If the plansource were being used for other purposes,
+ * it's possible that its generic plan could be invalidated and regenerated
+ * while the current caller wasn't looking, and then there could be a chance
+ * collision of address between this caller's now-stale plan pointer and the
+ * actual address of the new generic plan.  For current uses, that scenario
+ * can't happen; but with a plansource shared across multiple uses, it'd be
+ * advisable to also save plan->generation and verify that that still matches.
+ */
+bool CachedPlanIsSimplyValid(CachedPlanSource *plansource, CachedPlan *plan, ResourceOwner owner)
+{
+    /*
+     * Careful here: since the caller doesn't necessarily hold a refcount on
+     * the plan to start with, it's possible that "plan" is a dangling
+     * pointer.  Don't dereference it until we've verified that it still
+     * matches the plansource's gplan (which is either valid or NULL).
+     */
+    Assert(plansource->magic == CACHEDPLANSOURCE_MAGIC);
+
+    /*
+     * Has cache invalidation fired on this plan?  We can check this right
+     * away since there are no locks that we'd need to acquire first.  Note
+     * that here we *do* check plansource->is_valid, so as to force plan
+     * rebuild if that's become false.
+     */
+    if (!plansource->is_valid || plan != plansource->gplan || !plan->is_valid)
+        return false;
+
+    Assert(plan->magic == CACHEDPLAN_MAGIC);
+
+    /* Is the search_path still the same as when we made it? */
+    Assert(plansource->search_path != NULL);
+    if (!OverrideSearchPathMatchesCurrent(plansource->search_path))
+        return false;
+
+    /* It's still good.  Bump refcount if requested. */
+    if (owner) {
+        ResourceOwnerEnlargePlanCacheRefs(owner);
+        plan->refcount++;
+        ResourceOwnerRememberPlanCacheRef(owner, plan);
+    }
+
+    return true;
+}
+
+/*
+ * CachedPlanAllowsSimpleValidityCheck: can we use CachedPlanIsSimplyValid?
+ *
+ * This function, together with CachedPlanIsSimplyValid, provides a fast path
+ * for revalidating "simple" generic plans.  The core requirement to be simple
+ * is that the plan must not require taking any locks, which translates to
+ * not touching any tables; this happens to match up well with an important
+ * use-case in PL/pgSQL.  This function tests whether that's true, along
+ * with checking some other corner cases that we'd rather not bother with
+ * handling in the fast path.  (Note that it's still possible for such a plan
+ * to be invalidated, for example due to a change in a function that was
+ * inlined into the plan.)
+ *
+ * If the plan is simply valid, and "owner" is not NULL, record a refcount on
+ * the plan in that resowner before returning.  It is caller's responsibility
+ * to be sure that a refcount is held on any plan that's being actively used.
+ *
+ * This must only be called on known-valid generic plans (eg, ones just
+ * returned by GetCachedPlan).  If it returns true, the caller may re-use
+ * the cached plan as long as CachedPlanIsSimplyValid returns true; that
+ * check is much cheaper than the full revalidation done by GetCachedPlan.
+ * Nonetheless, no required checks are omitted.
+ */
+bool CachedPlanAllowsSimpleValidityCheck(CachedPlanSource *plansource, CachedPlan *plan, ResourceOwner owner)
+{
+    ListCell   *lc;
+
+    /*
+     * Sanity-check that the caller gave us a validated generic plan.  Notice
+     * that we *don't* assert plansource->is_valid as you might expect; that's
+     * because it's possible that that's already false when GetCachedPlan
+     * returns, e.g. because ResetPlanCache happened partway through.  We
+     * should accept the plan as long as plan->is_valid is true, and expect to
+     * replan after the next CachedPlanIsSimplyValid call.
+     */
+    Assert(plansource->magic == CACHEDPLANSOURCE_MAGIC);
+    Assert(plan->magic == CACHEDPLAN_MAGIC);
+    Assert(plan->is_valid);
+    Assert(plan == plansource->gplan);
+    Assert(plansource->search_path != NULL);
+    Assert(OverrideSearchPathMatchesCurrent(plansource->search_path));
+
+    /* We don't support oneshot plans here. */
+    if (plansource->is_oneshot)
+        return false;
+    Assert(!plan->is_oneshot);
+
+    /*
+     * If the plan is dependent on RLS considerations, or it's transient,
+     * reject.  These things probably can't ever happen for table-free
+     * queries, but for safety's sake let's check.
+     */
+
+    if (plan->dependsOnRole)
+        return false;
+    if (TransactionIdIsValid(plan->saved_xmin))
+        return false;
+
+    /*
+     * Reject if AcquirePlannerLocks would have anything to do.  This is
+     * simplistic, but there's no need to inquire any more carefully; indeed,
+     * for current callers it shouldn't even be possible to hit any of these
+     * checks.
+     */
+    foreach(lc, plansource->query_list) {
+        Query      *query = lfirst_node(Query, lc);
+
+        if (query->commandType == CMD_UTILITY)
+            return false;
+        if (query->rtable || query->cteList || query->hasSubLinks)
+            return false;
+    }
+
+    /*
+     * Reject if AcquireExecutorLocks would have anything to do.  This is
+     * probably unnecessary given the previous check, but let's be safe.
+     */
+    foreach(lc, plan->stmt_list)
+    {
+        PlannedStmt *plannedstmt = lfirst_node(PlannedStmt, lc);
+        ListCell   *lc2;
+
+        if (plannedstmt->commandType == CMD_UTILITY)
+            return false;
+
+        /*
+         * We have to grovel through the rtable because it's likely to contain
+         * an RTE_RESULT relation, rather than being totally empty.
+         */
+        foreach(lc2, plannedstmt->rtable)
+        {
+            RangeTblEntry *rte = (RangeTblEntry *) lfirst(lc2);
+
+            if (rte->rtekind == RTE_RELATION)
+                return false;
+        }
+
+        if (!IsA(plannedstmt->planTree, BaseResult))
+            return false;
+    }
+
+    /*
+     * Okay, it's simple.  Note that what we've primarily established here is
+     * that no locks need be taken before checking the plan's is_valid flag.
+     */
+
+    /* Bump refcount if requested. */
+    if (owner) {
+        ResourceOwnerEnlargePlanCacheRefs(owner);
+        plan->refcount++;
+        ResourceOwnerRememberPlanCacheRef(owner, plan);
+    }
+
+    return true;
 }
 
 /*

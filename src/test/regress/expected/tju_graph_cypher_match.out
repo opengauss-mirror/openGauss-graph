@@ -1,0 +1,77 @@
+CREATE graph test;
+NOTICE:  CREATE TABLE / PRIMARY KEY will create implicit index "gs_vertex_pkey" for table "gs_vertex"
+SET graph_path=test;
+CREATE VLABEL person;
+NOTICE:  merging column "id" with inherited definition
+NOTICE:  merging column "properties" with inherited definition
+NOTICE:  CREATE TABLE / PRIMARY KEY will create implicit index "person_pkey" for table "person"
+CREATE VLABEL friend inherits (person);
+NOTICE:  merging column "id" with inherited definition
+NOTICE:  merging column "properties" with inherited definition
+NOTICE:  CREATE TABLE / PRIMARY KEY will create implicit index "friend_pkey" for table "friend"
+CREATE ELABEL knows;
+NOTICE:  merging column "id" with inherited definition
+NOTICE:  merging column "start" with inherited definition
+NOTICE:  merging column "end" with inherited definition
+NOTICE:  merging column "properties" with inherited definition
+CREATE ELABEL live_together;
+NOTICE:  merging column "id" with inherited definition
+NOTICE:  merging column "start" with inherited definition
+NOTICE:  merging column "end" with inherited definition
+NOTICE:  merging column "properties" with inherited definition
+CREATE ELABEL room_mate inherits (knows, live_together);
+NOTICE:  merging multiple inherited definitions of column "id"
+NOTICE:  merging multiple inherited definitions of column "start"
+NOTICE:  merging multiple inherited definitions of column "end"
+NOTICE:  merging multiple inherited definitions of column "properties"
+NOTICE:  merging column "id" with inherited definition
+NOTICE:  merging column "start" with inherited definition
+NOTICE:  merging column "end" with inherited definition
+NOTICE:  merging column "properties" with inherited definition
+CREATE PROPERTY INDEX ON person (name);
+CYPHER CREATE (:person {name: 'Tom'})-[:knows {fromdate:'2011-11-24'}]->(:person {name: 'Summer'});
+CYPHER CREATE (:person {name: 'Pat'})-[:knows {fromdate:'2013-12-25'}]->(:person {name: 'Nikki'});
+CYPHER CREATE (:person {name: 'Olive'})-[:knows {fromdate:'2015-01-26'}]->(:person {name: 'Todd'});
+CYPHER MATCH (p:Person {name: 'Tom'}),(k:Person{name: 'Pat'}) 
+CREATE (p)-[:KNOWS {fromdate:'2017-02-27'} ]->(k);
+CYPHER MATCH (a:person {name: 'Olive'})-[:knows {fromdate:'2015-01-26'}]->(k:person)
+RETURN k;
+              k              
+-----------------------------
+ person[3.6]{"name": "Todd"}
+(1 row)
+
+CYPHER MATCH (:person {name: 'Tom'})-[r:knows]->(:person {name: 'Summer'})
+SET r.since = '2009-01-08';
+CYPHER MATCH (a:person {name: 'Tom'})-[r:knows]->(b:person {name: 'Summer'})
+RETURN a,r,b;
+             a              |                                  r                                   |               b               
+----------------------------+----------------------------------------------------------------------+-------------------------------
+ person[3.1]{"name": "Tom"} | knows[5.1][3.1,3.2]{"since": "2009-01-08", "fromdate": "2011-11-24"} | person[3.2]{"name": "Summer"}
+(1 row)
+
+CYPHER CREATE (:person {name: 'Jack'})-[:knows {fromdate:'2015-01-26'}]->(:person {name: 'Tom'});                         
+CYPHER MATCH (m:person {name: 'Jack'})-[l:knows]->(b:person {name: 'Tom'}) DELETE l;
+CYPHER MATCH (m:person {name: 'Jack'})-[l:knows]->(b:person {name: 'Tom'}) RETURN l;
+ l 
+---
+(0 rows)
+
+CYPHER MATCH (m:person {name: 'Tom'})-[l:knows]->(b:person {name: 'Summer'}) DELETE l;
+CYPHER MATCH (m:person {name: 'Tom'})-[l:knows]->(b:person {name: 'Pat'}) DELETE l;
+CYPHER MATCH (m:person {name: 'Tom'}) DELETE m;
+CYPHER MATCH (m:person {name: 'Tom'}) RETURN m;
+ m 
+---
+(0 rows)
+
+DROP GRAPH test CASCADE;
+NOTICE:  drop cascades to 8 other objects
+DETAIL:  drop cascades to sequence test.gs_label_seq
+drop cascades to vlabel gs_vertex
+drop cascades to elabel gs_edge
+drop cascades to vlabel person
+drop cascades to vlabel friend
+drop cascades to elabel knows
+drop cascades to elabel live_together
+drop cascades to elabel room_mate

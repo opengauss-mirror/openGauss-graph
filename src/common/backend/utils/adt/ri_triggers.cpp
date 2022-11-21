@@ -212,6 +212,19 @@ Datum RI_FKey_noaction(PG_FUNCTION_ARGS);
 template <bool is_del>
 Datum RI_FKey_setdefault(PG_FUNCTION_ARGS);
 
+/*
+ * Since tuple lock has been enhanced, KeyShareLock is needed instead
+ * of ShareLock for foreign key. But ustore table still acquires ShareLock.
+ */
+static inline bool IsShareLockForForeignKey(Relation relation)
+{
+#ifdef ENABLE_MULTIPLE_NODES
+    return true;
+#else
+    return RelationIsUstoreFormat(relation);
+#endif
+}
+
 /* ----------
  * RI_FKey_check -
  *
@@ -285,7 +298,7 @@ static Datum RI_FKey_check(PG_FUNCTION_ARGS)
      * Get the relation descriptors of the FK and PK tables.
      *
      * pk_rel is opened in RowShareLock mode since that's what our eventual
-     * SELECT FOR SHARE will get on it.
+     * SELECT FOR KEY SHARE will get on it.
      */
     fk_rel = trigdata->tg_relation;
     pk_rel = heap_open(riinfo.pk_relid, RowShareLock);
@@ -304,6 +317,7 @@ static Datum RI_FKey_check(PG_FUNCTION_ARGS)
     if (riinfo.nkeys == 0) {
         ri_BuildQueryKeyFull(&qkey, &riinfo, RI_PLAN_CHECK_LOOKUPPK_NOCOLS);
 
+        SPI_STACK_LOG("connect", NULL, NULL);
         if (SPI_connect() != SPI_OK_CONNECT) {
             heap_close(pk_rel, RowShareLock);
             ereport(ERROR, (errcode(ERRCODE_SPI_CONNECTION_FAILURE), errmsg("SPI_connect failed")));
@@ -320,8 +334,10 @@ static Datum RI_FKey_check(PG_FUNCTION_ARGS)
              * ----------
              */
             quoteRelationName(pkrelname, pk_rel);
-            rc = snprintf_s(
-                querystr, sizeof(querystr), sizeof(querystr) - 1, "SELECT 1 FROM ONLY %s x FOR SHARE OF x", pkrelname);
+
+            rc = snprintf_s(querystr, sizeof(querystr), sizeof(querystr) - 1,
+                IsShareLockForForeignKey(pk_rel) ? "SELECT 1 FROM ONLY %s x FOR SHARE OF x" :
+                "SELECT 1 FROM ONLY %s x FOR KEY SHARE OF x", pkrelname);
             securec_check_ss(rc, "\0", "\0");
 
             /* Prepare and save the plan */
@@ -333,6 +349,7 @@ static Datum RI_FKey_check(PG_FUNCTION_ARGS)
          */
         (void)ri_PerformCheck(&qkey, qplan, fk_rel, pk_rel, NULL, NULL, false, SPI_OK_SELECT, NameStr(riinfo.conname));
 
+        SPI_STACK_LOG("finish", NULL, NULL);
         if (SPI_finish() != SPI_OK_FINISH) {
             heap_close(pk_rel, RowShareLock);
             ereport(ERROR, (errcode(ERRCODE_SPI_FINISH_FAILURE), errmsg("SPI_finish failed")));
@@ -418,6 +435,7 @@ static Datum RI_FKey_check(PG_FUNCTION_ARGS)
             break;
     }
 
+    SPI_STACK_LOG("connect", NULL, NULL);
     if (SPI_connect() != SPI_OK_CONNECT) {
         heap_close(pk_rel, RowShareLock);
         ereport(ERROR, (errcode(ERRCODE_SPI_CONNECTION_FAILURE), errmsg("SPI_connect failed")));
@@ -436,7 +454,8 @@ static Datum RI_FKey_check(PG_FUNCTION_ARGS)
 
         /* ----------
          * The query string built is
-         *	SELECT 1 FROM ONLY <pktable> WHERE pkatt1 = $1 [AND ...] FOR SHARE
+         *	SELECT 1 FROM ONLY <pktable> x WHERE pkatt1 = $1 [AND ...]
+         *          FOR KEY SHARE OF x
          * The type id's for the $ parameters are those of the
          * corresponding FK attributes.
          * ----------
@@ -456,7 +475,9 @@ static Datum RI_FKey_check(PG_FUNCTION_ARGS)
             querysep = "AND";
             queryoids[i] = fk_type;
         }
-        appendStringInfo(&querybuf, " FOR SHARE OF x");
+
+        appendStringInfo(&querybuf, IsShareLockForForeignKey(pk_rel) ? " FOR SHARE OF x" :
+            " FOR KEY SHARE OF x");
 
         /* Prepare and save the plan */
         qplan = ri_PlanCheck(querybuf.data, riinfo.nkeys, queryoids, &qkey, fk_rel, pk_rel, true);
@@ -467,6 +488,7 @@ static Datum RI_FKey_check(PG_FUNCTION_ARGS)
      */
     (void)ri_PerformCheck(&qkey, qplan, fk_rel, pk_rel, NULL, new_row, false, SPI_OK_SELECT, NameStr(riinfo.conname));
 
+    SPI_STACK_LOG("finish", NULL, NULL);
     if (SPI_finish() != SPI_OK_FINISH) {
         heap_close(pk_rel, RowShareLock);
         ereport(ERROR, (errcode(ERRCODE_SPI_FINISH_FAILURE), errmsg("SPI_finish failed")));
@@ -565,6 +587,7 @@ static bool ri_Check_Pk_Match(Relation pk_rel, Relation fk_rel, HeapTuple old_ro
             break;
     }
 
+    SPI_STACK_LOG("connect", NULL, NULL);
     if (SPI_connect() != SPI_OK_CONNECT)
         ereport(ERROR, (errcode(ERRCODE_SPI_CONNECTION_FAILURE), errmsg("SPI_connect failed")));
 
@@ -581,7 +604,8 @@ static bool ri_Check_Pk_Match(Relation pk_rel, Relation fk_rel, HeapTuple old_ro
 
         /* ----------
          * The query string built is
-         *	SELECT 1 FROM ONLY <pktable> WHERE pkatt1 = $1 [AND ...] FOR SHARE
+         *	SELECT 1 FROM ONLY <pktable> x WHERE pkatt1 = $1 [AND ...]
+         *         FOR KEY SHARE OF x
          * The type id's for the $ parameters are those of the
          * PK attributes themselves.
          * ----------
@@ -601,7 +625,8 @@ static bool ri_Check_Pk_Match(Relation pk_rel, Relation fk_rel, HeapTuple old_ro
             querysep = "AND";
             queryoids[i] = pk_type;
         }
-        appendStringInfo(&querybuf, " FOR SHARE OF x");
+
+        appendStringInfo(&querybuf, IsShareLockForForeignKey(pk_rel) ? " FOR SHARE OF x" : " FOR KEY SHARE OF x");
 
         /* Prepare and save the plan */
         qplan = ri_PlanCheck(querybuf.data, riinfo->nkeys, queryoids, &qkey, fk_rel, pk_rel, true);
@@ -620,6 +645,7 @@ static bool ri_Check_Pk_Match(Relation pk_rel, Relation fk_rel, HeapTuple old_ro
         SPI_OK_SELECT,
         NULL);
 
+    SPI_STACK_LOG("finish", NULL, NULL);
     if (SPI_finish() != SPI_OK_FINISH)
         ereport(ERROR, (errcode(ERRCODE_SPI_FINISH_FAILURE), errmsg("SPI_finish failed")));
 
@@ -664,7 +690,7 @@ Datum RI_FKey_noaction(PG_FUNCTION_ARGS)
      * (the new and old tuple for update)
      *
      * fk_rel is opened in RowShareLock mode since that's what our eventual
-     * SELECT FOR SHARE will get on it.
+     * SELECT FOR KEY SHARE will get on it.
      */
     fk_rel = heap_open(riinfo.fk_relid, RowShareLock);
     pk_rel = trigdata->tg_relation;
@@ -732,6 +758,7 @@ Datum RI_FKey_noaction(PG_FUNCTION_ARGS)
                 heap_close(fk_rel, RowShareLock);
                 return PointerGetDatum(NULL);
             }
+            SPI_STACK_LOG("connect", NULL, NULL);
             if (SPI_connect() != SPI_OK_CONNECT)
                 ereport(ERROR, (errcode(ERRCODE_SPI_CONNECTION_FAILURE), errmsg("SPI_connect failed")));
 
@@ -749,7 +776,8 @@ Datum RI_FKey_noaction(PG_FUNCTION_ARGS)
 
                 /* ----------
                  * The query string built is
-                 *  SELECT 1 FROM ONLY <fktable> WHERE $1 = fkatt1 [AND ...]
+                 *  SELECT 1 FROM ONLY <fktable> x WHERE $1 = fkatt1 [AND ...]
+                 *         FOR KEY SHARE OF x
                  * The type id's for the $ parameters are those of the
                  * corresponding PK attributes.
                  * ----------
@@ -769,7 +797,9 @@ Datum RI_FKey_noaction(PG_FUNCTION_ARGS)
                     querysep = "AND";
                     queryoids[i] = pk_type;
                 }
-                appendStringInfo(&querybuf, " FOR SHARE OF x");
+
+                appendStringInfo(&querybuf, IsShareLockForForeignKey(fk_rel) ?
+                    " FOR SHARE OF x" : " FOR KEY SHARE OF x");
 
                 /* Prepare and save the plan */
                 qplan = ri_PlanCheck(querybuf.data, riinfo.nkeys, queryoids, &qkey, fk_rel, pk_rel, true);
@@ -788,6 +818,7 @@ Datum RI_FKey_noaction(PG_FUNCTION_ARGS)
                 SPI_OK_SELECT,
                 NameStr(riinfo.conname));
 
+            SPI_STACK_LOG("finish", NULL, NULL);
             if (SPI_finish() != SPI_OK_FINISH)
                 ereport(ERROR, (errcode(ERRCODE_SPI_FINISH_FAILURE), errmsg("SPI_finish failed")));
 
@@ -912,6 +943,7 @@ Datum RI_FKey_cascade_del(PG_FUNCTION_ARGS)
                     break;
             }
 
+            SPI_STACK_LOG("connect", NULL, NULL);
             if (SPI_connect() != SPI_OK_CONNECT)
                 ereport(ERROR, (errcode(ERRCODE_SPI_CONNECTION_FAILURE), errmsg("SPI_connect failed")));
 
@@ -929,7 +961,7 @@ Datum RI_FKey_cascade_del(PG_FUNCTION_ARGS)
 
                 /* ----------
                  * The query string built is
-                 *	DELETE FROM ONLY <fktable> WHERE $1 = fkatt1 [AND ...]
+                 *	DELETE FROM ONLY <fktable> x WHERE $1 = fkatt1 [AND ...]
                  * The type id's for the $ parameters are those of the
                  * corresponding PK attributes.
                  * ----------
@@ -968,6 +1000,7 @@ Datum RI_FKey_cascade_del(PG_FUNCTION_ARGS)
                 SPI_OK_DELETE,
                 NameStr(riinfo.conname));
 
+            SPI_STACK_LOG("finish", NULL, NULL);
             if (SPI_finish() != SPI_OK_FINISH)
                 ereport(ERROR, (errcode(ERRCODE_SPI_FINISH_FAILURE), errmsg("SPI_finish failed")));
 
@@ -1078,6 +1111,7 @@ Datum RI_FKey_cascade_upd(PG_FUNCTION_ARGS)
                 return PointerGetDatum(NULL);
             }
 
+            SPI_STACK_LOG("connect", NULL, NULL);
             if (SPI_connect() != SPI_OK_CONNECT)
                 ereport(ERROR, (errcode(ERRCODE_SPI_CONNECTION_FAILURE), errmsg("SPI_connect failed")));
 
@@ -1145,6 +1179,7 @@ Datum RI_FKey_cascade_upd(PG_FUNCTION_ARGS)
                 SPI_OK_UPDATE,
                 NameStr(riinfo.conname));
 
+            SPI_STACK_LOG("finish", NULL, NULL);
             if (SPI_finish() != SPI_OK_FINISH)
                 ereport(ERROR, (errcode(ERRCODE_SPI_FINISH_FAILURE), errmsg("SPI_finish failed")));
 
@@ -1259,6 +1294,7 @@ Datum RI_FKey_restrict(PG_FUNCTION_ARGS)
                 return PointerGetDatum(NULL);
             }
 
+            SPI_STACK_LOG("connect", NULL, NULL);
             if (SPI_connect() != SPI_OK_CONNECT)
                 ereport(ERROR, (errcode(ERRCODE_SPI_CONNECTION_FAILURE), errmsg("SPI_connect failed")));
 
@@ -1277,7 +1313,8 @@ Datum RI_FKey_restrict(PG_FUNCTION_ARGS)
 
                 /* ----------
                  * The query string built is
-                 *	SELECT 1 FROM ONLY <fktable> WHERE $1 = fkatt1 [AND ...]
+                 *	SELECT 1 FROM ONLY <fktable> x WHERE $1 = fkatt1 [AND ...]
+                 *         FOR KEY SHARE OF x
                  * The type id's for the $ parameters are those of the
                  * corresponding PK attributes.
                  * ----------
@@ -1297,7 +1334,9 @@ Datum RI_FKey_restrict(PG_FUNCTION_ARGS)
                     querysep = "AND";
                     queryoids[i] = pk_type;
                 }
-                appendStringInfo(&querybuf, " FOR SHARE OF x");
+
+                appendStringInfo(&querybuf, IsShareLockForForeignKey(fk_rel) ?
+                    " FOR SHARE OF x" : " FOR KEY SHARE OF x");
 
                 /* Prepare and save the plan */
                 qplan = ri_PlanCheck(querybuf.data, riinfo.nkeys, queryoids, &qkey, fk_rel, pk_rel, true);
@@ -1316,6 +1355,7 @@ Datum RI_FKey_restrict(PG_FUNCTION_ARGS)
                 SPI_OK_SELECT,
                 NameStr(riinfo.conname));
 
+            SPI_STACK_LOG("finish", NULL, NULL);
             if (SPI_finish() != SPI_OK_FINISH)
                 ereport(ERROR, (errcode(ERRCODE_SPI_FINISH_FAILURE), errmsg("SPI_finish failed")));
 
@@ -1449,6 +1489,7 @@ Datum RI_FKey_setnull_del(PG_FUNCTION_ARGS)
                     break;
             }
 
+            SPI_STACK_LOG("connect", NULL, NULL);
             if (SPI_connect() != SPI_OK_CONNECT)
                 ereport(ERROR, (errcode(ERRCODE_SPI_CONNECTION_FAILURE), errmsg("SPI_connect failed")));
 
@@ -1512,6 +1553,7 @@ Datum RI_FKey_setnull_del(PG_FUNCTION_ARGS)
                 SPI_OK_UPDATE,
                 NameStr(riinfo.conname));
 
+            SPI_STACK_LOG("finish", NULL, NULL);
             if (SPI_finish() != SPI_OK_FINISH)
                 ereport(ERROR, (errcode(ERRCODE_SPI_FINISH_FAILURE), errmsg("SPI_finish failed")));
 
@@ -1621,6 +1663,7 @@ Datum RI_FKey_setnull_upd(PG_FUNCTION_ARGS)
                 return PointerGetDatum(NULL);
             }
 
+            SPI_STACK_LOG("connect", NULL, NULL);
             if (SPI_connect() != SPI_OK_CONNECT)
                 ereport(ERROR, (errcode(ERRCODE_SPI_CONNECTION_FAILURE), errmsg("SPI_connect failed")));
 
@@ -1712,6 +1755,7 @@ Datum RI_FKey_setnull_upd(PG_FUNCTION_ARGS)
                 SPI_OK_UPDATE,
                 NameStr(riinfo.conname));
 
+            SPI_STACK_LOG("finish", NULL, NULL);
             if (SPI_finish() != SPI_OK_FINISH)
                 ereport(ERROR, (errcode(ERRCODE_SPI_FINISH_FAILURE), errmsg("SPI_finish failed")));
 
@@ -1823,6 +1867,7 @@ Datum RI_FKey_setdefault(PG_FUNCTION_ARGS)
                 return PointerGetDatum(NULL);
             }
 
+            SPI_STACK_LOG("connect", NULL, NULL);
             if (SPI_connect() != SPI_OK_CONNECT)
                 ereport(ERROR, (errcode(ERRCODE_SPI_CONNECTION_FAILURE), errmsg("SPI_connect failed")));
 
@@ -1897,6 +1942,7 @@ Datum RI_FKey_setdefault(PG_FUNCTION_ARGS)
                 SPI_OK_UPDATE,
                 NameStr(riinfo.conname));
 
+            SPI_STACK_LOG("finish", NULL, NULL);
             if (SPI_finish() != SPI_OK_FINISH)
                 ereport(ERROR, (errcode(ERRCODE_SPI_FINISH_FAILURE), errmsg("SPI_finish failed")));
 
@@ -2208,6 +2254,7 @@ bool RI_Initial_Check(Trigger* trigger, Relation fk_rel, Relation pk_rel)
     securec_check_ss(rc, "\0", "\0");
     (void)set_config_option("work_mem", workmembuf, PGC_USERSET, PGC_S_SESSION, GUC_ACTION_SAVE, true, 0);
 
+    SPI_STACK_LOG("connect", NULL, NULL);
     if (SPI_connect() != SPI_OK_CONNECT)
         ereport(ERROR, (errcode(ERRCODE_SPI_CONNECTION_FAILURE), errmsg("SPI_connect failed")));
 
@@ -2277,6 +2324,7 @@ bool RI_Initial_Check(Trigger* trigger, Relation fk_rel, Relation pk_rel)
         ri_ReportViolation(&qkey, constrname, pk_rel, fk_rel, tuple, tupdesc, false);
     }
 
+    SPI_STACK_LOG("finish", NULL, NULL);
     if (SPI_finish() != SPI_OK_FINISH)
         ereport(ERROR, (errcode(ERRCODE_SPI_FINISH_FAILURE), errmsg("SPI_finish failed")));
 

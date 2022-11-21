@@ -21,6 +21,7 @@
 #include <math.h>
 
 #include "catalog/catalog.h"
+#include "catalog/pg_authid.h"
 #include "catalog/pg_tablespace.h"
 #include "catalog/pg_type.h"
 #include "commands/dbcommands.h"
@@ -33,7 +34,7 @@
 #include "pgstat.h"
 #include "postmaster/syslogger.h"
 #include "replication/replicainternal.h"
-#include "storage/fd.h"
+#include "storage/smgr/fd.h"
 #include "storage/pmsignal.h"
 #include "storage/proc.h"
 #include "storage/procarray.h"
@@ -73,18 +74,23 @@ Datum current_database(PG_FUNCTION_ARGS)
 Datum current_query(PG_FUNCTION_ARGS)
 {
     /* there is no easy way to access the more concise 'query_string' */
-    if (t_thrd.postgres_cxt.debug_query_string)
-        PG_RETURN_TEXT_P(cstring_to_text(t_thrd.postgres_cxt.debug_query_string));
-    else
+    if (t_thrd.postgres_cxt.debug_query_string) {
+        char *mask_string = maskPassword(t_thrd.postgres_cxt.debug_query_string);
+        if (mask_string == NULL) {
+            mask_string = (char *)t_thrd.postgres_cxt.debug_query_string;
+        }
+        PG_RETURN_TEXT_P(cstring_to_text(mask_string));
+    } else {
         PG_RETURN_NULL();
+    }
 }
 
 /*
  * Send a signal to another backend.
  *
- * The signal is delivered if the user is either a superuser or the same
- * role as the backend being signaled. For "dangerous" signals, an explicit
- * check for superuser needs to be done prior to calling this function.
+ * The signal is delivered for users with sysadmin privilege or the member of gs_role_signal_backend role
+ * or the owner of the database or the same user as the backend being signaled.
+ * For "dangerous" signals, an explicit check for superuser needs to be done prior to calling this function.
  *
  * Returns 0 on success, 1 on general failure, and 2 on permission error.
  * In the event of a general failure (return code 1), a warning message will
@@ -112,10 +118,16 @@ static int pg_signal_backend(ThreadId pid, int sig)
          */
         proc = BackendPidGetProc(pid);
 
-        if (proc == NULL ||
-            (!pg_database_ownercheck(proc->databaseId, u_sess->misc_cxt.CurrentUserId) &&
-             proc->roleId != GetUserId()))
+        if (proc == NULL) {
             return SIGNAL_BACKEND_NOPERMISSION;
+        } else {
+            bool rolePermission = is_member_of_role(GetUserId(), DEFAULT_ROLE_SIGNAL_BACKENDID) &&
+                (proc->roleId != BOOTSTRAP_SUPERUSERID && !is_role_persistence(proc->roleId));
+            if (!pg_database_ownercheck(proc->databaseId, u_sess->misc_cxt.CurrentUserId) &&
+                proc->roleId != GetUserId() && !rolePermission) {
+                return SIGNAL_BACKEND_NOPERMISSION;
+            }
+        }
     }
 
     if (!IsBackendPid(pid)) {
@@ -186,8 +198,9 @@ uint64 get_query_id_beentry(ThreadId  tid)
 }
 
 /*
- * Signal to cancel a backend process.	This is allowed if you are superuser or
- * have the same role as the process being canceled.
+ * Signal to cancel a backend process.
+ * This is allowed if you have sysadmin privilege or have the same user as the process being canceled
+ * or you are the member of gs_role_signal_backend role or the owner of the database.
  */
 Datum pg_cancel_backend(PG_FUNCTION_ARGS)
 {
@@ -204,17 +217,50 @@ Datum pg_cancel_backend(PG_FUNCTION_ARGS)
 
     r = pg_signal_backend(tid, SIGINT);
 
-    if (r == SIGNAL_BACKEND_NOPERMISSION)
+    if (r == SIGNAL_BACKEND_NOPERMISSION) {
         ereport(ERROR,
             (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-                (errmsg("must be system admin or have the same role to cancel queries running in other server "
-                        "processes"))));
+                (errmsg("must have sysadmin privilege or a member of the gs_role_signal_backend role or the "
+                    "owner of the database or the same user to cancel queries running in other server processes"))));
+    }
 
     if (t_thrd.proc && t_thrd.proc->workingVersionNum >= 92060) {
         uint64 query_id = get_query_id_beentry(tid);
         (void)gs_close_all_stream_by_debug_id(query_id);
     }
     PG_RETURN_BOOL(r == SIGNAL_BACKEND_SUCCESS);
+}
+
+Datum pg_cancel_session(PG_FUNCTION_ARGS)
+{
+    int r = -1;
+    ThreadId  tid = PG_GETARG_INT64(0);
+    uint64 sid = PG_GETARG_INT64(1);
+    if (tid == sid) {
+        if (u_sess->attr.attr_sql.enable_online_ddl_waitlock && !u_sess->attr.attr_common.xc_maintenance_mode)
+            ereport(ERROR,
+                (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+                    (errmsg("kill backend is prohibited during online expansion."))));
+
+        r = pg_signal_backend(tid, SIGINT);
+
+        if (r == SIGNAL_BACKEND_NOPERMISSION)
+            ereport(ERROR,
+                (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+                    (errmsg("must be system admin or have the same role to cancel queries running in other server "
+                            "processes"))));
+
+        if (t_thrd.proc && t_thrd.proc->workingVersionNum >= 92060) {
+            uint64 query_id = get_query_id_beentry(tid);
+            (void)gs_close_all_stream_by_debug_id(query_id);
+        }
+    } else if (ENABLE_THREAD_POOL) {
+        ThreadPoolSessControl *sess_ctrl = g_threadPoolControler->GetSessionCtrl();
+        int ctrl_idx = sess_ctrl->FindCtrlIdxBySessId(sid);
+        r = sess_ctrl->SendSignal((int)ctrl_idx, SIGINT);
+    }
+    PG_RETURN_BOOL(r == 0);
+
 }
 
 /*
@@ -233,11 +279,7 @@ Datum pg_cancel_invalid_query(PG_FUNCTION_ARGS)
                 (errmsg("must be system admin to cancel invalid queries running in all server processes"))));
         PG_RETURN_BOOL(false);
     } else {
-        if (GTM_LITE_MODE) {
-            proc_cancel_invalid_gtm_lite_conn();
-        } else {
-            pgstat_cancel_invalid_gtm_conn();
-        }
+        proc_cancel_invalid_gtm_lite_conn();
         PG_RETURN_BOOL(true);
     }
 #endif
@@ -254,10 +296,12 @@ static int kill_backend(ThreadId tid)
             (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE), (errmsg("kill backend is prohibited during online expansion."))));
 
     int r = pg_signal_backend(tid, SIGTERM);
-    if (r == SIGNAL_BACKEND_NOPERMISSION)
+    if (r == SIGNAL_BACKEND_NOPERMISSION) {
         ereport(ERROR,
             (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-                (errmsg("must be system admin or have the same role to terminate other backend"))));
+                (errmsg("must have sysadmin privilege or a member of the gs_role_signal_backend role or "
+                    "the owner of the database or the same user to terminate other backend"))));
+    }
     
     if (t_thrd.proc && t_thrd.proc->workingVersionNum >= 92060) {
         uint64 query_id = get_query_id_beentry(tid);
@@ -268,8 +312,9 @@ static int kill_backend(ThreadId tid)
 }
 
 /*
- * Signal to terminate a backend process.  This is allowed if you are superuser
- * or have the same role as the process being terminated.
+ * Signal to terminate a backend process.
+ * This is allowed for users have sysadmin privilege or a member of the gs_role_signal_backend role or
+ * the owner of the database or the same user as the process being terminated.
  */
 Datum pg_terminate_backend(PG_FUNCTION_ARGS)
 {
@@ -585,7 +630,7 @@ Datum pg_tablespace_databases(PG_FUNCTION_ARGS)
          * size = tablespace dirname length + dir sep char + oid + terminator
          */
 #ifdef PGXC
-        /* Postgres-XC tablespaces also include node name in path */
+        /* openGauss tablespaces also include node name in path */
         location_len = 9 + 1 + OIDCHARS + 1 + strlen(g_instance.attr.attr_common.PGXCNodeName) + 1 +
                        strlen(TABLESPACE_VERSION_DIRECTORY) + 1;
         fctx->location = (char*)palloc(location_len);
@@ -601,7 +646,7 @@ Datum pg_tablespace_databases(PG_FUNCTION_ARGS)
                 ss_rc = sprintf_s(fctx->location, location_len, "base");
             else
 #ifdef PGXC
-                /* Postgres-XC tablespaces also include node name in path */
+                /* openGauss tablespaces also include node name in path */
                 ss_rc = sprintf_s(fctx->location,
                     location_len,
                     "pg_tblspc/%u/%s_%s",

@@ -64,6 +64,7 @@
 #include "utils/fmgroids.h"
 #include "utils/relcache.h"
 #include "commands/copy.h"
+#include "instruments/instr_func_control.h"
 
 #define MAX_SLOW_QUERY_RETENSION_DAYS 604800
 #define MAX_FULL_SQL_RETENSION_SEC 86400
@@ -72,6 +73,7 @@
 
 #define STATEMENT_DETAILS_HEAD_SIZE (1 + 1)     /* [VERSION] + [TRUNCATED] */
 #define INSTR_STMT_UNIX_DOMAIN_PORT (-1)
+#define INSTR_STATEMENT_ATTRNUM 52
 
 /* lock/lwlock's detail information */
 typedef struct {
@@ -205,9 +207,9 @@ static void ReloadInfo()
         ProcessConfigFile(PGC_SIGHUP);
     }
 
-    if (u_sess->sig_cxt.got_PoolReload) {
+    if (IsGotPoolReload()) {
         processPoolerReload();
-        u_sess->sig_cxt.got_PoolReload = false;
+        ResetGotPoolReload(false);
     }
 }
 
@@ -284,7 +286,7 @@ static void set_stmt_basic_info(const knl_u_statement_context* statementCxt, Sta
     SET_TEXT_VALUES(statementInfo->query, (*i)++);
     values[(*i)++] = TimestampTzGetDatum(statementInfo->start_time);
     values[(*i)++] = TimestampTzGetDatum(statementInfo->finish_time);
-    values[(*i)++] = Int32GetDatum(statementInfo->slow_query_threshold);
+    values[(*i)++] = Int64GetDatum(statementInfo->slow_query_threshold);
     values[(*i)++] = Int64GetDatum(statementInfo->txn_id);
     values[(*i)++] = Int64GetDatum(statementInfo->tid);
     values[(*i)++] = Int64GetDatum(statementCxt->session_id);
@@ -313,8 +315,8 @@ static HeapTuple GetStatementTuple(Relation rel, StatementStatContext* statement
     const knl_u_statement_context* statementCxt)
 {
     int i = 0;
-    Datum values[51];
-    bool nulls[51] = {false};
+    Datum values[INSTR_STATEMENT_ATTRNUM];
+    bool nulls[INSTR_STATEMENT_ATTRNUM] = {false};
     errno_t rc = memset_s(nulls, sizeof(nulls), 0, sizeof(nulls));
     securec_check(rc, "\0", "\0");
 
@@ -372,7 +374,8 @@ static HeapTuple GetStatementTuple(Relation rel, StatementStatContext* statement
     values[i++] = BoolGetDatum(
         (statementInfo->finish_time - statementInfo->start_time >= statementInfo->slow_query_threshold &&
         statementInfo->slow_query_threshold >= 0) ? true : false);
-        
+    SET_TEXT_VALUES(statementInfo->trace_id, i++);
+    Assert(INSTR_STATEMENT_ATTRNUM == i);
     return heap_form_tuple(RelationGetDescr(rel), values, nulls);
 }
 
@@ -657,7 +660,8 @@ NON_EXEC_STATIC void StatementFlushMain()
     init_ps_display("statement flush process", "", "", "");
     SetThrdCxt();
     /* Create a resource owner to keep track of our resources. */
-    t_thrd.utils_cxt.CurrentResourceOwner = ResourceOwnerCreate(NULL, "Statement Flush", MEMORY_CONTEXT_DFX);
+    t_thrd.utils_cxt.CurrentResourceOwner = ResourceOwnerCreate(NULL, "Statement Flush",
+        THREAD_GET_MEM_CXT_GROUP(MEMORY_CONTEXT_DFX));
     u_sess->proc_cxt.MyProcPort->SessionStartTime = GetCurrentTimestamp();
     Reset_Pseudo_CurrentUserId();
 
@@ -732,7 +736,8 @@ NON_EXEC_STATIC void CleanStatementMain()
     init_ps_display("clean statement process", "", "", "");
     SetThrdCxt();
     /* Create a resource owner to keep track of our resources. */
-    t_thrd.utils_cxt.CurrentResourceOwner = ResourceOwnerCreate(NULL, "clean Statement", MEMORY_CONTEXT_DFX);
+    t_thrd.utils_cxt.CurrentResourceOwner = ResourceOwnerCreate(NULL, "clean Statement",
+        THREAD_GET_MEM_CXT_GROUP(MEMORY_CONTEXT_DFX));
     u_sess->proc_cxt.MyProcPort->SessionStartTime = GetCurrentTimestamp();
     Reset_Pseudo_CurrentUserId();
 
@@ -975,7 +980,7 @@ static void statement_detail_info_record(StatementStatContext *ssctx, const char
     }
 }
 
-void update_stmt_lock_cnt(StatementStatContext *ssctx, StmtDetailType type, int lockmode)
+static void update_stmt_lock_cnt(StatementStatContext *ssctx, StmtDetailType type, int lockmode)
 {
     switch (type) {
         case LOCK_START:
@@ -1394,11 +1399,10 @@ void instr_stmt_report_basic_info()
     }
     if (to_update_db_name || to_update_user_name || to_update_client_addr) {
         ResourceOwner old_cur_owner = t_thrd.utils_cxt.CurrentResourceOwner;
-        MemoryContext old_ctx = MemoryContextSwitchTo(t_thrd.mem_cxt.msg_mem_cxt);
-        t_thrd.utils_cxt.CurrentResourceOwner = ResourceOwnerCreate(NULL, "Full/Slow SQL", MEMORY_CONTEXT_DFX);
-        (void)MemoryContextSwitchTo(old_ctx);
+        t_thrd.utils_cxt.CurrentResourceOwner = ResourceOwnerCreate(old_cur_owner, "Full/Slow SQL",
+            THREAD_GET_MEM_CXT_GROUP(MEMORY_CONTEXT_DFX));
 
-        old_ctx = MemoryContextSwitchTo(u_sess->statement_cxt.stmt_stat_cxt);
+        MemoryContext old_ctx = MemoryContextSwitchTo(u_sess->statement_cxt.stmt_stat_cxt);
         if (to_update_db_name) {
             u_sess->statement_cxt.db_name = get_database_name(beentry->st_databaseid);
         }
@@ -1437,8 +1441,19 @@ void instr_stmt_report_debug_query_id(uint64 debug_query_id)
     CURRENT_STMT_METRIC_HANDLE->debug_query_id = debug_query_id;
 }
 
+void instr_stmt_report_trace_id(char *trace_id)
+{
+    CHECK_STMT_HANDLE();
+    errno_t rc =
+        memcpy_s(CURRENT_STMT_METRIC_HANDLE->trace_id, MAX_TRACE_ID_SIZE, trace_id, strlen(trace_id) + 1);
+    securec_check(rc, "\0", "\0");
+}
+
 inline void instr_stmt_track_param_query(const char *query)
 {
+    if (query == NULL) {
+        return;
+    }
     if (CURRENT_STMT_METRIC_HANDLE->params == NULL) {
         CURRENT_STMT_METRIC_HANDLE->query = pstrdup(query);
     } else {
@@ -1467,10 +1482,28 @@ void instr_stmt_report_query(uint64 unique_query_id)
     if (!u_sess->attr.attr_common.track_stmt_parameter) {
         CURRENT_STMT_METRIC_HANDLE->query = FindCurrentUniqueSQL();
     } else {
+        const char* query_string = NULL;
+        char* mask_string = NULL;
+
         if (u_sess->unique_sql_cxt.curr_single_unique_sql != NULL) {
-            instr_stmt_track_param_query(u_sess->unique_sql_cxt.curr_single_unique_sql);
+            query_string = u_sess->unique_sql_cxt.curr_single_unique_sql;
         } else {
-            instr_stmt_track_param_query(t_thrd.postgres_cxt.debug_query_string);
+            query_string = t_thrd.postgres_cxt.debug_query_string;
+        }
+
+        if (query_string == NULL) {
+            return;
+        }
+
+        mask_string = maskPassword(query_string);
+        if (mask_string == NULL) {
+            mask_string = (char*)query_string;
+        }
+
+        instr_stmt_track_param_query(mask_string);
+
+        if (mask_string != query_string) {
+            pfree(mask_string);
         }
     }
 
@@ -1527,7 +1560,8 @@ void instr_stmt_report_stat_at_handle_commit()
     CURRENT_STMT_METRIC_HANDLE->application_name = pstrdup(u_sess->attr.attr_common.application_name);
 
     /* unit: microseconds */
-    CURRENT_STMT_METRIC_HANDLE->slow_query_threshold = u_sess->attr.attr_storage.log_min_duration_statement * 1000;
+    CURRENT_STMT_METRIC_HANDLE->slow_query_threshold =
+        (int64)u_sess->attr.attr_storage.log_min_duration_statement * 1000;
 
     CURRENT_STMT_METRIC_HANDLE->tid = t_thrd.proc_cxt.MyProcPid;
 
@@ -1611,7 +1645,13 @@ void instr_stmt_report_query_plan(QueryDesc *queryDesc)
 {
     StatementStatContext *ssctx = (StatementStatContext *)u_sess->statement_cxt.curStatementMetrics;
     if (queryDesc == NULL || ssctx == NULL || ssctx->level <= STMT_TRACK_L0
-        || ssctx->level > STMT_TRACK_L2 || ssctx->plan_size != 0) {
+        || ssctx->level > STMT_TRACK_L2 || ssctx->plan_size != 0 || u_sess->statement_cxt.executer_run_level > 1) {
+        return;
+    }
+    /* when getting plan directly from CN, the plan is partial, deparse plan will be failed,
+     * it's reasonable, as CN has the full plan.
+     */
+    if (u_sess->exec_cxt.under_stream_runtime && IS_PGXC_DATANODE) {
         return;
     }
 
@@ -1663,4 +1703,22 @@ static bool is_valid_detail_record(uint32 bytea_data_len, const char *details, u
     }
 
     return true;
+}
+
+void instr_stmt_dynamic_change_level()
+{
+    CHECK_STMT_HANDLE();
+
+    /* if find user defined statement level, dynamic change the statement track level */
+    StatLevel specified_level = instr_track_stmt_find_level();
+    if (specified_level <= STMT_TRACK_OFF) {
+        return;
+    }
+
+    /* at commit stage, for dynamic track utility, need a symbol to decide flush the handle or not */
+    CURRENT_STMT_METRIC_HANDLE->level = (specified_level > CURRENT_STMT_METRIC_HANDLE->level) ?
+        specified_level : CURRENT_STMT_METRIC_HANDLE->level;
+    CURRENT_STMT_METRIC_HANDLE->dynamic_track_level = specified_level;
+    ereport(DEBUG1, (errmodule(MOD_INSTR), errmsg("[Statement] change (%lu) track level to L%d",
+        u_sess->unique_sql_cxt.unique_sql_id, CURRENT_STMT_METRIC_HANDLE->level - 1)));
 }

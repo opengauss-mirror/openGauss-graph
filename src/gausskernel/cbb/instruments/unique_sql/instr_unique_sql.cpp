@@ -100,10 +100,6 @@ static int KeyUpdatedtimeCmp(const void* a, const void* b);
 static bool AutoRecycleUniqueSQLEntry();
 #endif
 
-/* ---------Thread Local Variable---------- */
-/* save prev-hooks */
-static post_parse_analyze_hook_type g_prev_post_parse_analyze_hook = NULL;
-
 static uint32 uniqueSQLHashCode(const void* key, Size size)
 {
     const UniqueSQLKey* k = (const UniqueSQLKey*)key;
@@ -238,6 +234,7 @@ void InitUniqueSQL()
         UNIQUE_SQL_MAX_HASH_SIZE,
         &ctl,
         HASH_ELEM | HASH_SHRCTX | HASH_FUNCTION | HASH_COMPARE | HASH_PARTITION | HASH_NOEXCEPT);
+    init_builtin_unique_sql();
 }
 
 void instr_unique_sql_register_hook()
@@ -248,7 +245,7 @@ void instr_unique_sql_register_hook()
     }
 
     // register hooks
-    g_prev_post_parse_analyze_hook = post_parse_analyze_hook;
+    t_thrd.statement_cxt.instr_prev_post_parse_analyze_hook = (void *)post_parse_analyze_hook;
     post_parse_analyze_hook = UniqueSq::unique_sql_post_parse_analyze;
 }
 
@@ -442,7 +439,8 @@ static void UpdateUniqueSQLSortHashInfo(UniqueSQL* unique_sql)
  */
 void UpdateUniqueSQLHashStats(HashJoinTable hashtable, TimestampTz* start_time)
 {
-    if (!is_unique_sql_enabled()) {
+    /* isUniqueSQLContextInvalid happens when the query is explain xxx */
+    if (!is_unique_sql_enabled() || isUniqueSQLContextInvalid()) {
         return;
     }
 
@@ -472,7 +470,8 @@ void UpdateUniqueSQLHashStats(HashJoinTable hashtable, TimestampTz* start_time)
  */
 void UpdateUniqueSQLVecSortStats(Batchsortstate* state, uint64 spill_count, TimestampTz* start_time)
 {
-    if (!is_unique_sql_enabled()) {
+    /* isUniqueSQLContextInvalid happens when the query is explain xxx */
+    if (!is_unique_sql_enabled() || isUniqueSQLContextInvalid()) {
         return;
     }
     unique_sql_sorthash_instr* instr = u_sess->unique_sql_cxt.unique_sql_sort_instr;
@@ -495,30 +494,6 @@ void UpdateUniqueSQLVecSortStats(Batchsortstate* state, uint64 spill_count, Time
     }
 }
 
-static void mask_unique_sql_str(UniqueSQL* unique_sql)
-{
-    errno_t rc;
-
-    /* hide password */
-    if (unique_sql->unique_sql != NULL) {
-        char* mask_str = NULL;
-        mask_str = maskPassword(unique_sql->unique_sql);
-        if (mask_str != NULL) {
-            rc = memset_s(unique_sql->unique_sql, UNIQUE_SQL_MAX_LEN - 1, 0, UNIQUE_SQL_MAX_LEN - 1);
-            securec_check(rc, "\0", "\0");
-
-            /* after calling maskPassword, mask_str can be longer than original string,
-             * now the length of masked password('*..*') is fixed to 'password_min_length'(GUC) */
-            size_t valid_mask_len = strlen(mask_str) > (size_t)(UNIQUE_SQL_MAX_LEN - 1)
-                                        ? (size_t)(UNIQUE_SQL_MAX_LEN - 1)
-                                        : strlen(mask_str);
-            rc = memcpy_s(unique_sql->unique_sql, UNIQUE_SQL_MAX_LEN - 1, mask_str, valid_mask_len);
-            securec_check(rc, "\0", "\0");
-            pfree(mask_str);
-        }
-    }
-}
-
 static void set_unique_sql_string_in_entry(UniqueSQL* entry, Query* query, const char* sql, int32 multi_sql_offset)
 {
     errno_t rc = EOK;
@@ -537,7 +512,6 @@ static void set_unique_sql_string_in_entry(UniqueSQL* entry, Query* query, const
         // generate and store normalized query string
         if (normalized_unique_querystring(query, sql, entry->unique_sql, UNIQUE_SQL_MAX_LEN - 1,
             multi_sql_offset)) {
-            mask_unique_sql_str(entry);
             entry->unique_sql = trim(entry->unique_sql);
         } else {
             ereport(LOG,
@@ -1692,6 +1666,12 @@ Datum get_instr_unique_sql(PG_FUNCTION_ARGS)
     }
 }
 
+bool CheckSkipSQL(Query* query)
+{
+    return query->utilityStmt != NULL && (IsA(query->utilityStmt, ExplainStmt) ||
+        (IsA(query->utilityStmt, RemoteQuery) &&
+        (((RemoteQuery*)query->utilityStmt)->exec_direct_type != EXEC_DIRECT_NONE)));
+}
 /*
  * GenerateUniqueSQLInfo - generate unique sql info
  *
@@ -1711,8 +1691,8 @@ void GenerateUniqueSQLInfo(const char* sql, Query* query)
      * refer to the assert in method "relation_open"
      */
     if (sql == NULL || query == NULL || g_instance.stat_cxt.UniqueSQLHashtbl == NULL || !is_local_unique_sql() ||
-        IsAbortedTransactionBlockState() || 
-        (query->utilityStmt != NULL && IsA(query->utilityStmt, ExplainStmt))) {
+        IsAbortedTransactionBlockState() || CheckSkipSQL(query) ||
+        u_sess->unique_sql_cxt.skipUniqueSQLCount != 0) {
         return;
     }
 
@@ -1741,9 +1721,16 @@ void GenerateUniqueSQLInfo(const char* sql, Query* query)
     query->uniqueSQLId = u_sess->unique_sql_cxt.unique_sql_id;
     u_sess->slow_query_cxt.slow_query.unique_sql_id = u_sess->unique_sql_cxt.unique_sql_id;
 
+    /* dynamic enable statement tracking */
+    instr_stmt_dynamic_change_level();
+
     if (!OidIsValid(u_sess->unique_sql_cxt.unique_sql_cn_id)) {
         Oid node_oid = get_pgxc_nodeoid(g_instance.attr.attr_common.PGXCNodeName);
         u_sess->unique_sql_cxt.unique_sql_cn_id = get_pgxc_node_id(node_oid);
+        if (u_sess->globalSessionId.sessionId) {
+            u_sess->globalSessionId.nodeId = u_sess->unique_sql_cxt.unique_sql_cn_id;
+            pgstat_report_global_session_id(u_sess->globalSessionId);
+        }
     }
 
     u_sess->unique_sql_cxt.unique_sql_user_id = GetUserId();
@@ -1753,6 +1740,7 @@ void GenerateUniqueSQLInfo(const char* sql, Query* query)
 
     UpdateUniqueSQLStat(query, current_sql, 0);
     instr_stmt_report_query(u_sess->unique_sql_cxt.unique_sql_id);
+    pgstat_report_unique_sql_id(false);
 
     /* if track top enabled, only TOP SQL will generate unique sql id */
     if (IS_UNIQUE_SQL_TRACK_TOP) {
@@ -1775,8 +1763,8 @@ void UniqueSq::unique_sql_post_parse_analyze(ParseState* pstate, Query* query)
         }
     }
 
-    if (g_prev_post_parse_analyze_hook != NULL) {
-        g_prev_post_parse_analyze_hook(pstate, query);
+    if (t_thrd.statement_cxt.instr_prev_post_parse_analyze_hook != NULL) {
+        ((post_parse_analyze_hook_type)(t_thrd.statement_cxt.instr_prev_post_parse_analyze_hook))(pstate, query);
     }
 }
 
@@ -1802,6 +1790,8 @@ static void SetLocalUniqueSQLId(List* query_list)
                 if (!OidIsValid(u_sess->unique_sql_cxt.unique_sql_cn_id)) {
                     Oid node_oid = get_pgxc_nodeoid(g_instance.attr.attr_common.PGXCNodeName);
                     u_sess->unique_sql_cxt.unique_sql_cn_id = get_pgxc_node_id(node_oid);
+                    u_sess->globalSessionId.nodeId = u_sess->unique_sql_cxt.unique_sql_cn_id;
+                    pgstat_report_global_session_id(u_sess->globalSessionId);
                 }
 
                 u_sess->unique_sql_cxt.unique_sql_user_id = GetUserId();
@@ -1814,6 +1804,10 @@ static void SetLocalUniqueSQLId(List* query_list)
                 }
 #endif
                 instr_stmt_report_query(u_sess->unique_sql_cxt.unique_sql_id);
+                pgstat_report_unique_sql_id(false);
+
+                /* dynamic enable statement tracking */
+                instr_stmt_dynamic_change_level();
 
                 /* for BE message, only can have one SQL each time,
                  * so set top to true, then n_calls can be Updated
@@ -2040,7 +2034,8 @@ void ReplyUniqueSQLsStat(StringInfo msg, uint32 count)
 
     ResourceOwner old_cur_owner = t_thrd.utils_cxt.CurrentResourceOwner;
     MemoryContext old_ctx = MemoryContextSwitchTo(t_thrd.mem_cxt.msg_mem_cxt);
-    t_thrd.utils_cxt.CurrentResourceOwner = ResourceOwnerCreate(NULL, "ReplyUniqueSQL", MEMORY_CONTEXT_DFX);
+    t_thrd.utils_cxt.CurrentResourceOwner = ResourceOwnerCreate(NULL, "ReplyUniqueSQL",
+        THREAD_GET_MEM_CXT_GROUP(MEMORY_CONTEXT_DFX));
 
     PG_TRY();
     {
@@ -2481,7 +2476,7 @@ static bool AutoRecycleUniqueSQLEntry()
     long totalCount = hash_get_num_entries(g_instance.stat_cxt.UniqueSQLHashtbl);
     if (totalCount < u_sess->attr.attr_common.instr_unique_sql_count - 1) {
         LWLockRelease(UniqueSqlEvictLock);
-        ereport(DEBUG1,
+        ereport(LOG,
             (errmodule(MOD_INSTR), errmsg("[UniqueSQL] There is still free space in unique SQL hash table and no need to clean it up.")));
         return true;
     }
@@ -2497,8 +2492,8 @@ static bool AutoRecycleUniqueSQLEntry()
             (errmodule(MOD_INSTR), errcode(ERRCODE_LOG), errmsg("[UniqueSQL] instr_unique_sql_count is too large, uniquesql auto-clean will not happen.")));
         return false;
     }
-    double ratio = u_sess->attr.attr_common.unique_sql_clean_ratio;
-    int cleanCount = Max(int(ratio * instr_unique_sql_count + totalCount - instr_unique_sql_count), 1);
+    const double cleanRatio = 0.1;
+    int cleanCount = Max(int(cleanRatio * instr_unique_sql_count + (totalCount - instr_unique_sql_count)), 1);
     /* get remove entry list */
     KeyUpdatedtime* removeList = GetSortedEntryList();
     if (removeList == NULL) {
@@ -2518,7 +2513,7 @@ static bool AutoRecycleUniqueSQLEntry()
     }
     pfree(removeList);
     LWLockRelease(UniqueSqlEvictLock);
-    ereport(DEBUG1,
+    ereport(LOG,
             (errmodule(MOD_INSTR), errmsg("[UniqueSQL] Auto-cleanup over, %d uniquesqls are recycled.", cleanCount)));
     return true;
 }
@@ -2650,6 +2645,7 @@ void ResetCurrentUniqueSQL(bool need_reset_cn_id)
 #ifndef ENABLE_MULTIPLE_NODES
     u_sess->unique_sql_cxt.unique_sql_text = NULL;
 #endif
+    u_sess->unique_sql_cxt.skipUniqueSQLCount = 0;
 }
 
 void FindUniqueSQL(UniqueSQLKey key, char* unique_sql)

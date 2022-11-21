@@ -41,7 +41,6 @@ typedef gs_stl::gs_set<gs_stl::gs_string> policy_default_str_uset;
 typedef gs_stl::gs_set<gs_stl::gs_string> policy_default_str_set;
 
 loaded_labels *get_policy_labels();
-bool get_label_tables(const char *label_name, policy_default_str_uset *label_tables);
 bool is_label_exist(const char *name);
 bool load_policy_labels(bool reload = false);
 /* check if some label include table */
@@ -55,10 +54,7 @@ bool update_label_value(const gs_stl::gs_string object_name,
                         const gs_stl::gs_string new_object_name,
                         int object_type);
 
-bool is_labels_has_object(const GsPolicyFQDN *fqdn,
-                             const policy_default_str_set *labels,
-                             bool (*CheckLabelBoundPolicy)(bool, const gs_stl::gs_string));
-
 void reset_policy_labels();
 void clear_thread_local_label();
+void verify_drop_column(AlterTableStmt *stmt);
 #endif /* GS_POLICY_GS_POLICY_LABELS_H_ */

@@ -209,10 +209,40 @@ SELECT TO_CHAR(TO_DATE('27/OCT/17', 'DD-MON-RR') ,'DD') "Year";
 SELECT to_date('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa                              aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa                              aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa aaaaaaaaaaaaaaaaaaaaaaaaaaaa                              aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa                              aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa                              aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa                              aaaaaaaaaaaaaaaaaaaaaaaaaaa        aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa                              aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa                              aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa                              aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa                                                11111');
 SELECT to_date('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa                              aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa                              aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa aaaaaaaaaaaaaaaaaaaaaaaaaaaa                              aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa                              aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa                              aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa                              aaaaaaaaaaaaaaaaaaaaaaaaaaa        aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa                              aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa                              aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa                              aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 11111');
 
+SELECT TO_CHAR(timestamp '2021-08-30 21:21:55.535744', 'YYYYMMDDHH24MISSFF1');
+SELECT TO_CHAR(timestamp '2021-08-30 21:21:55.535744', 'YYYYMMDDHH24MISSFF2');
+SELECT TO_CHAR(timestamp '2021-08-30 21:21:55.535744', 'YYYYMMDDHH24MISSFF3');
+SELECT TO_CHAR(timestamp '2021-08-30 21:21:55.535744', 'YYYYMMDDHH24MISSFF4');
+SELECT TO_CHAR(timestamp '2021-08-30 21:21:55.535744', 'YYYYMMDDHH24MISSFF5');
+SELECT TO_CHAR(timestamp '2021-08-30 21:21:55.535744', 'YYYYMMDDHH24MISSFF6');
 
-/*----------------------------------------------
-DTS2017031602663: support timezone Asia/Beijing
-----------------------------------------------*/
+SELECT TO_CHAR(timestamptz '2021-08-30 21:21:55.535744+08', 'YYYYMMDDHH24MISSFF1');
+SELECT TO_CHAR(timestamptz '2021-08-30 21:21:55.535744+08', 'YYYYMMDDHH24MISSFF2');
+SELECT TO_CHAR(timestamptz '2021-08-30 21:21:55.535744+08', 'YYYYMMDDHH24MISSFF3');
+SELECT TO_CHAR(timestamptz '2021-08-30 21:21:55.535744+08', 'YYYYMMDDHH24MISSFF4');
+SELECT TO_CHAR(timestamptz '2021-08-30 21:21:55.535744+08', 'YYYYMMDDHH24MISSFF5');
+SELECT TO_CHAR(timestamptz '2021-08-30 21:21:55.535744+08', 'YYYYMMDDHH24MISSFF6');
+
+SELECT TO_CHAR(timestamp '2021-08-30 21:21:55.535744', 'yyyymmddhh24missff1');
+SELECT TO_CHAR(timestamp '2021-08-30 21:21:55.535744', 'yyyymmddhh24missff2');
+SELECT TO_CHAR(timestamp '2021-08-30 21:21:55.535744', 'yyyymmddhh24missff3');
+SELECT TO_CHAR(timestamp '2021-08-30 21:21:55.535744', 'yyyymmddhh24missff4');
+SELECT TO_CHAR(timestamp '2021-08-30 21:21:55.535744', 'yyyymmddhh24missff5');
+SELECT TO_CHAR(timestamp '2021-08-30 21:21:55.535744', 'yyyymmddhh24missff6');
+
+SELECT TO_CHAR(timestamptz '2021-08-30 21:21:55.535744+08', 'yyyymmddhh24missff1');
+SELECT TO_CHAR(timestamptz '2021-08-30 21:21:55.535744+08', 'yyyymmddhh24missff2');
+SELECT TO_CHAR(timestamptz '2021-08-30 21:21:55.535744+08', 'yyyymmddhh24missff3');
+SELECT TO_CHAR(timestamptz '2021-08-30 21:21:55.535744+08', 'yyyymmddhh24missff4');
+SELECT TO_CHAR(timestamptz '2021-08-30 21:21:55.535744+08', 'yyyymmddhh24missff5');
+SELECT TO_CHAR(timestamptz '2021-08-30 21:21:55.535744+08', 'yyyymmddhh24missff6');
+
+SELECT TO_CHAR(timestamp '2021-08-30 21:21:55.535744', 'YYYYMMDDHH24MISSXFF');
+SELECT TO_CHAR(timestamptz '2021-08-30 21:21:55.535744+08', 'YYYYMMDDHH24MISSXFF');
+
+SELECT TO_CHAR(timestamp '2021-08-30 21:21:55.535744', 'yyyymmddhh24missxff');
+SELECT TO_CHAR(timestamptz '2021-08-30 21:21:55.535744+08', 'yyyymmddhh24missxff');
+
 set timezone='Asia/Beijing';
 select extract(timezone from now());
 

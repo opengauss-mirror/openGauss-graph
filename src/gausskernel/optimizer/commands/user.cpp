@@ -6,6 +6,7 @@
  * Portions Copyright (c) 2020 Huawei Technologies Co.,Ltd.
  * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
+ * Portions Copyright (c) 2021, openGauss Contributors
  *
  * src/gausskernel/optimizer/commands/user.cpp
  *
@@ -44,6 +45,7 @@
 #include "miscadmin.h"
 #include "nodes/pg_list.h"
 #include "nodes/value.h"
+#include "postmaster/rbcleaner.h"
 #include "storage/lmgr.h"
 #include "storage/predicate_internals.h"
 #include "utils/acl.h"
@@ -72,6 +74,7 @@
 #include "catalog/pgxc_group.h"
 #include "openssl/rand.h"
 #include "instruments/instr_workload.h"
+#include "client_logic/client_logic.h"
 
 #if defined(__LP64__) || defined(__64BIT__)
 typedef unsigned int GS_UINT32;
@@ -105,7 +108,6 @@ static bool IsCurrentSchemaAttachRoles(List* roles);
 
 /* Database Security: Support password complexity */
 static bool IsSpecialCharacter(char ch);
-static bool IsPasswdEqual(const char* roleID, char* passwd1, char* passwd2);
 static void IsPasswdSatisfyPolicy(char* Password);
 static bool CheckPasswordComplexity(
     const char* roleID, char* newPasswd, char* oldPasswd, bool isCreaterole);
@@ -324,7 +326,8 @@ void initSqlCountUser()
 {
     ResourceOwner currentOwner = t_thrd.utils_cxt.CurrentResourceOwner;
     ResourceOwner tmpOwner;
-    t_thrd.utils_cxt.CurrentResourceOwner = ResourceOwnerCreate(NULL, "ForSqlCount", MEMORY_CONTEXT_OPTIMIZER);
+    t_thrd.utils_cxt.CurrentResourceOwner = ResourceOwnerCreate(NULL, "ForSqlCount",
+        THREAD_GET_MEM_CXT_GROUP(MEMORY_CONTEXT_OPTIMIZER));
 
     Relation relation = heap_open(AuthIdRelationId, AccessShareLock);
     SysScanDesc scan = systable_beginscan(relation, InvalidOid, false, NULL, 0, NULL);
@@ -524,6 +527,19 @@ static inline void clean_role_password(const DefElem* dpassword)
     }
 
     return;
+}
+
+/*
+ * True iff role name starts with the gs_role_ prefix.
+ * The prefix gs_role_ is reserverd for the predefined role names.
+ */
+static bool IsReservedRoleName(const char* name)
+{
+    if (strncmp(name, "gs_role_", strlen("gs_role_")) == 0) {
+        return true;
+    } else {
+        return false;
+    }
 }
 
 /*
@@ -1141,6 +1157,15 @@ void CreateRole(CreateRoleStmt* stmt)
     }
 
     /*
+     * Make sure that the user is not trying to create a role in the reserved "gs_role_" namespace.
+     */
+    if (IsReservedRoleName(stmt->role)) {
+        str_reset(password);
+        ereport(ERROR, (errcode(ERRCODE_RESERVED_NAME), errmsg("role name \"%s\" is reserved", stmt->role),
+            errdetail("Role names starting with \"gs_role_\" are reserved.")));
+    }
+
+    /*
      * Check the pg_authid relation to be certain the role doesn't already
      * exist.
      */
@@ -1557,6 +1582,30 @@ bool RoleIsDba(Oid rolOid)
 }
 
 /*
+ * Check that if the role is a predefined role.
+ */
+static bool IsPredefinedRole(const char* name)
+{
+    static char* predefinedRoles[] = {
+        "gs_role_copy_files",
+        "gs_role_signal_backend",
+        "gs_role_tablespace",
+        "gs_role_replication",
+        "gs_role_account_lock",
+        "gs_role_pldebugger",
+        "gs_role_directory_create",
+        "gs_role_directory_drop"
+    };
+
+    for (unsigned i = 0; i < lengthof(predefinedRoles); i++) {
+        if (strcmp(name, predefinedRoles[i]) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/*
  * ALTER ROLE
  *
  * Note: the rolemembers option accepted here is intended to support the
@@ -1659,6 +1708,14 @@ void AlterRole(AlterRoleStmt* stmt)
     ListCell* head = NULL;
 
     USER_STATUS rolestatus = UNLOCK_STATUS;
+
+    /*
+     * Make sure that the user is not trying to alter a predefined role.
+     */
+    if (IsPredefinedRole(stmt->role)) {
+        ereport(ERROR, (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+            errmsg("Permission denied to alter predefined roles.")));
+    }
 
     /* Extract options from the statement node tree */
     foreach (option, stmt->options) {
@@ -2277,7 +2334,7 @@ void AlterRole(AlterRoleStmt* stmt)
         /* Database Security:  Support separation of privilege. */
         CheckAlterAuditadminPrivilege(roleid, isOnlyAlterPassword);
     } else if (((Form_pg_authid)GETSTRUCT(tuple))->rolreplication || isreplication >= 0) {
-        if (!isRelSuperuser() && !have_createrole_privilege()) {
+        if (!isRelSuperuser()) {
             str_reset(password);
             str_reset(replPasswd);
             ereport(ERROR, (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE), errmsg("Permission denied.")));
@@ -2680,7 +2737,7 @@ void AlterRole(AlterRoleStmt* stmt)
         }
 
         /* if not superuser or have createrole privilege, we must check the oldPasswd and replPasswd */
-        if (!(isRelSuperuser() || have_createrole_privilege()) || GetUserId() == roleid) {
+        if (!(isRelSuperuser() || have_createrole_privilege()) || (GetUserId() == roleid && !initialuser())) {
             /* if rolepassword is seted in pg_authid, replPasswd must be checked. */
             if (oldPasswd != NULL) {
                 if (replPasswd ==  NULL) {
@@ -2693,7 +2750,7 @@ void AlterRole(AlterRoleStmt* stmt)
                                    "grammar.")));
                 } else {
                     /* Database Security: Support lock/unlock account */
-                    if (!IsPasswdEqual(stmt->role, replPasswd, oldPasswd)) {
+                    if (!VerifyPasswdDigest(stmt->role, replPasswd, oldPasswd)) {
                         /* the password is not right, and try to lock the account */
                         if (u_sess->attr.attr_security.Password_lock_time > 0 &&
                             u_sess->attr.attr_security.Failed_login_attempts > 0) {
@@ -2973,6 +3030,14 @@ void AlterRoleSet(AlterRoleSetStmt* stmt)
     bool is_opradmin = false;
     bool isNull = false;
 
+    /*
+     * Make sure that the user is not trying to alter a predefined role.
+     */
+    if (IsPredefinedRole(stmt->role)) {
+        ereport(ERROR, (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+            errmsg("Permission denied to alter predefined roles.")));
+    }
+
     pg_authid_rel = heap_open(AuthIdRelationId, RowExclusiveLock);
     pg_authid_dsc = RelationGetDescr(pg_authid_rel);
 
@@ -3079,6 +3144,14 @@ void DropRole(DropRoleStmt* stmt)
         bool is_opradmin = false;
         Oid nodegroup_id;
 
+        /*
+         * Make sure that the user is not trying to drop a predefined role.
+        */
+        if (IsPredefinedRole(role)) {
+            ereport(ERROR, (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+                errmsg("Permission denied to drop predefined roles.")));
+        }
+
         HeapTuple tuple = SearchSysCache1(AUTHNAME, PointerGetDatum(role));
         if (!HeapTupleIsValid(tuple)) {
             if (!stmt->missing_ok) {
@@ -3146,6 +3219,8 @@ void DropRole(DropRoleStmt* stmt)
             InvokeObjectAccessHook(OAT_DROP, AuthIdRelationId, roleid, 0, &drop_arg);
         }
 
+        RbCltPurgeUser(roleid);
+
         /*
          * Lock the role, so nobody can add dependencies to her while we drop
          * her.  We keep the lock until the end of transaction.
@@ -3208,7 +3283,7 @@ void DropRole(DropRoleStmt* stmt)
                     errdetail_log("%s", detail_log)));
 
         /* Relate to remove all job belong the user. */
-        remove_job_by_oid(NameStr(((Form_pg_authid)GETSTRUCT(tuple))->rolname), UserOid, true);
+        remove_job_by_oid(roleid, UserOid, true);
 
         if (IsUnderPostmaster) {
             DropRoleStmt stmt_temp;
@@ -3259,6 +3334,12 @@ void DropRole(DropRoleStmt* stmt)
         DropAuthHistory(roleid);
         /* Database Security: Support lock/unlock account */
         DropUserStatus(roleid);
+
+        /*
+         * Remove owned client master keys and column keys.
+         */
+        delete_client_master_keys(roleid);
+        delete_column_keys(roleid);
 
         /*
          * Remove any comments or security labels on this role.
@@ -3314,6 +3395,9 @@ void RenameRole(const char* oldname, const char* newname)
     int i;
     Oid roleid;
     bool is_opradmin = false;
+    Relation pg_job_tbl = NULL;
+    TableScanDesc scan = NULL;
+    HeapTuple tuple = NULL;
 
     Relation rel = heap_open(AuthIdRelationId, RowExclusiveLock);
     TupleDesc dsc = RelationGetDescr(rel);
@@ -3377,6 +3461,20 @@ void RenameRole(const char* oldname, const char* newname)
             ereport(ERROR, (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE), errmsg("Permission denied to rename role.")));
     }
 
+    /*
+     * Make sure that the user is not trying to rename a predefined role and not
+     * trying to rename a role into the reserved "gs_role_" namespace.
+     */
+    if (IsPredefinedRole(oldname)) {
+        ereport(ERROR, (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+            errmsg("Permission denied to rename predefined roles.")));
+    }
+
+    if (IsReservedRoleName(newname)) {
+        ereport(ERROR, (errcode(ERRCODE_RESERVED_NAME), errmsg("role name \"%s\" is reserved", newname),
+            errdetail("Role names starting with \"gs_role_\" are reserved.")));
+    }
+
     /* OK, construct the modified tuple */
     for (i = 0; i < Natts_pg_authid; i++)
         repl_repl[i] = false;
@@ -3413,6 +3511,23 @@ void RenameRole(const char* oldname, const char* newname)
      * Close pg_authid, but keep lock till commit.
      */
     heap_close(rel, NoLock);
+
+    /*
+     * change the user name in the pg_job.
+     */
+    pg_job_tbl = heap_open(PgJobRelationId, ExclusiveLock);
+    scan = heap_beginscan(pg_job_tbl, SnapshotNow, 0, NULL);
+
+    while (HeapTupleIsValid(tuple = heap_getnext(scan, ForwardScanDirection))) {
+        Form_pg_job pg_job = (Form_pg_job)GETSTRUCT(tuple);
+        if (strcmp(NameStr(pg_job->log_user), oldname) == 0) {
+            update_pg_job_username(pg_job->job_id, newname);
+        }
+    }
+
+    heap_endscan(scan);
+    heap_close(pg_job_tbl, ExclusiveLock);
+
 }
 
 /*
@@ -3546,7 +3661,7 @@ static List* roleNamesToIds(const List* memberNames)
 /*
  * AddRoleMems -- Add given members to the specified role
  *
- * rolename: name of role to add to (used only for error messages)
+ * rolename: name of role to add to
  * roleid: OID of role to add to
  * memberNames: list of names of roles to add (used only for error messages)
  * memberIds: OIDs of roles to add
@@ -3568,6 +3683,12 @@ static void AddRoleMems(
     /* Skip permission check if nothing to do */
     if (memberIds == NULL)
         return;
+
+    /* Check permissions: must have admin option on the predefined role to be changed. */
+    if (IsPredefinedRole(rolename) && !is_admin_of_role(grantorId, roleid)) {
+        ereport(ERROR, (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+            errmsg("must have admin option on predefined role \"%s\"", rolename)));
+    }
 
     /* Only persistence user himself or initial user can add him to other members. */
     if (is_role_persistence(roleid)) {
@@ -3700,7 +3821,7 @@ static void AddRoleMems(
 /*
  * DelRoleMems -- Remove given members from the specified role
  *
- * rolename: name of role to del from (used only for error messages)
+ * rolename: name of role to del from
  * roleid: OID of role to del from
  * memberNames: list of names of roles to del (used only for error messages)
  * memberIds: OIDs of roles to del
@@ -3720,6 +3841,12 @@ static void DelRoleMems(const char* rolename, Oid roleid, const List* memberName
     /* Skip permission check if nothing to do */
     if (memberIds == NULL)
         return;
+
+    /* Check permissions: must have admin option on the predefined role to be changed. */
+    if (IsPredefinedRole(rolename) && !is_admin_of_role(GetUserId(), roleid)) {
+        ereport(ERROR, (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+            errmsg("must have admin option on predefined role \"%s\"", rolename)));
+    }
 
     /* Only persistence user himself or initial user can delete him from other members */
     if (is_role_persistence(roleid)) {
@@ -3873,6 +4000,9 @@ static bool IsLockOnRelation(const LockInstanceData* instance)
             on_relation = true;
             break;
         case LOCKTAG_TUPLE:
+            on_relation = true;
+            break;
+        case LOCKTAG_UID:
             on_relation = true;
             break;
         case LOCKTAG_CSTORE_FREESPACE:
@@ -4105,139 +4235,7 @@ static bool IsSpecialCharacter(char ch)
     return false;
 }
 
-/*
- * Brief			: whether the passwd1 equal to the passwd2
- * Description		: the compare mainly contains encrypted password
- * Notes			:
- */
-static bool IsPasswdEqual(const char* rolename, char* passwd1, char* passwd2)
-{
-    char encrypted_md5_password[MD5_PASSWD_LEN + 1] = {0};
-    char encrypted_sha256_password[SHA256_PASSWD_LEN + 1] = {0};
-    char encrypted_sm3_password[SM3_PASSWD_LEN + 1] = {0};
-    char encrypted_combined_password[MD5_PASSWD_LEN + SHA256_PASSWD_LEN + 1] = {0};
-    char salt[SALT_LENGTH * 2 + 1] = {0};
-    int iteration_count = 0;
-    errno_t rc = EOK;
 
-    if (passwd1 == NULL || passwd2 == NULL || strlen(passwd1) == 0 || strlen(passwd2) == 0) {
-        return false;
-    }
-
-    if (isMD5(passwd2)) {
-        if (!pg_md5_encrypt(passwd1, rolename, strlen(rolename), encrypted_md5_password)) {
-            /* Var 'encrypted_md5_password' has not been assigned any value if the function return 'false' */
-            str_reset(passwd1);
-            str_reset(passwd2);
-            ereport(ERROR, (errcode(ERRCODE_INVALID_PASSWORD), errmsg("md5-password encryption failed.")));
-        }
-        if (strncmp(passwd2, encrypted_md5_password, MD5_PASSWD_LEN + 1) == 0) {
-            rc = memset_s(encrypted_md5_password, MD5_PASSWD_LEN + 1, 0, MD5_PASSWD_LEN + 1);
-            securec_check(rc, "\0", "\0");
-            return true;
-        }
-    } else if (isSHA256(passwd2)) {
-        rc = strncpy_s(salt, sizeof(salt), &passwd2[SHA256_LENGTH], sizeof(salt) - 1);
-        securec_check(rc, "\0", "\0");
-        salt[sizeof(salt) - 1] = '\0';
-
-        iteration_count = get_stored_iteration(rolename);
-        if (!pg_sha256_encrypt(passwd1, salt, strlen(salt), encrypted_sha256_password, NULL, iteration_count)) {
-            rc = memset_s(encrypted_sha256_password, SHA256_PASSWD_LEN + 1, 0, SHA256_PASSWD_LEN + 1);
-            securec_check(rc, "\0", "\0");
-            str_reset(passwd1);
-            str_reset(passwd2);
-            ereport(ERROR, (errcode(ERRCODE_INVALID_PASSWORD), errmsg("sha256-password encryption failed.")));
-        }
-
-        if (strncmp(passwd2, encrypted_sha256_password, SHA256_PASSWD_LEN) == 0) {
-            rc = memset_s(encrypted_sha256_password, SHA256_PASSWD_LEN + 1, 0, SHA256_PASSWD_LEN + 1);
-            securec_check(rc, "\0", "\0");
-            return true;
-        }
-    } else if (isSM3(passwd2)) {
-        rc = strncpy_s(salt, sizeof(salt), &passwd2[SM3_LENGTH], sizeof(salt) - 1);
-        securec_check(rc, "\0", "\0");
-        salt[sizeof(salt) - 1] = '\0';
-
-        iteration_count = get_stored_iteration(rolename);
-        if (!gs_sm3_encrypt(passwd1, salt, strlen(salt), encrypted_sm3_password, NULL, iteration_count)) {
-            rc = memset_s(encrypted_sm3_password, SM3_PASSWD_LEN + 1, 0, SM3_PASSWD_LEN + 1);
-            securec_check(rc, "\0", "\0");
-            ereport(ERROR, (errcode(ERRCODE_INVALID_PASSWORD), errmsg("sm3-password encryption failed.")));
-        }
-
-        if (strncmp(passwd2, encrypted_sm3_password, SM3_PASSWD_LEN) == 0) {
-            rc = memset_s(encrypted_sm3_password, SM3_PASSWD_LEN + 1, 0, SM3_PASSWD_LEN + 1);
-            securec_check(rc, "\0", "\0");
-            return true;
-        }
-    } else if (isCOMBINED(passwd2)) {
-        rc = strncpy_s(salt, sizeof(salt), &passwd2[SHA256_LENGTH], sizeof(salt) - 1);
-        securec_check(rc, "\0", "\0");
-        salt[sizeof(salt) - 1] = '\0';
-
-        iteration_count = get_stored_iteration(rolename);
-        if (!pg_sha256_encrypt(passwd1, salt, strlen(salt), encrypted_sha256_password, NULL, iteration_count)) {
-            rc = memset_s(encrypted_sha256_password, SHA256_PASSWD_LEN + 1, 0, SHA256_PASSWD_LEN + 1);
-            securec_check(rc, "\0", "\0");
-            str_reset(passwd1);
-            str_reset(passwd2);
-            ereport(ERROR, (errcode(ERRCODE_INVALID_PASSWORD), errmsg("first stage encryption password failed")));
-        }
-
-        if (!pg_md5_encrypt(passwd1, rolename, strlen(rolename), encrypted_md5_password)) {
-            /* Var 'encrypted_md5_password' has not been assigned any value if the function return 'false' */
-            str_reset(passwd1);
-            str_reset(passwd2);
-            ereport(ERROR, (errcode(ERRCODE_INVALID_PASSWORD), errmsg("second stage encryption password failed")));
-        }
-
-        rc = snprintf_s(encrypted_combined_password,
-            MD5_PASSWD_LEN + SHA256_PASSWD_LEN + 1,
-            MD5_PASSWD_LEN + SHA256_PASSWD_LEN,
-            "%s%s",
-            encrypted_sha256_password,
-            encrypted_md5_password);
-        securec_check_ss(rc, "\0", "\0");
-
-        /*
-         * When alter user's password:
-         * 1. No need to compare the new iteration and old iteration.
-         * 2. No need to compare MD5 password, just compare SHA256 is enough.
-         */
-        if (strncmp(passwd2, encrypted_combined_password, SHA256_PASSWD_LEN) == 0) {
-            /* clear the sensitive messages in the stack. */
-            rc = memset_s(encrypted_md5_password, MD5_PASSWD_LEN + 1, 0, MD5_PASSWD_LEN + 1);
-            securec_check(rc, "\0", "\0");
-            rc = memset_s(encrypted_sha256_password, SHA256_PASSWD_LEN + 1, 0, SHA256_PASSWD_LEN + 1);
-            securec_check(rc, "\0", "\0");
-            rc = memset_s(encrypted_combined_password,
-                MD5_PASSWD_LEN + SHA256_PASSWD_LEN + 1,
-                0,
-                MD5_PASSWD_LEN + SHA256_PASSWD_LEN + 1);
-            securec_check(rc, "\0", "\0");
-            return true;
-        }
-    } else {
-        if (strcmp(passwd1, passwd2) == 0) {
-            return true;
-        }
-    }
-
-    /* clear sensitive messages in stack. */
-    rc = memset_s(encrypted_md5_password, MD5_PASSWD_LEN + 1, 0, MD5_PASSWD_LEN + 1);
-    securec_check(rc, "\0", "\0");
-    rc = memset_s(encrypted_sha256_password, SHA256_PASSWD_LEN + 1, 0, SHA256_PASSWD_LEN + 1);
-    securec_check(rc, "\0", "\0");
-    rc = memset_s(
-        encrypted_combined_password, MD5_PASSWD_LEN + SHA256_PASSWD_LEN + 1, 0, MD5_PASSWD_LEN + SHA256_PASSWD_LEN + 1);
-    securec_check(rc, "\0", "\0");
-    rc = memset_s(encrypted_sm3_password, SM3_PASSWD_LEN + 1, 0, SM3_PASSWD_LEN + 1);
-    securec_check(rc, "\0", "\0");
-
-    return false;
-}
 
 static void CalculateTheNumberOfAllTypesOfCharacters(const char* ptr, int *kinds, bool *include_unusual_character)
 {
@@ -4275,19 +4273,19 @@ static void IsPasswdSatisfyPolicy(char* Password)
     /* Password must contain at least u_sess->attr.attr_security.Password_min_length characters */
     if ((int)strlen(Password) < u_sess->attr.attr_security.Password_min_length) {
         str_reset(Password);
-        ereport(ERROR,
-            (errcode(ERRCODE_INVALID_PASSWORD),
-                errmsg(
-                    "Password must contain at least %d characters.", u_sess->attr.attr_security.Password_min_length)));
+        ereport(ERROR, (errcode(ERRCODE_INVALID_PASSWORD),
+            errmsg("Password must contain at least %d characters.", u_sess->attr.attr_security.Password_min_length),
+            errcause("The minimum number of characters is specified by password_min_length."),
+            erraction("Add more characters to the password.")));
     }
 
     /* Password can't contain more than u_sess->attr.attr_security.Password_max_length characters */
     if ((int)strlen(Password) > u_sess->attr.attr_security.Password_max_length) {
         str_reset(Password);
-        ereport(ERROR,
-            (errcode(ERRCODE_INVALID_PASSWORD),
-                errmsg("Password can't contain more than %d characters.",
-                    u_sess->attr.attr_security.Password_max_length)));
+        ereport(ERROR, (errcode(ERRCODE_INVALID_PASSWORD),
+            errmsg("Password can't contain more than %d characters.", u_sess->attr.attr_security.Password_max_length),
+            errcause("The maximum number of characters is specified by password_max_length."),
+            erraction("Remove some characters from the password.")));
     }
 
     /* Calculate the number of all types of characters */
@@ -4296,9 +4294,11 @@ static void IsPasswdSatisfyPolicy(char* Password)
     /* If contain unusual character in password, show the warning. */
     if (include_unusual_character) {
         str_reset(Password);
-        ereport(ERROR,
-            (errmsg("Password cannot contain characters except numbers, alphabetic characters and "
-                    "specified special characters.")));
+        ereport(ERROR, (errcode(ERRCODE_INVALID_PASSWORD),
+            errmsg("Password cannot contain characters except numbers, alphabetic characters and "
+                   "specified special characters."),
+            errcause("Password contain invalid characters."),
+            erraction("Use valid characters in password.")));
     }
 
     /* Calculate the number of character types */
@@ -4311,44 +4311,50 @@ static void IsPasswdSatisfyPolicy(char* Password)
     /* Password must contain at least u_sess->attr.attr_security.Password_min_upper upper characters */
     if (kinds[0] < u_sess->attr.attr_security.Password_min_upper) {
         str_reset(Password);
-        ereport(ERROR,
-            (errcode(ERRCODE_INVALID_PASSWORD),
-                errmsg("Password must contain at least %d upper characters.",
-                    u_sess->attr.attr_security.Password_min_upper)));
+        ereport(ERROR, (errcode(ERRCODE_INVALID_PASSWORD),
+            errmsg("Password must contain at least %d upper characters.",
+                   u_sess->attr.attr_security.Password_min_upper),
+            errcause("The minimum number of upper characters is specified by password_min_upper."),
+            erraction("Add more upper characters to the password.")));
     }
 
     /* Password must contain at least u_sess->attr.attr_security.Password_min_lower lower characters */
     if (kinds[1] < u_sess->attr.attr_security.Password_min_lower) {
         str_reset(Password);
-        ereport(ERROR,
-            (errcode(ERRCODE_INVALID_PASSWORD),
-                errmsg("Password must contain at least %d lower characters.",
-                    u_sess->attr.attr_security.Password_min_lower)));
+        ereport(ERROR, (errcode(ERRCODE_INVALID_PASSWORD),
+            errmsg("Password must contain at least %d lower characters.",
+                   u_sess->attr.attr_security.Password_min_lower),
+            errcause("The minimum number of lower characters is specified by password_min_lower."),
+            erraction("Add more lower characters to the password.")));
     }
 
     /* Password must contain at least u_sess->attr.attr_security.Password_min_digital digital characters */
     if (kinds[2] < u_sess->attr.attr_security.Password_min_digital) {
         str_reset(Password);
-        ereport(ERROR,
-            (errcode(ERRCODE_INVALID_PASSWORD),
-                errmsg("Password must contain at least %d digital characters.",
-                    u_sess->attr.attr_security.Password_min_digital)));
+        ereport(ERROR, (errcode(ERRCODE_INVALID_PASSWORD),
+            errmsg("Password must contain at least %d digital characters.",
+                   u_sess->attr.attr_security.Password_min_digital),
+            errcause("The minimum number of digital characters is specified by password_min_digital."),
+            erraction("Add more digital characters to the password.")));
     }
 
     /* Password must contain at least u_sess->attr.attr_security.Password_min_special special characters */
     if (kinds[3] < u_sess->attr.attr_security.Password_min_special) {
         str_reset(Password);
-        ereport(ERROR,
-            (errcode(ERRCODE_INVALID_PASSWORD),
-                errmsg("Password must contain at least %d special characters.",
-                    u_sess->attr.attr_security.Password_min_special)));
+        ereport(ERROR, (errcode(ERRCODE_INVALID_PASSWORD),
+            errmsg("Password must contain at least %d special characters.",
+                   u_sess->attr.attr_security.Password_min_special),
+            errcause("The minimum number of special characters is specified by password_min_special."),
+            erraction("Add more special characters to the password.")));
     }
 
     /* Password must contain at least three kinds of characters */
     if (kinds_num < 3) {
         str_reset(Password);
-        ereport(ERROR,
-            (errcode(ERRCODE_INVALID_PASSWORD), errmsg("Password must contain at least three kinds of characters.")));
+        ereport(ERROR, (errcode(ERRCODE_INVALID_PASSWORD),
+            errmsg("Password must contain at least three kinds of characters."),
+            errcause("Password must contain numbers, alphabetic characters and specified special characters."),
+            erraction("Add at least three kinds of characters to the password.")));
     }
 
     check_weak_password(Password);
@@ -4384,6 +4390,13 @@ static bool CheckPasswordComplexity(const char* roleID, char* newPasswd, char* o
      * Just for createrole but not for alter, and alter password is not in dump content.
      */
     if (isCreaterole && isPWDENCRYPTED(newPasswd)) {
+        if (VerifyPasswdDigest(roleID, "\0", newPasswd)) {
+            str_reset(newPasswd);
+            str_reset(oldPasswd);
+            ereport(ERROR,
+                (errcode(ERRCODE_INVALID_PASSWORD),
+                    errmsg("New password should not be empty.")));
+        }
         ereport(NOTICE,
             (errcode(ERRCODE_INVALID_PASSWORD),
                 errmsg("Using encrypted password directly now and it is not recommended."),
@@ -4420,7 +4433,7 @@ static bool CheckPasswordComplexity(const char* roleID, char* newPasswd, char* o
 
     /* If oldPasswd exist, newPasswd should not equal to the old ones */
     if (oldPasswd != NULL) {
-        if (IsPasswdEqual(roleID, newPasswd, oldPasswd)) {
+        if (VerifyPasswdDigest(roleID, newPasswd, oldPasswd)) {
             str_reset(newPasswd);
             str_reset(oldPasswd);
             ereport(
@@ -4434,7 +4447,7 @@ static bool CheckPasswordComplexity(const char* roleID, char* newPasswd, char* o
             ereport(
                 ERROR, (errcode(ERRCODE_OUT_OF_MEMORY), errmsg("reverse_string failed, possibility out of memory")));
         }
-        if (IsPasswdEqual(roleID, reverse_str, oldPasswd)) {
+        if (VerifyPasswdDigest(roleID, reverse_str, oldPasswd)) {
             free(reverse_str);
             str_reset(newPasswd);
             str_reset(oldPasswd);
@@ -4693,10 +4706,7 @@ bool is_role_persistence(Oid roleid)
 /*
  * Brief			: Check if the current user ID has the privilege to lock/unlock
  *					: the user with ROLEID roleid
- * Description		: When enablePrivilegesSeparate is turned off, users with different
- *					: attribute may have different behavior. When enablePrivilegesSeparate
- *					: is turned on, users with sysadmin, auditadmin and createrole
- *					: have the same behavior.
+ * Description		: Users with different attribute may have different behavior.
  * @in roleid		: the user's roleid
  * @in tuple		: The user's tuple
  * @in is_opradmin   : is this user a operatoradmin
@@ -4704,35 +4714,35 @@ bool is_role_persistence(Oid roleid)
  */
 void CheckLockPrivilege(Oid roleID, HeapTuple tuple, bool is_opradmin)
 {
-    if (!isRelSuperuser() && !have_createrole_privilege()) {
+    if (!isRelSuperuser() && !have_createrole_privilege() &&
+        !is_member_of_role(GetUserId(), DEFAULT_ROLE_ACCOUNT_LOCK)) {
         ereport(ERROR, (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE), errmsg("Permission denied.")));
     }
 
-    /* Only initialuser can lock/unlock persistence and operatoradmin users. */
-    if (get_rolkind(tuple) == ROLKIND_PERSISTENCE || is_opradmin) {
-        if(!initialuser())
+    if (get_rolkind(tuple) == ROLKIND_PERSISTENCE) {
+        if (!initialuser()) {
             ereport(ERROR, (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE), errmsg("Permission denied.")));
+        }
+    } else if (is_opradmin) {
+        if (!initialuser() && !is_member_of_role_nosuper(GetUserId(), DEFAULT_ROLE_ACCOUNT_LOCK)) {
+            ereport(ERROR, (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE), errmsg("Permission denied.")));
+        }
     }
 
     /* make a difference for lock/unlock between g_instance.attr.attr_security.enablePrivilegesSeparate is on and off */
     if (!g_instance.attr.attr_security.enablePrivilegesSeparate) {
         /* No need to consider auditadmin user */
-        if (((Form_pg_authid)GETSTRUCT(tuple))->rolsystemadmin && roleID != BOOTSTRAP_SUPERUSERID) {
-            if (!isRelSuperuser()) {
-                ereport(ERROR, (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE), errmsg("Permission denied.")));
-            }
-        }
-
-        if (((Form_pg_authid)GETSTRUCT(tuple))->rolcreaterole) {
-            if (!isRelSuperuser()) {
+        if ((((Form_pg_authid)GETSTRUCT(tuple))->rolsystemadmin && roleID != BOOTSTRAP_SUPERUSERID) ||
+            ((Form_pg_authid)GETSTRUCT(tuple))->rolcreaterole) {
+            if (!is_member_of_role(GetUserId(), DEFAULT_ROLE_ACCOUNT_LOCK)) {
                 ereport(ERROR, (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE), errmsg("Permission denied.")));
             }
         }
     } else {
-        /* Only superuser can lock/unlock special users. */
+        /* Need to consider auditadmin user */
         if (((Form_pg_authid)GETSTRUCT(tuple))->rolcreaterole || ((Form_pg_authid)GETSTRUCT(tuple))->rolauditadmin ||
             ((Form_pg_authid)GETSTRUCT(tuple))->rolsystemadmin) {
-            if (!isRelSuperuser())
+            if (!is_member_of_role(GetUserId(), DEFAULT_ROLE_ACCOUNT_LOCK))
                 ereport(ERROR, (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE), errmsg("Permission denied.")));
         }
     }
@@ -5252,6 +5262,11 @@ bool TryUnlockAccount(Oid roleID, bool superunlock, bool isreset)
     bool result = false;
     bool unlockflag = 0;
     char* rolename = NULL;
+
+    /* We could not insert new xlog if recovery in process */
+    if (RecoveryInProgress()) {
+        return false;
+    }
 
     if (!OidIsValid(roleID)) {
         ereport(ERROR, (errcode(ERRCODE_UNDEFINED_OBJECT), errmsg("TryUnlockAccount(): roleid is not valid.")));
@@ -5951,11 +5966,11 @@ Datum calculate_encrypted_sha256_password(const char* password, const char* roln
     errno_t rc = EOK;
 
     if (!pg_sha256_encrypt(password,
-            salt_string,
-            strlen(salt_string),
-            encrypted_sha256_password,
-            NULL,
-            u_sess->attr.attr_security.auth_iteration_count)) {
+        salt_string,
+        strlen(salt_string),
+        encrypted_sha256_password,
+        NULL,
+        u_sess->attr.attr_security.auth_iteration_count)) {
         rc = memset_s(encrypted_sha256_password, SHA256_PASSWD_LEN + 1, 0, SHA256_PASSWD_LEN + 1);
         securec_check(rc, "\0", "\0");
         ereport(ERROR, (errcode(ERRCODE_INVALID_PASSWORD), errmsg("password encryption failed")));
@@ -5984,7 +5999,7 @@ Datum calculate_encrypted_sha256_password(const char* password, const char* roln
     return datum_value;
 }
 
-Datum gs_calculate_encrypted_sm3_password(const char* password, const char* rolname, const char* salt_string)
+static Datum gs_calculate_encrypted_sm3_password(const char* password, const char* salt_string)
 {
     char encrypted_sm3_password[SM3_PASSWD_LEN + 1] = {0};
     char encrypted_sm3_password_complex[SM3_PASSWD_LEN + ITERATION_STRING_LEN + 1] = {0};
@@ -5992,12 +6007,12 @@ Datum gs_calculate_encrypted_sm3_password(const char* password, const char* roln
     Datum datum_value;
     errno_t rc = EOK;
 
-    if (!gs_sm3_encrypt(password,
-            salt_string,
-            strlen(salt_string),
-            encrypted_sm3_password,
-            NULL,
-            u_sess->attr.attr_security.auth_iteration_count)) {
+    if (!GsSm3Encrypt(password,
+        salt_string,
+        strlen(salt_string),
+        encrypted_sm3_password,
+        NULL,
+        u_sess->attr.attr_security.auth_iteration_count)) {
         rc = memset_s(encrypted_sm3_password, SM3_PASSWD_LEN + 1, 0, SM3_PASSWD_LEN + 1);
         securec_check(rc, "\0", "\0");
         ereport(ERROR, (errcode(ERRCODE_INVALID_PASSWORD), errmsg("password encryption failed")));
@@ -6037,6 +6052,9 @@ Datum gs_calculate_encrypted_sm3_password(const char* password, const char* roln
 Datum calculate_encrypted_password(bool is_encrypted, const char* password, const char* rolname, 
                                    const char* salt_string)
 {
+    if (password == NULL || password[0] == '\0') {
+        ereport(ERROR, (errcode(ERRCODE_INVALID_PASSWORD), errmsg("The password could not be NULL.")));
+    }
     errno_t rc = EOK;
     char encrypted_md5_password[MD5_PASSWD_LEN + 1] = {0};
     Datum datum_value;
@@ -6065,7 +6083,7 @@ Datum calculate_encrypted_password(bool is_encrypted, const char* password, cons
     } else if (u_sess->attr.attr_security.Password_encryption_type == 1) {
         datum_value = calculate_encrypted_combined_password(password, rolname, salt_string);
     } else if (u_sess->attr.attr_security.Password_encryption_type == PASSWORD_TYPE_SM3) {
-        datum_value = gs_calculate_encrypted_sm3_password(password, rolname, salt_string);
+        datum_value = gs_calculate_encrypted_sm3_password(password, salt_string);
     } else {
         datum_value = calculate_encrypted_sha256_password(password, rolname, salt_string);
     }

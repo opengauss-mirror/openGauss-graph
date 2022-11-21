@@ -5,6 +5,7 @@
  *
  * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
+ * Portions Copyright (c) 2021, openGauss Contributors
  *
  *
  * IDENTIFICATION
@@ -30,6 +31,11 @@
 #include "optimizer/streamplan.h"
 #include "parser/parse_expr.h"
 #endif /* FRONTEND_PARSER */
+#include "storage/tcap.h"
+
+#ifdef GS_GRAPH
+#include "nodes/graphnodes.h"
+#endif
 
 static bool expression_returns_set_walker(Node* node, void* context);
 static int leftmostLoc(int loc1, int loc2);
@@ -47,6 +53,19 @@ Oid exprType(const Node* expr)
     }
 
     switch (nodeTag(expr)) {
+        case T_BoolExpr:
+        case T_BooleanTest:
+        case T_CurrentOfExpr:
+        case T_HashFilter:
+        case T_NullTest:
+        case T_ScalarArrayOpExpr:
+        case T_RowCompareExpr:
+            type = BOOLOID;
+            break;
+        case T_GroupingFunc:
+        case T_GroupingId:
+            type = INT4OID;
+            break;
         case T_Var:
             type = ((const Var*)expr)->vartype;
             break;
@@ -58,9 +77,6 @@ Oid exprType(const Node* expr)
             break;
         case T_Aggref:
             type = ((const Aggref*)expr)->aggtype;
-            break;
-        case T_GroupingFunc:
-            type = INT4OID;
             break;
         case T_WindowFunc:
             type = ((const WindowFunc*)expr)->wintype;
@@ -89,12 +105,6 @@ Oid exprType(const Node* expr)
             break;
         case T_NullIfExpr:
             type = ((const NullIfExpr*)expr)->opresulttype;
-            break;
-        case T_ScalarArrayOpExpr:
-            type = BOOLOID;
-            break;
-        case T_BoolExpr:
-            type = BOOLOID;
             break;
         case T_SubLink: {
             const SubLink* sublink = (const SubLink*)expr;
@@ -185,9 +195,6 @@ Oid exprType(const Node* expr)
         case T_RowExpr:
             type = ((const RowExpr*)expr)->row_typeid;
             break;
-        case T_RowCompareExpr:
-            type = BOOLOID;
-            break;
         case T_CoalesceExpr:
             type = ((const CoalesceExpr*)expr)->coalescetype;
             break;
@@ -203,13 +210,6 @@ Oid exprType(const Node* expr)
                 type = XMLOID;
             }
             break;
-        case T_NullTest:
-        case T_HashFilter:
-            type = BOOLOID;
-            break;
-        case T_BooleanTest:
-            type = BOOLOID;
-            break;
         case T_CoerceToDomain:
             type = ((const CoerceToDomain*)expr)->resulttype;
             break;
@@ -219,21 +219,36 @@ Oid exprType(const Node* expr)
         case T_SetToDefault:
             type = ((const SetToDefault*)expr)->typeId;
             break;
-        case T_CurrentOfExpr:
-            type = BOOLOID;
-            break;
         case T_PlaceHolderVar:
             type = exprType((Node*)((const PlaceHolderVar*)expr)->phexpr);
             break;
-        case T_GroupingId:
-            type = INT4OID;
-            break;
         case T_Rownum:
-            type = INT8OID;
+            if (ROWNUM_TYPE_COMPAT) {
+                type = NUMERICOID;
+            } else {
+                type = INT8OID;
+            }
             break;
-        case T_GradientDescentExpr:
-            type = ((const GradientDescentExpr*)expr)->fieldtype;
-            break;
+#ifdef GS_GRAPH
+        case T_CypherTypeCast:
+			type = ((const CypherTypeCast *) expr)->type;
+			break;
+		case T_CypherMapExpr:
+			type = JSONBOID;
+			break;
+		case T_CypherListExpr:
+			type = JSONBOID;
+			break;
+		case T_CypherListCompExpr:
+			type = JSONBOID;
+			break;
+		case T_CypherListCompVar:
+			type = JSONBOID;
+			break;
+		case T_CypherAccessExpr:
+			type = JSONBOID;
+			break;
+#endif
         default:
             ereport(ERROR,
                 (errcode(ERRCODE_UNRECOGNIZED_NODE_TYPE), errmsg("unrecognized node type: %d", (int)nodeTag(expr))));
@@ -270,6 +285,10 @@ int32 exprTypmod(const Node* expr)
             /* Be smart about length-coercion functions... */
             if (exprIsLengthCoercion(expr, &coercedTypmod)) {
                 return coercedTypmod;
+            }
+            FuncExpr *fexpr = (FuncExpr *)expr;
+            if (IsClientLogicType(fexpr->funcresulttype)) {
+                return fexpr->funcresulttype_orig;
             }
         } break;
         case T_NamedArgExpr:
@@ -465,6 +484,20 @@ int32 exprTypmod(const Node* expr)
             return ((const SetToDefault*)expr)->typeMod;
         case T_PlaceHolderVar:
             return exprTypmod((Node*)((const PlaceHolderVar*)expr)->phexpr);
+#ifdef GS_GRAPH
+        case T_CypherTypeCast:
+			return -1;
+		case T_CypherMapExpr:
+			return -1;
+		case T_CypherListExpr:
+			return -1;
+		case T_CypherListCompExpr:
+			return -1;
+		case T_CypherListCompVar:
+			return -1;
+		case T_CypherAccessExpr:
+			return -1;
+#endif
         default:
             break;
     }
@@ -843,9 +876,26 @@ Oid exprCollation(const Node* expr)
         case T_PlaceHolderVar:
             coll = exprCollation((Node*)((const PlaceHolderVar*)expr)->phexpr);
             break;
-        case T_GradientDescentExpr:
-            coll = InvalidOid;
-            break;
+#ifdef GS_GRAPH        
+        case T_CypherTypeCast:
+			coll = InvalidOid;
+			break;
+		case T_CypherMapExpr:
+			coll = InvalidOid;
+			break;
+		case T_CypherListExpr:
+			coll = InvalidOid;
+			break;
+		case T_CypherListCompExpr:
+			coll = InvalidOid;
+			break;
+		case T_CypherListCompVar:
+			coll = InvalidOid;
+			break;
+		case T_CypherAccessExpr:
+			coll = InvalidOid;
+			break;
+#endif
         default:
             ereport(
                 ERROR, (errcode(ERRCODE_DATATYPE_MISMATCH), errmsg("unrecognized node type: %d", (int)nodeTag(expr))));
@@ -1043,6 +1093,26 @@ void exprSetCollation(Node* expr, Oid collation)
         case T_CurrentOfExpr:
             Assert(!OidIsValid(collation)); /* result is always boolean */
             break;
+#ifdef GS_GRAPH
+        case T_CypherTypeCast:
+			/* XXX: Don't care for now */
+			break;
+		case T_CypherMapExpr:
+			Assert(!OidIsValid(collation));
+			break;
+		case T_CypherListExpr:
+			Assert(!OidIsValid(collation));
+			break;
+		case T_CypherListCompExpr:
+			Assert(!OidIsValid(collation));
+			break;
+		case T_CypherListCompVar:
+			Assert(!OidIsValid(collation));
+			break;
+		case T_CypherAccessExpr:
+			Assert(!OidIsValid(collation));
+			break;
+#endif
         default:
             ereport(
                 ERROR, (errcode(ERRCODE_DATATYPE_MISMATCH), errmsg("unrecognized node type: %d", (int)nodeTag(expr))));
@@ -1370,6 +1440,9 @@ int exprLocation(const Node* expr)
         case T_RangeTableSample:
             loc = ((const RangeTableSample*)expr)->location;
             break;
+        case T_RangeTimeCapsule:
+            loc = ((const RangeTimeCapsule*)expr)->location;
+            break;
         case T_TypeName:
             loc = ((const TypeName*)expr)->location;
             break;
@@ -1400,6 +1473,36 @@ int exprLocation(const Node* expr)
         case T_Rownum:
             loc = ((const Rownum*)expr)->location;
             break;
+#ifdef GS_GRAPH
+        case T_CypherTypeCast:
+			loc = ((const CypherTypeCast *) expr)->location;
+			break;
+		case T_CypherMapExpr:
+			{
+				const CypherMapExpr *m = (const CypherMapExpr *) expr;
+
+				loc = leftmostLoc(m->location,
+								  exprLocation((Node *) m->keyvals));
+			}
+			break;
+		case T_CypherListExpr:
+			{
+				const CypherListExpr *cl = (const CypherListExpr *) expr;
+
+				loc = leftmostLoc(cl->location,
+								  exprLocation((Node *) cl->elems));
+			}
+			break;
+		case T_CypherListCompExpr:
+			loc = exprLocation((Node *) ((CypherListCompExpr *) expr)->list);
+			break;
+		case T_CypherListCompVar:
+			loc = ((CypherListCompVar *) expr)->location;
+			break;
+		case T_CypherAccessExpr:
+			loc = exprLocation((Node *) ((CypherAccessExpr *) expr)->arg);
+			break;
+#endif
         default:
             /* for any other node type it's just unknown... */
             loc = -1;
@@ -1555,7 +1658,6 @@ bool expression_tree_walker(Node* node, bool (*walker)(), void* context)
         case T_Null:
         case T_PgFdwRemoteInfo:
         case T_Rownum:
-        case T_GradientDescentExpr:
             /* primitive node types with no expression subnodes */
             break;
         case T_Aggref: {
@@ -1800,6 +1902,8 @@ bool expression_tree_walker(Node* node, bool (*walker)(), void* context)
             UpsertExpr* upsertClause = (UpsertExpr*)node;
             if (p2walker(upsertClause->updateTlist, context))
                 return true;
+            if (p2walker(upsertClause->upsertWhere, context))
+                return true;
         } break;
         case T_JoinExpr: {
             JoinExpr* join = (JoinExpr*)node;
@@ -1859,8 +1963,86 @@ bool expression_tree_walker(Node* node, bool (*walker)(), void* context)
                 return true;
             }
         } break;
+        case T_TimeCapsuleClause: {
+            TimeCapsuleClause* tcc = (TimeCapsuleClause*)node;
+
+            if (p2walker(tcc->tvver, context)) {
+                return true;
+            }
+        } break;
         case T_PlaceHolderInfo:
             return p2walker(((PlaceHolderInfo*)node)->ph_var, context);
+#ifdef GS_GRAPH
+        case T_CypherTypeCast:
+			{
+				CypherTypeCast *tc = (CypherTypeCast *) node;
+
+				if (p2walker((Node *) tc->arg, context))
+					return true;
+			}
+			break;
+		case T_CypherMapExpr:
+			{
+				CypherMapExpr *m = (CypherMapExpr *) node;
+
+				if (expression_tree_walker((Node *) m->keyvals,
+										   walker, context))
+					return true;
+			}
+			break;
+		case T_CypherListExpr:
+			{
+				CypherListExpr *cl = (CypherListExpr *) node;
+
+				if (expression_tree_walker((Node *) cl->elems,
+										   walker, context))
+					return true;
+			}
+			break;
+		case T_CypherListCompExpr:
+			{
+				CypherListCompExpr *clc = (CypherListCompExpr *) node;
+
+				if (p2walker(clc->list, context))
+					return true;
+				if (p2walker(clc->cond, context))
+					return true;
+				if (p2walker(clc->elem, context))
+					return true;
+			}
+			break;
+		case T_CypherListCompVar:
+			break;
+		case T_CypherAccessExpr:
+			{
+				CypherAccessExpr *a = (CypherAccessExpr *) node;
+				ListCell   *le;
+
+				if (p2walker(a->arg, context))
+					return true;
+
+				foreach(le, a->path)
+				{
+					Node	   *elem = (Node*) lfirst(le);
+
+					if (IsA(elem, CypherIndices))
+					{
+						CypherIndices *cind = (CypherIndices *) elem;
+
+						if (p2walker(cind->lidx, context))
+							return true;
+						if (p2walker(cind->uidx, context))
+							return true;
+					}
+					else
+					{
+						if (p2walker(elem, context))
+							return true;
+					}
+				}
+			}
+			break;
+#endif
         default:
             ereport(
                 ERROR, (errcode(ERRCODE_DATATYPE_MISMATCH), errmsg("unrecognized node type: %d", (int)nodeTag(node))));
@@ -1932,6 +2114,31 @@ bool query_tree_walker(Query* query, bool (*walker)(), void* context, int flags)
         }
     }
 
+#ifdef GS_GRAPH 
+	if (p2walker(query->dijkstraEndId, context))
+		return true;
+	if (p2walker(query->dijkstraEdgeId, context))
+		return true;
+	if (p2walker(query->dijkstraLimit, context))
+		return true;
+	if (p2walker(query->shortestpathEndIdLeft, context))
+		return true;
+	if (p2walker(query->shortestpathEndIdRight, context))
+		return true;
+	if (p2walker(query->shortestpathTableOidLeft, context))
+		return true;
+	if (p2walker(query->shortestpathTableOidRight, context))
+		return true;
+	if (p2walker(query->shortestpathCtidLeft, context))
+		return true;
+	if (p2walker(query->shortestpathCtidRight, context))
+		return true;
+	if (p2walker(query->shortestpathSource, context))
+		return true;
+	if (p2walker(query->shortestpathTarget, context))
+		return true;
+#endif
+
     return false;
 }
 
@@ -1957,11 +2164,12 @@ bool range_table_walker(List* rtable, bool (*walker)(), void* context, int flags
 
         switch (rte->rtekind) {
             case RTE_RELATION:
-                if (p2walker((Node*)rte->tablesample, context)) {
+                if (p2walker((Node *)rte->tablesample, context) || p2walker((Node *)rte->timecapsule, context)) {
                     return true;
                 }
                 /* fall through */
             case RTE_CTE:
+            case RTE_RESULT:
                 /* nothing to do */
                 break;
             case RTE_SUBQUERY:
@@ -2068,7 +2276,7 @@ bool range_table_walker(List* rtable, bool (*walker)(), void* context, int flags
  * and doing the right thing.
  */
 
-Node* expression_tree_mutator(Node* node, Node* (*mutator)(Node*, void*), void* context, bool isCopy)
+Node* expression_tree_mutator(Node* node, Node* (*mutator)(Node *oldfield, void *context), void* context, bool isCopy)
 {
     /*
      * The mutator has already decided not to modify the current node, but we
@@ -2498,6 +2706,7 @@ Node* expression_tree_mutator(Node* node, Node* (*mutator)(Node*, void*), void* 
 
             FLATCOPY(newnode, upsertClause, UpsertExpr, isCopy);
             MUTATE(newnode->updateTlist, upsertClause->updateTlist, List*);
+            MUTATE(newnode->upsertWhere, upsertClause->upsertWhere, Node*);
             return (Node*)newnode;
         } break;
         case T_FromExpr: {
@@ -2576,6 +2785,100 @@ Node* expression_tree_mutator(Node* node, Node* (*mutator)(Node*, void*), void* 
             MUTATE(newnode->repeatable, tsc->repeatable, Expr*);
             return (Node*)newnode;
         } break;
+        case T_TimeCapsuleClause: {
+            TimeCapsuleClause* tcc = (TimeCapsuleClause*)node;
+            TimeCapsuleClause* newnode = NULL;
+
+            FLATCOPY(newnode, tcc, TimeCapsuleClause, isCopy);
+            MUTATE(newnode->tvver, tcc->tvver, Node*);
+            return (Node*)newnode;
+        } break;
+
+#ifdef GS_GRAPH
+        case T_CypherTypeCast:
+			{
+				CypherTypeCast *tc = (CypherTypeCast *) node;
+				CypherTypeCast *newnode;
+
+				FLATCOPY(newnode, tc, CypherTypeCast, true);
+				MUTATE(newnode->arg, tc->arg, Expr *);
+				return (Node *) newnode;
+			}
+			break;
+		case T_CypherMapExpr:
+			{
+				CypherMapExpr *m = (CypherMapExpr *) node;
+				CypherMapExpr *newnode;
+
+				FLATCOPY(newnode, m, CypherMapExpr, true);
+				MUTATE(newnode->keyvals, m->keyvals, List *);
+				return (Node *) newnode;
+			}
+			break;
+		case T_CypherListExpr:
+			{
+				CypherListExpr *cl = (CypherListExpr *) node;
+				CypherListExpr *newnode;
+
+				FLATCOPY(newnode, cl, CypherListExpr, true);
+				MUTATE(newnode->elems, cl->elems, List *);
+				return (Node *) newnode;
+			}
+			break;
+		case T_CypherListCompExpr:
+			{
+				CypherListCompExpr *clc = (CypherListCompExpr *) node;
+				CypherListCompExpr *newnode;
+
+				FLATCOPY(newnode, clc, CypherListCompExpr, true);
+				MUTATE(newnode->list, clc->list, Expr*);
+				MUTATE(newnode->cond, clc->cond, Expr*);
+				MUTATE(newnode->elem, clc->elem, Expr*);
+				return (Node *) newnode;
+			}
+			break;
+		case T_CypherListCompVar:
+			{
+				CypherListCompVar *clcv = (CypherListCompVar *) node;
+				CypherListCompVar *newnode;
+
+				FLATCOPY(newnode, clcv, CypherListCompVar, true);
+				return (Node *) newnode;
+			}
+			break;
+		case T_CypherAccessExpr:
+			{
+				CypherAccessExpr *a = (CypherAccessExpr *) node;
+				CypherAccessExpr *newnode;
+
+				FLATCOPY(newnode, a, CypherAccessExpr, true);
+				MUTATE(newnode->arg, a->arg, Expr *);
+				MUTATE(newnode->path, a->path, List *);
+				return (Node *) newnode;
+			}
+			break;
+		case T_CypherIndices:
+			{
+				CypherIndices *i = (CypherIndices *) node;
+				CypherIndices *newnode;
+
+				FLATCOPY(newnode, i, CypherIndices, true);
+				MUTATE(newnode->lidx, i->lidx, Expr *);
+				MUTATE(newnode->uidx, i->uidx, Expr *);
+				return (Node *) newnode;
+			}
+			break;
+		case T_GraphDelElem:
+			{
+				GraphDelElem *i = (GraphDelElem *) node;
+				GraphDelElem *newnode;
+
+				FLATCOPY(newnode, i, GraphDelElem, true);
+				MUTATE(newnode->elem, i->elem, Node*);
+				return (Node *) newnode;
+			}
+			break;
+#endif
         default:
             ereport(ERROR,
                 (errcode(ERRCODE_UNRECOGNIZED_NODE_TYPE), errmsg("unrecognized node type: %d", (int)nodeTag(node))));
@@ -2604,7 +2907,7 @@ Node* expression_tree_mutator(Node* node, Node* (*mutator)(Node*, void*), void* 
  * modified in-place; they must pass QTW_DONT_COPY_QUERY in flags.	All
  * modified substructure is safely copied in any case.
  */
-Query* query_tree_mutator(Query* query, Node* (*mutator)(Node*, void*), void* context, int flags)
+Query* query_tree_mutator(Query* query, Node* (*mutator)(Node* oldfield, void* context), void* context, int flags)
 {
     Assert(query != NULL && IsA(query, Query));
 
@@ -2638,7 +2941,7 @@ Query* query_tree_mutator(Query* query, Node* (*mutator)(Node*, void*), void* co
  * a query's rangetable.  This is split out since it can be useful on
  * its own.
  */
-List* range_table_mutator(List* rtable, Node* (*mutator)(Node*, void*), void* context, int flags)
+List* range_table_mutator(List* rtable, Node* (*mutator)(Node* oldfield, void* context), void* context, int flags)
 {
     List* newrt = NIL;
     ListCell* rt = NULL;
@@ -2651,8 +2954,10 @@ List* range_table_mutator(List* rtable, Node* (*mutator)(Node*, void*), void* co
         switch (rte->rtekind) {
             case RTE_RELATION:
                 MUTATE(newrte->tablesample, rte->tablesample, TableSampleClause*);
+                MUTATE(newrte->timecapsule, rte->timecapsule, TimeCapsuleClause*);
                 break;
             case RTE_CTE:
+            case RTE_RESULT:
 #ifdef PGXC
             case RTE_REMOTE_DUMMY:
 #endif /* PGXC */
@@ -2715,7 +3020,7 @@ bool query_or_expression_tree_walker(Node* node, bool (*walker)(), void* context
  * the recursion when the mutator's normal change of state is not appropriate
  * for the outermost Query node.
  */
-Node* query_or_expression_tree_mutator(Node* node, Node* (*mutator)(Node*, void*), void* context, int flags)
+Node* query_or_expression_tree_mutator(Node* node, Node* (*mutator)(Node* oldfield, void* context), void* context, int flags)
 {
     Node* (*p2mutator)(Node*, void*) = (Node * (*)(Node*, void*)) mutator;
     if (node && IsA(node, Query)) {
@@ -3139,6 +3444,17 @@ bool raw_expression_tree_walker(Node* node, bool (*walker)(), void* context)
                 return true;
             }
         } break;
+        case T_RangeTimeCapsule: {
+            RangeTimeCapsule* rtc = (RangeTimeCapsule*)node;
+
+            if (p2walker(rtc->relation, context)) {
+                return true;
+            }
+            /* method name is deemed uninteresting */
+            if (p2walker(rtc->tvver, context)) {
+                return true;
+            }
+        } break;
         case T_TypeName: {
             TypeName* tn = (TypeName*)node;
 
@@ -3196,3 +3512,686 @@ bool lockNextvalWalker(Node* node, void* context)
     lockSeqForNextvalFunc(node);
     return expression_tree_walker(node, (bool (*)())lockNextvalWalker, context);
 }
+
+#ifdef GS_GRAPH
+/*
+ * raw_expression_tree_mutator --- make a modified copy of raw parse trees
+ *
+ * This has exactly the same API as expression_tree_mutator, but instead of
+ * walking post-analysis parse trees, it knows how to walk the node types
+ * found in raw grammar output.
+ *
+ */
+Node *
+raw_expression_tree_mutator(Node *node,
+							Node *(*mutator) (Node *oldfield, void *context),
+							void *context)
+{
+	/*
+	 * The mutator has already decided not to modify the current node, but we
+	 * must call the mutator for any sub-nodes.
+	 */
+
+#define FLATCOPY(newnode, node, nodetype)  \
+	( (newnode) = (nodetype *) palloc(sizeof(nodetype)), \
+	  memcpy((newnode), (node), sizeof(nodetype)) )
+
+#define CHECKFLATCOPY(newnode, node, nodetype)	\
+	( AssertMacro(IsA((node), nodetype)), \
+	  (newnode) = (nodetype *) palloc(sizeof(nodetype)), \
+	  memcpy((newnode), (node), sizeof(nodetype)) )
+
+#define MUTATE(newfield, oldfield, fieldtype)  \
+		( (newfield) = (fieldtype) mutator((Node *) (oldfield), context) )
+
+	if (node == NULL)
+		return NULL;
+
+	/* Guard against stack overflow due to overly complex expressions */
+	check_stack_depth();
+
+	switch (nodeTag(node))
+	{
+		case T_SetToDefault:
+		case T_CurrentOfExpr:
+		case T_Integer:
+		case T_Float:
+		case T_String:
+		case T_BitString:
+		case T_Null:
+		case T_ParamRef:
+		case T_A_Const:
+		case T_A_Star:
+		case T_Alias:
+			/* primitive node types with no subnodes */
+			return (Node *) copyObject(node);
+			break;
+
+			/* we assume the colnames list isn't interesting */
+			break;
+		case T_RangeVar:
+			{
+				RangeVar   *rv = (RangeVar *) node;
+				RangeVar   *newnode;
+
+				FLATCOPY(newnode, rv, RangeVar);
+				MUTATE(newnode->alias, rv->alias, Alias *);
+				return (Node *) newnode;
+			}
+			break;
+		case T_GroupingFunc:
+			{
+				GroupingFunc *groupfn = (GroupingFunc *) node;
+				GroupingFunc *newnode;
+
+				FLATCOPY(newnode, groupfn, GroupingFunc);
+				MUTATE(newnode->args, groupfn->args, List *);
+				return (Node *) newnode;
+			}
+			break;
+		case T_SubLink:
+			{
+				SubLink    *sublink = (SubLink *) node;
+				SubLink    *newnode;
+
+				FLATCOPY(newnode, sublink, SubLink);
+				MUTATE(newnode->testexpr, sublink->testexpr, Node *);
+
+				/*
+				 * Also invoke the mutator on the sublink's Query node, so it
+				 * can recurse into the sub-query if it wants to.
+				 */
+				MUTATE(newnode->subselect, sublink->subselect, Node *);
+				return (Node *) newnode;
+			}
+			break;
+		case T_CaseExpr:
+			{
+				CaseExpr   *caseexpr = (CaseExpr *) node;
+				CaseExpr   *newnode;
+
+				FLATCOPY(newnode, caseexpr, CaseExpr);
+				MUTATE(newnode->arg, caseexpr->arg, Expr *);
+				MUTATE(newnode->args, caseexpr->args, List *);
+				MUTATE(newnode->defresult, caseexpr->defresult, Expr *);
+				return (Node *) newnode;
+			}
+			break;
+		case T_RowExpr:
+			{
+				RowExpr    *rowexpr = (RowExpr *) node;
+				RowExpr    *newnode;
+
+				FLATCOPY(newnode, rowexpr, RowExpr);
+				MUTATE(newnode->args, rowexpr->args, List *);
+				/* Assume colnames needn't be duplicated */
+				return (Node *) newnode;
+			}
+		case T_CoalesceExpr:
+			{
+				CoalesceExpr *coalesceexpr = (CoalesceExpr *) node;
+				CoalesceExpr *newnode;
+
+				FLATCOPY(newnode, coalesceexpr, CoalesceExpr);
+				MUTATE(newnode->args, coalesceexpr->args, List *);
+				return (Node *) newnode;
+			}
+			break;
+		case T_MinMaxExpr:
+			{
+				MinMaxExpr *minmaxexpr = (MinMaxExpr *) node;
+				MinMaxExpr *newnode;
+
+				FLATCOPY(newnode, minmaxexpr, MinMaxExpr);
+				MUTATE(newnode->args, minmaxexpr->args, List *);
+				return (Node *) newnode;
+			}
+			break;
+		case T_XmlExpr:
+			{
+				XmlExpr    *xexpr = (XmlExpr *) node;
+				XmlExpr    *newnode;
+
+				FLATCOPY(newnode, xexpr, XmlExpr);
+				MUTATE(newnode->named_args, xexpr->named_args, List *);
+				/* assume mutator does not care about arg_names */
+				MUTATE(newnode->args, xexpr->args, List *);
+				return (Node *) newnode;
+			}
+			break;
+		case T_NullTest:
+			{
+				NullTest   *ntest = (NullTest *) node;
+				NullTest   *newnode;
+
+				FLATCOPY(newnode, ntest, NullTest);
+				MUTATE(newnode->arg, ntest->arg, Expr *);
+				return (Node *) newnode;
+			}
+			break;
+		case T_BooleanTest:
+			{
+				BooleanTest *btest = (BooleanTest *) node;
+				BooleanTest *newnode;
+
+				FLATCOPY(newnode, btest, BooleanTest);
+				MUTATE(newnode->arg, btest->arg, Expr *);
+				return (Node *) newnode;
+			}
+			break;
+		case T_JoinExpr:
+			{
+				JoinExpr   *join = (JoinExpr *) node;
+				JoinExpr   *newnode;
+
+				FLATCOPY(newnode, join, JoinExpr);
+				MUTATE(newnode->larg, join->larg, Node *);
+				MUTATE(newnode->rarg, join->rarg, Node *);
+				MUTATE(newnode->quals, join->quals, Node *);
+				/* We do not mutate alias or using by default */
+				return (Node *) newnode;
+			}
+			break;
+		case T_IntoClause:
+			{
+				IntoClause *into = (IntoClause *) node;
+				IntoClause *newnode;
+
+				FLATCOPY(newnode, into, IntoClause);
+				MUTATE(newnode->rel, into->rel, RangeVar *);
+				MUTATE(newnode->viewQuery, into->viewQuery, Node *);
+				return (Node *) newnode;
+			}
+			break;
+		case T_List:
+			{
+				/*
+				 * We assume the mutator isn't interested in the list nodes
+				 * per se, so just invoke it on each list element. NOTE: this
+				 * would fail badly on a list with integer elements!
+				 */
+				List	   *resultlist;
+				ListCell   *temp;
+
+				resultlist = NIL;
+				foreach(temp, (List *) node)
+				{
+					resultlist = lappend(resultlist,
+										 mutator((Node *) lfirst(temp),
+												 context));
+				}
+				return (Node *) resultlist;
+			}
+			break;
+		case T_InsertStmt:
+			{
+				InsertStmt *stmt = (InsertStmt *) node;
+				InsertStmt *newnode;
+
+				FLATCOPY(newnode, stmt, InsertStmt);
+				MUTATE(newnode->relation, stmt->relation, RangeVar *);
+				MUTATE(newnode->cols, stmt->cols, List *);
+				MUTATE(newnode->selectStmt, stmt->selectStmt, Node *);
+				MUTATE(newnode->onConflictClause, stmt->onConflictClause,
+					   OnConflictClause *);
+				MUTATE(newnode->returningList, stmt->returningList, List *);
+				MUTATE(newnode->withClause, stmt->withClause, WithClause *);
+				return (Node *) newnode;
+			}
+			break;
+		case T_DeleteStmt:
+			{
+				DeleteStmt *stmt = (DeleteStmt *) node;
+				DeleteStmt *newnode;
+
+				FLATCOPY(newnode, stmt, DeleteStmt);
+				MUTATE(newnode->relation, stmt->relation, RangeVar *);
+				MUTATE(newnode->usingClause, stmt->usingClause, List *);
+				MUTATE(newnode->whereClause, stmt->whereClause, Node *);
+				MUTATE(newnode->returningList, stmt->returningList, List *);
+				MUTATE(newnode->withClause, stmt->withClause, WithClause *);
+				return (Node *) newnode;
+			}
+			break;
+		case T_UpdateStmt:
+			{
+				UpdateStmt *stmt = (UpdateStmt *) node;
+				UpdateStmt *newnode;
+
+				FLATCOPY(newnode, stmt, UpdateStmt);
+				MUTATE(newnode->relation, stmt->relation, RangeVar *);
+				MUTATE(newnode->targetList, stmt->targetList, List *);
+				MUTATE(newnode->whereClause, stmt->whereClause, Node *);
+				MUTATE(newnode->fromClause, stmt->fromClause, List *);
+				MUTATE(newnode->returningList, stmt->returningList, List *);
+				MUTATE(newnode->withClause, stmt->withClause, WithClause *);
+				return (Node *) newnode;
+			}
+			break;
+		case T_SelectStmt:
+			{
+				SelectStmt *stmt = (SelectStmt *) node;
+				SelectStmt *newnode;
+
+				FLATCOPY(newnode, stmt, SelectStmt);
+				MUTATE(newnode->distinctClause, stmt->distinctClause, List *);
+				MUTATE(newnode->intoClause, stmt->intoClause, IntoClause *);
+				MUTATE(newnode->targetList, stmt->targetList, List *);
+				MUTATE(newnode->fromClause, stmt->fromClause, List *);
+				MUTATE(newnode->whereClause, stmt->whereClause, Node *);
+				MUTATE(newnode->groupClause, stmt->groupClause, List *);
+				MUTATE(newnode->havingClause, stmt->havingClause, Node *);
+				MUTATE(newnode->windowClause, stmt->windowClause, List *);
+				MUTATE(newnode->valuesLists, stmt->valuesLists, List *);
+				MUTATE(newnode->sortClause, stmt->sortClause, List *);
+				MUTATE(newnode->limitOffset, stmt->limitOffset, Node *);
+				MUTATE(newnode->limitCount, stmt->limitCount, Node *);
+				MUTATE(newnode->lockingClause, stmt->lockingClause, List *);
+				MUTATE(newnode->withClause, stmt->withClause, WithClause *);
+				MUTATE(newnode->larg, stmt->larg, SelectStmt *);
+				MUTATE(newnode->rarg, stmt->rarg, SelectStmt *);
+				return (Node *) newnode;
+			}
+			break;
+		case T_A_Expr:
+			{
+				A_Expr   *expr = (A_Expr *) node;
+				A_Expr   *newnode;
+
+				FLATCOPY(newnode, expr, A_Expr);
+				MUTATE(newnode->name, expr->name, List *);
+				MUTATE(newnode->lexpr, expr->lexpr, Node *);
+				MUTATE(newnode->rexpr, expr->rexpr, Node *);
+				return (Node *) newnode;
+			}
+			break;
+		case T_BoolExpr:
+			{
+				BoolExpr   *expr = (BoolExpr *) node;
+				BoolExpr   *newnode;
+
+				FLATCOPY(newnode, expr, BoolExpr);
+				MUTATE(newnode->args, expr->args, List *);
+				return (Node *) newnode;
+			}
+			break;
+		case T_ColumnRef:
+			/* we assume the fields contain nothing interesting */
+			{
+				ColumnRef   *colref = (ColumnRef *) node;
+				ColumnRef   *newnode;
+
+				FLATCOPY(newnode, colref, ColumnRef);
+				MUTATE(newnode->fields, colref->fields, List *);
+				return (Node *) newnode;
+			}
+			break;
+		case T_FuncCall:
+			{
+				FuncCall   *fcall = (FuncCall *) node;
+				FuncCall   *newnode;
+
+				FLATCOPY(newnode, fcall, FuncCall);
+				MUTATE(newnode->args, fcall->args, List *);
+				return (Node *) newnode;
+			}
+			break;
+		case T_NamedArgExpr:
+			{
+				NamedArgExpr *nexpr = (NamedArgExpr *) node;
+				NamedArgExpr *newnode;
+
+				FLATCOPY(newnode, nexpr, NamedArgExpr);
+				MUTATE(newnode->arg, nexpr->arg, Expr *);
+				return (Node *) newnode;
+			}
+			break;
+		case T_A_Indices:
+			{
+				A_Indices  *indices = (A_Indices *) node;
+				A_Indices  *newnode;
+
+				FLATCOPY(newnode, indices, A_Indices);
+				MUTATE(newnode->lidx, indices->lidx, Node *);
+				MUTATE(newnode->uidx, indices->uidx, Node *);
+				return (Node *) newnode;
+			}
+			break;
+		case T_A_Indirection:
+			{
+				A_Indirection *indir = (A_Indirection *) node;
+				A_Indirection *newnode;
+
+				FLATCOPY(newnode, indir, A_Indirection);
+				MUTATE(newnode->arg, indir->arg, Node *);
+				MUTATE(newnode->indirection, indir->indirection, List *);
+				return (Node *) newnode;
+			}
+			break;
+		case T_A_ArrayExpr:
+			{
+				A_ArrayExpr *arrexpr = (A_ArrayExpr *) node;
+				A_ArrayExpr *newnode;
+
+				FLATCOPY(newnode, arrexpr, A_ArrayExpr);
+				MUTATE(newnode->elements, arrexpr->elements, List *);
+				return (Node *) newnode;
+			}
+			break;
+		case T_ResTarget:
+			{
+				ResTarget  *rt = (ResTarget *) node;
+				ResTarget  *newnode;
+
+				FLATCOPY(newnode, rt, ResTarget);
+				MUTATE(newnode->indirection, rt->indirection, List *);
+				MUTATE(newnode->val, rt->val, Node *);
+				return (Node *) newnode;
+			}
+			break;
+		// case T_MultiAssignRef:
+		// 	{
+		// 		MultiAssignRef  *msref = (MultiAssignRef *) node;
+		// 		MultiAssignRef  *newnode;
+
+		// 		FLATCOPY(newnode, msref, MultiAssignRef);
+		// 		MUTATE(newnode->source, msref->source, Node *);
+		// 		return (Node *) newnode;
+		// 	}
+		// 	break;
+		case T_TypeCast:
+			{
+				TypeCast   *tc = (TypeCast *) node;
+				TypeCast   *newnode;
+
+				FLATCOPY(newnode, tc, TypeCast);
+				MUTATE(newnode->arg, tc->arg, Node *);
+				MUTATE(newnode->typname, tc->typname, TypeName *);
+				return (Node *) newnode;
+			}
+			break;
+		case T_CollateClause:
+			{
+				CollateClause *collate = (CollateClause *) node;
+				CollateClause *newnode;
+
+				FLATCOPY(newnode, collate, CollateClause);
+				MUTATE(newnode->arg, collate->arg, Node *);
+				return (Node *) newnode;
+			}
+			break;
+		case T_SortBy:
+			{
+				SortBy *sortby = (SortBy *) node;
+				SortBy *newnode;
+
+				FLATCOPY(newnode, sortby, SortBy);
+				MUTATE(newnode->node, sortby->node, Node *);
+				return (Node *) newnode;
+			}
+			break;
+		case T_WindowDef:
+			{
+				WindowDef  *wd = (WindowDef *) node;
+				WindowDef  *newnode;
+
+				FLATCOPY(newnode, wd, WindowDef);
+				MUTATE(newnode->partitionClause, wd->partitionClause, List *);
+				MUTATE(newnode->orderClause, wd->orderClause, List *);
+				MUTATE(newnode->startOffset, wd->startOffset, Node *);
+				MUTATE(newnode->endOffset, wd->endOffset, Node *);
+				return (Node *) newnode;
+			}
+			break;
+		case T_RangeSubselect:
+			{
+				RangeSubselect *rs = (RangeSubselect *) node;
+				RangeSubselect *newnode;
+
+				FLATCOPY(newnode, rs, RangeSubselect);
+				MUTATE(newnode->subquery, rs->subquery, Node *);
+				MUTATE(newnode->alias, rs->alias, Alias *);
+				return (Node *) newnode;
+			}
+			break;
+		case T_RangeFunction:
+			{
+				RangeFunction *rf = (RangeFunction *) node;
+				RangeFunction *newnode;
+
+				FLATCOPY(newnode, rf, RangeFunction);
+				MUTATE(newnode->functions, rf->functions, List *);
+				MUTATE(newnode->alias, rf->alias, Alias *);
+				MUTATE(newnode->coldeflist, rf->coldeflist, List *);
+				return (Node *) newnode;
+			}
+			break;
+		case T_RangeTableSample:
+			{
+				RangeTableSample *rts = (RangeTableSample *) node;
+				RangeTableSample *newnode;
+
+				FLATCOPY(newnode, rts, RangeTableSample);
+				MUTATE(newnode->relation, rts->relation, Node *);
+				MUTATE(newnode->args, rts->args, List *);
+				MUTATE(newnode->repeatable, rts->repeatable, Node *);
+				/* method name is deemed uninteresting */
+				return (Node *) newnode;
+
+			}
+			break;
+		case T_TypeName:
+			{
+				TypeName   *tn = (TypeName *) node;
+				TypeName   *newnode;
+
+				FLATCOPY(newnode, tn, TypeName);
+				MUTATE(newnode->typmods, tn->typmods, List *);
+				MUTATE(newnode->arrayBounds, tn->arrayBounds, List *);
+				/* type name itself is deemed uninteresting */
+				return (Node *) newnode;
+			}
+			break;
+		case T_ColumnDef:
+			{
+				ColumnDef  *coldef = (ColumnDef *) node;
+				ColumnDef  *newnode;
+
+				FLATCOPY(newnode, coldef, ColumnDef);
+				MUTATE(newnode->typname, coldef->typname, TypeName *);
+				MUTATE(newnode->raw_default, coldef->raw_default, Node *);
+				MUTATE(newnode->collClause, coldef->collClause,
+					   CollateClause *);
+				MUTATE(newnode->constraints, coldef->constraints, List *);
+				return (Node *) newnode;
+			}
+			break;
+		case T_GroupingSet:
+			{
+				GroupingSet   *groupset = (GroupingSet *) node;
+				GroupingSet   *newnode;
+
+				FLATCOPY(newnode, groupset, GroupingSet);
+				MUTATE(newnode->content, groupset->content, List *);
+				return (Node *) newnode;
+			}
+			break;
+		case T_LockingClause:
+			{
+				LockingClause   *locing = (LockingClause *) node;
+				LockingClause   *newnode;
+
+				FLATCOPY(newnode, locing, LockingClause);
+				MUTATE(newnode->lockedRels, locing->lockedRels, List *);
+				return (Node *) newnode;
+			}
+			break;
+		case T_XmlSerialize:
+			{
+				XmlSerialize *xs = (XmlSerialize *) node;
+				XmlSerialize *newnode;
+
+				FLATCOPY(newnode, xs, XmlSerialize);
+				MUTATE(newnode->expr, xs->expr, Node *);
+				MUTATE(newnode->typname, xs->typname, TypeName *);
+				return (Node *) newnode;
+			}
+			break;
+		case T_WithClause:
+			{
+				WithClause   *with = (WithClause *) node;
+				WithClause   *newnode;
+
+				FLATCOPY(newnode, with, WithClause);
+				MUTATE(newnode->ctes, with->ctes, List *);
+				return (Node *) newnode;
+			}
+			break;
+		case T_InferClause:
+			{
+				InferClause *stmt = (InferClause *) node;
+				InferClause *newnode;
+
+				FLATCOPY(newnode, stmt, InferClause);
+				MUTATE(newnode->indexElems, stmt->indexElems, List *);
+				MUTATE(newnode->whereClause, stmt->whereClause, Node *);
+				return (Node *) newnode;
+			}
+			break;
+		// case T_OnConflictClause:
+		// 	{
+		// 		OnConflictClause *stmt = (OnConflictClause *) node;
+		// 		OnConflictClause *newnode;
+
+		// 		FLATCOPY(newnode, stmt, OnConflictClause);
+		// 		MUTATE(newnode->infer, stmt->infer, InferClause *);
+		// 		MUTATE(newnode->targetList, stmt->targetList, List *);
+		// 		MUTATE(newnode->whereClause, stmt->whereClause, Node *);
+		// 		return (Node *) newnode;
+		// 	}
+		// 	break;
+		case T_CommonTableExpr:
+			{
+				CommonTableExpr *cte = (CommonTableExpr *) node;
+				CommonTableExpr *newnode;
+
+				FLATCOPY(newnode, cte, CommonTableExpr);
+
+				/*
+				 * Also invoke the mutator on the CTE's Query node, so it can
+				 * recurse into the sub-query if it wants to.
+				 */
+				MUTATE(newnode->ctequery, cte->ctequery, Node *);
+				return (Node *) newnode;
+			}
+			break;
+		case T_CypherListComp:
+			{
+				CypherListComp *clc = (CypherListComp *) node;
+				CypherListComp *newnode;
+
+				FLATCOPY(newnode, clc, CypherListComp);
+				MUTATE(newnode->list, clc->list, Node *);
+				MUTATE(newnode->cond, clc->cond, Node *);
+				MUTATE(newnode->elem, clc->elem, Node *);
+				return (Node *) newnode;
+			}
+			break;
+		case T_CypherGenericExpr:
+			{
+				CypherGenericExpr *g = (CypherGenericExpr *) node;
+				CypherGenericExpr *newnode;
+
+				FLATCOPY(newnode, g, CypherGenericExpr);
+				MUTATE(newnode->expr, g->expr, Node *);
+				return (Node *) newnode;
+			}
+			break;
+		case T_CypherMapExpr:
+			{
+				CypherMapExpr *m = (CypherMapExpr *) node;
+				CypherMapExpr *newnode;
+
+				FLATCOPY(newnode, m, CypherMapExpr);
+				MUTATE(newnode->keyvals, m->keyvals, List *);
+				return (Node *) newnode;
+			}
+			break;
+		case T_CypherListExpr:
+			{
+				CypherListExpr *cl = (CypherListExpr *) node;
+				CypherListExpr *newnode;
+
+				FLATCOPY(newnode, cl, CypherListExpr);
+				MUTATE(newnode->elems, cl->elems, List *);
+				return (Node *) newnode;
+			}
+			break;
+		default:
+			elog(ERROR, "unrecognized node type: %d",
+				 (int) nodeTag(node));
+			break;
+	}
+	/* can't get here, but keep compiler happy */
+	return NULL;
+}
+#endif /* GS_GRAPH */
+
+/*
+ * strip_implicit_coercions: remove implicit coercions at top level of tree
+ *
+ * This doesn't modify or copy the input expression tree, just return a
+ * pointer to a suitable place within it.
+ *
+ * Note: there isn't any useful thing we can do with a RowExpr here, so
+ * just return it unchanged, even if it's marked as an implicit coercion.
+ */
+// Node *
+// strip_implicit_coercions(Node *node)
+// {
+// 	if (node == NULL)
+// 		return NULL;
+// 	if (IsA(node, FuncExpr))
+// 	{
+// 		FuncExpr   *f = (FuncExpr *) node;
+
+// 		if (f->funcformat == COERCE_IMPLICIT_CAST)
+// 			return strip_implicit_coercions((Node*)linitial(f->args));
+// 	}
+// 	else if (IsA(node, RelabelType))
+// 	{
+// 		RelabelType *r = (RelabelType *) node;
+
+// 		if (r->relabelformat == COERCE_IMPLICIT_CAST)
+// 			return strip_implicit_coercions((Node *) r->arg);
+// 	}
+// 	else if (IsA(node, CoerceViaIO))
+// 	{
+// 		CoerceViaIO *c = (CoerceViaIO *) node;
+
+// 		if (c->coerceformat == COERCE_IMPLICIT_CAST)
+// 			return strip_implicit_coercions((Node *) c->arg);
+// 	}
+// 	else if (IsA(node, ArrayCoerceExpr))
+// 	{
+// 		ArrayCoerceExpr *c = (ArrayCoerceExpr *) node;
+
+// 		if (c->coerceformat == COERCE_IMPLICIT_CAST)
+// 			return strip_implicit_coercions((Node *) c->arg);
+// 	}
+// 	else if (IsA(node, ConvertRowtypeExpr))
+// 	{
+// 		ConvertRowtypeExpr *c = (ConvertRowtypeExpr *) node;
+
+// 		if (c->convertformat == COERCE_IMPLICIT_CAST)
+// 			return strip_implicit_coercions((Node *) c->arg);
+// 	}
+// 	else if (IsA(node, CoerceToDomain))
+// 	{
+// 		CoerceToDomain *c = (CoerceToDomain *) node;
+
+// 		if (c->coercionformat == COERCE_IMPLICIT_CAST)
+// 			return strip_implicit_coercions((Node *) c->arg);
+// 	}
+// 	return node;
+// }

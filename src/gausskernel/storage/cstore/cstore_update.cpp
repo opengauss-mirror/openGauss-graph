@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2020 Huawei Technologies Co.,Ltd.
+ * Portions Copyright (c) 2021, openGauss Contributors
  *
  * openGauss is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
@@ -25,6 +26,7 @@
 #include "knl/knl_variable.h"
 
 #include "access/cstore_update.h"
+#include "catalog/pg_partition_fn.h"
 
 int CStoreUpdate::BATCHROW_TIMES = 3;
 
@@ -327,7 +329,8 @@ void CStoreUpdate::BatchDeleteAndInsert(VectorBatch *batch, int oriBatchCols, in
     (void)MemoryContextSwitchTo(updateCnxt);
 }
 
-void CStoreUpdate::PartitionBatchDeleteAndInsert(VectorBatch *batch, int oriBatchCols, int options, JunkFilter *junkfilter)
+void CStoreUpdate::PartitionBatchDeleteAndInsert(VectorBatch *batch, int oriBatchCols, int options,
+    JunkFilter *junkfilter)
 {
     int currentCols = batch->m_cols;
     batch->m_cols = oriBatchCols;

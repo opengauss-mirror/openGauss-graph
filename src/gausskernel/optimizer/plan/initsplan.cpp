@@ -591,7 +591,7 @@ static List* deconstruct_recurse(PlannerInfo* root, Node* jtnode,
             List* sub_joinlist = NIL;
             int sub_members;
 
-            sub_joinlist = deconstruct_recurse(root, (Node*)lfirst(l), below_outer_join,
+            sub_joinlist = deconstruct_recurse(root, (Node*)lfirst(l), below_outer_join,   // wq: lfirst(lc) ((lc)->data.ptr_value)
                         &sub_qualscope, inner_join_rels, &child_postponed_quals);
             *qualscope = bms_add_members(*qualscope, sub_qualscope);
             sub_members = list_length(sub_joinlist);
@@ -663,6 +663,9 @@ static List* deconstruct_recurse(PlannerInfo* root, Node* jtnode,
          */
         switch (j->jointype) {
             case JOIN_INNER:
+#ifdef GS_GRAPH
+            case JOIN_VLE:
+#endif  
                 leftjoinlist = deconstruct_recurse(root, j->larg, below_outer_join,
                                                    &leftids, &left_inners,
                                                    &child_postponed_quals);
@@ -677,6 +680,10 @@ static List* deconstruct_recurse(PlannerInfo* root, Node* jtnode,
             case JOIN_LEFT:
             case JOIN_ANTI:
             case JOIN_LEFT_ANTI_FULL:
+#ifdef GS_GRAPH
+            case JOIN_CYPHER_MERGE:
+		    case JOIN_CYPHER_DELETE:
+#endif           
                 leftjoinlist = deconstruct_recurse(root, j->larg, below_outer_join,
                                                    &leftids, &left_inners,
                                                    &child_postponed_quals);
@@ -738,6 +745,14 @@ static List* deconstruct_recurse(PlannerInfo* root, Node* jtnode,
                                         j->jointype, (List*)j->quals);
             if (j->jointype == JOIN_SEMI)
                 ojscope = NULL;
+#ifdef GS_GRAPH
+            else if(j->jointype == JOIN_VLE)
+			{
+				ojscope = NULL;
+                sjinfo->min_hops = j->minHops;
+				sjinfo->max_hops = j->maxHops;
+			}
+#endif  
             else
                 ojscope = bms_union(sjinfo->min_lefthand, sjinfo->min_righthand);
         } else {
@@ -885,11 +900,11 @@ static SpecialJoinInfo* make_outerjoininfo(
         "unexpected join type.");
 
     /*
-     * Presently the executor cannot support FOR UPDATE/SHARE marking of rels
+     * Presently the executor cannot support FOR [KEY] UPDATE/SHARE marking of rels
      * appearing on the nullable side of an outer join. (It's somewhat unclear
      * what that would mean, anyway: what should we mark when a result row is
      * generated from no element of the nullable relation?)  So, complain if
-     * any nullable rel is FOR UPDATE/SHARE.
+     * any nullable rel is FOR [KEY] UPDATE/SHARE.
      *
      * You might be wondering why this test isn't made far upstream in the
      * parser.	It's because the parser hasn't got enough info --- consider
@@ -906,7 +921,12 @@ static SpecialJoinInfo* make_outerjoininfo(
             ereport(ERROR,
                 (errmodule(MOD_OPT),
                     errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+#ifndef ENABLE_MULTIPLE_NODES
+                    errmsg("SELECT FOR UPDATE/SHARE/NO KEY UPDATE/KEY SHARE cannot be applied to the nullable side "
+                           "of an outer join")));
+#else
                     errmsg("SELECT FOR UPDATE/SHARE cannot be applied to the nullable side of an outer join")));
+#endif
         }
     }
 
@@ -918,7 +938,11 @@ static SpecialJoinInfo* make_outerjoininfo(
     sjinfo->join_quals = clause;
 
     /* If it's a full join, no need to be very smart */
+#ifdef GS_GRAPH
+    if (jointype == JOIN_FULL || jointype == JOIN_VLE) {
+#else    
     if (jointype == JOIN_FULL) {
+#endif    
         sjinfo->min_lefthand = bms_copy(left_rels);
         sjinfo->min_righthand = bms_copy(right_rels);
         sjinfo->lhs_strict = false; /* don't care about this */

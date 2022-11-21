@@ -8,6 +8,7 @@
  * Portions Copyright (c) 1994, Regents of the University of California
  * Portions Copyright (c) 2010-2012 Postgres-XC Development Group
  *
+ * Portions Copyright (c) 2021, openGauss Contributors
  * src/include/parser/parse_utilcmd.h
  *
  * -------------------------------------------------------------------------
@@ -39,6 +40,7 @@ typedef struct {
     PartitionState* csc_partTableState;
     List* reloptions;
     List* partitionKey; /* partitionkey for partiitoned table */
+    List* subPartitionKey; /* subpartitionkey for subpartiitoned table */
     IndexStmt* pkey;    /* PRIMARY KEY index, if any */
 #ifdef PGXC
     List* fallback_dist_col;    /* suggested column to distribute on */
@@ -47,23 +49,21 @@ typedef struct {
 #endif
     Node* node; /* @hdfs record a CreateStmt or AlterTableStmt object. */
     char* internalData;
-
     List* uuids;     /* used for create sequence */
     bool isResizing; /* true if the table is resizing */
-    Oid  bucketOid;     /* bucket oid of the resizing table */
-    List *relnodelist;  /* filenode of the resizing table */
-    List *toastnodelist; /* toast node of the resizing table */
     bool ofType;         /* true if statement contains OF typename */
 } CreateStmtContext;
 
+typedef enum TransformTableType { TRANSFORM_INVALID = 0, TRANSFORM_TO_HASHBUCKET, TRANSFORM_TO_NONHASHBUCKET} TransformTableType;
+
 extern void checkPartitionSynax(CreateStmt *stmt);
 extern List* transformCreateStmt(CreateStmt* stmt, const char* queryString, const List* uuids,
-    bool preCheck, bool isFirstNode = true);
+    bool preCheck, Oid *namespaceid, bool isFirstNode = true);
 extern List* transformAlterTableStmt(Oid relid, AlterTableStmt* stmt, const char* queryString);
 extern IndexStmt* transformIndexStmt(Oid relid, IndexStmt* stmt, const char* queryString);
 extern void transformRuleStmt(RuleStmt* stmt, const char* queryString, List** actions, Node** whereClause);
 extern List* transformCreateSchemaStmt(CreateSchemaStmt* stmt);
-extern void transformRangePartitionValue(ParseState* pstate, Node* rangePartDef, bool needCheck);
+extern void transformPartitionValue(ParseState* pstate, Node* rangePartDef, bool needCheck);
 extern List* transformListPartitionValue(ParseState* pstate, List* boundary, bool needCheck, bool needFree);
 extern List* transformRangePartitionValueInternal(ParseState* pstate, List* boundary,
     bool needCheck, bool needFree, bool isPartition = true);
@@ -75,6 +75,10 @@ extern bool CheckLocalIndexColumn(char loctype, char* partcolname, char* indexco
 extern Oid generateClonedIndex(Relation source_idx, Relation source_relation, char* tempIndexName, Oid targetTblspcOid,
     bool skip_build, bool partitionedIndex);
 extern void checkPartitionName(List* partitionList, bool isPartition = true);
+extern void checkSubPartitionName(List* partitionList);
+extern List* GetPartitionNameList(List* partitionList);
+extern char* GetPartitionDefStateName(Node *partitionDefState);
+extern NodeTag GetPartitionStateType(char type);
 
 extern Oid searchSeqidFromExpr(Node* cooked_default);
 extern bool is_start_end_def_list(List* def_list);
@@ -87,6 +91,21 @@ extern bool is_multi_nodegroup_createtbllike(PGXCSubCluster* subcluster, Oid oid
 extern char* getTmptableIndexName(const char* srcSchema, const char* srcIndex);
 
 extern IndexStmt* generateClonedIndexStmt(
-    CreateStmtContext* cxt, Relation source_idx, const AttrNumber* attmap, int attmap_length, Relation rel);
+    CreateStmtContext* cxt, Relation source_idx, const AttrNumber* attmap, int attmap_length, Relation rel,
+    TransformTableType transformType);
+
+extern List *transformCreateGraphStmt(CreateGraphStmt *stmt);
+extern List *transformCreateLabelStmt(CreateLabelStmt *labelStmt,
+									  const char *queryString);
+extern char getLabelKind(char *labname, Oid graphid);
+extern AlterTableStmt *transformAlterLabelStmt(AlterTableStmt *stmt);
+
+extern Node *transformCreateConstraintStmt(ParseState *pstate,
+										   CreateConstraintStmt *stmt);
+extern Node *transformDropConstraintStmt(ParseState *pstate, DropConstraintStmt *stmt);
+extern IndexStmt *transformCreatePropertyIndexStmt(Oid relid,
+												CreatePropertyIndexStmt *stmt,
+												const char *queryString);
+extern DropStmt *transformDropPropertyIndex(DropPropertyIndexStmt *stmt);
 
 #endif /* PARSE_UTILCMD_H */

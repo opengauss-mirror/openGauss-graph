@@ -23,6 +23,7 @@
 #include "miscadmin.h"
 #include "parser/parse_clause.h"
 #include "storage/lmgr.h"
+#include "storage/tcap.h"
 #include "utils/acl.h"
 #include "utils/lsyscache.h"
 #include "utils/syscache.h"
@@ -64,6 +65,11 @@ void LockTableCommand(LockStmt* lockstmt)
                      errmsg("permission denied: \"%s\" is a system catalog", rv->relname),
                      errhint("use xc_maintenance_mode to lock this system catalog")));
         }
+        /* In redistribute, support auto send term to lock holder. */
+        if (lockstmt->cancelable && !u_sess->attr.attr_sql.enable_cluster_resize) {
+            ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("Only support gs_redis application using")));
+        }
+        t_thrd.xact_cxt.enable_lock_cancel = lockstmt->cancelable;
 
         reloid = RangeVarGetRelidExtended(rv,
             lockstmt->mode,
@@ -74,9 +80,12 @@ void LockTableCommand(LockStmt* lockstmt)
             RangeVarCallbackForLockTable,
             (void*)&lockstmt->mode);
 
+        TrForbidAccessRbObject(RelationRelationId, reloid, rv->relname);
+
         if (recurse)
             LockTableRecurse(reloid, lockstmt->mode, lockstmt->nowait);
     }
+    t_thrd.xact_cxt.enable_lock_cancel = false;
 }
 
 /*

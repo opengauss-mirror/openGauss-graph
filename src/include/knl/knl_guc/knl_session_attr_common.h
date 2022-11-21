@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2020 Huawei Technologies Co.,Ltd.
+ * Portions Copyright (c) 2021, openGauss Contributors
  *
  * openGauss is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
@@ -81,6 +82,7 @@ typedef struct knl_session_attr_common {
     int max_query_retry_times;
     int StatementTimeout;
     int SessionTimeout;
+    int SessionTimeoutCount;
     int pgstat_collect_thread_status_interval;
     int extra_float_digits;
     int effective_io_concurrency;
@@ -141,6 +143,7 @@ typedef struct knl_session_attr_common {
     struct tagGtmHostIP* GtmHostArray[MAX_GTM_HOST_NUM];
     int GtmHostIPNumArray[MAX_GTM_HOST_NUM];
     char* test_param_str;
+    char* seg_test_param_str;
     char* application_name;
     char* analysis_options;
     int bytea_output;
@@ -165,16 +168,17 @@ typedef struct knl_session_attr_common {
     bool assert_enabled;
     int AlarmReportInterval;
     int xmloption;
-    bool enable_ts_compaction;    
+    bool enable_ts_compaction;
+    bool enable_ts_kvmerge;
+    bool enable_ts_outorder;    
     bool ts_adaptive_threads;
     char* ts_compaction_strategy;
     int ts_consumer_workers;
+    int ts_cudesc_threshold;
+    int ts_valid_partition;
 
     /* instrumentation guc parameters */
     int instr_unique_sql_count;
-#ifndef ENABLE_MULTIPLE_NODES
-    double unique_sql_clean_ratio;
-#endif
     bool enable_instr_cpu_timer;
     int unique_sql_track_type;
     bool enable_instr_track_wait;
@@ -207,7 +211,15 @@ typedef struct knl_session_attr_common {
 
     char* router_att;
     bool enable_router;
+    int backend_version;
+#ifdef ENABLE_MULTIPLE_NODES
+    bool enable_gpc_grayrelease_mode;
+#endif
     int gpc_clean_timeout;
+    char* node_name;
+#ifndef ENABLE_MULTIPLE_NODES
+    bool plsql_show_all_error;
+#endif
     uint32 extension_session_vars_array_size;
     void** extension_session_vars_array;
 } knl_session_attr_common;

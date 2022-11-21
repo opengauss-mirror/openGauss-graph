@@ -61,6 +61,23 @@ void PageInit(Page page, Size pageSize, Size specialSize, bool isHeap)
     }
 }
 
+void SegPageInit(Page page, Size pageSize)
+{
+    PageHeader p = (PageHeader)page;
+
+    Assert(pageSize == BLCKSZ);
+
+    /* Make sure all fields of page are zero, as well as unused space */
+    errno_t ret = memset_s(p, pageSize, 0, pageSize);
+    securec_check(ret, "", "");
+
+    p->pd_upper = pageSize;
+    p->pd_special = pageSize;
+
+    p->pd_lower = SizeOfPageHeaderData;
+    PageSetPageSizeAndVersion(page, pageSize, PG_SEGMENT_PAGE_LAYOUT_VERSION);
+}
+
 void PageReinitWithDict(Page page, Size dictSize)
 {
     HeapPageHeader pd;
@@ -594,7 +611,7 @@ bool PageFreeDict(Page page)
  *		The page is PageInit'd with the same special-space size as the
  *		given page, and the special space is copied from the given page.
  */
-Page PageGetTempPageCopySpecial(Page page, bool isbtree)
+Page PageGetTempPageCopySpecial(Page page)
 {
     Size pageSize;
     Page temp;
@@ -605,10 +622,7 @@ Page PageGetTempPageCopySpecial(Page page, bool isbtree)
 
     Assert(!PageIsCompressed(page));
 
-    if (isbtree && PageIs4BXidVersion(page))
-        PageInit(temp, pageSize, PageGetSpecialSize(page) + sizeof(TransactionId));
-    else
-        PageInit(temp, pageSize, PageGetSpecialSize(page));
+    PageInit(temp, pageSize, PageGetSpecialSize(page));
     rc = memcpy_s(PageGetSpecialPointer(temp), PageGetSpecialSize(page), PageGetSpecialPointer(page),
                   PageGetSpecialSize(page));
     securec_check(rc, "", "");

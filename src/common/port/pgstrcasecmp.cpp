@@ -33,7 +33,7 @@
  */
 int pg_str_case_cmp_work(const char* s1, const char* s2, size_t n, bool useN)
 {
-    while (!useN || (useN && n-- > 0)) {
+    while (!useN || n-- > 0) {
         unsigned char ch1 = (unsigned char)*s1++;
         unsigned char ch2 = (unsigned char)*s2++;
 
@@ -140,6 +140,20 @@ char* pg_strtolower(char* str)
     }
     while (*ptrout) {
         *ptrout = pg_tolower(*ptrout);
+        ptrout++;
+    }
+    return str;
+}
+
+char* pg_strtoupper(char* str)
+{
+    char* ptrout = str;
+
+    if (str == NULL) {
+        return NULL;
+    }
+    while (*ptrout) {
+        *ptrout = pg_toupper(*ptrout);
         ptrout++;
     }
     return str;

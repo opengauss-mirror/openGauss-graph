@@ -13,11 +13,17 @@
  * -------------------------------------------------------------------------
  */
 
-#include "plpgsql.h"
+#include "utils/plpgsql.h"
 
+#include "access/xact.h"
+#include "catalog/dependency.h"
+#include "catalog/gs_package.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_proc.h"
+#include "catalog/pg_synonym.h"
 #include "catalog/pg_type.h"
+#include "catalog/pg_type_fn.h"
+#include "commands/typecmds.h"
 #include "funcapi.h"
 #include "nodes/makefuncs.h"
 #include "parser/analyze.h"
@@ -30,12 +36,26 @@
 #include "parser/scanner.h"
 #include "parser/scansup.h"
 #include "utils/builtins.h"
+#include "utils/fmgroids.h"
+#include "utils/guc.h"
+#include "utils/lsyscache.h"
 #include "utils/memutils.h"
+#include "utils/pl_package.h"
 #include "utils/syscache.h"
+#include "utils/typcache.h"
+#include "knl/knl_session.h"
 
 #include <limits.h>
 
 
+#define LENGTH_OF_BRACKETS_AND_DOT 4
+#define LENGTH_OF_QUOTATION_MARKS 2
+#define IS_ANONYMOUS_BLOCK \
+    (u_sess->plsql_cxt.curr_compile_context->plpgsql_curr_compile != NULL && \
+        strcmp(u_sess->plsql_cxt.curr_compile_context->plpgsql_curr_compile->fn_signature, "inline_code_block") ==0)
+#define IS_PACKAGE \
+    (u_sess->plsql_cxt.curr_compile_context->plpgsql_curr_compile_package != NULL && \
+        u_sess->plsql_cxt.curr_compile_context->plpgsql_curr_compile == NULL)
 /* Location tracking support --- simpler than bison's default */
 #define YYLLOC_DEFAULT(Current, Rhs, N) \
     do { \
@@ -60,7 +80,7 @@ record_stmt_label(char * label, PLpgSQL_stmt *stmt)
             (PLpgSQL_gotoLabel *)palloc0(sizeof(PLpgSQL_gotoLabel));
     gl->label = label;
     gl->stmt = stmt;
-    u_sess->plsql_cxt.goto_labels = lappend(u_sess->plsql_cxt.goto_labels, (void *)gl);
+    u_sess->plsql_cxt.curr_compile_context->goto_labels = lappend(u_sess->plsql_cxt.curr_compile_context->goto_labels, (void *)gl);
 }
 
 /*
@@ -85,6 +105,7 @@ typedef struct
 
 union YYSTYPE;					/* need forward reference for tok_is_keyword */
 
+
 static	bool			tok_is_keyword(int token, union YYSTYPE *lval,
                                        int kw_token, const char *kw_str);
 static	void			word_is_not_variable(PLword *word, int location);
@@ -92,33 +113,41 @@ static	void			cword_is_not_variable(PLcword *cword, int location);
 static	void			current_token_is_not_variable(int tok);
 static void yylex_inparam(StringInfoData* func_inparam,
                                             int *params,
-                                            int * tok);
-static void 	yylex_outparam(char** fieldnames,
+                                            int * tok,
+                                            int *tableof_func_dno,
+                                            int *tableof_var_dno);
+static int   	yylex_outparam(char** fieldnames,
                                int *varnos,
                                int nfields,
                                PLpgSQL_row **row,
                                PLpgSQL_rec **rec,
                                int *token,
+                               bool is_push_back,
                                bool overload = false);
 
-static bool is_function(const char *name, bool is_assign, bool no_parenthesis);
+static bool is_function(const char *name, bool is_assign, bool no_parenthesis, List* funcNameList = NULL);
+static bool is_unreservedkeywordfunction(ScanKeyword* keyword, bool no_parenthesis, const char *name);
+static bool is_paren_friendly_datatype(TypeName *name);
 static void 	plpgsql_parser_funcname(const char *s, char **output,
                                         int numidents);
 static PLpgSQL_stmt 	*make_callfunc_stmt(const char *sqlstart,
-                                int location, bool is_assign);
-static PLpgSQL_stmt 	*make_callfunc_stmt_no_arg(const char *sqlstart, int location);
-static PLpgSQL_expr 	*read_sql_construct5(int until,
+                                int location, bool is_assign, bool eaten_first_token, List* funcNameList = NULL, int arrayFuncDno = -1, bool isCallFunc = false);
+static PLpgSQL_stmt 	*make_callfunc_stmt_no_arg(const char *sqlstart, int location, bool withsemicolon = false, List* funcNameList = NULL);
+static PLpgSQL_expr 	*read_sql_construct6(int until,
                                              int until2,
                                              int until3,
                                              int until4,
                                              int until5,
+                                             int until6,
                                              const char *expected,
                                              const char *sqlstart,
                                              bool isexpression,
                                              bool valid_sql,
                                              bool trim,
                                              int *startloc,
-                                             int *endtoken);
+                                             int *endtoken,
+                                             DList* tokenstack = NULL,
+                                             bool issaveexpr = false);
                                              
 static	PLpgSQL_expr	*read_sql_construct(int until,
                                             int until2,
@@ -148,15 +177,19 @@ static	PLpgSQL_stmt	*make_return_query_stmt(int location);
 static  PLpgSQL_stmt	*make_case(int location, PLpgSQL_expr *t_expr,
                                    List *case_when_list, List *else_stmts);
 static	char			*NameOfDatum(PLwdatum *wdatum);
+static  char                    *CopyNameOfDatum(PLwdatum *wdatum);
 static	void			 check_assignable(PLpgSQL_datum *datum, int location);
 static	void			 read_into_target(PLpgSQL_rec **rec, PLpgSQL_row **row,
-                                          bool *strict);
+                                          bool *strict, bool bulk_collect);
 static	PLpgSQL_row		*read_into_scalar_list(char *initial_name,
                                                PLpgSQL_datum *initial_datum,
+                                               int initial_dno,
                                                int initial_location);
-static	PLpgSQL_row		*read_into_array_scalar_list(char *initial_name,
+static	PLpgSQL_row		*read_into_array_table_scalar_list(char *initial_name,
                                                PLpgSQL_datum *initial_datum,
-                                               int initial_location);
+                                               int initial_dno,
+                                               int initial_location,
+                                               bool bulk_collect);
 static void             read_using_target(List **in_expr, PLpgSQL_row **out_row);
 
 static PLpgSQL_row  *read_into_placeholder_scalar_list(char *initial_name,
@@ -164,6 +197,7 @@ static PLpgSQL_row  *read_into_placeholder_scalar_list(char *initial_name,
 
 static	PLpgSQL_row		*make_scalar_list1(char *initial_name,
                                            PLpgSQL_datum *initial_datum,
+                                           int initial_dno,
                                            int lineno, int location);
 static	void			 check_sql_expr(const char *stmt, int location,
                                         int leaderlen);
@@ -175,12 +209,59 @@ static	void			 check_labels(const char *start_label,
 static	PLpgSQL_expr	*read_cursor_args(PLpgSQL_var *cursor,
                                           int until, const char *expected);
 static	List			*read_raise_options(void);
-static  bool            last_pragma;
-
+static  int             errstate = ERROR;
+static char* get_proc_str(int tok);
+static char* get_init_proc(int tok);
+static char* get_attrname(int tok);
+static AttrNumber get_assign_attrno(PLpgSQL_datum* target,  char* attrname);
+static void raw_parse_package_function(char* proc_str);
+static void checkFuncName(List* funcname);
+static void IsInPublicNamespace(char* varname);
+static void SetErrorState();
+static void AddNamespaceIfNeed(int dno, char* ident);
+static void AddNamespaceIfPkgVar(const char* ident, IdentifierLookup save_IdentifierLookup);
+bool plpgsql_is_token_keyword(int tok);
+static void check_bulk_into_type(PLpgSQL_row* row);
+static void check_table_index(PLpgSQL_datum* datum, char* funcName);
+static PLpgSQL_type* build_type_from_record_var(int dno);
+static PLpgSQL_type * build_array_type_from_elemtype(PLpgSQL_type *elem_type);
+static PLpgSQL_var* plpgsql_build_nested_variable(PLpgSQL_var *nest_table, bool isconst, char* name, int lineno);
+static void read_multiset(StringInfoData* ds, char* tableName1, Oid typeOid1);
+static Oid get_table_type(PLpgSQL_datum* datum);
+static void read_multiset(StringInfoData* ds, char* tableName1, Oid typeOid1);
+static Oid get_table_type(PLpgSQL_datum* datum);
+static Node* make_columnDef_from_attr(PLpgSQL_rec_attr* attr);
+static TypeName* make_typename_from_datatype(PLpgSQL_type* datatype);
+static Oid plpgsql_build_package_record_type(const char* typname, List* list, bool add2namespace);
+static void  plpgsql_build_package_array_type(const char* typname, Oid elemtypoid, char arraytype);
+static void plpgsql_build_package_refcursor_type(const char* typname);
+int plpgsql_yylex_single(void);
+static void get_datum_tok_type(PLpgSQL_datum* target, int* tok_flag);
+static bool copy_table_var_indents(char* tableName, char* idents, int tablevar_namelen);
+static int push_back_token_stack(DList* tokenstack);
+static int read_assignlist(bool is_push_back, int* token);
+static void plpgsql_cast_reference_list(List* idents, StringInfoData* ds, bool isPkgVar);
+static bool PkgVarNeedCast(List* idents);
+static void CastArrayNameToArrayFunc(StringInfoData* ds, List* idents, bool needDot = true);
+static Oid get_table_index_type(PLpgSQL_datum* datum, int *tableof_func_dno);
+static int get_nest_tableof_layer(PLpgSQL_var *var, const char *typname, int errstate);
+static void SetErrorState();
+static void CheckDuplicateFunctionName(List* funcNameList);
+static void check_autonomous_nest_tablevar(PLpgSQL_var* var);
+#ifndef ENABLE_MULTIPLE_NODES
+static PLpgSQL_type* build_type_from_cursor_var(PLpgSQL_var* var);
+static bool checkAllAttrName(TupleDesc tupleDesc);
+static void BuildForQueryVariable(PLpgSQL_expr* expr, PLpgSQL_row **row, PLpgSQL_rec **rec,
+    const char* refname, int lineno);
+#endif
+static Oid createCompositeTypeForCursor(PLpgSQL_var* var, PLpgSQL_expr* expr);
+static void check_record_nest_tableof_index(PLpgSQL_datum* datum);
+static void check_tableofindex_args(int tableof_var_dno, Oid argtype);
+static bool need_build_row_for_func_arg(PLpgSQL_rec **rec, PLpgSQL_row **row, int out_arg_num, int all_arg, int *varnos, char *p_argmodes);
 %}
 
 %expect 0
-%name-prefix="plpgsql_yy"
+%name-prefix "plpgsql_yy"
 %locations
 
 %union {
@@ -207,13 +288,14 @@ static  bool            last_pragma;
             PLpgSQL_datum   *scalar;
             PLpgSQL_rec		*rec;
             PLpgSQL_row		*row;
+            int  dno;
         }						forvariable;
         struct
         {
             char *label;
             int  n_initvars;
             int  *initvarnos;
-            bool autonomous;
+            bool isAutonomous;
         }						declhdr;
         struct
         {
@@ -235,8 +317,10 @@ static  bool            last_pragma;
         PLpgSQL_stmt_fetch		*fetch;
         PLpgSQL_case_when		*casewhen;
         PLpgSQL_rec_attr	*recattr;
+        Node                            *plnode;
 }
 
+%type <plnode> assign_el
 %type <declhdr> decl_sect
 %type <varname> decl_varname
 %type <boolean>	decl_const decl_notnull exit_type
@@ -244,20 +328,20 @@ static  bool            last_pragma;
 %type <dtype>	decl_datatype
 %type <oid>		decl_collate
 %type <datum>	decl_cursor_args
-%type <list>	decl_cursor_arglist
+%type <list>	decl_cursor_arglist assign_list
 %type <nsitem>	decl_aliasitem
 
 %type <expr>	expr_until_semi expr_until_rightbracket
 %type <expr>	expr_until_then expr_until_loop opt_expr_until_when
 %type <expr>	opt_exitcond
 
-%type <ival>	assign_var foreach_slice
-%type <var>		cursor_variable
+%type <ival>	assign_var foreach_slice error_code cursor_variable
 %type <datum>	decl_cursor_arg
 %type <forvariable>	for_variable
 %type <stmt>	for_control forall_control
 
-%type <str>		any_identifier opt_block_label opt_label goto_block_label label_name
+%type <str>		any_identifier opt_block_label opt_label goto_block_label label_name spec_proc init_proc
+%type <str>		opt_rollback_to opt_savepoint_name savepoint_name attr_name
 
 %type <list>	proc_sect proc_stmts stmt_elsifs stmt_else forall_body
 %type <loop_body>	loop_body
@@ -266,7 +350,7 @@ static  bool            last_pragma;
 %type <stmt>	stmt_return stmt_raise stmt_execsql
 %type <stmt>	stmt_dynexecute stmt_for stmt_perform stmt_getdiag
 %type <stmt>	stmt_open stmt_fetch stmt_move stmt_close stmt_null
-%type <stmt>	stmt_commit stmt_rollback
+%type <stmt>	stmt_commit stmt_rollback stmt_savepoint
 %type <stmt>	stmt_case stmt_foreach_a
 
 %type <list>	proc_exceptions
@@ -282,16 +366,21 @@ static  bool            last_pragma;
 %type <diagitem> getdiag_list_item
 %type <ival>	getdiag_item getdiag_target
 %type <ival>	varray_var
+%type <ival>	table_var
 %type <ival>	record_var
 %type <expr>	expr_until_parenthesis
 %type <ival>	opt_scrollable
 %type <fetch>	opt_fetch_direction
+%type <expr>	fetch_limit_expr
+%type <datum>	fetch_into_target
 
 %type <keyword>	unreserved_keyword
 
 %type <list>	record_attr_list
 %type <recattr>	record_attr
+%type <boolean> opt_save_exceptions
 
+%type <keyword> unreserved_keyword_func
 
 /*
  * Basic non-keyword token types.  These are hard-wired into the core lexer.
@@ -304,6 +393,17 @@ static  bool            last_pragma;
 %token <str>	IDENT FCONST SCONST BCONST VCONST XCONST Op CmpOp COMMENTSTRING
 %token <ival>	ICONST PARAM
 %token			TYPECAST ORA_JOINOP DOT_DOT COLON_EQUALS PARA_EQUALS
+/* token for Cypher 
+ * ADD_EQUALS is for Cypher SET clause.
+ */
+%token  		EQUALS_GREATER LESS_EQUALS GREATER_EQUALS NOT_EQUALS
+%token			ADD_EQUALS 
+/*
+ * token for sparql
+ */ 
+%token _CARET_CARET _AT
+%token <str>	QVAR
+%token <str>	BLANK_NODE_LABEL SPARQL_STRING ALGO_CLAUSE PAGERANK_ARG LANGTAG QNAME QNAME_NS Q_IRI_REF 
 
 /*
  * Other tokens recognized by plpgsql's lexer interface layer (pl_scanner.c).
@@ -312,15 +412,18 @@ static  bool            last_pragma;
 %token <cword>		T_CWORD		/* unrecognized composite identifier */
 %token <wdatum>		T_DATUM		/* a VAR, ROW, REC, or RECFIELD variable */
 %token <word>		T_PLACEHOLDER		/* place holder , for IN/OUT parameters */
-%token <wdatum>		T_VARRAY T_ARRAY_FIRST  T_ARRAY_LAST  T_ARRAY_COUNT  T_ARRAY_EXTEND  T_VARRAY_VAR  T_RECORD
+%token <wdatum>		T_VARRAY T_ARRAY_FIRST  T_ARRAY_LAST  T_ARRAY_COUNT  T_ARRAY_EXISTS  T_ARRAY_PRIOR  T_ARRAY_NEXT  T_ARRAY_DELETE  T_ARRAY_EXTEND  T_ARRAY_TRIM  T_VARRAY_VAR  T_RECORD
+%token <wdatum>		T_TABLE T_TABLE_VAR T_PACKAGE_VARIABLE
+%token <wdatum>     T_PACKAGE_CURSOR_ISOPEN T_PACKAGE_CURSOR_FOUND T_PACKAGE_CURSOR_NOTFOUND T_PACKAGE_CURSOR_ROWCOUNT
 %token				LESS_LESS
 %token				GREATER_GREATER
 
-%token				T_REFCURSOR		/* token for cursor type */
+%token	<wdatum>	T_REFCURSOR		/* token for cursor type */
 %token				T_SQL_ISOPEN
 %token				T_SQL_FOUND
 %token				T_SQL_NOTFOUND
 %token				T_SQL_ROWCOUNT
+%token				T_SQL_BULK_EXCEPTIONS
 %token				T_CURSOR_ISOPEN
 %token				T_CURSOR_FOUND
 %token				T_CURSOR_NOTFOUND
@@ -336,12 +439,15 @@ static  bool            last_pragma;
 %token <keyword>	K_ALL
 %token <keyword>	K_ALTER
 %token <keyword>	K_ARRAY
+%token <keyword>	K_AS
 %token <keyword>	K_BACKWARD
 %token <keyword>	K_BEGIN
+%token <keyword>	K_BULK
 %token <keyword>	K_BY
 %token <keyword>	K_CASE
 %token <keyword>	K_CLOSE
 %token <keyword>	K_COLLATE
+%token <keyword>	K_COLLECT
 %token <keyword>	K_COMMIT
 %token <keyword>	K_CONSTANT
 %token <keyword>	K_CONTINUE
@@ -352,14 +458,18 @@ static  bool            last_pragma;
 %token <keyword>	K_DEFAULT
 %token <keyword>	K_DELETE
 %token <keyword>	K_DETAIL
+%token <keyword>	K_DETERMINISTIC
 %token <keyword>	K_DIAGNOSTICS
+%token <keyword>	K_DISTINCT
 %token <keyword>	K_DUMP
 %token <keyword>	K_ELSE
 %token <keyword>	K_ELSIF
 %token <keyword>	K_END
 %token <keyword>	K_ERRCODE
 %token <keyword>	K_ERROR
+%token <keyword>    K_EXCEPT
 %token <keyword>	K_EXCEPTION
+%token <keyword>	K_EXCEPTIONS
 %token <keyword>	K_EXECUTE
 %token <keyword>	K_EXIT
 %token <keyword>	K_FETCH
@@ -369,23 +479,30 @@ static  bool            last_pragma;
 %token <keyword>	K_FOREACH
 %token <keyword>	K_FORWARD
 %token <keyword>	K_FROM
+%token <keyword>	K_FUNCTION
 %token <keyword>	K_GET
 %token <keyword>	K_GOTO
 %token <keyword>	K_HINT
 %token <keyword>	K_IF
 %token <keyword>	K_IMMEDIATE
+%token <keyword>    K_INSTANTIATION
 %token <keyword>	K_IN
+%token <keyword>	K_INDEX
 %token <keyword>	K_INFO
 %token <keyword>	K_INSERT
+%token <keyword>	K_INTERSECT
 %token <keyword>	K_INTO
 %token <keyword>	K_IS
 %token <keyword>	K_LAST
+%token <keyword>	K_LIMIT
 %token <keyword>	K_LOG
 %token <keyword>	K_LOOP
 %token <keyword>    K_MERGE
 %token <keyword>	K_MESSAGE
 %token <keyword>	K_MESSAGE_TEXT
 %token <keyword>	K_MOVE
+%token <keyword>    K_MULTISET
+%token <keyword>    K_MULTISETS
 %token <keyword>	K_NEXT
 %token <keyword>	K_NO
 %token <keyword>	K_NOT
@@ -396,17 +513,20 @@ static  bool            last_pragma;
 %token <keyword>	K_OPTION
 %token <keyword>	K_OR
 %token <keyword>	K_OUT
+%token <keyword>    K_PACKAGE
 %token <keyword>	K_PERFORM
 %token <keyword>	K_PG_EXCEPTION_CONTEXT
 %token <keyword>	K_PG_EXCEPTION_DETAIL
 %token <keyword>	K_PG_EXCEPTION_HINT
 %token <keyword>	K_PRAGMA
 %token <keyword>	K_PRIOR
+%token <keyword>	K_PROCEDURE
 %token <keyword>	K_QUERY
 %token <keyword>	K_RAISE
 %token <keyword>	K_RECORD
 %token <keyword>	K_REF
 %token <keyword>	K_RELATIVE
+%token <keyword>	K_RELEASE
 %token <keyword>	K_RESULT_OID
 %token <keyword>	K_RETURN
 %token <keyword>	K_RETURNED_SQLSTATE
@@ -414,6 +534,7 @@ static  bool            last_pragma;
 %token <keyword>	K_ROLLBACK
 %token <keyword>	K_ROWTYPE
 %token <keyword>	K_ROW_COUNT
+%token <keyword>	K_SAVE
 %token <keyword>	K_SAVEPOINT
 %token <keyword>	K_SELECT
 %token <keyword>	K_SCROLL
@@ -422,9 +543,11 @@ static  bool            last_pragma;
 %token <keyword>	K_STACKED
 %token <keyword>	K_STRICT
 %token <keyword>	K_SYS_REFCURSOR
+%token <keyword>	K_TABLE
 %token <keyword>	K_THEN
 %token <keyword>	K_TO
 %token <keyword>	K_TYPE
+%token <keyword>	K_UNION
 %token <keyword>	K_UPDATE
 %token <keyword>	K_USE_COLUMN
 %token <keyword>	K_USE_VARIABLE
@@ -438,9 +561,58 @@ static  bool            last_pragma;
 
 %%
 
-pl_function		: comp_options pl_block opt_semi
+pl_body         : pl_package_spec
+                | pl_function
+                | pl_package_init
+                ;
+pl_package_spec : K_PACKAGE { SetErrorState(); } decl_sect K_END
                     {
-                        u_sess->plsql_cxt.plpgsql_parse_result = (PLpgSQL_stmt_block *) $2;
+                        int nDatums = 0;
+                        if (u_sess->plsql_cxt.curr_compile_context->plpgsql_curr_compile!=NULL) {
+                            nDatums = u_sess->plsql_cxt.curr_compile_context->plpgsql_nDatums;
+                        } else {
+                            nDatums = u_sess->plsql_cxt.curr_compile_context->plpgsql_pkg_nDatums;
+                        }
+
+                        for (int i = 0; i < nDatums; i++) {
+                            u_sess->plsql_cxt.curr_compile_context->plpgsql_Datums[i]->ispkg = true;
+                        }
+                        PLpgSQL_nsitem* ns_cur = plpgsql_ns_top();
+                        while (ns_cur != NULL) {
+                            if (ns_cur != NULL && ns_cur->pkgname == NULL) {
+                                ns_cur->pkgname =  u_sess->plsql_cxt.curr_compile_context->plpgsql_curr_compile_package->pkg_signature;
+                            }
+                            ns_cur = ns_cur->prev;
+                        }
+                        u_sess->plsql_cxt.curr_compile_context->plpgsql_curr_compile_package->n_initvars = $3.n_initvars;
+                        u_sess->plsql_cxt.curr_compile_context->plpgsql_curr_compile_package->initvarnos = $3.initvarnos;
+                    }
+                ;
+pl_package_init : K_INSTANTIATION { SetErrorState(); } init_proc
+                    {
+                        if (u_sess->plsql_cxt.curr_compile_context->plpgsql_curr_compile_package != NULL)
+                        {
+                            List* raw_parsetree_list = NULL;
+                            u_sess->plsql_cxt.plpgsql_yylloc = plpgsql_yylloc;
+                            raw_parsetree_list = raw_parser($3);
+                            DoStmt* stmt;
+                            stmt = (DoStmt *)linitial(raw_parsetree_list);
+                            stmt->isExecuted = false;
+                            if (u_sess->plsql_cxt.curr_compile_context->plpgsql_curr_compile_package->is_spec_compiling) {
+                                stmt->isSpec = true;
+                            } else {
+                                stmt->isSpec = false;
+                            }
+                            List *proc_list = u_sess->plsql_cxt.curr_compile_context->plpgsql_curr_compile_package->proc_list;
+                            u_sess->plsql_cxt.curr_compile_context->plpgsql_curr_compile_package->proc_list = lappend(proc_list,stmt);
+                        } else {
+                            yyerror("instantiation only use in package compile");
+                        }
+                    }
+
+pl_function		: comp_options  { SetErrorState(); } pl_block opt_semi
+                    {
+                        u_sess->plsql_cxt.curr_compile_context->plpgsql_parse_result = (PLpgSQL_stmt_block *) $3;
                     }
                 ;
 
@@ -450,19 +622,19 @@ comp_options	:
 
 comp_option		: '#' K_OPTION K_DUMP
                     {
-                        u_sess->plsql_cxt.plpgsql_DumpExecTree = true;
+                        u_sess->plsql_cxt.curr_compile_context->plpgsql_DumpExecTree = true;
                     }
                 | '#' K_VARIABLE_CONFLICT K_ERROR
                     {
-                        u_sess->plsql_cxt.plpgsql_curr_compile->resolve_option = PLPGSQL_RESOLVE_ERROR;
+                        u_sess->plsql_cxt.curr_compile_context->plpgsql_curr_compile->resolve_option = PLPGSQL_RESOLVE_ERROR;
                     }
                 | '#' K_VARIABLE_CONFLICT K_USE_VARIABLE
                     {
-                        u_sess->plsql_cxt.plpgsql_curr_compile->resolve_option = PLPGSQL_RESOLVE_VARIABLE;
+                        u_sess->plsql_cxt.curr_compile_context->plpgsql_curr_compile->resolve_option = PLPGSQL_RESOLVE_VARIABLE;
                     }
                 | '#' K_VARIABLE_CONFLICT K_USE_COLUMN
                     {
-                        u_sess->plsql_cxt.plpgsql_curr_compile->resolve_option = PLPGSQL_RESOLVE_COLUMN;
+                        u_sess->plsql_cxt.curr_compile_context->plpgsql_curr_compile->resolve_option = PLPGSQL_RESOLVE_COLUMN;
                     }
                 ;
 
@@ -478,10 +650,9 @@ pl_block		: decl_sect K_BEGIN proc_sect exception_sect K_END opt_label
 
                         newp->cmd_type	= PLPGSQL_STMT_BLOCK;
                         newp->lineno		= plpgsql_location_to_lineno(@2);
+                        newp->sqlString = plpgsql_get_curline_query();
                         newp->label		= $1.label;
-#ifndef ENABLE_MULTIPLE_NODES
-                        newp->autonomous = $1.autonomous;
-#endif
+                        newp->isAutonomous = $1.isAutonomous;
                         newp->n_initvars = $1.n_initvars;
                         newp->initvarnos = $1.initvarnos;
                         newp->body		= $3;
@@ -501,28 +672,28 @@ pl_block		: decl_sect K_BEGIN proc_sect exception_sect K_END opt_label
 decl_sect		: opt_block_label
                     {
                         /* done with decls, so resume identifier lookup */
-                        u_sess->plsql_cxt.plpgsql_IdentifierLookup = IDENTIFIER_LOOKUP_NORMAL;
+                        u_sess->plsql_cxt.curr_compile_context->plpgsql_IdentifierLookup = IDENTIFIER_LOOKUP_NORMAL;
                         $$.label	  = $1;
                         $$.n_initvars = 0;
                         $$.initvarnos = NULL;
-                        $$.autonomous = false;
+                        $$.isAutonomous = false;
                     }
                 | opt_block_label decl_start
                     {
-                        u_sess->plsql_cxt.plpgsql_IdentifierLookup = IDENTIFIER_LOOKUP_NORMAL;
+                        u_sess->plsql_cxt.curr_compile_context->plpgsql_IdentifierLookup = IDENTIFIER_LOOKUP_NORMAL;
                         $$.label	  = $1;
                         $$.n_initvars = 0;
                         $$.initvarnos = NULL;
-                        $$.autonomous = false;
+                        $$.isAutonomous = false;
                     }
-                | opt_block_label decl_start decl_stmts
+                | opt_block_label decl_start { SetErrorState(); } decl_stmts
                     {
-                        u_sess->plsql_cxt.plpgsql_IdentifierLookup = IDENTIFIER_LOOKUP_NORMAL;
+                        u_sess->plsql_cxt.curr_compile_context->plpgsql_IdentifierLookup = IDENTIFIER_LOOKUP_NORMAL;
                         $$.label	  = $1;
                         /* Remember variables declared in decl_stmts */
                         $$.n_initvars = plpgsql_add_initdatums(&($$.initvarnos));
-                        $$.autonomous = last_pragma;
-                        last_pragma = false;
+                        $$.isAutonomous = u_sess->plsql_cxt.pragma_autonomous;
+                        u_sess->plsql_cxt.pragma_autonomous = false;
                     }
                 ;
 
@@ -530,12 +701,12 @@ decl_start		: K_DECLARE
                     {
                         /* Forget any variables created before block */
                         plpgsql_add_initdatums(NULL);
-                        last_pragma = false;
+                        u_sess->plsql_cxt.pragma_autonomous = false;
                         /*
                          * Disable scanner lookup of identifiers while
                          * we process the decl_stmts
                          */
-                        u_sess->plsql_cxt.plpgsql_IdentifierLookup = IDENTIFIER_LOOKUP_DECLARE;
+                        u_sess->plsql_cxt.curr_compile_context->plpgsql_IdentifierLookup = IDENTIFIER_LOOKUP_DECLARE;
                     }
                 ;
 
@@ -554,16 +725,24 @@ decl_stmt		: decl_statement
                          * Throw a helpful error if user tries to put block
                          * label just before BEGIN, instead of before DECLARE.
                          */
-                        ereport(ERROR,
+                        const char* message = "block label must be placed before DECLARE, not after";
+                        InsertErrorMessage(message, plpgsql_yylloc);
+                        ereport(errstate,
                                 (errcode(ERRCODE_SYNTAX_ERROR),
                                  errmsg("block label must be placed before DECLARE, not after"),
                                  parser_errposition(@1)));
                     }
                 ;
 
+as_is        : K_IS
+                | K_AS /* A db */
+                ;
+
 decl_statement	: decl_varname decl_const decl_datatype decl_collate decl_notnull decl_defval
                     {
                         PLpgSQL_variable	*var;
+
+                        IsInPublicNamespace($1.name);
 
                         /*
                          * If a collation is supplied, insert it into the
@@ -571,14 +750,42 @@ decl_statement	: decl_varname decl_const decl_datatype decl_collate decl_notnull
                          * a freshly built struct not shared with other
                          * variables.
                          */
+
+                        if ($3 == NULL) {
+                            // not allowed going on when plsql_show_all_error is on
+#ifndef ENABLE_MULTIPLE_NODES
+                            if (!u_sess->attr.attr_common.plsql_show_all_error) {
+                                yyerror("missing data type declaration");
+                            } else {
+                                const char* message = "missing data type declaration";
+                                InsertErrorMessage(message, @4);
+                                yyerror("missing data type declaration");
+                                ereport(ERROR,
+                                        (errcode(ERRCODE_DATATYPE_MISMATCH),
+                                         errmsg("missing data type declaration"),
+                                         parser_errposition(@4)));
+                            }
+#else
+                            yyerror("missing data type declaration");
+#endif
+                        } else {
+
+                        if ($3 && $3->typoid == REFCURSOROID && IsOnlyCompilePackage())
+                        {
+                            yyerror("not allow use ref cursor in package");
+                        }
+
                         if (OidIsValid($4))
                         {
-                            if (!OidIsValid($3->collation))
-                                ereport(ERROR,
+                            if (!OidIsValid($3->collation)) {
+                                const char* message = "collations are not supported by type";
+                                InsertErrorMessage(message, plpgsql_yylloc);
+                                ereport(errstate,
                                         (errcode(ERRCODE_DATATYPE_MISMATCH),
                                          errmsg("collations are not supported by type %s",
                                                 format_type_be($3->typoid)),
                                          parser_errposition(@4)));
+                            }
                             $3->collation = $4;
                         }
 
@@ -588,44 +795,52 @@ decl_statement	: decl_varname decl_const decl_datatype decl_collate decl_notnull
                         {
                             if (var->dtype == PLPGSQL_DTYPE_VAR)
                                 ((PLpgSQL_var *) var)->isconst = $2;
-                            else
-                                ereport(ERROR,
+                            else {
+                                const char* message = "row or record variable cannot be CONSTANT";
+                                InsertErrorMessage(message, plpgsql_yylloc);
+                                ereport(errstate,
                                         (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
                                          errmsg("row or record variable cannot be CONSTANT"),
                                          parser_errposition(@2)));
+                            }
                         }
                         if ($5)
                         {
                             if (var->dtype == PLPGSQL_DTYPE_VAR)
                                 ((PLpgSQL_var *) var)->notnull = $5;
-                            else
-                                ereport(ERROR,
+                            else {
+                                const char* message = "row or record variable cannot be NOT NULL";
+                                InsertErrorMessage(message, plpgsql_yylloc);
+                                ereport(errstate,
                                         (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
                                          errmsg("row or record variable cannot be NOT NULL"),
                                          parser_errposition(@4)));
-
+                            }
                         }
                         if ($6 != NULL)
                         {
                             if (var->dtype == PLPGSQL_DTYPE_VAR)
                                 ((PLpgSQL_var *) var)->default_val = $6;
-                            else
-                                ereport(ERROR,
-                                        (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-                                         errmsg("default value for row or record variable is not supported"),
-                                         parser_errposition(@5)));
+                            else {
+                                ((PLpgSQL_row *) var)->default_val = $6;
+                            }
                         }
-
+                        }
                         pfree_ext($1.name);
+                        
                     }
                 | decl_varname K_ALIAS K_FOR decl_aliasitem ';'
                     {
+                        IsInPublicNamespace($1.name);
                         plpgsql_ns_additem($4->itemtype,
                                            $4->itemno, $1.name);
                         pfree_ext($1.name);
                     }
                 |	K_CURSOR decl_varname opt_scrollable 
-                    { plpgsql_ns_push($2.name); }
+                    {
+                        IsInPublicNamespace($2.name);
+                        plpgsql_ns_push($2.name); 
+                    }
                     decl_cursor_args decl_is_for decl_cursor_query
                     {
                         PLpgSQL_var *newp;
@@ -646,17 +861,30 @@ decl_statement	: decl_varname decl_const decl_datatype decl_collate decl_notnull
                         else
                             newp->cursor_explicit_argrow = $5->dno;
                         newp->cursor_options = CURSOR_OPT_FAST_PLAN | $3;
-
+                        u_sess->plsql_cxt.plpgsql_yylloc = plpgsql_yylloc;
+                        newp->datatype->cursorCompositeOid = IS_ANONYMOUS_BLOCK ? 
+                            InvalidOid : createCompositeTypeForCursor(newp, $7);
                         pfree_ext($2.name);
                     }
-                |	K_TYPE decl_varname K_IS K_REF K_CURSOR ';'
+                |	K_TYPE decl_varname as_is K_REF K_CURSOR ';'
                     {
+                        IsInPublicNamespace($2.name);
                         /* add name of cursor type to PLPGSQL_NSTYPE_REFCURSOR */
                         plpgsql_ns_additem(PLPGSQL_NSTYPE_REFCURSOR,0,$2.name);
+                        if (IS_PACKAGE) {
+                            plpgsql_build_package_refcursor_type($2.name);
+                        }
                         pfree_ext($2.name);
+
                     }
                 |	decl_varname T_REFCURSOR ';'
                     {
+                        IsInPublicNamespace($1.name);
+                        if (IsOnlyCompilePackage()) {
+                            yyerror("not allow use ref cursor in package");
+                        }
+                        AddNamespaceIfNeed(-1, $2.ident);
+
                         plpgsql_build_variable(
                                 $1.name, 
                                 $1.lineno,
@@ -664,9 +892,12 @@ decl_statement	: decl_varname decl_const decl_datatype decl_collate decl_notnull
                                 true);
                         pfree_ext($1.name);
                     }
-
                 |	decl_varname K_SYS_REFCURSOR ';'
                     {
+                        IsInPublicNamespace($1.name);
+                        if (IsOnlyCompilePackage()) {
+                            yyerror("not allow use ref cursor in package");
+                        }
                         plpgsql_build_variable(
                                 $1.name, 
                                 $1.lineno,
@@ -679,72 +910,578 @@ decl_statement	: decl_varname decl_const decl_datatype decl_collate decl_notnull
                  * "type varrayname is varray(ICONST) of datatype;"
                  * and "varname varrayname := varrayname()"
                  */
-                |	K_TYPE decl_varname K_IS K_VARRAY '(' ICONST ')'  K_OF decl_datatype ';'
+                |	K_TYPE decl_varname as_is K_VARRAY '(' ICONST ')'  K_OF decl_datatype ';'
                     {
+                        IsInPublicNamespace($2.name);
+
+                        $9->collectionType = PLPGSQL_COLLECTION_ARRAY;
+                        $9->tableOfIndexType = InvalidOid;
+
+                        if($9->typinput.fn_oid == F_ARRAY_IN) {
+                            ereport(errstate,
+                                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                                    errmodule(MOD_PLSQL),
+                                    errmsg("array or table type nested by array type is not supported yet."),
+                                    errdetail("Define array type \"%s\" of array or table type is not supported yet.", $2.name),
+                                    errcause("feature not supported"),
+                                    erraction("check define of array type")));
+                            u_sess->plsql_cxt.have_error = true;
+                        }
+                        if($9->typoid == REFCURSOROID) {
+                            ereport(errstate,
+                                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                                    errmodule(MOD_PLSQL),
+                                    errmsg("ref cursor type nested by array is not supported yet."),
+                                    errdetail("Define array type \"%s\" of ref cursor type is not supported yet.", $2.name),
+                                    errcause("feature not supported"),
+                                    erraction("check define of array type")));
+                            u_sess->plsql_cxt.have_error = true;
+                        }
+
                         plpgsql_build_varrayType($2.name, $2.lineno, $9, true);
+                        if (IS_PACKAGE) {
+                            plpgsql_build_package_array_type($2.name, $9->typoid, TYPCATEGORY_ARRAY);
+                        }
                         pfree_ext($2.name);
                     }
-                |	decl_varname varray_var decl_defval
+                |       K_TYPE decl_varname as_is K_VARRAY '(' ICONST ')'  K_OF record_var ';'
                     {
-                        char *type_name;
-                        errno_t ret;
-                        PLpgSQL_type * var_type = ((PLpgSQL_var *)u_sess->plsql_cxt.plpgsql_Datums[$2])->datatype;
-                        PLpgSQL_var *newp;
-                        int len = strlen(var_type->typname) + 3;
-                        type_name = (char *)palloc0(len);
-                        ret = strcpy_s(type_name, len, var_type->typname);
-                        securec_check(ret, "", "");
-                        ret = strcat_s(type_name, len, "[]");
-                        securec_check(ret, "", "");
-                        var_type = parse_datatype(type_name, yylloc);
+#ifdef ENABLE_MULTIPLE_NODES
+                        ereport(errstate,
+                            (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                                errmodule(MOD_PLSQL),
+                                errmsg("array or record type nesting is not supported in distributed database yet."),
+                                errdetail("Define array type \"%s\" of record is not supported in distributed database yet.", $2.name),
+                                errcause("feature not supported"),
+                                erraction("check define of array type")));
+                        u_sess->plsql_cxt.have_error = true;
+#endif
+                        if (IS_ANONYMOUS_BLOCK) {
+                            ereport(errstate,
+                                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                                    errmodule(MOD_PLSQL),
+                                    errmsg("array or record type nesting is not supported in anonymous block yet."),
+                                    errdetail("Define array type \"%s\" of record is not supported yet.", $2.name),
+                                    errcause("feature not supported"),
+                                    erraction("check define of array type")));
+                            u_sess->plsql_cxt.have_error = true;
+                        }
+                        IsInPublicNamespace($2.name);
 
-                        newp = (PLpgSQL_var *)plpgsql_build_variable($1.name, $1.lineno,var_type,true);
-                        if (NULL == newp)
+                        PLpgSQL_type *newp = NULL;
+                        newp = build_type_from_record_var($9);
+                        newp->collectionType = PLPGSQL_COLLECTION_ARRAY;
+                        newp->tableOfIndexType = InvalidOid;
+                        plpgsql_build_varrayType($2.name, $2.lineno, newp, true);
+                        if (IS_PACKAGE) {
+                            plpgsql_build_package_array_type($2.name, newp->typoid, TYPCATEGORY_ARRAY);
+                        }
+                        pfree_ext($2.name);
+                    }
+
+                |       K_TYPE decl_varname as_is K_VARRAY '(' ICONST ')'  K_OF varray_var ';'
+                    {
+                        ereport(errstate,
+                            (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                                errmodule(MOD_PLSQL),
+                                errmsg("array type nested by array is not supported yet."),
+                                errdetail("Define array type \"%s\" of array is not supported yet.", $2.name),
+                                errcause("feature not supported"),
+                                erraction("check define of array type")));
+                        u_sess->plsql_cxt.have_error = true;
+                    }
+
+                |       K_TYPE decl_varname as_is K_VARRAY '(' ICONST ')'  K_OF table_var ';'
+                    {
+                        ereport(errstate,
+                            (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                                errmodule(MOD_PLSQL),
+                                errmsg("table type nested by array is not supported yet."),
+                                errdetail("Define array type \"%s\" of table type is not supported yet.", $2.name),
+                                errcause("feature not supported"),
+                                erraction("check define of array type")));
+                        u_sess->plsql_cxt.have_error = true;
+                    }
+
+                |       K_TYPE decl_varname as_is K_VARRAY '(' ICONST ')'  K_OF T_REFCURSOR ';'
+                    {
+                        ereport(errstate,
+                            (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                                errmodule(MOD_PLSQL),
+                                errmsg("ref cursor type nested by array is not supported yet."),
+                                errdetail("Define array type \"%s\" of ref cursor type is not supported yet.", $2.name),
+                                errcause("feature not supported"),
+                                erraction("check define of array type")));
+                        u_sess->plsql_cxt.have_error = true;
+                    }
+
+                |	decl_varname decl_const varray_var decl_defval
+                    {
+                        IsInPublicNamespace($1.name);
+
+                        PLpgSQL_type *var_type = ((PLpgSQL_var *)u_sess->plsql_cxt.curr_compile_context->plpgsql_Datums[$3])->datatype;
+                        PLpgSQL_var *newp;
+                        PLpgSQL_type *new_var_type;
+
+                        new_var_type = build_array_type_from_elemtype(var_type);
+                        new_var_type->collectionType = var_type->collectionType;
+                        new_var_type->tableOfIndexType = var_type->tableOfIndexType;
+
+                        newp = (PLpgSQL_var *)plpgsql_build_variable($1.name, $1.lineno, new_var_type, true);
+                        newp->isconst = $2;
+                        newp->default_val = $4;
+
+                        if (NULL == newp) {
+                            const char* message = "build variable failed";
+                            InsertErrorMessage(message, plpgsql_yylloc);
+                            ereport(errstate,
+                                (errcode(ERRCODE_UNEXPECTED_NULL_VALUE),
+                                    errmsg("build variable failed")));
+                            u_sess->plsql_cxt.have_error = true;
+                        }
+                        pfree_ext($1.name);
+                    }
+                |   K_TYPE decl_varname as_is K_TABLE K_OF decl_datatype decl_notnull ';'
+                    {
+#ifdef ENABLE_MULTIPLE_NODES
+                        ereport(ERROR,
+                            (errmodule(MOD_PLSQL),
+                                errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                                errmsg("table of is not support in distribute database"),
+                                errdetail("N/A"), errcause("PL/SQL uses unsupported feature."),
+                                erraction("Modify SQL statement according to the manual.")));
+#endif
+                        if (u_sess->attr.attr_sql.sql_compatibility != A_FORMAT) {
                             ereport(ERROR,
+                                (errmodule(MOD_PLSQL),
+                                    errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                                    errmsg("table of is only support in A-format database."),
+                                    errdetail("N/A"), errcause("PL/SQL uses unsupported feature."),
+                                    erraction("Modify SQL statement according to the manual.")));
+                        }
+                        IsInPublicNamespace($2.name);
+
+                        $6->collectionType = PLPGSQL_COLLECTION_TABLE;
+                        $6->tableOfIndexType = InvalidOid;
+                        if($6->typinput.fn_oid == F_ARRAY_IN) {
+                            ereport(errstate,
+                                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                                    errmodule(MOD_PLSQL),
+                                    errmsg("array or table type nested by table type is not supported yet."),
+                                    errdetail("Define table type \"%s\" of array or table type is not supported yet.", $2.name),
+                                    errcause("feature not supported"),
+                                    erraction("check define of table type")));
+                            u_sess->plsql_cxt.have_error = true;
+                        }
+                        if($6->typoid == REFCURSOROID) {
+                            ereport(errstate,
+                                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                                    errmodule(MOD_PLSQL),
+                                    errmsg("ref cursor type nested by table type is not supported yet."),
+                                    errdetail("Define table type \"%s\" of ref cursor type is not supported yet.", $2.name),
+                                    errcause("feature not supported"),
+                                    erraction("check define of table type")));
+                            u_sess->plsql_cxt.have_error = true;
+                        }
+                        plpgsql_build_tableType($2.name, $2.lineno, $6, true);
+                        if (IS_PACKAGE) {
+                            plpgsql_build_package_array_type($2.name, $6->typoid, TYPCATEGORY_TABLEOF);
+                        }
+                        pfree_ext($2.name);
+                    }
+                |   K_TYPE decl_varname as_is K_TABLE K_OF table_var decl_notnull ';'
+                    {
+                        IsInPublicNamespace($2.name);
+                        PLpgSQL_var *check_var = (PLpgSQL_var *)u_sess->plsql_cxt.curr_compile_context->plpgsql_Datums[$6];
+                        /* get and check nest tableof's depth */
+                        int depth = get_nest_tableof_layer(check_var, $2.name, errstate);
+                        PLpgSQL_type *nest_type = plpgsql_build_nested_datatype();
+                        nest_type->tableOfIndexType = INT4OID;
+                        nest_type->collectionType = PLPGSQL_COLLECTION_TABLE;
+                        PLpgSQL_var* var = (PLpgSQL_var*)plpgsql_build_tableType($2.name, $2.lineno, nest_type, true);
+                        /* nested table type */
+                        var->nest_table = (PLpgSQL_var *)u_sess->plsql_cxt.curr_compile_context->plpgsql_Datums[$6];
+                        var->nest_layers = depth;
+                        var->isIndexByTblOf = false;
+                        pfree_ext($2.name);
+                    }
+                |   K_TYPE decl_varname as_is K_TABLE K_OF record_var decl_notnull ';'
+                    {
+#ifdef ENABLE_MULTIPLE_NODES
+                        ereport(errstate,
+                            (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                                errmodule(MOD_PLSQL),
+                                errmsg("array or record type nesting is not supported in distributed database yet."),
+                                errdetail("Define table type \"%s\" of record is not supported in distributed database yet.", $2.name),
+                                errcause("feature not supported"),
+                                erraction("check define of table type")));
+                        u_sess->plsql_cxt.have_error = true;
+#endif
+                        if (u_sess->attr.attr_sql.sql_compatibility != A_FORMAT) {
+                            ereport(ERROR,
+                                (errmodule(MOD_PLSQL),
+                                    errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                                    errmsg("table of is only support in A-format database."),
+                                    errdetail("N/A"), errcause("PL/SQL uses unsupported feature."),
+                                    erraction("Modify SQL statement according to the manual.")));
+                        }
+
+                        if (IS_ANONYMOUS_BLOCK) {
+                            ereport(errstate,
+                                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                                    errmodule(MOD_PLSQL),
+                                    errmsg("array or record type nesting is not supported in anonymous block yet."),
+                                    errdetail("Define table type \"%s\" of record is not supported yet.", $2.name),
+                                    errcause("feature not supported"),
+                                    erraction("check define of table type")));
+                            u_sess->plsql_cxt.have_error = true;
+                        }
+
+                        IsInPublicNamespace($2.name);
+
+                        PLpgSQL_type *newp = NULL;
+                        newp = build_type_from_record_var($6);
+                        newp->collectionType = PLPGSQL_COLLECTION_TABLE;
+                        newp->tableOfIndexType = InvalidOid;
+                        plpgsql_build_tableType($2.name, $2.lineno, newp, true);
+                        if (IS_PACKAGE) {
+                            plpgsql_build_package_array_type($2.name, newp->typoid, TYPCATEGORY_TABLEOF);
+                        }
+                        pfree_ext($2.name);
+                    }
+
+                |   K_TYPE decl_varname as_is K_TABLE K_OF varray_var decl_notnull ';'
+                    {
+                        ereport(errstate,
+                            (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                                errmodule(MOD_PLSQL),
+                                errmsg("array type nested by table type is not supported yet."),
+                                errdetail("Define table type \"%s\" of array is not supported yet.", $2.name),
+                                errcause("feature not supported"),
+                                erraction("check define of table type")));
+                        u_sess->plsql_cxt.have_error = true;
+                    }
+
+                |   K_TYPE decl_varname as_is K_TABLE K_OF T_REFCURSOR decl_notnull ';'
+                    {
+                        ereport(errstate,
+                            (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                                errmodule(MOD_PLSQL),
+                                errmsg("ref cursor type nested by table type is not supported yet."),
+                                errdetail("Define table type \"%s\" of ref cursor is not supported yet.", $2.name),
+                                errcause("feature not supported"),
+                                erraction("check define of table type")));
+                        u_sess->plsql_cxt.have_error = true;
+                    }
+
+                |   K_TYPE decl_varname as_is K_TABLE K_OF varray_var decl_notnull K_INDEX K_BY decl_datatype ';'
+                    {
+                        ereport(errstate,
+                            (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                                errmodule(MOD_PLSQL),
+                                errmsg("array type nested by table type is not supported yet."),
+                                errdetail("Define table type \"%s\" of array is not supported yet.", $2.name),
+                                errcause("feature not supported"),
+                                erraction("check define of table type")));
+                        u_sess->plsql_cxt.have_error = true;
+                    }
+
+                |   K_TYPE decl_varname as_is K_TABLE K_OF T_REFCURSOR decl_notnull K_INDEX K_BY decl_datatype ';'
+                    {
+                        ereport(errstate,
+                            (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                                errmodule(MOD_PLSQL),
+                                errmsg("ref cursor type nested by table type is not supported yet."),
+                                errdetail("Define table type \"%s\" of ref cursor type is not supported yet.", $2.name),
+                                errcause("feature not supported"),
+                                erraction("check define of table type")));
+                        u_sess->plsql_cxt.have_error = true;
+                    }
+
+                |   K_TYPE decl_varname as_is K_TABLE K_OF decl_datatype decl_notnull K_INDEX K_BY decl_datatype ';'
+                    {
+#ifdef ENABLE_MULTIPLE_NODES
+                        ereport(ERROR,
+                            (errmodule(MOD_PLSQL),
+                                errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                                errmsg("table of is not support in distribute database"),
+                                errdetail("N/A"), errcause("PL/SQL uses unsupported feature."),
+                                erraction("Modify SQL statement according to the manual.")));
+#endif
+                        if (u_sess->attr.attr_sql.sql_compatibility != A_FORMAT) {
+                            ereport(ERROR,
+                                (errmodule(MOD_PLSQL),
+                                    errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                                    errmsg("table of is only support in A-format database."),
+                                    errdetail("N/A"), errcause("PL/SQL uses unsupported feature."),
+                                    erraction("Modify SQL statement according to the manual.")));
+                        }
+                        IsInPublicNamespace($2.name);
+
+                        $6->collectionType = PLPGSQL_COLLECTION_TABLE;
+                        if ($10->typoid != VARCHAROID && $10->typoid != INT4OID) {
+                            const char* message = "unsupported table index type";
+                            InsertErrorMessage(message, plpgsql_yylloc);
+                            ereport(errstate,
+                                (errcode(ERRCODE_UNEXPECTED_NULL_VALUE),
+                                     errmsg("unsupported table index type")));
+                            u_sess->plsql_cxt.have_error = true;
+                        }
+                        $6->tableOfIndexType = $10->typoid;
+                        if($6->typinput.fn_oid == F_ARRAY_IN) {
+                            ereport(errstate,
+                                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                                    errmodule(MOD_PLSQL),
+                                    errmsg("array or table type nested by table type is not supported yet."),
+                                    errdetail("Define table type \"%s\" of array or table type is not supported yet.", $2.name),
+                                    errcause("feature not supported"),
+                                    erraction("check define of table type")));
+                            u_sess->plsql_cxt.have_error = true;
+                        }
+                        if($6->typoid == REFCURSOROID) {
+                            ereport(errstate,
+                                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                                    errmodule(MOD_PLSQL),
+                                    errmsg("ref cursor type nested by table type is not supported yet."),
+                                    errdetail("Define table type \"%s\" of ref cursor type is not supported yet.", $2.name),
+                                    errcause("feature not supported"),
+                                    erraction("check define of table type")));
+                            u_sess->plsql_cxt.have_error = true;
+                        }
+                        PLpgSQL_var* var = (PLpgSQL_var*)plpgsql_build_tableType($2.name, $2.lineno, $6, true);
+                        var->isIndexByTblOf = true;
+
+                        if (IS_PACKAGE) {
+                            if ($10->typoid == VARCHAROID) {
+                                plpgsql_build_package_array_type($2.name, $6->typoid, TYPCATEGORY_TABLEOF_VARCHAR);
+                            } else {
+                                plpgsql_build_package_array_type($2.name, $6->typoid, TYPCATEGORY_TABLEOF_INTEGER);
+                            }
+                        }
+                        pfree_ext($2.name);
+                    }
+                |   K_TYPE decl_varname as_is K_TABLE K_OF table_var decl_notnull K_INDEX K_BY decl_datatype ';'
+                    {
+                        IsInPublicNamespace($2.name);
+
+                        if ($10->typoid != VARCHAROID && $10->typoid != INT4OID) {
+                            const char* message = "unsupported table index type";
+                            InsertErrorMessage(message, plpgsql_yylloc);
+                            ereport(errstate,
+                                (errcode(ERRCODE_UNEXPECTED_NULL_VALUE),
+                                     errmsg("unsupported table index type")));
+                            u_sess->plsql_cxt.have_error = true;
+                        }
+                        PLpgSQL_var *check_var = (PLpgSQL_var *)u_sess->plsql_cxt.curr_compile_context->plpgsql_Datums[$6];
+                        /* get and check nest tableof's depth */
+                        int depth = get_nest_tableof_layer(check_var, $2.name, errstate);
+                        PLpgSQL_type *nest_type = plpgsql_build_nested_datatype();
+                        nest_type->tableOfIndexType = $10->typoid;
+                        nest_type->collectionType = PLPGSQL_COLLECTION_TABLE;
+                        PLpgSQL_var* var = (PLpgSQL_var*)plpgsql_build_tableType($2.name, $2.lineno, nest_type, true);
+                        /* nested table type */
+                        var->nest_table = (PLpgSQL_var *)u_sess->plsql_cxt.curr_compile_context->plpgsql_Datums[$6];
+                        var->nest_layers = depth;
+                        var->isIndexByTblOf = true;
+                        pfree_ext($2.name);
+                    }
+                |   K_TYPE decl_varname as_is K_TABLE K_OF record_var decl_notnull K_INDEX K_BY decl_datatype ';'
+                    {
+#ifdef ENABLE_MULTIPLE_NODES
+                        ereport(errstate,
+                            (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                                errmodule(MOD_PLSQL),
+                                errmsg("array or record type nesting is not supported in distributed database yet."),
+                                errdetail("Define table type \"%s\" of record is not supported in distributed database yet.", $2.name),
+                                errcause("feature not supported"),
+                                erraction("check define of table type")));
+                        u_sess->plsql_cxt.have_error = true;
+#endif
+                        if (u_sess->attr.attr_sql.sql_compatibility != A_FORMAT) {
+                            ereport(ERROR,
+                                (errmodule(MOD_PLSQL),
+                                    errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                                    errmsg("table of is only support in A-format database."),
+                                    errdetail("N/A"), errcause("PL/SQL uses unsupported feature."),
+                                    erraction("Modify SQL statement according to the manual.")));
+                        }
+                        if (IS_ANONYMOUS_BLOCK) {
+                            ereport(errstate,
+                                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                                    errmodule(MOD_PLSQL),
+                                    errmsg("array or record type nesting is not supported in anonymous block yet."),
+                                    errdetail("Define table type \"%s\" of record is not supported yet.", $2.name),
+                                    errcause("feature not supported"),
+                                    erraction("check define of table type")));
+                            u_sess->plsql_cxt.have_error = true;
+                        }
+
+                        IsInPublicNamespace($2.name);
+
+                        PLpgSQL_type *newp = NULL;
+                        newp = build_type_from_record_var($6);
+                        newp->collectionType = PLPGSQL_COLLECTION_TABLE;
+
+                        if ($10->typoid != VARCHAROID && $10->typoid != INT4OID) {
+                            ereport(errstate,
+                                (errcode(ERRCODE_UNEXPECTED_NULL_VALUE),
+                                     errmsg("unsupported table index type")));
+                            u_sess->plsql_cxt.have_error = true;
+                        }
+                        newp->tableOfIndexType = $10->typoid;
+                        PLpgSQL_var *var = (PLpgSQL_var*)plpgsql_build_tableType($2.name, $2.lineno, newp, true);
+                        var->isIndexByTblOf = true;
+
+                        if (IS_PACKAGE) {
+                            if ($10->typoid == VARCHAROID) {
+                                plpgsql_build_package_array_type($2.name, newp->typoid, TYPCATEGORY_TABLEOF_VARCHAR);
+                            } else {
+                                plpgsql_build_package_array_type($2.name, newp->typoid, TYPCATEGORY_TABLEOF_INTEGER);
+                            }
+                        }
+                        pfree_ext($2.name);
+                    }
+
+                |	decl_varname decl_const table_var decl_defval
+                    {
+                        IsInPublicNamespace($1.name);
+
+                        PLpgSQL_type *var_type = ((PLpgSQL_var *)u_sess->plsql_cxt.curr_compile_context->plpgsql_Datums[$3])->datatype;
+                        PLpgSQL_var *table_type = (PLpgSQL_var *)u_sess->plsql_cxt.curr_compile_context->plpgsql_Datums[$3];
+                        
+                        PLpgSQL_var *newp;
+                        PLpgSQL_type *new_var_type;
+                        new_var_type = build_array_type_from_elemtype(var_type);
+
+                        new_var_type->collectionType = var_type->collectionType;
+                        new_var_type->tableOfIndexType = var_type->tableOfIndexType;
+
+                        newp = (PLpgSQL_var *)plpgsql_build_variable($1.name, $1.lineno, new_var_type, true);
+                        if (NULL == newp) {
+                            const char* message = "build variable failed";
+                            InsertErrorMessage(message, plpgsql_yylloc);
+                            ereport(errstate,
                                     (errcode(ERRCODE_UNEXPECTED_NULL_VALUE),
                                      errmsg("build variable failed")));
+                            u_sess->plsql_cxt.have_error = true;
+                        }
+                        newp->isconst = $2;
+                        newp->default_val = $4;
+
+                        if (table_type->nest_table != NULL) {
+                            newp->nest_table = plpgsql_build_nested_variable(table_type->nest_table, $2, $1.name, $1.lineno);
+                            newp->nest_layers = table_type->nest_layers;
+                        }
                         pfree_ext($1.name);
-                        pfree_ext(type_name);
                     }
-                |	K_TYPE decl_varname K_IS K_RECORD '(' record_attr_list ')' ';'
+                |	K_TYPE decl_varname as_is K_RECORD '(' record_attr_list ')' ';'
                     {
+                        IsInPublicNamespace($2.name);
                         PLpgSQL_rec_type	*newp = NULL;
 
                         newp = plpgsql_build_rec_type($2.name, $2.lineno, $6, true);
-                        if (NULL == newp)
-                            ereport(ERROR,
+                        if (NULL == newp) {
+                            const char* message = "build variable failed";
+                            InsertErrorMessage(message, plpgsql_yylloc);
+                            ereport(errstate,
                                     (errcode(ERRCODE_UNEXPECTED_NULL_VALUE),
                                      errmsg("build variable failed")));
+                            u_sess->plsql_cxt.have_error = true;
+                        }
+                        if (IS_PACKAGE) {
+                            newp->typoid = plpgsql_build_package_record_type($2.name, $6, true);
+                        }
                         pfree_ext($2.name);
                     }
-                |	decl_varname record_var ';'
+                |	decl_varname record_var decl_defval
                     {
+                        IsInPublicNamespace($1.name);
+
                         PLpgSQL_var *newp = NULL;
-                        PLpgSQL_type * var_type = (PLpgSQL_type *)u_sess->plsql_cxt.plpgsql_Datums[$2];
+                        PLpgSQL_type * var_type = (PLpgSQL_type *)u_sess->plsql_cxt.curr_compile_context->plpgsql_Datums[$2];
 
                         newp = (PLpgSQL_var *)plpgsql_build_variable($1.name,$1.lineno,
                                                                     var_type,true);
-                        if (NULL == newp)
-                            ereport(ERROR,
+                        if (NULL == newp) {
+                            const char* message = "build variable failed";
+                            InsertErrorMessage(message, plpgsql_yylloc);
+                            ereport(errstate,
                                     (errcode(ERRCODE_UNEXPECTED_NULL_VALUE),
                                      errmsg("build variable failed")));
+                            u_sess->plsql_cxt.have_error = true;
+                        }
+                        if ($3 != NULL) {
+                            ((PLpgSQL_row *) newp)->default_val = $3;
+                        }
                         pfree_ext($1.name);
                     }
-		|	K_PRAGMA any_identifier ';'
-		    {
-			if (pg_strcasecmp($2, "autonomous_transaction") == 0)
-#ifndef ENABLE_MULTIPLE_NODES			
-				last_pragma = true;
-#else			     
-
-				ereport(ERROR,
-		                	(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-		                         errmsg("autonomous transaction is not yet supported.")));
-#endif				
-			else
-				elog(ERROR, "invalid pragma");
-		    }
+                |   K_FUNCTION {u_sess->parser_cxt.is_procedure=false;} spec_proc
+                    {
+                        u_sess->plsql_cxt.procedure_start_line = GetLineNumber(u_sess->plsql_cxt.curr_compile_context->core_yy->scanbuf, @1);
+                        u_sess->plsql_cxt.plpgsql_yylloc = @1;
+                        u_sess->plsql_cxt.isCreateFunction = true;
+                        raw_parse_package_function($3);
+                        u_sess->plsql_cxt.isCreateFunction = false;
+                        u_sess->plsql_cxt.procedure_start_line = 0;
+                        u_sess->plsql_cxt.plpgsql_yylloc = 0;
+                    }
+                |   K_PROCEDURE {u_sess->parser_cxt.is_procedure=true;} spec_proc
+                    {
+                        u_sess->plsql_cxt.procedure_start_line = GetLineNumber(u_sess->plsql_cxt.curr_compile_context->core_yy->scanbuf, @1);
+                        u_sess->plsql_cxt.plpgsql_yylloc = plpgsql_yylloc;
+                        u_sess->plsql_cxt.isCreateFunction = true;
+                        raw_parse_package_function($3);
+                        u_sess->plsql_cxt.isCreateFunction = false;
+                        u_sess->plsql_cxt.procedure_start_line = 0;
+                        u_sess->plsql_cxt.plpgsql_yylloc = 0;
+                    }
+                |	K_PRAGMA any_identifier ';'
+                    {
+                        if (pg_strcasecmp($2, "autonomous_transaction") == 0) {
+                            u_sess->plsql_cxt.pragma_autonomous = true;
+                            if (u_sess->plsql_cxt.curr_compile_context->plpgsql_curr_compile !=NULL) {
+                                u_sess->plsql_cxt.curr_compile_context->plpgsql_curr_compile->is_autonomous = true;
+                            }
+                        }
+                        else {
+                            elog(errstate, "invalid pragma");
+                            u_sess->plsql_cxt.have_error = true;
+                        }
+                    }
+                |   K_PRAGMA any_identifier '(' any_identifier ',' error_code ')' ';'
+                    {
+                        if (pg_strcasecmp($2, "exception_init") == 0) {
+                            if (u_sess->attr.attr_sql.sql_compatibility == A_FORMAT) {
+                                plpgsql_set_variable($4, $6);
+                            }
+                        } else {
+                            elog(errstate, "invalid pragma.");
+                            u_sess->plsql_cxt.have_error = true;
+                        }
+                    }
                 ;
+
+error_code       : ICONST
+                 {
+                    $$ = $1;
+                 }
+                 | '-' ICONST
+                 {
+                    $$ = -$2;
+                 }
+
+spec_proc        :
+                 {
+                     $$ = get_proc_str(yychar);
+                     yyclearin;
+                 }    
+
+init_proc        :
+                 {
+                     $$ = get_init_proc(yychar);
+                     yyclearin;
+                 }    
+
 
 record_attr_list : record_attr
                    {
@@ -756,13 +1493,23 @@ record_attr_list : record_attr
                     }
                  ;
 
-record_attr		: decl_varname decl_datatype decl_notnull decl_rec_defval
+record_attr		: attr_name decl_datatype decl_notnull decl_rec_defval
                   {
                         PLpgSQL_rec_attr	*attr = NULL;
+                        if($2->typoid == REFCURSOROID) {
+                            ereport(ERROR,
+                                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                                    errmodule(MOD_PLSQL),
+                                    errmsg("ref cursor type nested by record is not supported yet."),
+                                    errdetail("Define record type of ref cursor type is not supported yet."),
+                                    errcause("feature not supported"),
+                                    erraction("check define of record type")));
+                            u_sess->plsql_cxt.have_error = true;
+                        }
 
                         attr = (PLpgSQL_rec_attr*)palloc0(sizeof(PLpgSQL_rec_attr));
 
-                        attr->attrname = $1.name;
+                        attr->attrname = $1;
                         attr->type = $2;
 
                         attr->notnull = $3;
@@ -770,21 +1517,167 @@ record_attr		: decl_varname decl_datatype decl_notnull decl_rec_defval
                         {
                             if (attr->type->ttype == PLPGSQL_TTYPE_SCALAR)
                                 attr->defaultvalue = $4;
-                            else
-                                ereport(ERROR,
+                            else {
+                                const char* message = "default value for row or record variable is not supported";
+                                InsertErrorMessage(message, plpgsql_yylloc);
+                                ereport(errstate,
                                         (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
                                          errmsg("default value for row or record variable is not supported"),
                                          parser_errposition(@3)));
+                            }
                         }
 
-                        if ($3 && $4 == NULL)
-                            ereport(ERROR,
+                        if ($3 && $4 == NULL) {
+                            const char* message = "variables must have default value";
+                            InsertErrorMessage(message, plpgsql_yylloc);
+                            ereport(errstate,
                                 (errcode(ERRCODE_SYNTAX_ERROR),
                                 errmsg("variables declared as NOT NULL must have "
                                 "a default value.")));
+                        }
 
                         $$ = attr;
                     }
+			| attr_name record_var decl_notnull decl_rec_defval
+                  {
+#ifdef ENABLE_MULTIPLE_NODES
+                        ereport(errstate,
+                            (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                                errmodule(MOD_PLSQL),
+                                errmsg("array or record type nesting is not supported in distributed database yet."),
+                                errdetail("Define a record type of record is not supported in distributed database yet."),
+                                errcause("feature not supported"),
+                                erraction("check define of record type")));
+                        u_sess->plsql_cxt.have_error = true;
+#endif
+                        if (IS_ANONYMOUS_BLOCK) {
+                            ereport(errstate,
+                                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                                    errmodule(MOD_PLSQL),
+                                    errmsg("array or record type nesting is not supported in anonymous block yet."),
+                                    errdetail("Define a record type of record is not supported yet."),
+                                    errcause("feature not supported"),
+                                    erraction("check define of record type")));
+                            u_sess->plsql_cxt.have_error = true;
+                        }
+
+                        PLpgSQL_rec_attr	*attr = NULL;
+
+                        attr = (PLpgSQL_rec_attr*)palloc0(sizeof(PLpgSQL_rec_attr));
+
+                        attr->attrname = $1;
+                        attr->type = build_type_from_record_var($2);
+
+                        attr->notnull = $3;
+                        if ($4 != NULL)
+                        {
+                            if (attr->type->ttype == PLPGSQL_TTYPE_SCALAR)
+                                attr->defaultvalue = $4;
+                            else {
+                                ereport(errstate,
+                                        (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                                         errmsg("default value for row or record variable is not supported"),
+                                         parser_errposition(@3)));
+                                u_sess->plsql_cxt.have_error = true;
+                            }
+                        }
+
+                        if ($3 && $4 == NULL) {
+                            ereport(errstate,
+                                (errcode(ERRCODE_SYNTAX_ERROR),
+                                errmsg("variables declared as NOT NULL must have "
+                                "a default value.")));
+                            u_sess->plsql_cxt.have_error = true;
+                        }
+
+                        $$ = attr;
+                    }
+			| attr_name T_REFCURSOR decl_notnull decl_rec_defval
+                  {
+                        ereport(errstate,
+                            (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                                errmodule(MOD_PLSQL),
+                                errmsg("ref cursor type nested by record is not supported yet."),
+                                errdetail("Define a record type of ref cursor type is not supported yet."),
+                                errcause("feature not supported"),
+                                erraction("check define of record type")));
+                        u_sess->plsql_cxt.have_error = true;
+                  }
+            | attr_name varray_var decl_notnull decl_rec_defval
+                  {
+                        PLpgSQL_rec_attr        *attr = NULL;
+
+                        attr = (PLpgSQL_rec_attr*)palloc0(sizeof(PLpgSQL_rec_attr));
+
+                        attr->attrname = $1;
+
+                        PLpgSQL_type *var_type = ((PLpgSQL_var *)u_sess->plsql_cxt.curr_compile_context->plpgsql_Datums[$2])->datatype;
+                        PLpgSQL_type *new_var_type = build_array_type_from_elemtype(var_type);
+                        new_var_type->collectionType = var_type->collectionType;
+                        new_var_type->tableOfIndexType = var_type->tableOfIndexType;
+                        attr->type = new_var_type;
+                        attr->notnull = $3;
+                        if ($4 != NULL)
+                        {
+                            if (attr->type->ttype == PLPGSQL_TTYPE_SCALAR)
+                                attr->defaultvalue = $4;
+                            else {
+                                ereport(errstate,
+                                        (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                                         errmsg("default value for row or record variable is not supported"),
+                                         parser_errposition(@3)));
+                                u_sess->plsql_cxt.have_error = true;
+                            }
+                        }
+
+                        if ($3 && $4 == NULL) {
+                            ereport(errstate,
+                                (errcode(ERRCODE_SYNTAX_ERROR),
+                                errmsg("variables declared as NOT NULL must have "
+                                "a default value.")));
+                            u_sess->plsql_cxt.have_error = true;
+                        }
+
+                        $$ = attr;
+                    }
+                        | attr_name table_var decl_notnull decl_rec_defval
+                  {
+                        PLpgSQL_rec_attr        *attr = NULL;
+
+                        attr = (PLpgSQL_rec_attr*)palloc0(sizeof(PLpgSQL_rec_attr));
+
+                        attr->attrname = $1;
+
+                        PLpgSQL_type *var_type = ((PLpgSQL_var *)u_sess->plsql_cxt.curr_compile_context->plpgsql_Datums[$2])->datatype;
+                        PLpgSQL_type *new_var_type = build_array_type_from_elemtype(var_type);
+                        new_var_type->collectionType = var_type->collectionType;
+                        new_var_type->tableOfIndexType = var_type->tableOfIndexType;
+                        attr->type = new_var_type;
+                        attr->notnull = $3;
+                        if ($4 != NULL)
+                        {
+                            if (attr->type->ttype == PLPGSQL_TTYPE_SCALAR)
+                                attr->defaultvalue = $4;
+                            else {
+                                ereport(errstate,
+                                        (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                                         errmsg("default value for row or record variable is not supported"),
+                                         parser_errposition(@3)));
+                                u_sess->plsql_cxt.have_error = true;
+                            }
+                        }
+
+                        if ($3 && $4 == NULL) {
+                            ereport(errstate,
+                                (errcode(ERRCODE_SYNTAX_ERROR),
+                                errmsg("variables declared as NOT NULL must have "
+                                "a default value.")));
+                            u_sess->plsql_cxt.have_error = true;
+                        }
+
+                        $$ = attr;
+                    }
+
                 ;
 
 opt_scrollable :
@@ -831,7 +1724,8 @@ decl_cursor_args :
                         newp->nfields = list_length($2);
                         newp->fieldnames = (char **)palloc(newp->nfields * sizeof(char *));
                         newp->varnos = (int *)palloc(newp->nfields * sizeof(int));
-
+                        newp->isImplicit = true;
+                        newp->addNamespace = false;
                         i = 0;
                         foreach (l, $2)
                         {
@@ -880,12 +1774,15 @@ decl_aliasitem	: T_WORD
                         nsi = plpgsql_ns_lookup(plpgsql_ns_top(), false,
                                                 $1.ident, NULL, NULL,
                                                 NULL);
-                        if (nsi == NULL)
-                            ereport(ERROR,
+                        if (nsi == NULL) {
+                            const char* message = "variables not exists";
+                            InsertErrorMessage(message, plpgsql_yylloc);
+                            ereport(errstate,
                                     (errcode(ERRCODE_UNDEFINED_OBJECT),
                                      errmsg("variable \"%s\" does not exist",
                                             $1.ident),
                                      parser_errposition(@1)));
+                        }
                         $$ = nsi;
                     }
                 | T_CWORD
@@ -906,12 +1803,20 @@ decl_aliasitem	: T_WORD
                                                     NULL);
                         else
                             nsi = NULL;
-                        if (nsi == NULL)
-                            ereport(ERROR,
-                                    (errcode(ERRCODE_UNDEFINED_OBJECT),
-                                     errmsg("variable \"%s\" does not exist",
-                                            NameListToString($1.idents)),
-                                     parser_errposition(@1)));
+                        if (nsi == NULL) {
+                            int yylloc_bak = yylloc;
+                            int isPkg =plpgsql_pkg_adddatum2ns($1.idents);
+                            yylloc = yylloc_bak;
+                            if (isPkg < 0) {
+                                const char* message = "variables not exists";
+                                InsertErrorMessage(message, plpgsql_yylloc);
+                                ereport(errstate,
+                                        (errcode(ERRCODE_UNDEFINED_OBJECT),
+                                         errmsg("variable \"%s\" does not exist",
+                                                NameListToString($1.idents)),
+                                         parser_errposition(@1)));
+                            }
+                        }
                         $$ = nsi;
                     }
                 ;
@@ -945,6 +1850,72 @@ decl_varname	: T_WORD
                                               NULL) != NULL)
                             yyerror("duplicate declaration");
                     }
+                | T_VARRAY
+                    {
+                        $$.name = pstrdup($1.ident);
+                        $$.lineno = plpgsql_location_to_lineno(@1);
+                        if (plpgsql_ns_lookup(plpgsql_ns_top(), true,
+                                              $1.ident, NULL, NULL,
+                                              NULL) != NULL)
+                            yyerror("duplicate declaration");
+
+                    }
+                | T_RECORD
+                    {
+                        $$.name = pstrdup($1.ident);
+                        $$.lineno = plpgsql_location_to_lineno(@1);
+                        if (plpgsql_ns_lookup(plpgsql_ns_top(), true,
+                                              $1.ident, NULL, NULL,
+                                              NULL) != NULL)
+                            yyerror("duplicate declaration");
+
+                    }
+                | T_TABLE
+                    {
+                        $$.name = pstrdup($1.ident);
+                        $$.lineno = plpgsql_location_to_lineno(@1);
+                        if (plpgsql_ns_lookup(plpgsql_ns_top(), true,
+                                              $1.ident, NULL, NULL,
+                                              NULL) != NULL)
+                            yyerror("duplicate declaration");
+
+                    }
+                | T_REFCURSOR
+                    {
+                        $$.name = pstrdup($1.ident);
+                        $$.lineno = plpgsql_location_to_lineno(@1);
+                        if (plpgsql_ns_lookup(plpgsql_ns_top(), true,
+                                              $1.ident, NULL, NULL,
+                                              NULL) != NULL)
+                            yyerror("duplicate declaration");
+
+                    }
+                | T_TABLE_VAR
+                    {
+                        if ($1.idents != NIL) {
+                            yyerror("syntax error");
+                        }
+                        $$.name = pstrdup($1.ident);
+                        $$.lineno = plpgsql_location_to_lineno(@1);
+                        if (plpgsql_ns_lookup(plpgsql_ns_top(), true,
+                                              $1.ident, NULL, NULL,
+                                              NULL) != NULL)
+                            yyerror("duplicate declaration");
+
+                    }
+                | T_VARRAY_VAR
+                    {
+                        if ($1.idents != NIL || strcmp($1.ident, "bulk_exceptions") == 0) {
+                            yyerror("syntax error");
+                        }
+                        $$.name = pstrdup($1.ident);
+                        $$.lineno = plpgsql_location_to_lineno(@1);
+                        if (plpgsql_ns_lookup(plpgsql_ns_top(), true,
+                                              $1.ident, NULL, NULL,
+                                              NULL) != NULL)
+                            yyerror("duplicate declaration");
+
+                    }
                 ;
 
 decl_const		:
@@ -959,6 +1930,7 @@ decl_datatype	:
                          * If there's a lookahead token, read_datatype
                          * should consume it.
                          */
+                        u_sess->plsql_cxt.plpgsql_yylloc = plpgsql_yylloc;
                         $$ = read_datatype(yychar);
                         yyclearin;
                     }
@@ -1055,6 +2027,8 @@ proc_stmt		: pl_block ';'
                         { $$ = $1; }
                 | label_stmts
                         { $$ = $1; }
+                | stmt_savepoint
+                        { $$ = $1; }
                 ;
 
 
@@ -1064,7 +2038,7 @@ goto_block_label	:
                     }
                 | LESS_LESS any_identifier GREATER_GREATER
                     {
-                        plpgsql_ns_push($2);
+                        plpgsql_ns_additem(PLPGSQL_NSTYPE_GOTO_LABEL, 0, "");
                         $$ = $2;
                     }
                 ;
@@ -1114,14 +2088,25 @@ label_stmt		: stmt_assign
                         { $$ = $1; }
                 ;
 
-stmt_perform	: K_PERFORM expr_until_semi
+stmt_perform	: K_PERFORM {
+#ifndef ENABLE_MULTIPLE_NODES
+                        if (enable_out_param_override()) {
+                            const char* message = "not support perform when behavior_compat_options=\"proc_outparam_override\"";
+                            InsertErrorMessage(message, plpgsql_yylloc);
+                            ereport(errstate,
+                                    (errcode(ERRCODE_SYNTAX_ERROR),
+                                     errmsg("not support perform when behavior_compat_options=\"proc_outparam_override\""),
+                                     parser_errposition(@1)));
+                        }
+#endif
+                    } expr_until_semi
                     {
                         PLpgSQL_stmt_perform *newp;
-
                         newp = (PLpgSQL_stmt_perform *)palloc0(sizeof(PLpgSQL_stmt_perform));
                         newp->cmd_type = PLPGSQL_STMT_PERFORM;
                         newp->lineno   = plpgsql_location_to_lineno(@1);
-                        newp->expr  = $2;
+                        newp->expr  = $3;
+                        newp->sqlString = plpgsql_get_curline_query();
 
                         $$ = (PLpgSQL_stmt *)newp;
                     }
@@ -1136,9 +2121,14 @@ stmt_assign		: assign_var assign_operator expr_until_semi
                         newp->lineno   = plpgsql_location_to_lineno(@1);
                         newp->varno = $1;
                         newp->expr  = $3;
+                        newp->sqlString = plpgsql_get_curline_query();
 
                         $$ = (PLpgSQL_stmt *)newp;
                     }
+                | T_CWORD assign_operator expr_until_semi
+                  {
+                        cword_is_not_variable(&($1), @1);
+                  }
                 ;
 
 stmt_getdiag	: K_GET getdiag_area_opt K_DIAGNOSTICS getdiag_list ';'
@@ -1151,6 +2141,7 @@ stmt_getdiag	: K_GET getdiag_area_opt K_DIAGNOSTICS getdiag_list ';'
                         newp->lineno   = plpgsql_location_to_lineno(@1);
                         newp->is_stacked = $2;
                         newp->diag_items = $4;
+                        newp->sqlString = plpgsql_get_curline_query();
 
                         /*
                          * Check information items are valid for area option.
@@ -1164,12 +2155,15 @@ stmt_getdiag	: K_GET getdiag_area_opt K_DIAGNOSTICS getdiag_list ';'
                                 /* these fields are disallowed in stacked case */
                                 case PLPGSQL_GETDIAG_ROW_COUNT:
                                 case PLPGSQL_GETDIAG_RESULT_OID:
-                                    if (newp->is_stacked)
-                                        ereport(ERROR,
+                                    if (newp->is_stacked) {
+                                        const char* message = "diagnostics item is not allowed in GET STACKED DIAGNOSTICS";
+                                        InsertErrorMessage(message, plpgsql_yylloc);
+                                        ereport(errstate,
                                                 (errcode(ERRCODE_SYNTAX_ERROR),
                                                  errmsg("diagnostics item %s is not allowed in GET STACKED DIAGNOSTICS",
                                                         plpgsql_getdiag_kindname(ditem->kind)),
                                                  parser_errposition(@1)));
+                                    }
                                     break;
                                 /* these fields are disallowed in current case */
                                 case PLPGSQL_GETDIAG_ERROR_CONTEXT:
@@ -1177,15 +2171,20 @@ stmt_getdiag	: K_GET getdiag_area_opt K_DIAGNOSTICS getdiag_list ';'
                                 case PLPGSQL_GETDIAG_ERROR_HINT:
                                 case PLPGSQL_GETDIAG_RETURNED_SQLSTATE:
                                 case PLPGSQL_GETDIAG_MESSAGE_TEXT:
-                                    if (!newp->is_stacked)
-                                        ereport(ERROR,
+                                    if (!newp->is_stacked) {
+                                        const char* message = "diagnostics item is not allowed in GET CURRENT DIAGNOSTICS";
+                                        InsertErrorMessage(message, plpgsql_yylloc);
+                                        ereport(errstate,
                                                 (errcode(ERRCODE_SYNTAX_ERROR),
                                                  errmsg("diagnostics item %s is not allowed in GET CURRENT DIAGNOSTICS",
                                                         plpgsql_getdiag_kindname(ditem->kind)),
                                                  parser_errposition(@1)));
+                                    }
                                     break;
                                 default:
-                                    elog(ERROR, "unrecognized diagnostic item kind: %d",
+                                    const char* message = "unrecognized diagnostic item kind";
+                                    InsertErrorMessage(message, plpgsql_yylloc);
+                                    elog(errstate, "unrecognized diagnostic item kind: %d",
                                          ditem->kind);
                                     break;
                             }
@@ -1265,13 +2264,16 @@ getdiag_target	: T_DATUM
                     {
                         check_assignable($1.datum, @1);
                         if ($1.datum->dtype == PLPGSQL_DTYPE_ROW ||
-                            $1.datum->dtype == PLPGSQL_DTYPE_REC)
-                            ereport(ERROR,
+                            $1.datum->dtype == PLPGSQL_DTYPE_REC) {
+                            const char* message = "not a scalar variable";
+                            InsertErrorMessage(message, plpgsql_yylloc);
+                            ereport(errstate,
                                     (errcode(ERRCODE_SYNTAX_ERROR),
                                      errmsg("\"%s\" is not a scalar variable",
                                             NameOfDatum(&($1))),
                                      parser_errposition(@1)));
-                        $$ = $1.datum->dno;
+                        }
+                        $$ = $1.dno;
                     }
                 | T_WORD
                     {
@@ -1285,63 +2287,215 @@ getdiag_target	: T_DATUM
                     }
                 ;
 
+table_var		: T_TABLE
+                    {
+                        $$ = $1.dno;
+                        AddNamespaceIfNeed($1.dno, $1.ident);
+                    }
+                ;
+
 varray_var		: T_VARRAY
                     {
-                        $$ = $1.datum->dno;
+                        $$ = $1.dno;
+                        AddNamespaceIfNeed($1.dno, $1.ident);
                     }
                 ;
 
 record_var		: T_RECORD
                     {
-                        $$ = $1.datum->dno;
+                        $$ = $1.dno;
+                        AddNamespaceIfNeed($1.dno, $1.ident);
                     }
                 ;
 
-assign_var		: T_DATUM
+assign_var
+                : T_RECORD assign_list
                     {
                         check_assignable($1.datum, @1);
-                        $$ = $1.datum->dno;
+                        if ($2 == NIL) {
+                            $$ = $1.dno;
+                        } else {
+                            if(IsA((Node*)linitial($2), A_Indices) && list_length($2) == 1) {
+                                PLpgSQL_arrayelem       *newp;
+
+                                newp = (PLpgSQL_arrayelem *)palloc0(sizeof(PLpgSQL_arrayelem));
+                                newp->dtype             = PLPGSQL_DTYPE_ARRAYELEM;
+                                newp->subscript = (PLpgSQL_expr*)(((A_Indices*)linitial($2))->uidx);
+                                newp->arrayparentno = $1.dno;
+                                /* initialize cached type data to "not valid" */
+                                newp->parenttypoid = InvalidOid;
+                                newp->assignattrno = -1;
+                                plpgsql_adddatum((PLpgSQL_datum *) newp);
+
+                                $$ = newp->dno;
+                            } else {
+                                PLpgSQL_assignlist       *newp;
+                                newp = (PLpgSQL_assignlist *)palloc0(sizeof(PLpgSQL_assignlist));
+                                newp->dtype             = PLPGSQL_DTYPE_ASSIGNLIST;
+                                newp->assignlist = $2;
+                                newp->targetno = $1.dno;
+                                plpgsql_adddatum((PLpgSQL_datum *) newp);
+                                $$ = newp->dno;
+                            }
+                        }
+
                     }
-                | T_RECORD
+                | T_VARRAY_VAR assign_list
                     {
                         check_assignable($1.datum, @1);
-                        $$ = $1.datum->dno;
+                        if ($2 == NIL) {
+                            $$ = $1.dno;
+                        } else {
+                            if(IsA((Node*)linitial($2), A_Indices) && list_length($2) == 1) {
+                                PLpgSQL_arrayelem       *newp;
+
+                                newp = (PLpgSQL_arrayelem *)palloc0(sizeof(PLpgSQL_arrayelem));
+                                newp->dtype             = PLPGSQL_DTYPE_ARRAYELEM;
+                                newp->subscript = (PLpgSQL_expr*)(((A_Indices*)linitial($2))->uidx);
+                                newp->arrayparentno = $1.dno;
+                                /* initialize cached type data to "not valid" */
+                                newp->parenttypoid = InvalidOid;
+                                newp->assignattrno = -1;
+                                plpgsql_adddatum((PLpgSQL_datum *) newp);
+
+                                $$ = newp->dno;
+                            } else {
+                                PLpgSQL_assignlist       *newp;
+                                newp = (PLpgSQL_assignlist *)palloc0(sizeof(PLpgSQL_assignlist));
+                                newp->dtype             = PLPGSQL_DTYPE_ASSIGNLIST;
+                                newp->assignlist = $2;
+                                newp->targetno = $1.dno;
+                                plpgsql_adddatum((PLpgSQL_datum *) newp);
+                                $$ = newp->dno;
+                            }
+                        }
+
                     }
-                | T_VARRAY_VAR
+                | T_TABLE_VAR assign_list
                     {
                         check_assignable($1.datum, @1);
-                        $$ = $1.datum->dno;
+                        if ($1.datum->dtype == PLPGSQL_DTYPE_VAR) {
+                            check_autonomous_nest_tablevar((PLpgSQL_var*)$1.datum);
+                        }
+                        if ($2 == NIL) {
+                            $$ = $1.dno;
+                        } else {
+                            if(IsA((Node*)linitial($2), A_Indices) && list_length($2) == 1) {
+                                PLpgSQL_tableelem       *newp;
+                                newp = (PLpgSQL_tableelem *)palloc0(sizeof(PLpgSQL_tableelem));
+                                newp->dtype = PLPGSQL_DTYPE_TABLEELEM;
+                                newp->subscript = (PLpgSQL_expr*)(((A_Indices*)linitial($2))->uidx);
+                                newp->tableparentno = $1.dno;
+                                /* initialize cached type data to "not valid" */
+                                newp->tabletypoid = InvalidOid;
+                                newp->assignattrno = -1;
+                                plpgsql_adddatum((PLpgSQL_datum *) newp);
+                                $$ = newp->dno;
+                            } else {
+                                PLpgSQL_assignlist       *newp;
+                                newp = (PLpgSQL_assignlist *)palloc0(sizeof(PLpgSQL_assignlist));
+                                newp->dtype             = PLPGSQL_DTYPE_ASSIGNLIST;
+                                newp->assignlist = $2;
+                                newp->targetno = $1.dno;
+                                plpgsql_adddatum((PLpgSQL_datum *) newp);
+                                $$ = newp->dno;
+                            }
+                        }
+
                     }
-                | assign_var '[' expr_until_rightbracket
+                | T_DATUM  assign_list
                     {
-                        PLpgSQL_arrayelem	*newp;
+                        check_assignable($1.datum, @1);
+                        if ($2 == NIL) {
+                            check_record_nest_tableof_index($1.datum);
+                            $$ = $1.dno;
+                        } else {
+                            if(IsA((Node*)linitial($2), A_Indices) && list_length($2) == 1) {
+                                PLpgSQL_datum* target = u_sess->plsql_cxt.curr_compile_context->plpgsql_Datums[$1.dno];
+                                if (target->dtype == PLPGSQL_DTYPE_VAR &&
+                                    ((PLpgSQL_var*)target)->datatype->collectionType == PLPGSQL_COLLECTION_TABLE) {
+                                    PLpgSQL_tableelem       *newp;
+                                    newp = (PLpgSQL_tableelem *)palloc0(sizeof(PLpgSQL_tableelem));
+                                    newp->dtype             = PLPGSQL_DTYPE_TABLEELEM;
+                                    newp->subscript = (PLpgSQL_expr*)(((A_Indices*)linitial($2))->uidx);
+                                    newp->tableparentno = $1.dno;
+                                    /* initialize cached type data to "not valid" */
+                                    newp->tabletypoid = InvalidOid;
+                                    newp->assignattrno = -1;
+                                    plpgsql_adddatum((PLpgSQL_datum *) newp);
 
-                        newp = (PLpgSQL_arrayelem *)palloc0(sizeof(PLpgSQL_arrayelem));
-                        newp->dtype		= PLPGSQL_DTYPE_ARRAYELEM;
-                        newp->subscript	= $3;
-                        newp->arrayparentno = $1;
-                        /* initialize cached type data to "not valid" */
-                        newp->parenttypoid = InvalidOid;
+                                    $$ = newp->dno; 
+                                } else {
+								    PLpgSQL_arrayelem	*newp;
 
-                        plpgsql_adddatum((PLpgSQL_datum *) newp);
+                                    newp = (PLpgSQL_arrayelem *)palloc0(sizeof(PLpgSQL_arrayelem));
+                                    newp->dtype		= PLPGSQL_DTYPE_ARRAYELEM;
+                                    newp->subscript	= (PLpgSQL_expr*)(((A_Indices*)linitial($2))->uidx);
+                                    newp->arrayparentno = $1.dno;
+                                    /* initialize cached type data to "not valid" */
+                                    newp->parenttypoid = InvalidOid;
+                                    newp->assignattrno = -1;
+                                    plpgsql_adddatum((PLpgSQL_datum *) newp);
 
-                        $$ = newp->dno;
+                                    $$ = newp->dno;
+                                }
+                            } else {
+                                PLpgSQL_assignlist	*newp;
+                                newp = (PLpgSQL_assignlist *)palloc0(sizeof(PLpgSQL_assignlist));
+                                newp->dtype		= PLPGSQL_DTYPE_ASSIGNLIST;
+                                newp->targetno = $1.dno;
+                                newp->assignlist = $2;
+                                plpgsql_adddatum((PLpgSQL_datum *) newp);
+                                $$ = newp->dno;
+                            }
+                        }
                     }
-
-                | assign_var '(' expr_until_parenthesis
+                | T_PACKAGE_VARIABLE assign_list
+                  {
+                        check_assignable($1.datum, @1);
+                        if ($2 != NIL) {
+                            PLpgSQL_assignlist	*newptr;
+                            newptr = (PLpgSQL_assignlist *)palloc0(sizeof(PLpgSQL_assignlist));
+                            newptr->dtype		= PLPGSQL_DTYPE_ASSIGNLIST;
+                            newptr->targetno = $1.dno;
+                            newptr->assignlist = $2;
+                            plpgsql_adddatum((PLpgSQL_datum *) newptr);
+                            $$ = newptr->dno;
+                        } else {
+                            check_record_nest_tableof_index($1.datum);
+                            $$ = $1.dno;
+                        }
+                  }
+                ;
+assign_list     : /*EMPTY*/                             {$$ = NIL; }
+                | assign_list assign_el                 {$$ = lappend($1, $2);}
+                ;
+assign_el      : '.' attr_name
                     {
-                        PLpgSQL_arrayelem	*newp;
-                        newp = (PLpgSQL_arrayelem *)palloc0(sizeof(PLpgSQL_arrayelem));
-                        newp->dtype		= PLPGSQL_DTYPE_ARRAYELEM;
-                        newp->subscript	= $3;
-                        newp->arrayparentno = $1;
-                        /* initialize cached type data to "not valid" */
-                        newp->parenttypoid = InvalidOid;
-                        plpgsql_adddatum((PLpgSQL_datum *)newp);
-                        $$ = newp->dno;
+                        $$ = (Node *) makeString($2);
+                    } 
+               | '(' expr_until_parenthesis
+                    {
+                        A_Indices *ai = makeNode(A_Indices);
+                        ai->lidx = NULL;
+                        ai->uidx = (Node *)$2;
+                        $$ = (Node *)ai;
+                    }
+                | '[' expr_until_rightbracket
+                    {
+                        A_Indices *ai = makeNode(A_Indices);
+                        ai->lidx = NULL;
+                        ai->uidx = (Node *)$2;
+                        $$ = (Node *)ai;
                     }
                 ;
-
+attr_name
+                :  
+                    {
+                        $$ = get_attrname(yychar);
+                        yyclearin;
+                    }
+	        ;
 stmt_goto		: K_GOTO label_name
                     {
                         PLpgSQL_stmt_goto *newp;
@@ -1350,6 +2504,7 @@ stmt_goto		: K_GOTO label_name
                         newp->cmd_type  = PLPGSQL_STMT_GOTO;
                         newp->lineno = plpgsql_location_to_lineno(@1);
                         newp->label = $2;
+                        newp->sqlString = plpgsql_get_curline_query();
 
                         $$ = (PLpgSQL_stmt *)newp;
                     }
@@ -1371,6 +2526,7 @@ stmt_if			: K_IF expr_until_then proc_sect stmt_elsifs stmt_else K_END K_IF ';'
                         newp->then_body	= $3;
                         newp->elsif_list = $4;
                         newp->else_body  = $5;
+                        newp->sqlString = plpgsql_get_curline_query();
 
                         $$ = (PLpgSQL_stmt *)newp;
                     }
@@ -1441,6 +2597,7 @@ case_when		: K_WHEN expr_until_then proc_sect
                         newp->lineno	= plpgsql_location_to_lineno(@1);
                         newp->expr	= $2;
                         newp->stmts	= $3;
+                        newp->sqlString = plpgsql_get_curline_query();
                         $$ = newp;
                     }
                 ;
@@ -1473,6 +2630,7 @@ stmt_loop		: opt_block_label K_LOOP loop_body
                         newp->lineno   = plpgsql_location_to_lineno(@2);
                         newp->label	  = $1;
                         newp->body	  = $3.stmts;
+                        newp->sqlString = plpgsql_get_curline_query();
 
                         check_labels($1, $3.end_label, $3.end_label_location);
                         plpgsql_ns_pop();
@@ -1494,6 +2652,7 @@ stmt_while		: opt_block_label K_WHILE expr_until_loop loop_body
                         newp->label	  = $1;
                         newp->cond	  = $3;
                         newp->body	  = $4.stmts;
+                        newp->sqlString = plpgsql_get_curline_query();
 
                         check_labels($1, $4.end_label, $4.end_label_location);
                         plpgsql_ns_pop();
@@ -1516,6 +2675,7 @@ stmt_for		: opt_block_label K_FOR for_control loop_body
                             newp->lineno   = plpgsql_location_to_lineno(@2);
                             newp->label	  = $1;
                             newp->body	  = $4.stmts;
+                            newp->sqlString = plpgsql_get_curline_query();
                             $$ = (PLpgSQL_stmt *) newp;
 
                             /* register the stmt if it is labeled */
@@ -1535,6 +2695,7 @@ stmt_for		: opt_block_label K_FOR for_control loop_body
                             newp->lineno   = plpgsql_location_to_lineno(@2);
                             newp->label	  = $1;
                             newp->body	  = $4.stmts;
+                            newp->sqlString = plpgsql_get_curline_query();
                             $$ = (PLpgSQL_stmt *) newp;
 
                             /* register the stmt if it is labeled */
@@ -1545,7 +2706,7 @@ stmt_for		: opt_block_label K_FOR for_control loop_body
                         /* close namespace started in opt_block_label */
                         plpgsql_ns_pop();
                     }
-                | opt_block_label K_FORALL forall_control forall_body
+                | opt_block_label K_FORALL forall_control opt_save_exceptions forall_body
                     {
                         /* This runs after we've scanned the loop body */
                         /* A db FORALL support 3 types like below. We implemented the first one.  
@@ -1559,15 +2720,20 @@ stmt_for		: opt_block_label K_FOR for_control loop_body
                             PLpgSQL_stmt_fori		*newm;
 
                             newm = (PLpgSQL_stmt_fori *) $3;
+                            newm->lineno   = plpgsql_location_to_lineno(@2);
                             newm->label	  = NULL;
-                            newm->body	  = $4;
+                            newm->save_exceptions = $4;
+                            newm->body	  = $5;
+                            newm->sqlString = plpgsql_get_curline_query();
                             $$ = (PLpgSQL_stmt *) newm;
                         }
-                        else
-                            ereport(ERROR,
+                        else {
+                            const char* message = "please use \'FORALL index_name IN lower_bound .. upper_bound\'";
+                            InsertErrorMessage(message, plpgsql_yylloc);
+                            ereport(errstate,
                                     (errcode(ERRCODE_SYNTAX_ERROR),
                                      errmsg("please use \'FORALL index_name IN lower_bound .. upper_bound\'")));
-
+                        }
                         /* close namespace started in opt_block_label */
                         plpgsql_ns_pop();
                     }
@@ -1577,7 +2743,6 @@ for_control		: for_variable K_IN
                     {
                         int			tok = yylex();
                         int			tokloc = yylloc;
-
                         if (tok == K_EXECUTE)
                         {
                             /* EXECUTE means it's a dynamic FOR loop */
@@ -1604,17 +2769,20 @@ for_control		: for_variable K_IN
                             else if ($1.scalar)
                             {
                                 /* convert single scalar to list */
-                                newp->row = make_scalar_list1($1.name, $1.scalar,
+                                newp->row = make_scalar_list1($1.name, $1.scalar, $1.dno,
                                                              $1.lineno, @1);
                                 /* no need for check_assignable */
                             }
                             else
                             {
-                                ereport(ERROR,
+                                const char* message = "loop variable of loop over rows must be a record or row variable or list of scalar variables";
+                                InsertErrorMessage(message, plpgsql_yylloc);
+                                ereport(errstate,
                                         (errcode(ERRCODE_DATATYPE_MISMATCH),
                                          errmsg("loop variable of loop over rows must be a record or row variable or list of scalar variables"),
                                          parser_errposition(@1)));
                             }
+
                             newp->query = expr;
 
                             if (term == K_USING)
@@ -1630,7 +2798,7 @@ for_control		: for_variable K_IN
 
                             $$ = (PLpgSQL_stmt *) newp;
                         }
-                        else if (tok == T_DATUM &&
+                        else if ((tok == T_DATUM || tok == T_PACKAGE_VARIABLE) &&
                                  yylval.wdatum.datum->dtype == PLPGSQL_DTYPE_VAR &&
                                  ((PLpgSQL_var *) yylval.wdatum.datum)->datatype->typoid == REFCURSOROID)
                         {
@@ -1640,21 +2808,27 @@ for_control		: for_variable K_IN
 
                             newp = (PLpgSQL_stmt_forc *) palloc0(sizeof(PLpgSQL_stmt_forc));
                             newp->cmd_type = PLPGSQL_STMT_FORC;
-                            newp->curvar = cursor->dno;
+                            newp->curvar = yylval.wdatum.dno;
 
                             /* Should have had a single variable name */
-                            if ($1.scalar && $1.row)
-                                ereport(ERROR,
+                            if ($1.scalar && $1.row) {
+                                const char* message = "cursor FOR loop must have only one target variable";
+                                InsertErrorMessage(message, plpgsql_yylloc);
+                                ereport(errstate,
                                         (errcode(ERRCODE_SYNTAX_ERROR),
                                          errmsg("cursor FOR loop must have only one target variable"),
                                          parser_errposition(@1)));
+                            }
 
                             /* can't use an unbound cursor this way */
-                            if (cursor->cursor_explicit_expr == NULL)
-                                ereport(ERROR,
+                            if (cursor->cursor_explicit_expr == NULL) {
+                                const char* message = "cursor FOR loop must use a bound cursor variable";
+                                InsertErrorMessage(message, plpgsql_yylloc);
+                                ereport(errstate,
                                         (errcode(ERRCODE_SYNTAX_ERROR),
                                          errmsg("cursor FOR loop must use a bound cursor variable"),
                                          parser_errposition(tokloc)));
+                            }
 
                             /* collect cursor's parameters if any */
                             newp->argquery = read_cursor_args(cursor,
@@ -1734,11 +2908,14 @@ for_control		: for_variable K_IN
                                     expr_by = NULL;
 
                                 /* Should have had a single variable name */
-                                if ($1.scalar && $1.row)
-                                    ereport(ERROR,
+                                if ($1.scalar && $1.row) {
+                                    const char* message = "integer FOR loop must have only one target variable";
+                                    InsertErrorMessage(message, plpgsql_yylloc);
+                                    ereport(errstate,
                                             (errcode(ERRCODE_SYNTAX_ERROR),
                                              errmsg("integer FOR loop must have only one target variable"),
                                              parser_errposition(@1)));
+                                }
 
                                 /* create loop's private variable */
                                 fvar = (PLpgSQL_var *)
@@ -1770,11 +2947,14 @@ for_control		: for_variable K_IN
                                 char				*tmp_query;
                                 PLpgSQL_stmt_fors	*newp;
 
-                                if (reverse)
-                                    ereport(ERROR,
+                                if (reverse) {
+                                    const char* message = "cannot specify REVERSE in query FOR loop";
+                                    InsertErrorMessage(message, plpgsql_yylloc);
+                                    ereport(errstate,
                                             (errcode(ERRCODE_SYNTAX_ERROR),
                                              errmsg("cannot specify REVERSE in query FOR loop"),
                                              parser_errposition(tokloc)));
+                                }
 
                                 AssertEreport(strncmp(expr1->query, "SELECT ", 7) == 0,
                                                     MOD_PLSQL,
@@ -1782,44 +2962,112 @@ for_control		: for_variable K_IN
                                 tmp_query = pstrdup(expr1->query + 7);
                                 pfree_ext(expr1->query);
                                 expr1->query = tmp_query;
-
+                              
                                 check_sql_expr(expr1->query, expr1loc, 0);
-
                                 newp = (PLpgSQL_stmt_fors *)palloc0(sizeof(PLpgSQL_stmt_fors));
                                 newp->cmd_type = PLPGSQL_STMT_FORS;
                                 if ($1.rec)
                                 {
+#ifndef ENABLE_MULTIPLE_NODES
+                                    /* only A format and not in upgrade, IMPLICIT_FOR_LOOP_VARIABLE is valid */
+                                    if (u_sess->attr.attr_sql.sql_compatibility == A_FORMAT
+                                        && IMPLICIT_FOR_LOOP_VARIABLE
+                                        && u_sess->attr.attr_common.upgrade_mode == 0) {
+                                        BuildForQueryVariable(expr1, &newp->row, &newp->rec, $1.name, $1.lineno);
+                                        check_assignable((PLpgSQL_datum *)newp->rec ?
+                                            (PLpgSQL_datum *)newp->rec : (PLpgSQL_datum *)newp->row, @1);
+                                    } else {
+                                        /* check the sql */
+                                        if (u_sess->attr.attr_sql.sql_compatibility == A_FORMAT && ALLOW_PROCEDURE_COMPILE_CHECK) {
+                                            (void)getCursorTupleDesc(expr1, false, true);
+                                        }
+                                        newp->rec = $1.rec;
+                                        check_assignable((PLpgSQL_datum *) newp->rec, @1);
+                                    }
+#else
                                     newp->rec = $1.rec;
                                     check_assignable((PLpgSQL_datum *) newp->rec, @1);
+#endif
                                 }
                                 else if ($1.row)
                                 {
+#ifndef ENABLE_MULTIPLE_NODES
+                                    /* only A format and not in upgrade, IMPLICIT_FOR_LOOP_VARIABLE is valid */
+                                    if (u_sess->attr.attr_sql.sql_compatibility == A_FORMAT
+                                        && IMPLICIT_FOR_LOOP_VARIABLE
+                                        && u_sess->attr.attr_common.upgrade_mode == 0) {
+                                        BuildForQueryVariable(expr1, &newp->row, &newp->rec, $1.name, $1.lineno);
+                                        check_assignable((PLpgSQL_datum *)newp->rec ?
+                                            (PLpgSQL_datum *)newp->rec : (PLpgSQL_datum *)newp->row, @1);
+                                    } else {
+                                        /* check the sql */
+                                        if (u_sess->attr.attr_sql.sql_compatibility == A_FORMAT && ALLOW_PROCEDURE_COMPILE_CHECK) {
+                                            (void)getCursorTupleDesc(expr1, false, true);
+                                        }
+                                        newp->row = $1.row;
+                                        check_assignable((PLpgSQL_datum *) newp->row, @1);
+                                    }
+#else
                                     newp->row = $1.row;
                                     check_assignable((PLpgSQL_datum *) newp->row, @1);
+#endif
                                 }
                                 else if ($1.scalar)
                                 {
+#ifndef ENABLE_MULTIPLE_NODES
+                                    /* only A format and not in upgrade, IMPLICIT_FOR_LOOP_VARIABLE is valid */
+                                    if (u_sess->attr.attr_sql.sql_compatibility == A_FORMAT
+                                        && IMPLICIT_FOR_LOOP_VARIABLE
+                                        && u_sess->attr.attr_common.upgrade_mode == 0) {
+                                        BuildForQueryVariable(expr1, &newp->row, &newp->rec, $1.name, $1.lineno);
+                                        check_assignable((PLpgSQL_datum *)newp->rec ?
+                                            (PLpgSQL_datum *)newp->rec : (PLpgSQL_datum *)newp->row, @1);
+                                    } else {
+                                        /* check the sql */
+                                        if (u_sess->attr.attr_sql.sql_compatibility == A_FORMAT && ALLOW_PROCEDURE_COMPILE_CHECK) {
+                                            (void)getCursorTupleDesc(expr1, false, true);
+                                        }
+                                        /* convert single scalar to list */
+                                        newp->row = make_scalar_list1($1.name, $1.scalar, $1.dno, $1.lineno, @1);
+                                        /* no need for check_assignable */
+                                    }
+#else
                                     /* convert single scalar to list */
-                                    newp->row = make_scalar_list1($1.name, $1.scalar,
-                                                                 $1.lineno, @1);
+                                    newp->row = make_scalar_list1($1.name, $1.scalar, $1.dno, $1.lineno, @1);
                                     /* no need for check_assignable */
+#endif
                                 }
                                 else
                                 {
+#ifndef ENABLE_MULTIPLE_NODES
+                                    if (u_sess->attr.attr_sql.sql_compatibility == A_FORMAT && ALLOW_PROCEDURE_COMPILE_CHECK) {
+                                        BuildForQueryVariable(expr1, &newp->row, &newp->rec, $1.name, $1.lineno);
+                                        check_assignable((PLpgSQL_datum *)newp->rec ?
+                                            (PLpgSQL_datum *)newp->rec : (PLpgSQL_datum *)newp->row, @1);
+                                    } else {
+                                        PLpgSQL_type dtype;
+                                        dtype.ttype = PLPGSQL_TTYPE_REC;
+                                        newp->rec = (PLpgSQL_rec *)
+                                        plpgsql_build_variable($1.name,$1.lineno, &dtype, true);
+                                        check_assignable((PLpgSQL_datum *) newp->rec, @1);
+                                    }
+#else
                                     PLpgSQL_type dtype;
                                     dtype.ttype = PLPGSQL_TTYPE_REC;
                                     newp->rec = (PLpgSQL_rec *) 
-                                        plpgsql_build_variable($1.name,$1.lineno, &dtype, true);
+                                    plpgsql_build_variable($1.name,$1.lineno, &dtype, true);
                                     check_assignable((PLpgSQL_datum *) newp->rec, @1);
+#endif
                                 }
 
                                 newp->query = expr1;
+                                
                                 $$ = (PLpgSQL_stmt *) newp;
                             }
                         }
                     }
                 ;
-forall_control		:for_variable K_IN
+forall_control         :for_variable K_IN
                     {
                         int		tok;
                         int		expr1loc;
@@ -1854,11 +3102,12 @@ forall_control		:for_variable K_IN
                             check_sql_expr(expr1->query, expr1loc, 7);
 
                             /* Read and check the second one */
-                            expr2 = read_sql_construct5(K_MERGE,
+                            expr2 = read_sql_construct6(K_MERGE,
                                                         K_INSERT, 
                                                         K_SELECT,
                                                         K_UPDATE,
                                                         K_DELETE,
+                                                        K_SAVE,
                                                         "DML",
                                                         "SELECT ",
                                                         true,
@@ -1869,22 +3118,35 @@ forall_control		:for_variable K_IN
 
                             plpgsql_push_back_token(tok);
 
-                            if (';' == tok)
-                                ereport(ERROR,
+                            if (';' == tok) {
+                                const char* message = "FORALL must follow DML statement.";
+                                InsertErrorMessage(message, plpgsql_yylloc);
+                                ereport(errstate,
                                         (errcode(ERRCODE_FORALL_NEED_DML),
                                          errmsg("FORALL must follow DML statement.")));
+                            }
 
                             /* should follow DML statement */
-                            if (tok != K_INSERT && tok != K_UPDATE && tok != K_DELETE && tok != K_SELECT && tok != K_MERGE)
-                                ereport(ERROR,
+                            if (tok != K_INSERT && tok != K_UPDATE && tok != K_DELETE && tok != K_SELECT && tok != K_MERGE && tok != K_SAVE) { 
+                                const char* message = "FORALL must follow DML statement.";
+                                InsertErrorMessage(message, plpgsql_yylloc);
+                                ereport(errstate,
                                         (errcode(ERRCODE_FORALL_NEED_DML),
                                          errmsg("FORALL must follow DML statement.")));
+                            }
+
+                            if (tok == K_SAVE) {
+                                CheckSaveExceptionsDML(errstate);
+                            }
 
                             /* Should have had a single variable name */
-                            if ($1.scalar && $1.row)
-                                ereport(ERROR,
+                            if ($1.scalar && $1.row) {
+                                const char* message = "integer FORALL must have just one target variable.";
+                                InsertErrorMessage(message, plpgsql_yylloc);
+                                ereport(errstate,
                                         (errcode(ERRCODE_SYNTAX_ERROR),
                                          errmsg("integer FORALL must have just one target variable")));
+                            }
 
                             /* create loop's private variable */
                             fvar = (PLpgSQL_var *)
@@ -1903,12 +3165,33 @@ forall_control		:for_variable K_IN
 
                             $$ = (PLpgSQL_stmt *) newm;
                         }
-                        else
-                            ereport(ERROR,
+                        else {
+                            const char* message = "please use \'FORALL index_name IN lower_bound .. upper_bound\'";
+                            InsertErrorMessage(message, plpgsql_yylloc);
+                            ereport(errstate,
                                     (errcode(ERRCODE_SYNTAX_ERROR),
-                                     errmsg("please use \'FORALL index_name IN lower_bound .. upper_bound\'")));						
+                                     errmsg("please use \'FORALL index_name IN lower_bound .. upper_bound\'")));
+                        }
                     }
                 ;
+
+opt_save_exceptions : K_SAVE K_EXCEPTIONS
+                    {
+#ifndef ENABLE_MULTIPLE_NODES
+                        $$ = true;
+#else
+                        const char* message = "SAVE EXCEPTIONS is not supported";
+                        InsertErrorMessage(message, plpgsql_yylloc);
+                        ereport(errstate,
+                            (errcode(ERRCODE_SYNTAX_ERROR),
+                                errmsg("%s.", message)));
+                        $$ = false;
+#endif
+                    }
+                    |
+                    {
+                        $$ = false;
+                    }
 /*
  * Processing the for_variable is tricky because we don't yet know if the
  * FOR is an integer FOR loop or a loop over query results.  In the former
@@ -1936,18 +3219,21 @@ for_variable	: T_DATUM
                             $$.scalar = NULL;
                             $$.rec = NULL;
                             $$.row = (PLpgSQL_row *) $1.datum;
+                            $$.dno = $1.dno;
                         }
                         else if ($1.datum->dtype == PLPGSQL_DTYPE_RECORD)
                         {
                             $$.scalar = NULL;
                             $$.rec = NULL;
                             $$.row = (PLpgSQL_row *) $1.datum;
+                            $$.dno = $1.dno;
                         }
                         else if ($1.datum->dtype == PLPGSQL_DTYPE_REC)
                         {
                             $$.scalar = NULL;
                             $$.rec = (PLpgSQL_rec *) $1.datum;
                             $$.row = NULL;
+                            $$.dno = $1.dno;
                         }
                         else
                         {
@@ -1956,12 +3242,14 @@ for_variable	: T_DATUM
                             $$.scalar = $1.datum;
                             $$.rec = NULL;
                             $$.row = NULL;
+                            $$.dno = $1.dno;
                             /* check for comma-separated list */
                             tok = yylex();
                             plpgsql_push_back_token(tok);
                             if (tok == ',')
                                 $$.row = read_into_scalar_list($$.name,
                                                                $$.scalar,
+                                                               $$.dno,
                                                                @1);
                         }
                     }
@@ -1974,12 +3262,14 @@ for_variable	: T_DATUM
                             $$.scalar = NULL;
                             $$.rec = NULL;
                             $$.row = (PLpgSQL_row *) $1.datum;
+                            $$.dno = $1.dno;
                         }
                         else if ($1.datum->dtype == PLPGSQL_DTYPE_REC)
                         {
                             $$.scalar = NULL;
                             $$.rec = (PLpgSQL_rec *) $1.datum;
                             $$.row = NULL;
+                            $$.dno = $1.dno;
                         }
                         else
                         {
@@ -1988,12 +3278,53 @@ for_variable	: T_DATUM
                             $$.scalar = $1.datum;
                             $$.rec = NULL;
                             $$.row = NULL;
+                            $$.dno = $1.dno;
                             /* check for comma-separated list */
                             tok = yylex();
                             plpgsql_push_back_token(tok);
                             if (tok == ',')
                                 $$.row = read_into_scalar_list($$.name,
                                                                $$.scalar,
+                                                               $$.dno,
+                                                               @1);
+                        }
+                    }
+                | T_TABLE_VAR
+                    {
+                        $$.name = NameOfDatum(&($1));
+                        $$.lineno = plpgsql_location_to_lineno(@1);
+                        if ($1.datum->dtype == PLPGSQL_DTYPE_ROW)
+                        {
+                            $$.scalar = NULL;
+                            $$.rec = NULL;
+                            $$.row = (PLpgSQL_row *) $1.datum;
+                            $$.dno = $1.dno;
+                        }
+                        else if ($1.datum->dtype == PLPGSQL_DTYPE_REC)
+                        {
+                            $$.scalar = NULL;
+                            $$.rec = (PLpgSQL_rec *) $1.datum;
+                            $$.row = NULL;
+                            $$.dno = $1.dno;
+                        }
+                        else
+                        {
+                            int			tok;
+
+                            $$.scalar = $1.datum;
+                            if ($1.datum->dtype == PLPGSQL_DTYPE_VAR) {
+                                check_autonomous_nest_tablevar((PLpgSQL_var*)$1.datum);
+                            }
+                            $$.rec = NULL;
+                            $$.row = NULL;
+                            $$.dno = $1.dno;
+                            /* check for comma-separated list */
+                            tok = yylex();
+                            plpgsql_push_back_token(tok);
+                            if (tok == ',')
+                                $$.row = read_into_scalar_list($$.name,
+                                                               $$.scalar,
+                                                               $$.dno,
                                                                @1);
                         }
                     }
@@ -2030,25 +3361,32 @@ stmt_foreach_a	: opt_block_label K_FOREACH for_variable foreach_slice K_IN K_ARR
                         newp->slice = $4;
                         newp->expr = $7;
                         newp->body = $8.stmts;
+                        newp->sqlString = plpgsql_get_curline_query();
 
                         if ($3.rec)
                         {
-                            newp->varno = $3.rec->dno;
+                            newp->varno = $3.dno;
                             check_assignable((PLpgSQL_datum *) $3.rec, @3);
                         }
                         else if ($3.row)
                         {
-                            newp->varno = $3.row->dno;
+                            if ($3.scalar) {
+                                newp->varno = $3.row->dno;
+                            } else {
+                                newp->varno = $3.dno;
+                            }
                             check_assignable((PLpgSQL_datum *) $3.row, @3);
                         }
                         else if ($3.scalar)
                         {
-                            newp->varno = $3.scalar->dno;
+                            newp->varno = $3.dno;
                             check_assignable($3.scalar, @3);
                         }
                         else
                         {
-                            ereport(ERROR,
+                            const char* message = "loop variable of FOREACH must be a known variable or list of variables";
+                            InsertErrorMessage(message, plpgsql_yylloc);
+                            ereport(errstate,
                                     (errcode(ERRCODE_SYNTAX_ERROR),
                                      errmsg("loop variable of FOREACH must be a known variable or list of variables"),
                                              parser_errposition(@3)));
@@ -2089,6 +3427,7 @@ stmt_exit		: exit_type opt_label opt_exitcond
                         newp->lineno	  = plpgsql_location_to_lineno(@1);
                         newp->label	  = $2;
                         newp->cond	  = $3;
+                        newp->sqlString = plpgsql_get_curline_query();
 
                         $$ = (PLpgSQL_stmt *)newp;
                     }
@@ -2115,11 +3454,13 @@ stmt_return		: K_RETURN
                         if (tok_is_keyword(tok, &yylval,
                                            K_NEXT, "next"))
                         {
+                            u_sess->plsql_cxt.plpgsql_yylloc = plpgsql_yylloc;
                             $$ = make_return_next_stmt(@1);
                         }
                         else if (tok_is_keyword(tok, &yylval,
                                                 K_QUERY, "query"))
                         {
+                            u_sess->plsql_cxt.plpgsql_yylloc = plpgsql_yylloc;
                             $$ = make_return_query_stmt(@1);
                         }
                         else
@@ -2149,6 +3490,8 @@ stmt_raise		: K_RAISE
                         newp->message	= NULL;
                         newp->params		= NIL;
                         newp->options	= NIL;
+                        newp->sqlString = plpgsql_get_curline_query();
+                        newp->hasExceptionInit = false;
 
                         tok = yylex();
                         if (tok == 0)
@@ -2160,18 +3503,24 @@ stmt_raise		: K_RAISE
                          */
                         if (tok != ';')
                         {
-                            if (T_DATUM == tok && PLPGSQL_DTYPE_ROW == yylval.wdatum.datum->dtype)
+                            if (T_CWORD == tok) {
+                                yyerror("not found package");                      
+                            }
+                            if ((T_DATUM == tok || T_PACKAGE_VARIABLE == tok) && PLPGSQL_DTYPE_ROW == yylval.wdatum.datum->dtype)
                             {
                                 PLpgSQL_expr *expr = NULL;
+                                errno_t rc = EOK;
 
-                                sprintf(message, "line:%d ", plpgsql_location_to_lineno(@1));
+                                rc = sprintf_s(message, sizeof(message), "line:%d ", plpgsql_location_to_lineno(@1));
+                                securec_check_ss(rc, "\0", "\0");
                                 appendStringInfoString(&ds, message);
                                 appendStringInfoString(&ds,"%");
 
                                 row = (PLpgSQL_row *)yylval.wdatum.datum;
 
                                 /* condname is system embedded error name, so it is still null in this case. */
-                                newp->condname = pstrdup(unpack_sql_state(row->customErrorCode));
+                                newp->hasExceptionInit = row->hasExceptionInit;
+                                newp->condname = pstrdup(plpgsql_get_sqlstate(row->customErrorCode));
                                 newp->message = pstrdup(ds.data);
                                 plpgsql_push_back_token(tok);
                                 expr = read_sql_construct(';', 0, 0, ";",
@@ -2355,12 +3704,6 @@ stmt_execsql			: K_ALTER
 		    {
 		    	$$ = make_execsql_stmt(K_WITH, @1);
 		    }
-		| K_SAVEPOINT
-		    {
-		    	ereport(ERROR,
-			    (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-			     errmsg("SAVEPOINT in function/procedure is not yet supported.")));
-		    }
 		| K_MERGE
 		    {
 		    	$$ = make_execsql_stmt(K_MERGE, @1);
@@ -2397,7 +3740,7 @@ stmt_execsql			: K_ALTER
                         }
                         else
                         {
-                            PLpgSQL_stmt *stmt = make_callfunc_stmt($1.ident, @1, false);
+                            PLpgSQL_stmt *stmt = make_callfunc_stmt($1.ident, @1, false, false);
                             if (stmt->cmd_type == PLPGSQL_STMT_PERFORM)
                             {
                                 ((PLpgSQL_stmt_perform *)stmt)->expr->is_funccall = true;
@@ -2411,42 +3754,122 @@ stmt_execsql			: K_ALTER
                     }
                     else
                     {
+                        u_sess->plsql_cxt.plpgsql_yylloc = plpgsql_yylloc;
                         $$ = make_execsql_stmt(T_WORD, @1);
                     }
                 }
             }
-        | T_CWORD
+        | unreserved_keyword_func
             {
-                int tok = yylex();
-                char *name = NULL;
+                int tok = -1;
                 bool isCallFunc = false;
                 bool FuncNoarg = false;
-
+                tok = yylex();
                 if ('(' == tok)
+                    isCallFunc = is_function($1, false, false);
+                else if (';' == tok)
                 {
-                    MemoryContext colCxt = MemoryContextSwitchTo(u_sess->plsql_cxt.compile_tmp_cxt);
-                    name = NameListToString($1.idents);
-                    (void)MemoryContextSwitchTo(colCxt);
-                    isCallFunc = is_function(name, false, false);
-                }
-                else if ('=' == tok || COLON_EQUALS == tok || '[' == tok)
-                    cword_is_not_variable(&($1), @1);
-                else if (';' == tok) {
-                    MemoryContext colCxt = MemoryContextSwitchTo(u_sess->plsql_cxt.compile_tmp_cxt);
-                    name = NameListToString($1.idents);
-                    (void)MemoryContextSwitchTo(colCxt);
-                    isCallFunc = is_function(name, false, true);
+                    isCallFunc = is_function($1, false, true);
                     FuncNoarg = true;
                 }
 
                 plpgsql_push_back_token(tok);
+                if(isCallFunc)
+                {
+                    if (FuncNoarg)
+                    {
+                        $$ = make_callfunc_stmt_no_arg($1, @1);
+                    }
+                    else
+                    {
+                         PLpgSQL_stmt *stmt = make_callfunc_stmt($1, @1, false, false);
+                         if (stmt == NULL)
+                         {
+                             plpgsql_push_back_token(tok);
+                             $$ = NULL;
+                             yyerror("syntax error");
+                         }
+                         else
+                         {
+                             if (stmt->cmd_type == PLPGSQL_STMT_PERFORM)
+                             {
+                                 ((PLpgSQL_stmt_perform *)stmt)->expr->is_funccall = true;
+                             }
+                             else if (stmt->cmd_type == PLPGSQL_STMT_EXECSQL)
+                             {
+                                ((PLpgSQL_stmt_execsql *)stmt)->sqlstmt->is_funccall = true;
+                             }
+                             $$ = stmt;
+                        }
+                    }
+                }
+                else
+                {
+                    plpgsql_push_back_token(tok);
+                    $$ = NULL;
+                    yyerror("syntax error");
+                }
+            }
+        | T_CWORD '('
+            {
+
+                char *name = NULL;
+                bool isCallFunc = false;
+                bool FuncNoarg = false;
+                checkFuncName($1.idents);
+                MemoryContext colCxt = MemoryContextSwitchTo(u_sess->plsql_cxt.curr_compile_context->compile_tmp_cxt);
+                name = NameListToString($1.idents);
+                (void)MemoryContextSwitchTo(colCxt);
+                isCallFunc = is_function(name, false, false, $1.idents);
+                if (isCallFunc)
+                {    
+                    if (FuncNoarg)
+                        $$ = make_callfunc_stmt_no_arg(name, @1, false, $1.idents); 
+                    else 
+                    {    
+                        PLpgSQL_stmt *stmt = make_callfunc_stmt(name, @1, false, true, $1.idents);
+                        if (stmt == NULL) {
+                            const char* message = "call func stmt was null";
+                            InsertErrorMessage(message, plpgsql_yylloc);
+                            ereport(ERROR,
+                                    (errcode(ERRCODE_DATA_EXCEPTION),
+                                        errmsg("call func stmt was null"),
+                                        errdetail("call func stmt was null, you can try to recompile the function")));
+                        }
+                        if (stmt->cmd_type == PLPGSQL_STMT_PERFORM)
+                        {    
+                            ((PLpgSQL_stmt_perform *)stmt)->expr->is_funccall = true;
+                        }    
+                        else if (stmt->cmd_type == PLPGSQL_STMT_EXECSQL)
+                        {    
+                            ((PLpgSQL_stmt_execsql *)stmt)->sqlstmt->is_funccall = true;
+                        }    
+                        $$ = stmt;
+                    }    
+                }    
+                else 
+                {    
+                    $$ = make_execsql_stmt(T_CWORD, @1); 
+                }    
+            }   
+        | T_CWORD ';'
+            {
+                char *name = NULL;
+                bool isCallFunc = false;
+                checkFuncName($1.idents);
+                MemoryContext colCxt = MemoryContextSwitchTo(u_sess->plsql_cxt.curr_compile_context->compile_tmp_cxt);
+                name = NameListToString($1.idents);
+                (void)MemoryContextSwitchTo(colCxt);
+                isCallFunc = is_function(name, false, true, $1.idents);
+                bool FuncNoarg = true;
+
                 if (isCallFunc)
                 {
                     if (FuncNoarg)
-                        $$ = make_callfunc_stmt_no_arg(name, @1);
+                        $$ = make_callfunc_stmt_no_arg(name, @1, true, $1.idents);
                     else
                     {
-                        PLpgSQL_stmt *stmt = make_callfunc_stmt(name, @1, false);
+                        PLpgSQL_stmt *stmt = make_callfunc_stmt(name, @1, false, true, $1.idents);
                         if (stmt->cmd_type == PLPGSQL_STMT_PERFORM)
                         {
                             ((PLpgSQL_stmt_perform *)stmt)->expr->is_funccall = true;
@@ -2463,18 +3886,325 @@ stmt_execsql			: K_ALTER
                     $$ = make_execsql_stmt(T_CWORD, @1);
                 }
             }
+        | T_ARRAY_TRIM
+            {
+                check_table_index(yylval.wdatum.datum, "trim");
+                int dno = yylval.wdatum.dno;
+                StringInfoData sqlBuf;
+                initStringInfo(&sqlBuf);
+                appendStringInfo(&sqlBuf, "array_trim(");
+                CastArrayNameToArrayFunc(&sqlBuf, yylval.wdatum.idents);
+
+                int tok = yylex();
+
+                if (';' == tok)
+                {
+                    appendStringInfo(&sqlBuf, " 1)");
+                    $$ = make_callfunc_stmt(sqlBuf.data, @1, false, false, NULL, dno);
+                } else {
+                    if('(' == tok) {
+                        int tok1 = yylex();
+                        if (tok1 == ')') {
+                            int tok2 = yylex();
+                            if (tok2 == ';') {
+                                appendStringInfo(&sqlBuf, " 1)");
+                                $$ = make_callfunc_stmt(sqlBuf.data, @1, false, false, NULL, dno);
+                            } else {
+                                plpgsql_push_back_token(tok);
+                                $$ = NULL;
+                                yyerror("syntax error");
+                            }
+                        } else if (tok1 != ICONST && tok1 != T_WORD && tok1 != SCONST && tok1 != T_DATUM) {
+                            plpgsql_push_back_token(tok);
+                            $$ = NULL;
+                            yyerror("syntax error");
+                        } else {
+                            if (ICONST == tok1) {
+                                appendStringInfo(&sqlBuf, " %d)", yylval.ival);
+                            } else if (SCONST == tok1) {
+                                appendStringInfo(&sqlBuf, " %s)  ", yylval.str);
+                            } else if (T_WORD == tok1) {
+                                appendStringInfo(&sqlBuf, " %s)", yylval.word.ident);
+                            } else {
+                                char *datName = NameOfDatum(&yylval.wdatum);
+                                appendStringInfo(&sqlBuf, " %s)  ",  datName);
+                                pfree_ext(datName);
+                            }
+                            int tok2 = yylex();
+                            if (tok2 != ')') {
+                                plpgsql_push_back_token(tok);
+                                $$ = NULL;
+                                yyerror("syntax error");
+                            } else {
+                                int tok3 = yylex();
+                                if (tok3 != ';') {
+                                    plpgsql_push_back_token(tok);
+                                    $$ = NULL;
+                                    yyerror("syntax error");
+                                } else {
+                                    $$ = make_callfunc_stmt(sqlBuf.data, @1, false, false, NULL, dno);
+                                }
+                            }
+                        }
+                    } else {
+                        plpgsql_push_back_token(tok);
+                        $$ = NULL;
+                        yyerror("syntax error");
+                    }
+                }
+                pfree_ext(sqlBuf.data);
+            }
         | T_ARRAY_EXTEND
             {
+                check_table_index(yylval.wdatum.datum, "trim");
+                int dno = yylval.wdatum.dno;
+                StringInfoData sqlBuf;
+
+                initStringInfo(&sqlBuf);
+                appendStringInfo(&sqlBuf, "array_extendnull(");
+                CastArrayNameToArrayFunc(&sqlBuf, yylval.wdatum.idents);
+
                 int tok = yylex();
                 if (';' == tok)
                 {
-                    $$ =  NULL;
+                    appendStringInfo(&sqlBuf, " 1)");
+                    $$ = make_callfunc_stmt(sqlBuf.data, @1, false, false, NULL, dno);
+                } else {
+                    if('(' == tok) {
+                        int tok1 = yylex();
+                        if (tok1 == ')') {
+                            int tok2 = yylex();
+                            if (tok2 == ';') {
+                                appendStringInfo(&sqlBuf, " 1)");
+                                $$ = make_callfunc_stmt(sqlBuf.data, @1, false, false, NULL, dno);
+                            } else {
+                                plpgsql_push_back_token(tok2);
+                                $$ = NULL;
+                                yyerror("syntax error");
+                            }
+                        } else if (tok1 != ICONST && tok1 != T_WORD && tok1 != SCONST && tok1 != T_DATUM) {
+                            plpgsql_push_back_token(tok);
+                            $$ = NULL;
+                            yyerror("syntax error");
+                        } else {
+                            if (ICONST == tok1) {
+                                appendStringInfo(&sqlBuf, " %d)  ",  yylval.ival);
+                            } else if (SCONST == tok1) {
+                                appendStringInfo(&sqlBuf, " %s)  ", yylval.str);
+                            } else if (T_WORD == tok1) {
+                                appendStringInfo(&sqlBuf, " %s)  ", yylval.word.ident);
+                            } else {
+                                char *datName = NameOfDatum(&yylval.wdatum);
+                                appendStringInfo(&sqlBuf, " %s)  ",  datName);
+                                pfree_ext(datName);
+                            }
+                            int tok2 = yylex();
+                            if (tok2 != ')') {
+                                plpgsql_push_back_token(tok);
+                                $$ = NULL;
+                                yyerror("syntax error");
+                            } else {
+                                int tok3 = yylex();
+                                if (tok3 != ';') {
+                                    plpgsql_push_back_token(tok);
+                                    $$ = NULL;
+                                    yyerror("syntax error");
+                                } else {
+                                    $$ = make_callfunc_stmt(sqlBuf.data, @1, false, false, NULL, dno);
+                                }
+                            }
+                        }
+                    } else {
+                        plpgsql_push_back_token(tok);
+                        $$ = NULL;
+                        yyerror("syntax error");
+                    }
                 }
-                else
+                pfree_ext(sqlBuf.data);
+            }
+        | T_ARRAY_DELETE
+            {
+                StringInfoData sqlBuf;
+                Oid indexType = get_table_index_type(yylval.wdatum.datum, NULL);
+                List* idents = yylval.wdatum.idents;
+                int dno = yylval.wdatum.dno;
+                initStringInfo(&sqlBuf);
+
+                int tok = yylex();
+
+                if (';' == tok)
                 {
-                    plpgsql_push_back_token(tok);
-                    $$ = make_callfunc_stmt("array_extend", @1, false);
+                    if (indexType == VARCHAROID || indexType == INT4OID) {
+                        appendStringInfo(&sqlBuf, "array_indexby_delete(");
+                        CastArrayNameToArrayFunc(&sqlBuf, idents, false);
+                        appendStringInfo(&sqlBuf, ")");
+                    } else {
+                        appendStringInfo(&sqlBuf, "array_delete(");
+                        CastArrayNameToArrayFunc(&sqlBuf, idents, false);
+                        appendStringInfo(&sqlBuf, ")");
+                    }
+                    
+                    $$ = make_callfunc_stmt(sqlBuf.data, @1, false, false, NULL, dno);
+                } else {
+                    if('(' == tok) {
+                        int tok1 = yylex();
+                        if (tok1 == ')') {
+                            int tok2 = yylex();
+                            if (tok2 == ';') {
+                                if (indexType == VARCHAROID || indexType == INT4OID) {
+                                    appendStringInfo(&sqlBuf, "array_indexby_delete(");
+                                    CastArrayNameToArrayFunc(&sqlBuf, idents, false);
+                                    appendStringInfo(&sqlBuf, ")");
+                                } else {
+                                    appendStringInfo(&sqlBuf, "array_delete(");
+                                    CastArrayNameToArrayFunc(&sqlBuf, idents, false);
+                                    appendStringInfo(&sqlBuf, ")");
+                                }
+                                
+                                $$ = make_callfunc_stmt(sqlBuf.data, @1, false, false, NULL, dno);
+                            } else {
+                                plpgsql_push_back_token(tok);
+                                $$ = NULL;
+                                yyerror("syntax error");
+                            }
+                        } else if (tok1 != ICONST && tok1 != T_WORD && tok1 != SCONST && tok1 != T_DATUM && tok1 != '-') {
+                            plpgsql_push_back_token(tok);
+                            $$ = NULL;
+                            yyerror("syntax error");
+                        } else {
+                            if (tok1 == '-') {
+                                if (indexType == VARCHAROID) {
+                                    yyerror("syntax error");
+                                }
+
+                                int tok3 = yylex();
+                                if (tok3 != ICONST && tok3 != T_WORD && tok3 != T_DATUM) {
+                                    yyerror("syntax error");
+                                }
+
+                                if (ICONST == tok3) {
+                                    if (indexType == INT4OID) {
+                                        appendStringInfo(&sqlBuf, "array_integer_delete(");
+                                        CastArrayNameToArrayFunc(&sqlBuf, idents);
+                                        appendStringInfo(&sqlBuf, "\'-%d\')", yylval.ival);
+                                    } else {
+                                        appendStringInfo(&sqlBuf, "array_deleteidx(");
+                                        CastArrayNameToArrayFunc(&sqlBuf, idents);
+                                        appendStringInfo(&sqlBuf, "-%d)", yylval.ival);
+                                    }
+                                } else if (T_WORD == tok3) {
+                                    if (indexType == INT4OID) {
+                                        appendStringInfo(&sqlBuf, "array_integer_delete(");
+                                        CastArrayNameToArrayFunc(&sqlBuf, idents);
+                                        appendStringInfo(&sqlBuf, "\'-%s\')", yylval.word.ident);
+                                    } else {
+                                        appendStringInfo(&sqlBuf, "array_deleteidx(");
+                                        CastArrayNameToArrayFunc(&sqlBuf, idents);
+                                        appendStringInfo(&sqlBuf, "-%s)", yylval.word.ident);
+                                    }
+
+                                } else {
+                                    char *datName = NameOfDatum(&yylval.wdatum);
+                                    if (indexType == INT4OID) {
+                                        appendStringInfo(&sqlBuf, "array_integer_delete(");
+                                        CastArrayNameToArrayFunc(&sqlBuf, idents);
+                                        appendStringInfo(&sqlBuf, "\'-%s\')", datName);
+                                    } else {
+                                        appendStringInfo(&sqlBuf, "array_deleteidx(");
+                                        CastArrayNameToArrayFunc(&sqlBuf, idents);
+                                        appendStringInfo(&sqlBuf, "-%s)", datName);
+                                    }
+
+                                    pfree_ext(datName);
+                                }
+                            } else {
+                                if (ICONST == tok1) {
+                                    if (indexType == VARCHAROID) {
+                                        appendStringInfo(&sqlBuf, "array_varchar_delete(");
+                                        CastArrayNameToArrayFunc(&sqlBuf, idents);
+                                        appendStringInfo(&sqlBuf, "\'%d\')", yylval.ival);
+                                    } else if (indexType == INT4OID) {
+                                        appendStringInfo(&sqlBuf, "array_integer_delete(");
+                                        CastArrayNameToArrayFunc(&sqlBuf, idents);
+                                        appendStringInfo(&sqlBuf, "\'%d\')", yylval.ival);
+                                    } else {
+                                        appendStringInfo(&sqlBuf, "array_deleteidx(");
+                                        CastArrayNameToArrayFunc(&sqlBuf, idents);
+                                        appendStringInfo(&sqlBuf, "%d)", yylval.ival);
+                                    }
+                                } else if (SCONST == tok1) {
+                                    if (indexType == VARCHAROID) {
+                                        appendStringInfo(&sqlBuf, "array_varchar_delete(");
+                                        CastArrayNameToArrayFunc(&sqlBuf, idents);
+                                        appendStringInfo(&sqlBuf, "\'%s\')", yylval.str);
+                                    } else if (indexType == INT4OID) {
+                                        appendStringInfo(&sqlBuf, "array_integer_delete(");
+                                        CastArrayNameToArrayFunc(&sqlBuf, idents);
+                                        appendStringInfo(&sqlBuf, "\'%s\')", yylval.str);
+                                    } else {
+                                        appendStringInfo(&sqlBuf, "array_deleteidx(");
+                                        CastArrayNameToArrayFunc(&sqlBuf, idents);
+                                        appendStringInfo(&sqlBuf, "%s)", yylval.str);
+                                    }
+
+                                } else if (T_WORD == tok1) {
+                                    if (indexType == VARCHAROID) {
+                                        appendStringInfo(&sqlBuf, "array_varchar_delete(");
+                                        CastArrayNameToArrayFunc(&sqlBuf, idents);
+                                        appendStringInfo(&sqlBuf, "\'%s\')", yylval.word.ident);
+                                    } else if (indexType == INT4OID) {
+                                        appendStringInfo(&sqlBuf, "array_integer_delete(");
+                                        CastArrayNameToArrayFunc(&sqlBuf, idents);
+                                        appendStringInfo(&sqlBuf, "\'%s\')", yylval.word.ident);
+                                    } else {
+                                        appendStringInfo(&sqlBuf, "array_deleteidx(");
+                                        CastArrayNameToArrayFunc(&sqlBuf, idents);
+                                        appendStringInfo(&sqlBuf, "%s)", yylval.word.ident);
+                                    }
+
+                                } else {
+                                    char *datName = NameOfDatum(&yylval.wdatum);
+                                    if (indexType == VARCHAROID) {
+                                        appendStringInfo(&sqlBuf, "array_varchar_delete(");
+                                        CastArrayNameToArrayFunc(&sqlBuf, idents);
+                                        appendStringInfo(&sqlBuf, "\'%s\')", datName);
+                                    } else if (indexType == INT4OID) {
+                                        appendStringInfo(&sqlBuf, "array_integer_delete(");
+                                        CastArrayNameToArrayFunc(&sqlBuf, idents);
+                                        appendStringInfo(&sqlBuf, "\'%s\')", datName);
+                                    } else {
+                                        appendStringInfo(&sqlBuf, "array_deleteidx(");
+                                        CastArrayNameToArrayFunc(&sqlBuf, idents);
+                                        appendStringInfo(&sqlBuf, "%s)", datName);
+                                    }
+
+                                    pfree_ext(datName);
+                                }
+                            }
+                            
+                            int tok2 = yylex();
+                            if (tok2 != ')') {
+                                plpgsql_push_back_token(tok);
+                                $$ = NULL;
+                                yyerror("syntax error");
+                            } else {
+                                int tok3 = yylex();
+                                if (tok3 != ';') {
+                                    plpgsql_push_back_token(tok);
+                                    $$ = NULL;
+                                    yyerror("syntax error");
+                                } else {
+                                    $$ = make_callfunc_stmt(sqlBuf.data, @1, false, false, NULL, dno);
+                                }
+                            }
+                        }
+                    } else {
+                        plpgsql_push_back_token(tok);
+                        $$ = NULL;
+                        yyerror("syntax error");
+                    }
                 }
+                pfree_ext(sqlBuf.data);
             }
         ;
 
@@ -2508,6 +4238,12 @@ stmt_dynexecute : K_EXECUTE
                         newp->isinouttype = false;
                         newp->ppd = NULL;
                         newp->isanonymousblock = true;
+                        newp->sqlString = plpgsql_get_curline_query();
+
+                        if (endtoken == K_BULK)
+                        {
+                            yyerror("syntax error");
+                        }
 
                         /* If we found "INTO", collect the argument */
                         
@@ -2516,7 +4252,7 @@ stmt_dynexecute : K_EXECUTE
                             if (newp->into)			/* multiple INTO */
                                 yyerror("syntax error");
                             newp->into = true;
-                            read_into_target(&newp->rec, &newp->row, &newp->strict);
+                            read_into_target(&newp->rec, &newp->row, &newp->strict, false);
                             endtoken = yylex();
                         }
                         /* If we found "USING", collect the argument */
@@ -2536,10 +4272,13 @@ stmt_dynexecute : K_EXECUTE
                             endtoken = yylex();
                             if( out_row && newp->row )
                             {
-                                    ereport(ERROR,
-                                            (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-                                             errmsg("target into is conflicted with using out (inout)"),
-                                             errdetail("\"select clause\" can't has out parameters, can only use \"into\"")));
+                                const char* message = "target into is conflicted with using out (inout)";
+                                InsertErrorMessage(message, plpgsql_yylloc);
+                                ereport(errstate,
+                                        (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                                            errmsg("target into is conflicted with using out (inout)"),
+                                            errdetail("\"select clause\" can't has out parameters, can only use \"into\"")));
+                                u_sess->plsql_cxt.have_error = true;
                             }
                             newp->out_row = newp->row ? newp->row:out_row;
 
@@ -2561,10 +4300,21 @@ stmt_open		: K_OPEN cursor_variable
                         newp = (PLpgSQL_stmt_open *)palloc0(sizeof(PLpgSQL_stmt_open));
                         newp->cmd_type = PLPGSQL_STMT_OPEN;
                         newp->lineno = plpgsql_location_to_lineno(@1);
-                        newp->curvar = $2->dno;
+                        newp->curvar = $2;
                         newp->cursor_options = CURSOR_OPT_FAST_PLAN;
+                        newp->sqlString = plpgsql_get_curline_query();
 
-                        if ($2->cursor_explicit_expr == NULL)
+#ifndef ENABLE_MULTIPLE_NODES
+                        if ((newp->curvar < 0 || newp->curvar >= u_sess->plsql_cxt.curr_compile_context->plpgsql_nDatums)
+                            && u_sess->attr.attr_common.plsql_show_all_error) 
+                        {
+                            ereport(ERROR,
+                                    (errcode(ERRCODE_SYNTAX_ERROR), errmsg("open cursor error"), parser_errposition(@2)));
+                        }
+#endif
+                        PLpgSQL_var* cur_var = (PLpgSQL_var *)u_sess->plsql_cxt.curr_compile_context->plpgsql_Datums[$2];
+
+                        if (cur_var->cursor_explicit_expr == NULL)
                         {
                             /* be nice if we could use opt_scrollable here */
                             tok = yylex();
@@ -2608,7 +4358,6 @@ stmt_open		: K_OPEN cursor_variable
                                     read_sql_expression2(K_USING, ';',
                                                          "USING or ;",
                                                          &endtoken);
-                                    
                                     /* If we found "USING", collect argument(s) */
                                     if(K_USING == endtoken)
                                     {
@@ -2625,11 +4374,20 @@ stmt_open		: K_OPEN cursor_variable
                                         yyerror("syntax error");
                                 }
                             }
+#ifndef ENABLE_MULTIPLE_NODES
+			    if (newp->query != NULL && u_sess->attr.attr_sql.sql_compatibility == A_FORMAT && ALLOW_PROCEDURE_COMPILE_CHECK) {
+                                (void)getCursorTupleDesc(newp->query, false, true);
+			    }
+                            else if (newp->dynquery != NULL && u_sess->attr.attr_sql.sql_compatibility == A_FORMAT && ALLOW_PROCEDURE_COMPILE_CHECK)
+			    {
+                                (void)getCursorTupleDesc(newp->dynquery, false, true);
+			    }
+#endif
                         }
                         else
                         {
                             /* predefined cursor query, so read args */
-                            newp->argquery = read_cursor_args($2, ';', ";");
+                            newp->argquery = read_cursor_args(cur_var, ';', ";");
                         }
 
                         $$ = (PLpgSQL_stmt *)newp;
@@ -2643,7 +4401,7 @@ stmt_fetch		: K_FETCH opt_fetch_direction cursor_variable K_INTO
                         PLpgSQL_row	   *row;
 
                         /* We have already parsed everything through the INTO keyword */
-                        read_into_target(&rec, &row, NULL);
+                        read_into_target(&rec, &row, NULL, false);
 
                         if (yylex() != ';')
                             yyerror("syntax error");
@@ -2652,17 +4410,56 @@ stmt_fetch		: K_FETCH opt_fetch_direction cursor_variable K_INTO
                          * We don't allow multiple rows in PL/pgSQL's FETCH
                          * statement, only in MOVE.
                          */
-                        if (fetch->returns_multiple_rows)
-                            ereport(ERROR,
+                        if (fetch->returns_multiple_rows) {
+                            const char* message = "FETCH statement cannot return multiple rows";
+                            InsertErrorMessage(message, plpgsql_yylloc);
+                            ereport(errstate,
                                     (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
                                      errmsg("FETCH statement cannot return multiple rows"),
                                      parser_errposition(@1)));
+                        }
 
                         fetch->lineno = plpgsql_location_to_lineno(@1);
                         fetch->rec		= rec;
                         fetch->row		= row;
-                        fetch->curvar	= $3->dno;
+                        fetch->curvar	= $3;
                         fetch->is_move	= false;
+                        fetch->bulk_collect = false;
+                        fetch->sqlString = plpgsql_get_curline_query();
+
+                        $$ = (PLpgSQL_stmt *)fetch;
+                    }
+                | K_FETCH opt_fetch_direction cursor_variable K_BULK K_COLLECT K_INTO fetch_into_target fetch_limit_expr
+                    {
+                        PLpgSQL_stmt_fetch *fetch = $2;
+                        if (fetch->has_direction) {
+                            yyerror("unexpected fetch direction statement");
+                        }
+
+                        /* only A_FORMAT can use bulk collect into */
+                        if (u_sess->attr.attr_sql.sql_compatibility != A_FORMAT) {
+                             yyerror("syntax error");
+                        }
+
+                        PLpgSQL_datum *datum = $7;
+                        fetch->rec		= NULL;
+                        fetch->row		= NULL;
+
+                        if (datum->dtype == PLPGSQL_DTYPE_REC) {
+                            fetch->rec = (PLpgSQL_rec *)datum;
+                        } else {
+                            fetch->row = (PLpgSQL_row *)datum;
+                            check_bulk_into_type((PLpgSQL_row*)datum);
+                        }
+
+                        fetch->lineno = plpgsql_location_to_lineno(@1);
+                        fetch->curvar	= $3;
+                        fetch->how_many	= FETCH_ALL;
+                        fetch->is_move	= false;
+                        fetch->expr		= $8;
+                        fetch->returns_multiple_rows = true;
+                        fetch->bulk_collect = true;
+                        fetch->sqlString = plpgsql_get_curline_query();
 
                         $$ = (PLpgSQL_stmt *)fetch;
                     }
@@ -2673,8 +4470,10 @@ stmt_move		: K_MOVE opt_fetch_direction cursor_variable ';'
                         PLpgSQL_stmt_fetch *fetch = $2;
 
                         fetch->lineno = plpgsql_location_to_lineno(@1);
-                        fetch->curvar	= $3->dno;
+                        fetch->curvar	= $3;
                         fetch->is_move	= true;
+                        fetch->bulk_collect = false;
+                        fetch->sqlString = plpgsql_get_curline_query();
 
                         $$ = (PLpgSQL_stmt *)fetch;
                     }
@@ -2686,6 +4485,32 @@ opt_fetch_direction	:
                     }
                 ;
 
+fetch_limit_expr    : K_LIMIT
+                    {
+                        $$ = read_sql_expression(';', ";");
+                    }
+                    | ';'
+                    {
+                        $$ = NULL;
+                    }
+                ;
+
+fetch_into_target :
+                    {
+                        PLpgSQL_datum *datum = NULL;
+                        PLpgSQL_rec *rec;
+                        PLpgSQL_row *row;
+                        read_into_target(&rec, &row, NULL, true);
+
+                        if (rec != NULL) {
+                            datum = (PLpgSQL_datum *)rec;
+                        } else {
+                            datum = (PLpgSQL_datum *)row;
+                        }
+                        $$ = datum;
+                    }
+                ;
+
 stmt_close		: K_CLOSE cursor_variable ';'
                     {
                         PLpgSQL_stmt_close *newp;
@@ -2693,7 +4518,8 @@ stmt_close		: K_CLOSE cursor_variable ';'
                         newp = (PLpgSQL_stmt_close *)palloc(sizeof(PLpgSQL_stmt_close));
                         newp->cmd_type = PLPGSQL_STMT_CLOSE;
                         newp->lineno = plpgsql_location_to_lineno(@1);
-                        newp->curvar = $2->dno;
+                        newp->curvar = $2;
+                        newp->sqlString = plpgsql_get_curline_query();
 
                         $$ = (PLpgSQL_stmt *)newp;
                     }
@@ -2702,11 +4528,12 @@ stmt_close		: K_CLOSE cursor_variable ';'
 stmt_null		: K_NULL ';'
                     {
                         /* We do building a node for NULL for GOTO */
-                        PLpgSQL_stmt *newp;
+                        PLpgSQL_stmt_null *newp;
 
                         newp = (PLpgSQL_stmt_null *)palloc(sizeof(PLpgSQL_stmt_null));
                         newp->cmd_type = PLPGSQL_STMT_NULL;
                         newp->lineno = plpgsql_location_to_lineno(@1);
+                        newp->sqlString = plpgsql_get_curline_query();
 
                         $$ = (PLpgSQL_stmt *)newp;
                     }
@@ -2718,7 +4545,8 @@ stmt_commit		: opt_block_label K_COMMIT ';'
 
                         newp = (PLpgSQL_stmt_commit *)palloc(sizeof(PLpgSQL_stmt_commit));
                         newp->cmd_type = PLPGSQL_STMT_COMMIT;
-                        newp->lineno = plpgsql_location_to_lineno(@1);
+                        newp->lineno = plpgsql_location_to_lineno(@2);
+                        newp->sqlString = plpgsql_get_curline_query();
                         plpgsql_ns_pop();
 
                         $$ = (PLpgSQL_stmt *)newp;
@@ -2726,13 +4554,88 @@ stmt_commit		: opt_block_label K_COMMIT ';'
                     }
                 ;
 
-stmt_rollback		: opt_block_label K_ROLLBACK ';'
+savepoint_name : any_identifier
                     {
-                        PLpgSQL_stmt_rollback *newp;
+                        $$ = $1;
+                    }
+                ;
 
-                        newp = (PLpgSQL_stmt_rollback *) palloc(sizeof(PLpgSQL_stmt_rollback));
-                        newp->cmd_type = PLPGSQL_STMT_ROLLBACK;
-                        newp->lineno = plpgsql_location_to_lineno(@1);
+opt_savepoint_name :
+                  K_SAVEPOINT savepoint_name
+                    {
+                        $$ = $2;
+                    }
+                | savepoint_name
+                    {
+                        $$ = $1;
+                    }
+                ;
+
+opt_rollback_to :
+                    {
+                        $$ = NULL;
+                    }
+                | K_TO opt_savepoint_name
+                    {
+                        $$ = $2;
+                    }
+                ;
+
+stmt_rollback : opt_block_label K_ROLLBACK opt_rollback_to ';'
+                    {
+                        if ($3 == NULL) {
+                            PLpgSQL_stmt_rollback *newp;
+
+                            newp = (PLpgSQL_stmt_rollback *) palloc(sizeof(PLpgSQL_stmt_rollback));
+                            newp->cmd_type = PLPGSQL_STMT_ROLLBACK;
+                            newp->lineno = plpgsql_location_to_lineno(@2);
+                            newp->sqlString = plpgsql_get_curline_query();
+                            plpgsql_ns_pop();
+
+                            $$ = (PLpgSQL_stmt *)newp;
+                            record_stmt_label($1, (PLpgSQL_stmt *)newp);
+                        } else {
+                            PLpgSQL_stmt_savepoint *newp;
+
+                            newp = (PLpgSQL_stmt_savepoint *) palloc(sizeof(PLpgSQL_stmt_savepoint));
+                            newp->cmd_type = PLPGSQL_STMT_SAVEPOINT;
+                            newp->lineno = plpgsql_location_to_lineno(@2);
+                            newp->sqlString = plpgsql_get_curline_query();
+                            newp->opType = PLPGSQL_SAVEPOINT_ROLLBACKTO;
+                            newp->spName = $3;
+                            plpgsql_ns_pop();
+
+                            $$ = (PLpgSQL_stmt *)newp;
+                            record_stmt_label($1, (PLpgSQL_stmt *)newp);
+                        }
+                    }
+                ;
+
+stmt_savepoint : opt_block_label K_SAVEPOINT savepoint_name ';'
+                    {
+                        PLpgSQL_stmt_savepoint *newp;
+
+                        newp = (PLpgSQL_stmt_savepoint *) palloc(sizeof(PLpgSQL_stmt_savepoint));
+                        newp->cmd_type = PLPGSQL_STMT_SAVEPOINT;
+                        newp->lineno = plpgsql_location_to_lineno(@2);
+                        newp->sqlString = plpgsql_get_curline_query();
+                        newp->opType = PLPGSQL_SAVEPOINT_CREATE;
+                        newp->spName = $3;
+                        plpgsql_ns_pop();
+
+                        $$ = (PLpgSQL_stmt *)newp;
+                        record_stmt_label($1, (PLpgSQL_stmt *)newp);
+                    }
+               | opt_block_label K_RELEASE opt_savepoint_name ';'
+                    {
+                        PLpgSQL_stmt_savepoint *newp;
+
+                        newp = (PLpgSQL_stmt_savepoint *) palloc(sizeof(PLpgSQL_stmt_savepoint));
+                        newp->cmd_type = PLPGSQL_STMT_SAVEPOINT;
+                        newp->lineno = plpgsql_location_to_lineno(@2);
+                        newp->sqlString = plpgsql_get_curline_query();
+                        newp->opType = PLPGSQL_SAVEPOINT_RELEASE;
+                        newp->spName = $3;
                         plpgsql_ns_pop();
 
                         $$ = (PLpgSQL_stmt *)newp;
@@ -2742,19 +4645,83 @@ stmt_rollback		: opt_block_label K_ROLLBACK ';'
 
 cursor_variable	: T_DATUM
                     {
-                        if ($1.datum->dtype != PLPGSQL_DTYPE_VAR)
-                            ereport(ERROR,
+                        if ($1.datum->dtype != PLPGSQL_DTYPE_VAR) {
+                            const char* message = "cursor variable must be a simple variable";
+                            InsertErrorMessage(message, plpgsql_yylloc);
+                            ereport(errstate,
                                     (errcode(ERRCODE_DATATYPE_MISMATCH),
                                      errmsg("cursor variable must be a simple variable"),
                                      parser_errposition(@1)));
+                        }
 
-                        if (((PLpgSQL_var *) $1.datum)->datatype->typoid != REFCURSOROID)
-                            ereport(ERROR,
+                        if (((PLpgSQL_var *) $1.datum)->datatype->typoid != REFCURSOROID) {
+                            const char* message = "variable must be of type cursor or refcursor";
+                            InsertErrorMessage(message, plpgsql_yylloc);
+                            ereport(errstate,
                                     (errcode(ERRCODE_DATATYPE_MISMATCH),
                                      errmsg("variable \"%s\" must be of type cursor or refcursor",
                                             ((PLpgSQL_var *) $1.datum)->refname),
                                      parser_errposition(@1)));
-                        $$ = (PLpgSQL_var *) $1.datum;
+                        }
+                        if (((PLpgSQL_var *) $1.datum)->ispkg) {
+                            if ((u_sess->plsql_cxt.curr_compile_context->plpgsql_curr_compile != NULL &&
+                                u_sess->plsql_cxt.curr_compile_context->plpgsql_curr_compile->is_autonomous) ||
+                                u_sess->is_autonomous_session) {
+                                const char* message =
+                                    "package cursor referenced in autonomous procedure is not supported yet";
+                                InsertErrorMessage(message, plpgsql_yylloc);
+                                ereport(errstate,
+                                    (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                                     errmsg("cursor referenced by \"%s\" in autonomous procedure is not supported yet",
+                                         $1.ident),
+                                     parser_errposition(@1)));
+                            }
+                        }
+                        $$ = $1.dno;
+                    }
+                | T_PACKAGE_VARIABLE
+                    {
+                        if ($1.datum->dtype != PLPGSQL_DTYPE_VAR) {
+                            const char* message = "cursor variable must be a simple variable";
+                            InsertErrorMessage(message, plpgsql_yylloc);
+                            ereport(errstate,
+                                    (errcode(ERRCODE_DATATYPE_MISMATCH),
+                                     errmsg("cursor variable must be a simple variable"),
+                                     parser_errposition(@1)));
+                        }
+
+                        if (((PLpgSQL_var *) $1.datum)->datatype->typoid != REFCURSOROID) {
+                            const char* message = "variable must be of type cursor or refcursor";
+                            InsertErrorMessage(message, plpgsql_yylloc);
+                            ereport(errstate,
+                                    (errcode(ERRCODE_DATATYPE_MISMATCH),
+                                     errmsg("variable \"%s\" must be of type cursor or refcursor",
+                                            ((PLpgSQL_var *) $1.datum)->refname),
+                                     parser_errposition(@1)));
+                        }
+                        if (list_length($1.idents) == 3) {
+                            const char* message =
+                                "cursor referenced in schema.package.cursor format is not supported yet";
+                            InsertErrorMessage(message, plpgsql_yylloc);
+                            ereport(errstate,
+                                    (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                                     errmsg("cursor referenced by \"%s\" is not supported yet",
+                                            $1.ident),
+                                     parser_errposition(@1)));
+                        }
+                        if ((u_sess->plsql_cxt.curr_compile_context->plpgsql_curr_compile != NULL &&
+                            u_sess->plsql_cxt.curr_compile_context->plpgsql_curr_compile->is_autonomous) ||
+                            u_sess->is_autonomous_session) {
+                            const char* message =
+                                "package cursor referenced in autonomous procedure is not supported yet";
+                            InsertErrorMessage(message, plpgsql_yylloc);
+                            ereport(errstate,
+                                    (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                                     errmsg("cursor referenced by \"%s\" in autonomous procedure is not supported yet",
+                                            $1.ident),
+                                     parser_errposition(@1)));
+                        }
+                        $$ = $1.dno;
                     }
                 | T_WORD
                     {
@@ -2779,25 +4746,7 @@ exception_sect	:
                          * scope of the names extends to the end of the
                          * current block.
                          */
-                        int			lineno = plpgsql_location_to_lineno(@1);
                         PLpgSQL_exception_block *newp = (PLpgSQL_exception_block *)palloc(sizeof(PLpgSQL_exception_block));
-                        PLpgSQL_variable *var;
-
-                        var = plpgsql_build_variable("sqlstate", lineno,
-                                                     plpgsql_build_datatype(TEXTOID,
-                                                                            -1,
-                                                                            u_sess->plsql_cxt.plpgsql_curr_compile->fn_input_collation),
-                                                     true);
-                        ((PLpgSQL_var *) var)->isconst = true;
-                        newp->sqlstate_varno = var->dno;
-
-                        var = plpgsql_build_variable("sqlerrm", lineno,
-                                                     plpgsql_build_datatype(TEXTOID,
-                                                                            -1,
-                                                                            u_sess->plsql_cxt.plpgsql_curr_compile->fn_input_collation),
-                                                     true);
-                        ((PLpgSQL_var *) var)->isconst = true;
-                        newp->sqlerrm_varno = var->dno;
 
                         $<exception_block>$ = newp;
                     }
@@ -2855,7 +4804,13 @@ proc_condition	: any_identifier
                                 if (PLPGSQL_DTYPE_ROW == yylval.wdatum.datum->dtype)
                                 {
                                     PLpgSQL_condition *newp = NULL;
-                                    PLpgSQL_row * row = ( PLpgSQL_row* ) u_sess->plsql_cxt.plpgsql_Datums[yylval.wdatum.datum->dno];
+                                    PLpgSQL_row* row = (PLpgSQL_row*)yylval.wdatum.datum;
+                                    if (!row->ispkg) {
+                                        row = ( PLpgSQL_row* ) u_sess->plsql_cxt.curr_compile_context->plpgsql_Datums[yylval.wdatum.dno];
+                                    } else {
+                                        PLpgSQL_package* pkg = row->pkg;
+                                        row = ( PLpgSQL_row* )pkg->datums[row->dno];
+                                    }
                                     TupleDesc	rowtupdesc = row ? row->rowtupdesc : NULL;
 
                                     if(rowtupdesc && 
@@ -2867,15 +4822,20 @@ proc_condition	: any_identifier
                                         newp->next = NULL;
                                     }
 
-                                    if(NULL == newp)
-                                        ereport(ERROR,
+                                    if(NULL == newp) {
+                                        const char* message = "unrecognized exception condition ";
+                                        InsertErrorMessage(message, plpgsql_yylloc);
+                                        ereport(errstate,
                                                 (errcode(ERRCODE_UNDEFINED_OBJECT),
                                                 errmsg("unrecognized exception condition \"%s\"",
                                                         row? row->refname : "??")));
+                                    }
                                     $$ = newp;
                                 }
-                                else
+                                else {
+                                    u_sess->plsql_cxt.plpgsql_yylloc = plpgsql_yylloc;
                                     $$ = plpgsql_parse_err_condition($1);
+                                }
                             }
                             else
                             {
@@ -2917,22 +4877,26 @@ expr_until_semi :
                         char *name = NULL;
                         bool isCallFunc = false;
                         PLpgSQL_expr* expr = NULL;
-
+                        List* funcNameList = NULL;
                         if (plpgsql_is_token_match2(T_WORD, '(') || 
                             plpgsql_is_token_match2(T_CWORD,'('))
                         {
                             tok = yylex();
-                            if (T_WORD == tok)
+                            if (T_WORD == tok) {
                                 name = yylval.word.ident;
-                            else
+                                isCallFunc = is_function(name, true, false);
+                            } else {
+                                checkFuncName(yylval.cword.idents);
+                                funcNameList = yylval.cword.idents;
                                 name = NameListToString(yylval.cword.idents);
+                                isCallFunc = is_function(name, true, false, yylval.cword.idents);
+                            }
 
-                            isCallFunc = is_function(name, true, false);
                         }
 
                         if (isCallFunc)
                         {
-                            stmt = make_callfunc_stmt(name, yylloc, true);
+                            stmt = make_callfunc_stmt(name, yylloc, true, false, funcNameList, -1, isCallFunc);
                             if (PLPGSQL_STMT_EXECSQL == stmt->cmd_type)
                                 expr = ((PLpgSQL_stmt_execsql*)stmt)->sqlstmt;
                             else if (PLPGSQL_STMT_PERFORM == stmt->cmd_type)
@@ -2943,8 +4907,19 @@ expr_until_semi :
                         }
                         else
                         {
-                            if (name != NULL)
+                            if (name != NULL) {
                                 plpgsql_push_back_token(tok);
+                                name = NULL;
+                            }
+
+                            if (!plpgsql_is_token_match2(T_CWORD,'('))
+                            {
+                                if (plpgsql_is_token_match(T_CWORD)) {
+                                    List* wholeName = yylval.cword.idents;
+                                    plpgsql_pkg_add_unknown_var_to_namespace(wholeName);
+                                }
+                            }
+
                             $$ = read_sql_expression(';', ";");
                         }	
                     }
@@ -2984,10 +4959,6 @@ opt_label	:
                     }
                 | any_identifier
                     {
-#if 0
-                        if (plpgsql_ns_lookup_label(plpgsql_ns_top(), $1) == NULL)
-                            yyerror("label does not exist");
-#endif
                         $$ = $1;
                     }
                 ;
@@ -3007,12 +4978,65 @@ any_identifier	: T_WORD
                     }
                 | T_DATUM
                     {
-                        if ($1.ident == NULL) /* composite name not OK */
+                        if ($1.ident == NULL && $1.idents == NULL) {
                             yyerror("syntax error");
-                        $$ = $1.ident;
+                        } else if ($1.ident != NULL) {
+                            $$ = $1.ident;
+                        } else {
+                            char* names = NameListToString($1.idents);
+                            $$ = names;
+                        }
                     }
                 ;
 
+unreserved_keyword_func :
+	 K_ABSOLUTE
+         | K_ALIAS
+         | K_BACKWARD
+         | K_CONSTANT
+         | K_CURRENT
+         | K_DEBUG
+         | K_DETAIL
+         | K_DUMP
+         | K_ERRCODE
+         | K_ERROR
+         | K_EXCEPTIONS
+         | K_FIRST
+         | K_FORWARD
+         | K_HINT
+         | K_INDEX
+         | K_INFO
+         | K_LAST
+         | K_LOG
+         | K_MESSAGE
+         | K_MESSAGE_TEXT
+         | K_MULTISET
+         | K_NEXT
+         | K_NO
+         | K_NOTICE
+         | K_OPTION
+         | K_PACKAGE
+         | K_INSTANTIATION
+         | K_PG_EXCEPTION_CONTEXT
+         | K_PG_EXCEPTION_DETAIL
+         | K_PG_EXCEPTION_HINT 
+         | K_QUERY
+         | K_RECORD
+         | K_RELATIVE
+         | K_RESULT_OID
+         | K_RETURNED_SQLSTATE
+         | K_REVERSE
+         | K_ROW_COUNT
+         | K_SCROLL
+         | K_SLICE
+         | K_STACKED
+         | K_SYS_REFCURSOR
+         | K_USE_COLUMN
+         | K_USE_VARIABLE
+         | K_VARIABLE_CONFLICT
+         | K_VARRAY
+         | K_WARNING 
+         ;
 unreserved_keyword	:
                 K_ABSOLUTE
                 | K_ALIAS
@@ -3025,23 +5049,31 @@ unreserved_keyword	:
                 | K_CURRENT
                 | K_DEBUG
                 | K_DETAIL
+                | K_DISTINCT
                 | K_DUMP
                 | K_ERRCODE
                 | K_ERROR
+                | K_EXCEPT
+                | K_EXCEPTIONS
                 | K_FIRST
                 | K_FORWARD
                 | K_HINT
+                | K_INDEX
                 | K_INFO
+                | K_INTERSECT
                 | K_IS
                 | K_LAST
                 | K_LOG
                 | K_MERGE
                 | K_MESSAGE
                 | K_MESSAGE_TEXT
+                | K_MULTISET
                 | K_NEXT
                 | K_NO
                 | K_NOTICE
                 | K_OPTION
+                | K_PACKAGE
+                | K_INSTANTIATION
                 | K_PG_EXCEPTION_CONTEXT
                 | K_PG_EXCEPTION_DETAIL
                 | K_PG_EXCEPTION_HINT
@@ -3055,11 +5087,14 @@ unreserved_keyword	:
                 | K_ROLLBACK
                 | K_ROW_COUNT
                 | K_ROWTYPE
+                | K_SAVE
                 | K_SCROLL
                 | K_SLICE
                 | K_SQLSTATE
                 | K_STACKED
                 | K_SYS_REFCURSOR
+                | K_TABLE
+                | K_UNION
                 | K_USE_COLUMN
                 | K_USE_VARIABLE
                 | K_VARIABLE_CONFLICT
@@ -3071,6 +5106,15 @@ unreserved_keyword	:
 %%
 
 #define MAX_EXPR_PARAMS  1024
+
+typedef struct {
+    YYSTYPE lval; /* semantic information */
+    YYLTYPE lloc; /* offset in scanbuf */
+    int tok;     /* token */
+    int leng;
+} TokenData;
+static DList* push_token_stack(int tok, DList* tokenstack);
+static TokenData* build_token_data(int token);
 
 /*
  * Check whether a token represents an "unreserved keyword".
@@ -3108,7 +5152,9 @@ tok_is_keyword(int token, union YYSTYPE *lval,
 static void
 word_is_not_variable(PLword *word, int location)
 {
-    ereport(ERROR,
+    const char* message = "it is not a known variable ";
+    InsertErrorMessage(message, plpgsql_yylloc);
+    ereport(errstate,
             (errcode(ERRCODE_SYNTAX_ERROR),
              errmsg("\"%s\" is not a known variable",
                     word->ident),
@@ -3119,7 +5165,9 @@ word_is_not_variable(PLword *word, int location)
 static void
 cword_is_not_variable(PLcword *cword, int location)
 {
-    ereport(ERROR,
+    const char* message = "it is not a known variable ";
+    InsertErrorMessage(message, plpgsql_yylloc);
+    ereport(errstate,
             (errcode(ERRCODE_SYNTAX_ERROR),
              errmsg("\"%s\" is not a known variable",
                     NameListToString(cword->idents)),
@@ -3150,27 +5198,43 @@ current_token_is_not_variable(int tok)
 static void 
 yylex_inparam(StringInfoData* func_inparam, 
               int *nparams,
-              int * tok)
+              int * tok,
+              int *tableof_func_dno,
+              int *tableof_var_dno)
 {
     PLpgSQL_expr * expr =   NULL;
 
-    if (*nparams)
-        appendStringInfoString(func_inparam, ",");
+    if (nparams != NULL) {
+        if (*nparams) {
+            appendStringInfoString(func_inparam, ",");
+        } 
+        /* 
+        * handle the problem that the function 
+        * arguments can only be variable. the argment validsql is set FALSE to
+        * ignore sql expression check to the "$n" type of arguments. 
+        */
+        expr = read_sql_construct(',', ')', 0, ",|)", "", true, false, false, NULL, tok);
 
-     /* 
-      * handle the problem that the function 
-      * arguments can only be variable. the argment validsql is set FALSE to
-      * ignore sql expression check to the "$n" type of arguments. 
-      */
-    expr = read_sql_construct(',', ')', 0, ",|)", "", true, false, false, NULL, tok);
+        if (*nparams >= MAX_EXPR_PARAMS) {
+            const char* message = "too many variables specified in SQL statement ";
+            InsertErrorMessage(message, plpgsql_yylloc);
+            ereport(errstate,
+                    (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+                    errmsg("too many variables specified in SQL statement ,more than %d", MAX_EXPR_PARAMS)));
+        }
 
-    if (*nparams >= MAX_EXPR_PARAMS)
-        ereport(ERROR,
-                (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-                 errmsg("too many variables specified in SQL statement ,more than %d", MAX_EXPR_PARAMS)));	
+        (*nparams)++;
+    } else {
+        expr = read_sql_construct(',', ')', 0, ",|)", "", true, false, false, NULL, tok);
+    }
 
-    (*nparams)++;
+    if (*tableof_func_dno != -1 && *tableof_func_dno != expr->tableof_func_dno) {
+        yyerror("do not support more than 2 table of index by variables call functions in function");
+    } else {
+        *tableof_func_dno = expr->tableof_func_dno;
+    }
 
+    *tableof_var_dno = expr->tableof_var_dno;
     /* 
      * handle the problem that the function 
      * arguments can only be variable. After revising, the arguments can be any
@@ -3184,50 +5248,272 @@ yylex_inparam(StringInfoData* func_inparam,
  * Description	: 
  * Notes		:
  */
-static void 
+static int 
 yylex_outparam(char** fieldnames,
                int *varnos,
                int nfields,
                PLpgSQL_row **row,
                PLpgSQL_rec **rec,
                int *token,
+               bool is_push_back,
                bool overload)
 {
     *token = yylex();
-
+    int loc = yylloc;
     if (T_DATUM == *token)
     {
-        if (PLPGSQL_TTYPE_ROW == yylval.wdatum.datum->dtype)
+        if (PLPGSQL_DTYPE_ROW == yylval.wdatum.datum->dtype)
         {
             check_assignable(yylval.wdatum.datum, yylloc);
             fieldnames[nfields] = pstrdup(NameOfDatum(&yylval.wdatum));
-            varnos[nfields] = yylval.wdatum.datum->dno;
+            int varno = yylval.wdatum.dno;
+            TokenData* temptokendata = build_token_data(*token);
+            int temtoken = yylex();
+            plpgsql_push_back_token(temtoken);
+            yylloc = temptokendata->lloc;
+            yylval = temptokendata->lval;
+            u_sess->plsql_cxt.curr_compile_context->plpgsql_yyleng = temptokendata->leng;
+            /* if is a.b.c.d? */
+            if ('.' == temtoken) {
+                varnos[nfields] = read_assignlist(is_push_back, token);
+            } else {
+                varnos[nfields] = varno;
+                *row = (PLpgSQL_row *)yylval.wdatum.datum;
+            }
+            if (is_push_back) {
+                yylloc = temptokendata->lloc;
+                yylval = temptokendata->lval;
+                u_sess->plsql_cxt.curr_compile_context->plpgsql_yyleng = temptokendata->leng;
+            }
+            pfree_ext(temptokendata);
+        }
+        else if (PLPGSQL_DTYPE_RECORD == yylval.wdatum.datum->dtype)
+        {
+            check_assignable(yylval.wdatum.datum, yylloc);
+            fieldnames[nfields] = pstrdup(NameOfDatum(&yylval.wdatum));
+            varnos[nfields] = yylval.wdatum.dno;
             *row = (PLpgSQL_row *)yylval.wdatum.datum;
         }
-        else if (PLPGSQL_TTYPE_REC == yylval.wdatum.datum->dtype)
+        else if (PLPGSQL_DTYPE_REC == yylval.wdatum.datum->dtype)
         {
             check_assignable(yylval.wdatum.datum, yylloc);
             fieldnames[nfields] = pstrdup(NameOfDatum(&yylval.wdatum));
-            varnos[nfields] = yylval.wdatum.datum->dno;
+            varnos[nfields] = yylval.wdatum.dno;
             *rec = (PLpgSQL_rec *)yylval.wdatum.datum;
         }
-        else if (PLPGSQL_TTYPE_SCALAR == yylval.wdatum.datum->dtype)
+        else if (PLPGSQL_DTYPE_VAR == yylval.wdatum.datum->dtype)
+        {
+            check_assignable(yylval.wdatum.datum, yylloc);
+            fieldnames[nfields] = pstrdup(NameOfDatum(&yylval.wdatum));
+            varnos[nfields] = yylval.wdatum.dno;
+        }
+        /* when out param is rec.a which res is not define, we pass the check */
+        else if (PLPGSQL_DTYPE_RECFIELD == yylval.wdatum.datum->dtype)
         {
             check_assignable(yylval.wdatum.datum, yylloc);
             fieldnames[nfields] = pstrdup(NameOfDatum(&yylval.wdatum));
             varnos[nfields] = yylval.wdatum.datum->dno;
         }
-        else
-            ereport(ERROR,
+        else {
+            const char* message = "it is not a scalar variable ";
+            InsertErrorMessage(message, plpgsql_yylloc);
+            ereport(errstate,
                 (errcode(ERRCODE_SYNTAX_ERROR),
                 errmsg("\"%s\" is not a scalar variable",
                 NameOfDatum(&yylval.wdatum))));
+        }
+    }
+    else if (T_VARRAY_VAR == *token || T_TABLE_VAR == *token)
+    {
+        /* Temporary processing array value for out param */
+        check_assignable(yylval.wdatum.datum, yylloc);
+        fieldnames[nfields] = CopyNameOfDatum(&yylval.wdatum);
+        varnos[nfields] = read_assignlist(is_push_back, token);
+    }
+    else if (T_PACKAGE_VARIABLE == *token)
+    {
+        if (PLPGSQL_DTYPE_ROW == yylval.wdatum.datum->dtype)
+        {
+            check_assignable(yylval.wdatum.datum, yylloc);
+            fieldnames[nfields] = pstrdup(NameOfDatum(&yylval.wdatum));
+            int varno = yylval.wdatum.dno;
+            TokenData* temptokendata = build_token_data(*token);
+            int temtoken = yylex();
+            plpgsql_push_back_token(temtoken);
+            yylloc = temptokendata->lloc;
+            yylval = temptokendata->lval;
+            u_sess->plsql_cxt.curr_compile_context->plpgsql_yyleng = temptokendata->leng;
+            /* if is a.b.c.d? */
+            if ('.' == temtoken) {
+                varnos[nfields] = read_assignlist(is_push_back, token);
+            } else {
+                varnos[nfields] = varno;
+                *row = (PLpgSQL_row *)yylval.wdatum.datum;
+            }
+            if (is_push_back) {
+                yylloc = temptokendata->lloc;
+                yylval = temptokendata->lval;
+                u_sess->plsql_cxt.curr_compile_context->plpgsql_yyleng = temptokendata->leng;
+            }
+            pfree_ext(temptokendata);
+        }
+        else if (PLPGSQL_DTYPE_RECORD == yylval.wdatum.datum->dtype)
+        {
+            check_assignable(yylval.wdatum.datum, yylloc);
+            fieldnames[nfields] = pstrdup(NameOfDatum(&yylval.wdatum));
+            varnos[nfields] = yylval.wdatum.dno;
+            *row = (PLpgSQL_row *)yylval.wdatum.datum;
+        }
+        else if (PLPGSQL_DTYPE_VAR == yylval.wdatum.datum->dtype)
+        {
+            check_assignable(yylval.wdatum.datum, yylloc);
+            int type_flag = -1;
+            get_datum_tok_type(yylval.wdatum.datum, &type_flag);
+            if (type_flag == -1) {
+                fieldnames[nfields] = pstrdup(NameOfDatum(&yylval.wdatum));
+                varnos[nfields] = yylval.wdatum.dno;
+            } else {
+                /* Temporary processing array value for out param */
+                fieldnames[nfields] = CopyNameOfDatum(&yylval.wdatum);
+                varnos[nfields] = read_assignlist(is_push_back, token);
+            }
+        }
+        else {
+            const char* message = "it is not a scalar variable ";
+            InsertErrorMessage(message, plpgsql_yylloc);
+            ereport(errstate,
+                (errcode(ERRCODE_SYNTAX_ERROR),
+                errmsg("\"%s\" is not a scalar variable",
+                NameOfDatum(&yylval.wdatum))));
+        }
     }
     else if (overload)
     {
         fieldnames[nfields] = NULL;
         varnos[nfields] = -1;
     }
+    return loc;
+}
+
+static int read_assignlist(bool is_push_back, int* token)
+{    
+    int varno = yylval.wdatum.dno;
+    TokenData* temptokendata = build_token_data(*token);
+    DList* tokenstack = NULL;
+    List* assignlist = NULL;
+
+    for (;;) {
+        int temtoken = yylex();
+        if ('(' != temtoken && '[' != temtoken && '.' != temtoken) {
+            plpgsql_push_back_token(temtoken);
+            break;
+        }
+        
+        if (is_push_back) {
+            TokenData* temptokendata1 = build_token_data(temtoken);
+            tokenstack = dlappend(tokenstack, temptokendata1);
+        }
+        
+        PLpgSQL_expr* expr = NULL;
+        char* attrname = NULL;
+        if ('(' == temtoken) {
+            expr = read_sql_construct6(')', 0, 0, 0, 0, 0, ")", "SELECT ",
+                true, true, true, NULL, NULL, tokenstack, true);
+        } else if ('[' == temtoken) {
+            expr = read_sql_construct6(']', 0, 0, 0, 0, 0, "]", "SELECT ",
+                true, true, true, NULL, NULL, tokenstack, true);
+        } else {
+            int attrtoken = plpgsql_yylex_single();
+            attrname = get_attrname(attrtoken);
+            if (tokenstack != NULL) {
+                TokenData* temptokendata1 = build_token_data(attrtoken);
+                tokenstack = dlappend(tokenstack, temptokendata1);
+            }
+        }
+
+        MemoryContext oldCxt = MemoryContextSwitchTo(u_sess->plsql_cxt.curr_compile_context->compile_cxt);
+        if (expr != NULL) {
+            A_Indices *ai = makeNode(A_Indices);
+            ai->lidx = NULL;
+            ai->uidx = (Node*)expr;
+            assignlist = lappend(assignlist, (Node*)ai);
+        } else {
+            Value* v = makeString(pstrdup(attrname));
+            assignlist = lappend(assignlist, (Node*)v);
+        }
+        MemoryContextSwitchTo(oldCxt);
+    }
+    if (assignlist != NULL) {
+        MemoryContext oldCxt = MemoryContextSwitchTo(u_sess->plsql_cxt.curr_compile_context->compile_cxt);
+        PLpgSQL_assignlist *newp = NULL;
+        newp = (PLpgSQL_assignlist*)palloc0(sizeof(PLpgSQL_assignlist));
+        newp->dtype = PLPGSQL_DTYPE_ASSIGNLIST;
+        newp->assignlist = assignlist;
+        newp->targetno = varno;
+        varno = plpgsql_adddatum((PLpgSQL_datum*)newp);
+        MemoryContextSwitchTo(oldCxt);
+    }
+
+    if (is_push_back) {
+        if (tokenstack != NULL) {
+            push_back_token_stack(tokenstack);
+        }
+
+        /* need restore yylloc or yylval if push back twice */
+        yylloc = temptokendata->lloc;
+        yylval = temptokendata->lval;
+        u_sess->plsql_cxt.curr_compile_context->plpgsql_yyleng = temptokendata->leng;
+    }
+    
+    pfree_ext(temptokendata);
+    return varno;
+}
+
+/* push token in tokenstack */
+static DList* push_token_stack(int tok, DList* tokenstack)
+{
+    TokenData* temptokendata = NULL;
+    if (tokenstack != NULL) {
+        temptokendata = build_token_data(tok);
+        tokenstack = dlappend(tokenstack, temptokendata);
+    }
+    return tokenstack;
+}
+
+/* build a TokenData for input token  */
+static TokenData* build_token_data(int token)
+{
+    TokenData* temptokendata = (TokenData*)palloc0(sizeof(TokenData));
+    temptokendata->lloc = yylloc;
+    temptokendata->lval = yylval;
+    temptokendata->tok = token;
+    temptokendata->leng = u_sess->plsql_cxt.curr_compile_context->plpgsql_yyleng;
+    return temptokendata;
+}
+
+/* push back token stored in tokenstack */
+static int push_back_token_stack(DList* tokenstack)
+{
+    int tok = 0;
+    if(tokenstack->length > MAX_PUSHBACKS) {
+        dlist_free(tokenstack, true);
+        yyerror("array with subscript words too much for overloaded function.");
+    } else {
+        DListCell* dlc = NULL;
+        for (dlc = dlist_tail_cell(tokenstack); dlc != NULL; dlc = lprev(dlc)) {
+            /* plpgsql_push_back_token function only push yylloc and yylval,
+             * so assign the token value to them.
+             */
+            TokenData* n = (TokenData*)lfirst(dlc);
+            tok = n->tok;
+            yylloc = n->lloc;
+            yylval = n->lval;
+            u_sess->plsql_cxt.curr_compile_context->plpgsql_yyleng = n->leng;
+            plpgsql_push_back_token(tok);
+        }
+        dlist_free(tokenstack, true);
+    }
+    return tok;
 }
 
 /*
@@ -3268,6 +5554,20 @@ plpgsql_parser_funcname(const char *s, char **output, int numidents)
     pfree_ext(str);
 }
 
+static int get_func_out_arg_num(char* p_argmodes, int all_arg)
+{
+    if (all_arg == 0 || p_argmodes == NULL) {
+        return 0;
+    }
+    int out_arg_num = 0;
+    for (int i = 0; i < all_arg; i++) {
+        if (p_argmodes[i] == 'o' || p_argmodes[i] == 'b') {
+            out_arg_num++;
+        }
+    }
+    return out_arg_num;
+}
+
 /*
  * Brief		: handle A-style function call.
  * Description	: handle A-style function call. First read the function 
@@ -3280,7 +5580,7 @@ plpgsql_parser_funcname(const char *s, char **output, int numidents)
  * Notes		:
  */ 
 static PLpgSQL_stmt *
-make_callfunc_stmt(const char *sqlstart, int location, bool is_assign)
+make_callfunc_stmt(const char *sqlstart, int location, bool is_assign, bool eaten_first_token, List* funcNameList, int arrayFuncDno, bool isCallFunc)
 {
     int nparams = 0;
     int nfields = 0;
@@ -3296,10 +5596,12 @@ make_callfunc_stmt(const char *sqlstart, int location, bool is_assign)
     int pos_outer = 0;
     /* pos_inner is the position got by its real postion in function invoke */
     int pos_inner = -1;
-    int	varnos[FUNC_MAX_ARGS];
+    int	varnos[FUNC_MAX_ARGS] = {-1};
     bool	namedarg[FUNC_MAX_ARGS];
     char*	namedargnamses[FUNC_MAX_ARGS];
     char *fieldnames[FUNC_MAX_ARGS];
+    bool outParamInvalid = false;
+    bool is_plpgsql_func_with_outparam = false;
 
     List *funcname = NIL;
     PLpgSQL_row *row = NULL;
@@ -3315,30 +5617,103 @@ make_callfunc_stmt(const char *sqlstart, int location, bool is_assign)
     int j = 0;
     int placeholders = 0;
     char *quoted_sqlstart = NULL;
+    bool is_have_tableof_index_func = false;
 
     MemoryContext oldCxt = NULL;
     bool	multi_func = false;
+    const char *varray_delete = "array_delete(\"";
+    const char *varray_indexby_delete = "array_indexby_delete(\"";
+    const char *varray_deleteidx = "array_deleteidx(\"";
+    const char *varray_deletevarchar = "array_varchar_delete(\"";
+    const char *varray_deleteinteger = "array_integer_delete(\"";
+    const char *varray_extend= "array_extendnull(\"";
+    const char *varray_trim = "array_trim(\"";
+
     /*get the function's name*/
     cp[0] = NULL;
     cp[1] = NULL;
     cp[2] = NULL;
-    /* the function make_callfunc_stmt is only to assemble a sql statement, so the context is set to tmp context */
-    oldCxt = MemoryContextSwitchTo(u_sess->plsql_cxt.compile_tmp_cxt);
-    plpgsql_parser_funcname(sqlstart, cp, 3);
 
-    if (cp[2] && cp[2][0] != '\0')
-        funcname = list_make3(makeString(cp[0]), makeString(cp[1]), makeString(cp[2]));
-    else if (cp[1] && cp[1][0] != '\0')
-        funcname = list_make2(makeString(cp[0]), makeString(cp[1]));
-    else
-        funcname = list_make1(makeString(cp[0]));
+    if (sqlstart != NULL && (strncmp(sqlstart, varray_delete, strlen(varray_delete)) == 0
+        || strncmp(sqlstart, varray_indexby_delete, strlen(varray_indexby_delete)) == 0
+        || strncmp(sqlstart, varray_deleteidx, strlen(varray_deleteidx)) == 0
+        || strncmp(sqlstart, varray_extend, strlen(varray_extend)) == 0
+        || strncmp(sqlstart, varray_trim, strlen(varray_trim)) == 0
+        || strncmp(sqlstart, varray_deletevarchar, strlen(varray_deletevarchar)) == 0
+        || strncmp(sqlstart, varray_deleteinteger, strlen(varray_deleteinteger)) == 0)) {
+        unsigned int chIdx = 0;
+
+        if (strncmp(sqlstart, varray_delete, strlen(varray_delete)) == 0) {
+            chIdx = strlen(varray_delete);
+        } else if (strncmp(sqlstart, varray_indexby_delete, strlen(varray_indexby_delete)) == 0) {
+            chIdx = strlen(varray_indexby_delete);
+            is_have_tableof_index_func = true;
+        } else if (strncmp(sqlstart, varray_deleteidx, strlen(varray_deleteidx)) == 0) {
+            chIdx = strlen(varray_deleteidx);
+        } else if (strncmp(sqlstart, varray_deletevarchar, strlen(varray_deletevarchar)) == 0) {
+            chIdx = strlen(varray_deletevarchar);
+            is_have_tableof_index_func = true;
+        } else if (strncmp(sqlstart, varray_deleteinteger, strlen(varray_deleteinteger)) == 0) {
+            chIdx = strlen(varray_deleteinteger);
+            is_have_tableof_index_func = true;
+        } else if (strncmp(sqlstart, varray_trim, strlen(varray_trim)) == 0) {
+            chIdx = strlen(varray_trim);
+        } else {
+            chIdx = strlen(varray_extend);
+        }
+
+        initStringInfo(&func_inparas);
+        appendStringInfoString(&func_inparas, "SELECT ");
+        appendStringInfoString(&func_inparas, sqlstart);
+
+        if (arrayFuncDno == -1) {
+            return NULL;
+        }
+
+        expr = (PLpgSQL_expr *)palloc0(sizeof(PLpgSQL_expr));
+        expr->dtype = PLPGSQL_DTYPE_EXPR;
+        expr->query = pstrdup(func_inparas.data);
+        expr->plan = NULL;
+        expr->paramnos = NULL;
+        expr->ns = plpgsql_ns_top();
+        expr->idx = (uint32)-1;
+        expr->out_param_dno = -1;
+        expr->is_have_tableof_index_func = is_have_tableof_index_func;
+
+        PLpgSQL_stmt_assign *perform = (PLpgSQL_stmt_assign*)palloc0(sizeof(PLpgSQL_stmt_assign));
+        perform->cmd_type = PLPGSQL_STMT_ASSIGN;;
+        perform->lineno   = plpgsql_location_to_lineno(location);
+        perform->varno = arrayFuncDno;
+        perform->expr  = expr;
+        perform->sqlString = pstrdup(func_inparas.data);
+        pfree_ext(func_inparas.data);
+        return (PLpgSQL_stmt *)perform;
+    }
+
+    /* the function make_callfunc_stmt is only to assemble a sql statement, so the context is set to tmp context */
+    oldCxt = MemoryContextSwitchTo(u_sess->plsql_cxt.curr_compile_context->compile_tmp_cxt);
+    if (funcNameList == NULL) {
+        plpgsql_parser_funcname(sqlstart, cp, 3);
+    } else {
+        funcname= funcNameList;
+    }
+    if (funcNameList == NULL) {
+        if (cp[2] && cp[2][0] != '\0')
+            funcname = list_make3(makeString(cp[0]), makeString(cp[1]), makeString(cp[2]));
+        else if (cp[1] && cp[1][0] != '\0')
+            funcname = list_make2(makeString(cp[0]), makeString(cp[1]));
+        else
+            funcname = list_make1(makeString(cp[0]));
+    }
 
 
     /* search the function */
     clist = FuncnameGetCandidates(funcname, -1, NIL, false, false, false);
     if (!clist)
     {
-        ereport(ERROR,
+        const char* message = "function not exist";
+        InsertErrorMessage(message, plpgsql_yylloc);
+        ereport(errstate,
                 (errcode(ERRCODE_UNDEFINED_FUNCTION),
                  errmsg("function \"%s\" doesn't exist ", sqlstart)));
         return NULL;
@@ -3349,7 +5724,9 @@ make_callfunc_stmt(const char *sqlstart, int location, bool is_assign)
         multi_func = true;
         if (IsPackageFunction(funcname) == false)
         {
-            ereport(ERROR,
+            const char* message = "function is not exclusive";
+            InsertErrorMessage(message, plpgsql_yylloc);
+            ereport(errstate,
             (errcode(ERRCODE_DUPLICATE_FUNCTION),
              errmsg("function \"%s\" isn't exclusive ", sqlstart)));
         }
@@ -3366,25 +5743,22 @@ make_callfunc_stmt(const char *sqlstart, int location, bool is_assign)
          */
         if (!HeapTupleIsValid(proctup))
         {
-            ereport(ERROR,
+            const char* message = "function does not exist";
+            InsertErrorMessage(message, plpgsql_yylloc);
+            ereport(errstate,
                     (errcode(ERRCODE_UNDEFINED_FUNCTION),
                      errmsg("function \"%s\" doesn't exist ", sqlstart)));
             return NULL;
         }
         /* get the all args informations, only "in" parameters if p_argmodes is null */
         narg = get_func_arg_info(proctup,&p_argtypes, &p_argnames, &p_argmodes);
-        if (p_argmodes)
-        {
-            for (i = 0; i < narg; i++)
-            {
-                if (p_argmodes[i] == 'i' || p_argmodes[i] == 'b')
-                {
+        if (p_argmodes) {
+            for (i = 0; i < narg; i++) {
+                if (p_argmodes[i] == 'i' || p_argmodes[i] == 'b') {
                     inArgNum++;
                 }
             }
-        }
-        else
-        {
+        } else {
             inArgNum = narg;
         }
         procStruct = (Form_pg_proc) GETSTRUCT(proctup);
@@ -3396,11 +5770,24 @@ make_callfunc_stmt(const char *sqlstart, int location, bool is_assign)
 
     tok = yylex();
 
-    /* check the format for the function without parameters */
-    if ((tok = yylex()) == ')')
-        noargs = TRUE;
+    /* 
+     *  check the format for the function without parameters
+     *  if eaten_first_token is true,first token is '(' ,so if next token is ')',it means
+     *  no args
+     */
+    if (eaten_first_token==true) {
+        if (tok == ')')
+            noargs = TRUE;
+    } else {
+        if ((tok = yylex()) == ')')
+            noargs = TRUE;
+    }
     plpgsql_push_back_token(tok);
 
+    if (isCallFunc && is_function_with_plpgsql_language_and_outparam(clist->oid)) {
+        is_assign = false;
+        is_plpgsql_func_with_outparam = true;
+    }
     /* has any "out" parameters, user execsql stmt */
     if (is_assign)
     {
@@ -3411,6 +5798,8 @@ make_callfunc_stmt(const char *sqlstart, int location, bool is_assign)
         appendStringInfoString(&func_inparas, "CALL ");
     }
 
+    int tableof_func_dno = -1;
+    int tableof_var_dno = -1;
     /*
      * Properly double-quote schema name and function name to handle uppercase
      * and special characters when making 'CALL func_name;' statement.
@@ -3456,6 +5845,7 @@ make_callfunc_stmt(const char *sqlstart, int location, bool is_assign)
                      * search the p_argnames to match the right argname with current arg,
                      * so the real postion of current arg can be determined 
                      */
+                    bool argMatch = false;
                     for (j = 0; j < narg; j++)
                     {
                         if ('o' == p_argmodes[j] || 'b' == p_argmodes[j])
@@ -3469,7 +5859,8 @@ make_callfunc_stmt(const char *sqlstart, int location, bool is_assign)
                             switch (p_argmodes[j])
                             {
                                 case 'i':
-                                    yylex_inparam(&func_inparas, &nparams, &tok);
+                                    yylex_inparam(&func_inparas, &nparams, &tok, &tableof_func_dno, &tableof_var_dno);
+                                    check_tableofindex_args(tableof_var_dno, p_argtypes[j]);
                                     break;
                                 case 'o':
                                 case 'b':
@@ -3497,24 +5888,47 @@ make_callfunc_stmt(const char *sqlstart, int location, bool is_assign)
                                         appendStringInfoString(&func_inparas, yylval.word.ident);
 
                                     appendStringInfoString(&func_inparas, "=>");
+                                    /* pass => */
                                     (void)yylex();
-                                    yylex_outparam(fieldnames, varnos, pos_outer, &row, &rec, &tok);
-                                    if (T_DATUM == tok)
+                                    yylex_outparam(fieldnames, varnos, pos_outer, &row, &rec, &tok, true);
+                                    if ((!enable_out_param_override() && p_argmodes[j] == 'b') 
+                                            || T_DATUM == tok || T_VARRAY_VAR == tok 
+                                            || T_TABLE_VAR == tok || T_PACKAGE_VARIABLE == tok)
                                     {
                                         nfields++;
-                                        appendStringInfoString(&func_inparas, NameOfDatum(&yylval.wdatum));
+                                        plpgsql_push_back_token(tok);
+                                        /* don't need inparam add ',' */
+                                        yylex_inparam(&func_inparas, NULL, &tok, &tableof_func_dno, &tableof_var_dno);
+                                        check_tableofindex_args(tableof_var_dno, p_argtypes[j]);
+                                    } else {
+                                        outParamInvalid = true;
                                     }
-
-                                    tok = yylex();
                                     nparams++;
                                     break;
                                 default:
-                                    ereport(ERROR,
+                                    const char* message = "parameter mode  not exist";
+                                    InsertErrorMessage(message, plpgsql_yylloc);
+                                    ereport(errstate,
                                             (errcode(ERRCODE_UNEXPECTED_NODE_STATE),
                                              errmsg("parameter mode %c doesn't exist", p_argmodes[j])));
                             }
+                            argMatch = true;
                             break;
                         }
+                    }
+                    if (!argMatch) {
+                        const char* message = "invoking function error,check function";
+                        InsertErrorMessage(message, plpgsql_yylloc);
+                        ereport(errstate,
+                            (errcode(ERRCODE_SYNTAX_ERROR),
+                             errmsg("when invoking function %s, no argments match \"%s\"", sqlstart, argname.data)));
+                    }
+                    if (outParamInvalid) {
+                        const char* message = "invoking function error,check function";
+                        InsertErrorMessage(message, plpgsql_yylloc);
+                        ereport(errstate,
+                            (errcode(ERRCODE_SYNTAX_ERROR),
+                             errmsg("when invoking function %s, no destination for argments \"%s\"", sqlstart, argname.data)));
                     }
                 }
                 else
@@ -3527,7 +5941,8 @@ make_callfunc_stmt(const char *sqlstart, int location, bool is_assign)
                             if (T_PLACEHOLDER == tok)
                                 placeholders++;
                             plpgsql_push_back_token(tok);
-                            yylex_inparam(&func_inparas, &nparams, &tok);
+                            yylex_inparam(&func_inparas, &nparams, &tok, &tableof_func_dno, &tableof_var_dno);
+                            check_tableofindex_args(tableof_var_dno, p_argtypes[i]);
                             break;
                         case 'o':
                             /*
@@ -3536,7 +5951,7 @@ make_callfunc_stmt(const char *sqlstart, int location, bool is_assign)
                              */
                             if (is_assign)
                             {
-                                if (T_DATUM == tok || T_PLACEHOLDER == tok)
+                                if (T_DATUM == tok || T_VARRAY_VAR == tok || T_TABLE_VAR == tok || T_PACKAGE_VARIABLE == tok || T_PLACEHOLDER == tok)
                                 {
                                     plpgsql_push_back_token(tok);
                                     (void)read_sql_expression2(',', ')', ",|)", &tok);
@@ -3549,36 +5964,30 @@ make_callfunc_stmt(const char *sqlstart, int location, bool is_assign)
                             if (T_PLACEHOLDER == tok)
                             {
                                 placeholders++;
-                                if (nparams)
-                                    appendStringInfoChar(&func_inparas, ',');
-                                appendStringInfoString(&func_inparas, yylval.word.ident);
-                                nparams++;
                             }
-                            else if (T_DATUM == tok)
+                            else if (T_DATUM == tok || T_VARRAY_VAR == tok || T_TABLE_VAR == tok || T_PACKAGE_VARIABLE == tok || T_PLACEHOLDER == tok)
                             {
-                                if (nparams)
-                                    appendStringInfoString(&func_inparas, ",");
-                                appendStringInfoString(&func_inparas, NameOfDatum(&yylval.wdatum));
-                                nparams++;
                                 nfields++;
+                            } else {
+                                outParamInvalid = true;
                             }
 
                             plpgsql_push_back_token(tok);
-                            yylex_outparam(fieldnames, varnos, pos_inner, &row, &rec, &tok);
-
-                            tok = yylex();
+                            yylex_outparam(fieldnames, varnos, pos_inner, &row, &rec, &tok, true);
+                            plpgsql_push_back_token(tok);
+                            yylex_inparam(&func_inparas, &nparams, &tok, &tableof_func_dno, &tableof_var_dno);
+                            check_tableofindex_args(tableof_var_dno, p_argtypes[i]);
                             break;
                         case 'b':
                             if (is_assign)
                             {
-                                /*
-                                 * if the function is in an assign expr, read the inout
-                                 * parameters.
-                                 */
-                                if (T_DATUM == tok)
+                                if (!enable_out_param_override() 
+                                        || (enable_out_param_override() 
+                                               && (T_DATUM == tok || T_VARRAY_VAR == tok 
+                                                      || T_TABLE_VAR == tok || T_PACKAGE_VARIABLE == tok)))
                                 {
                                     plpgsql_push_back_token(tok);
-                                    yylex_inparam(&func_inparas, &nparams, &tok);
+                                    yylex_inparam(&func_inparas, &nparams, &tok, &tableof_func_dno, &tableof_var_dno);
                                 }
                                 else
                                     yyerror("syntax error");
@@ -3588,17 +5997,33 @@ make_callfunc_stmt(const char *sqlstart, int location, bool is_assign)
                             if (T_PLACEHOLDER == tok)
                                 placeholders++;
                             plpgsql_push_back_token(tok);
-                            yylex_outparam(fieldnames, varnos, pos_inner, &row, &rec, &tok);
-                            if (T_DATUM == tok)
+                            yylex_outparam(fieldnames, varnos, pos_inner, &row, &rec, &tok, true);
+                            if (T_DATUM == tok || T_VARRAY_VAR == tok || T_TABLE_VAR == tok || T_PACKAGE_VARIABLE == tok) {
                                 nfields++;
+                            } else {
+                                outParamInvalid = true;
+                            }
+                            
                             plpgsql_push_back_token(tok);
-                            yylex_inparam(&func_inparas, &nparams, &tok);
+                            
+                            yylex_inparam(&func_inparas, &nparams, &tok, &tableof_func_dno, &tableof_var_dno);
+                            check_tableofindex_args(tableof_var_dno, p_argtypes[i]);
                             break;
                         default:
-                            ereport(ERROR,
+                            const char* message = "parameter mode  not exist";
+                            InsertErrorMessage(message, plpgsql_yylloc);
+                            ereport(errstate,
                                     (errcode(ERRCODE_UNEXPECTED_NODE_STATE),
                                      errmsg("parameter mode %c doesn't exist", p_argmodes[i])));
                     }
+                    if (is_plpgsql_func_with_outparam && outParamInvalid) {
+                        const char* message = "invoking function error,check function";
+                        InsertErrorMessage(message, plpgsql_yylloc);
+                        ereport(errstate,
+                            (errcode(ERRCODE_SYNTAX_ERROR),
+                             errmsg("when invoking function %s, no destination for argments \"%s\"", sqlstart, argname.data)));
+                    }
+
                 }
 
                 if (')' == tok)
@@ -3607,15 +6032,21 @@ make_callfunc_stmt(const char *sqlstart, int location, bool is_assign)
                     break;
                 }
 
-                if (narg - 1 == i)
-                    ereport(ERROR,
+                if (narg - 1 == i) {
+                    const char* message = "maybe input something superfluous";
+                    InsertErrorMessage(message, plpgsql_yylloc);
+                    ereport(errstate,
                             (errcode(ERRCODE_SYNTAX_ERROR),
                              errmsg("when invoking function %s, expected \")\", maybe input something superfluous.", sqlstart)));
+                }
 
-                if (',' != tok)
-                    ereport(ERROR,
+                if (',' != tok) {
+                    const char* message = "invoking function error,check function";
+                    InsertErrorMessage(message, plpgsql_yylloc);
+                    ereport(errstate,
                             (errcode(ERRCODE_SYNTAX_ERROR),
                              errmsg("when invoking function %s, expected \",\"", sqlstart)));
+                }
                 pfree_ext(argname.data);
             }
         }
@@ -3628,7 +6059,7 @@ make_callfunc_stmt(const char *sqlstart, int location, bool is_assign)
                     placeholders++;
                 plpgsql_push_back_token(tok);
         
-                yylex_inparam(&func_inparas, &nparams, &tok);
+                yylex_inparam(&func_inparas, &nparams, &tok, &tableof_func_dno, &tableof_var_dno);
         
                 if (')' == tok)
                 {
@@ -3636,10 +6067,13 @@ make_callfunc_stmt(const char *sqlstart, int location, bool is_assign)
                     break;
                 }
         
-                if (narg - 1 == i)
-                    ereport(ERROR,
+                if (narg - 1 == i) {
+                    const char* message = "maybe input something superfluous";
+                    InsertErrorMessage(message, plpgsql_yylloc);
+                    ereport(errstate,
                             (errcode(ERRCODE_SYNTAX_ERROR),
                              errmsg("when invoking function %s, expected \")\", maybe input something superfluous.", sqlstart)));
+                }
             }
         }
     }
@@ -3669,8 +6103,32 @@ make_callfunc_stmt(const char *sqlstart, int location, bool is_assign)
                 appendStringInfoString(&func_inparas, "=>");
                 (void)yylex();
                 
-                yylex_outparam(fieldnames, varnos, nfields, &row, &rec, &tok, true);
-                int loc = yylloc;
+                int loc = yylex_outparam(fieldnames, varnos, nfields, &row, &rec, &tok, false, true);
+                if (tok == '(') {
+                   int brackets = 1;
+                   int syntaxErr = false;
+                   // ignore record const value.
+                   while(brackets != 0 && !syntaxErr) {
+                       tok = yylex();
+                       switch(tok) {
+                           case '(':
+                               brackets++;
+                               break;
+                           case ')':
+                               brackets--;
+                               break;
+                           case 0:
+                               syntaxErr = true;
+                               break;
+                           default:
+                               ;
+                       }  
+                   }
+
+                   if (syntaxErr) {
+                       yyerror("Record/Composite type format error, brackets does't match.");
+                   }
+                }
                 tok = yylex();
                 int curloc = yylloc;
                 plpgsql_push_back_token(tok);
@@ -3682,9 +6140,9 @@ make_callfunc_stmt(const char *sqlstart, int location, bool is_assign)
             }
             else
             {
-                yylex_outparam(fieldnames, varnos, nfields, &row, &rec, &tok, true);
+                yylex_outparam(fieldnames, varnos, nfields, &row, &rec, &tok, true, true);
                 plpgsql_push_back_token(tok);
-                yylex_inparam(&func_inparas, &nparams, &tok);
+                yylex_inparam(&func_inparas, &nparams, &tok, &tableof_func_dno, &tableof_var_dno);
                 namedarg[nfields] = false;
                 namedargnamses[nfields] = NULL;
             }
@@ -3701,9 +6159,12 @@ make_callfunc_stmt(const char *sqlstart, int location, bool is_assign)
     {
         if (!is_assign)
         {
-                ereport(ERROR,
-                        (errcode(ERRCODE_SYNTAX_ERROR),
-                         errmsg("when invoking function %s, maybe input something superfluous.", sqlstart)));
+            const char* message = "maybe input something superfluous";
+            InsertErrorMessage(message, plpgsql_yylloc);
+            ereport(errstate,
+                    (errcode(ERRCODE_SYNTAX_ERROR),
+                    errmsg("when invoking function %s, maybe input something superfluous.", sqlstart)));
+            u_sess->plsql_cxt.have_error = true;
         }
         else
         {
@@ -3716,10 +6177,13 @@ make_callfunc_stmt(const char *sqlstart, int location, bool is_assign)
         }
     }
     
-    if (!multi_func && inArgNum - i >  ndefaultargs)
-        ereport(ERROR,
+    if (!multi_func && inArgNum - i >  ndefaultargs) {
+        const char* message = "function has no enough parameters";
+        InsertErrorMessage(message, plpgsql_yylloc);
+        ereport(errstate,
                 (errcode(ERRCODE_UNDEFINED_FUNCTION),
                  errmsg("function %s has no enough parameters", sqlstart)));
+    }
 
     (void)MemoryContextSwitchTo(oldCxt);
 
@@ -3731,6 +6195,8 @@ make_callfunc_stmt(const char *sqlstart, int location, bool is_assign)
     expr->paramnos 		= NULL;
     expr->ns			= plpgsql_ns_top();
     expr->idx			= (uint32)-1;
+    expr->out_param_dno	= -1;
+    expr->is_have_tableof_index_func = tableof_func_dno != -1 ? true : false;
 
     if (multi_func)
     {
@@ -3741,13 +6207,14 @@ make_callfunc_stmt(const char *sqlstart, int location, bool is_assign)
         function->fn_is_trigger = false;
         function->fn_input_collation = InvalidOid;
         function->out_param_varno = -1;		/* set up for no OUT param */
-        function->resolve_option = (PLpgSQL_resolve_option)u_sess->plsql_cxt.plpgsql_variable_conflict;
+        function->resolve_option = GetResolveOption();
         function->fn_cxt = CurrentMemoryContext;
 
-        estate->ndatums = u_sess->plsql_cxt.plpgsql_nDatums;
-        estate->datums = (PLpgSQL_datum **)palloc(sizeof(PLpgSQL_datum *) * u_sess->plsql_cxt.plpgsql_nDatums);
-        for (int i = 0; i < u_sess->plsql_cxt.plpgsql_nDatums; i++)
-            estate->datums[i] = u_sess->plsql_cxt.plpgsql_Datums[i];
+        PLpgSQL_compile_context* curr_compile = u_sess->plsql_cxt.curr_compile_context;
+        estate->ndatums = curr_compile->plpgsql_nDatums;
+        estate->datums = (PLpgSQL_datum **)palloc(sizeof(PLpgSQL_datum *) * curr_compile->plpgsql_nDatums);
+        for (int i = 0; i < curr_compile->plpgsql_nDatums; i++)
+            estate->datums[i] = curr_compile->plpgsql_Datums[i];
 
         function->cur_estate = estate;
         function->cur_estate->func = function;
@@ -3772,7 +6239,9 @@ make_callfunc_stmt(const char *sqlstart, int location, bool is_assign)
              */
             if (!HeapTupleIsValid(proctup))
             {
-                ereport(ERROR,
+                const char* message = "function does not exist";
+                InsertErrorMessage(message, plpgsql_yylloc);
+                ereport(errstate,
                         (errcode(ERRCODE_UNDEFINED_FUNCTION),
                          errmsg("function \"%s\" doesn't exist ", sqlstart)));
                 return NULL;
@@ -3784,6 +6253,10 @@ make_callfunc_stmt(const char *sqlstart, int location, bool is_assign)
             narg = procStruct->pronargs;
             ReleaseSysCache(proctup);
 
+            for (int k = 0; k < all_arg; k++)  {
+                check_tableofindex_args(varnos[k], p_argtypes[k]);
+            }
+
             /* if there is no "out" parameters ,use perform stmt,others use exesql */
             if ((0 == all_arg || NULL == p_argmodes))
             {
@@ -3792,14 +6265,19 @@ make_callfunc_stmt(const char *sqlstart, int location, bool is_assign)
                 perform->cmd_type = PLPGSQL_STMT_PERFORM;
                 perform->lineno   = plpgsql_location_to_lineno(location);
                 perform->expr	  = expr;
+                perform->sqlString = plpgsql_get_curline_query();
                 return (PLpgSQL_stmt *)perform;
             }
             else if (all_arg >= narg)
             {
-                if (NULL == rec &&  NULL == row)
+                int out_arg_num = get_func_out_arg_num(p_argmodes, all_arg);
+                /* out arg number > 1 should build a row */
+                bool need_build_row = need_build_row_for_func_arg(&rec, &row, out_arg_num, all_arg, varnos, p_argmodes);
+                if (need_build_row)
                 {
                     int new_nfields = 0;
                     int i = 0, j = 0;
+                    bool varnosInvalid = false;
                     for (i = 0; i < all_arg; i++)
                     {
                         if (p_argmodes[i] == 'i')
@@ -3815,6 +6293,7 @@ make_callfunc_stmt(const char *sqlstart, int location, bool is_assign)
                     row->nfields = new_nfields;
                     row->fieldnames = (char **)palloc0(sizeof(char *) * new_nfields);
                     row->varnos = (int *)palloc0(sizeof(int) * new_nfields);
+                    row->isImplicit = true;
 
                     /* fetch out argument from fieldnames into row->fieldnames */
                     for (i = 0; i < nfields; i++)
@@ -3828,6 +6307,8 @@ make_callfunc_stmt(const char *sqlstart, int location, bool is_assign)
                                 row->fieldnames[j] = fieldnames[i];
                                 row->varnos[j] = varnos[i];
                                 j++;
+                            } else {
+                                varnosInvalid = true;
                             }
                         }
                         else
@@ -3861,26 +6342,40 @@ make_callfunc_stmt(const char *sqlstart, int location, bool is_assign)
 
                             if (fieldnames[i] == NULL)
                             {
-                                ereport(ERROR,
+                                const char* message = "Named argument can not be a const";
+                                InsertErrorMessage(message, plpgsql_yylloc);
+                                ereport(errstate,
                                     (errcode(ERRCODE_SYNTAX_ERROR),
                                         errmsg("Named argument \"%s\" can not be a const", namedargnamses[i])));
                             }
 
                             if (row->varnos[pos_outer] > 0)
                             {
-                                ereport(ERROR,
+                                const char* message = "parameter is assigned more than once";
+                                InsertErrorMessage(message, plpgsql_yylloc);
+                                ereport(errstate,
                                 (errcode(ERRCODE_SYNTAX_ERROR),
                                     errmsg("parameter \"%s\" is assigned more than once", row->fieldnames[pos_outer])));
                             }
-                            
                             if (varnos[i] >= 0)
                             {
                                 row->fieldnames[pos_outer] = fieldnames[i];
                                 row->varnos[pos_outer] = varnos[i];
+                            } else {
+                                varnosInvalid = true;
                             }
                         }
                     }
-                    plpgsql_adddatum((PLpgSQL_datum *)row);
+                    if (varnosInvalid) {
+                        pfree_ext(row->refname);
+                        pfree_ext(row->fieldnames);
+                        pfree_ext(row->varnos);
+                        pfree_ext(row);
+                    } else if (u_sess->attr.attr_sql.sql_compatibility == A_FORMAT) {
+                        expr->out_param_dno = plpgsql_adddatum((PLpgSQL_datum *)row);
+                    } else {
+                        plpgsql_adddatum((PLpgSQL_datum *)row);
+                    }
                 }
 
                 PLpgSQL_stmt_execsql * execsql = NULL;
@@ -3889,25 +6384,32 @@ make_callfunc_stmt(const char *sqlstart, int location, bool is_assign)
                 execsql->lineno  = plpgsql_location_to_lineno(location);
                 execsql->sqlstmt = expr;
                 execsql->into	 = row || rec ? true:false;
+                execsql->bulk_collect = false;
                 execsql->strict  = true;
                 execsql->rec	 = rec;
                 execsql->row	 = row;
                 execsql->placeholders = placeholders;
                 execsql->multi_func = multi_func;
+                execsql->sqlString = plpgsql_get_curline_query();
                 return (PLpgSQL_stmt *)execsql;
             }
         }
         else
         {
-            ereport(ERROR,
+            const char* message = "function is not exclusive";
+            InsertErrorMessage(message, plpgsql_yylloc);
+            ereport(errstate,
             (errcode(ERRCODE_DUPLICATE_FUNCTION),
              errmsg("function \"%s\" isn't exclusive ", sqlstart)));
         }
     }
     else
     {
-        /* if have out parameters, generate row type to store the results. */
-        if (nfields && NULL == rec &&  NULL == row)
+        /*
+         * if have out parameters and no row/rec, generate row type to store the results.
+         * if have row/rec and more than 2 out parameters , also generate row type.
+         */
+        if (((nfields && NULL == rec &&  NULL == row) || nfields > 1) && !outParamInvalid)
         {
             row = (PLpgSQL_row*)palloc0(sizeof(PLpgSQL_row));
             row->dtype = PLPGSQL_DTYPE_ROW;
@@ -3917,12 +6419,23 @@ make_callfunc_stmt(const char *sqlstart, int location, bool is_assign)
             row->nfields = nfields;
             row->fieldnames = (char **)palloc(sizeof(char *) * nfields);
             row->varnos = (int *)palloc(sizeof(int) * nfields);
+            row->isImplicit = true;
             while (--nfields >= 0)
             {
                 row->fieldnames[nfields] = fieldnames[nfields];
                 row->varnos[nfields] = varnos[nfields];
             }
-            plpgsql_adddatum((PLpgSQL_datum *)row);
+            if (u_sess->attr.attr_sql.sql_compatibility == A_FORMAT) {
+                expr->out_param_dno = plpgsql_adddatum((PLpgSQL_datum *)row);
+            } else {
+                plpgsql_adddatum((PLpgSQL_datum *)row);
+            }
+        }
+        /* has invalid out param, set it to null */
+        if ((rec != NULL || row != NULL) && outParamInvalid)
+        {
+            rec = NULL;
+            row = NULL;
         }
         
         /* if there is no "out" parameters ,use perform stmt,others use exesql */
@@ -3933,6 +6446,7 @@ make_callfunc_stmt(const char *sqlstart, int location, bool is_assign)
             perform->cmd_type = PLPGSQL_STMT_PERFORM;
             perform->lineno   = plpgsql_location_to_lineno(location);
             perform->expr	  = expr;
+            perform->sqlString = plpgsql_get_curline_query();
             return (PLpgSQL_stmt *)perform;
         }
         else
@@ -3943,11 +6457,13 @@ make_callfunc_stmt(const char *sqlstart, int location, bool is_assign)
             execsql->lineno  = plpgsql_location_to_lineno(location);
             execsql->sqlstmt = expr;
             execsql->into	 = row || rec ? true:false;
+            execsql->bulk_collect = false;
             execsql->strict  = true;
             execsql->rec	 = rec;
             execsql->row	 = row;
             execsql->placeholders = placeholders;
             execsql->multi_func = multi_func;
+            execsql->sqlString = plpgsql_get_curline_query();
             return (PLpgSQL_stmt *)execsql;
         }
     }
@@ -3955,6 +6471,37 @@ make_callfunc_stmt(const char *sqlstart, int location, bool is_assign)
     pfree_ext(func_inparas.data);
     /* skip compile warning */
     return NULL;
+}
+
+
+static bool
+is_unreserved_keyword_func(const char *name)
+{
+    int i;
+    char *func_name[] = {"absolute", "alias", "backward", "constant","current", "debug", "detail","dump" ,"errcode","error", "exceptions", "first", "forward", "hint", "index", "info", "last", "log","message", "message_text", "multiset", "next", "no", "notice", "option", "package", "instantiation","pg_exception_context", "pg_exception_detail", "pg_exception_hint", "query", "record", "relative", "result_oid", "returned_sqlstate", "reverse","row_count","sroll", "slice", "stacked","sys_refcursor","use_column","use_variable","variable_conflict","varray","warning"};
+    for (i = 0; i <= 45; i++) {
+        if (pg_strcasecmp(func_name[i], name) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+/*
+ * Brief                : check if it is an log function invoke
+ * Description  : 
+ * in keyword: keyword info
+ * in no_parenthesis: if no-parenthesis function is called.
+ * in name: the function name
+ * returns: true if is a log function.
+ * Notes                : 
+ */
+static bool
+is_unreservedkeywordfunction(ScanKeyword* keyword, bool no_parenthesis, const char *name)
+{
+    if (keyword && no_parenthesis && UNRESERVED_KEYWORD == keyword->category && !is_unreserved_keyword_func(name))
+        return false;
+    else
+        return true;
 }
 
 /*
@@ -3967,12 +6514,13 @@ make_callfunc_stmt(const char *sqlstart, int location, bool is_assign)
  * Notes		: 
  */ 
 static bool 
-is_function(const char *name, bool is_assign, bool no_parenthesis)
+is_function(const char *name, bool is_assign, bool no_parenthesis, List* funcNameList)
 {
     ScanKeyword * keyword = NULL;
     List *funcname = NIL;
     FuncCandidateList clist = NULL;
     bool have_outargs = false;
+    bool have_inoutargs = false;
     char **p_argnames = NULL;
     char *p_argmodes = NULL;
     Oid *p_argtypes = NULL;
@@ -3982,17 +6530,16 @@ is_function(const char *name, bool is_assign, bool no_parenthesis)
     char *cp[3] = {0};
 
     /* the function is_function is only to judge if it's a function call, so memory used in it is all temp */
-    AutoContextSwitch plCompileCxtGuard(u_sess->plsql_cxt.compile_tmp_cxt);
-
-    plpgsql_parser_funcname(name, cp, 3);
+    AutoContextSwitch plCompileCxtGuard(u_sess->plsql_cxt.curr_compile_context->compile_tmp_cxt);
+    if (funcNameList == NULL) {
+        plpgsql_parser_funcname(name, cp, 3);
+    }
 
     /* 
      * if A.B.C, it's not a function invoke, because can not use function of 
      * other database. if A.B, then it must be a function invoke. 
      */
-    if (cp[2] && cp[2][0] != '\0')
-        return false;
-    else if (cp[0] && cp[0][0] != '\0')
+    if (cp[0] && cp[0][0] != '\0')
     {
         /* these are function in pg_proc who are overloaded, so they can not be
          * execured by := or direct call.
@@ -4008,22 +6555,32 @@ is_function(const char *name, bool is_assign, bool no_parenthesis)
         /* function name can not be reserved keyword */
         if (keyword && RESERVED_KEYWORD == keyword->category)
             return false;
-        /* and function name can not be unreserved keyword when no-parenthesis function is called.*/
-        if(keyword && no_parenthesis && UNRESERVED_KEYWORD == keyword->category)
+        /* function name can not be unreserved keyword when no-parenthesis function is called. except log function*/
+        if (!is_unreservedkeywordfunction(keyword, no_parenthesis, cp[0]))
+	{
             return false;
-
-        if (cp[1] && cp[1][0] != '\0')
-            funcname = list_make2(makeString(cp[0]), makeString(cp[1]));
-        else
-            funcname = list_make1(makeString(cp[0]));
-        /* search the function */
-        clist = FuncnameGetCandidates(funcname, -1, NIL, false, false, false);
+        }
+        if (funcNameList == NULL) {
+            if (cp[2] && cp[2][0] != '\0') 
+                funcname = list_make3(makeString(cp[0]), makeString(cp[1]),makeString(cp[2]));
+            else if (cp[1] && cp[1][0] != '\0')
+                funcname = list_make2(makeString(cp[0]), makeString(cp[1]));
+            else
+                funcname = list_make1(makeString(cp[0]));
+            /* search the function */
+            clist = FuncnameGetCandidates(funcname, -1, NIL, false, false, false);
+        } else {
+            clist = FuncnameGetCandidates(funcNameList, -1, NIL, false, false, false);
+        }
         if (!clist)
         {
-            if (!is_assign)
-                ereport(ERROR,
+            if (!is_assign) {
+                const char* message = "function does not exist";
+                InsertErrorMessage(message, plpgsql_yylloc);
+                ereport(errstate,
                     (errcode(ERRCODE_UNDEFINED_FUNCTION),
                      errmsg("function \"%s\" doesn't exist ", name)));
+            }
             return false;
         }
         else if (clist->next)
@@ -4040,10 +6597,13 @@ is_function(const char *name, bool is_assign, bool no_parenthesis)
                              0, 0, 0);
             if (!HeapTupleIsValid(proctup))
             {
-                if (!is_assign)
-                    ereport(ERROR,
+                if (!is_assign) {
+                    const char* message = "function does not exist";
+                    InsertErrorMessage(message, plpgsql_yylloc);
+                    ereport(errstate,
                         (errcode(ERRCODE_UNDEFINED_FUNCTION),
                          errmsg("function \"%s\" doesn't exist ", name)));
+                }
                 return false;
             }
 
@@ -4059,16 +6619,377 @@ is_function(const char *name, bool is_assign, bool no_parenthesis)
                         break;
                     }
                 }
+                for (i = 0; i < narg; i++)
+                {
+                    if ('b' == p_argmodes[i])
+                    {
+                        have_inoutargs = true;
+                        break;
+                    }
+                }
             }
             ReleaseSysCache(proctup);
         }
 
+        if (have_inoutargs && is_function_with_plpgsql_language_and_outparam(clist->oid))
+            return true;
+        if (!have_outargs && is_assign)
+            return false;
+        
+        return true;/* passed all test */
+    } else if (funcNameList != NULL) {
+        clist = FuncnameGetCandidates(funcNameList, -1, NIL, false, false, false);
+        if (!clist)
+        {
+            if (!is_assign) {
+                const char* message = "function does not exist";
+                InsertErrorMessage(message, plpgsql_yylloc);
+                ereport(errstate,
+                    (errcode(ERRCODE_UNDEFINED_FUNCTION),
+                     errmsg("function \"%s\" doesn't exist ", name)));
+            }
+            return false;
+        }
+        else if (clist->next)
+        {
+            if (is_assign)
+                return false;
+            else
+                return true;
+        }
+        else
+        {
+            proctup = SearchSysCache(PROCOID,
+                             ObjectIdGetDatum(clist->oid),
+                             0, 0, 0);
+            if (!HeapTupleIsValid(proctup))
+            {
+                if (!is_assign) {
+                    const char* message = "function does not exist";
+                    InsertErrorMessage(message, plpgsql_yylloc);
+                    ereport(errstate,
+                        (errcode(ERRCODE_UNDEFINED_FUNCTION),
+                         errmsg("function \"%s\" doesn't exist ", name)));
+                }
+                return false;
+            }
+
+            /* get the all args informations, only "in" parameters if p_argmodes is null */
+            narg = get_func_arg_info(proctup,&p_argtypes, &p_argnames, &p_argmodes);
+            if (p_argmodes)
+            {
+                for (i = 0; i < narg; i++)
+                {
+                    if ('o' == p_argmodes[i])
+                    {
+                        have_outargs = true;
+                        break;
+                    }
+                }
+                for (i = 0; i < narg; i++)
+                {
+                    if ('b' == p_argmodes[i])
+                    {
+                        have_inoutargs = true;
+                        break;
+                    }
+                }
+            }
+            ReleaseSysCache(proctup);
+        }
+
+        if (have_inoutargs && is_function_with_plpgsql_language_and_outparam(clist->oid))
+            return true;
         if (!have_outargs && is_assign)
             return false;
         
         return true;/* passed all test */
     }
     return false;
+}
+
+static void checkFuncName(List* funcname)
+{
+    MemoryContext colCxt = MemoryContextSwitchTo(u_sess->plsql_cxt.curr_compile_context->compile_tmp_cxt);
+    char* name = NameListToString(funcname);
+    Oid packageOid = InvalidOid;
+    Oid namespaceId = InvalidOid;
+    if (list_length(funcname) > 2) {
+        if (list_length(funcname) == 3) {
+            char* schemaname = strVal(linitial(funcname));
+            char* pkgname = strVal(lsecond(funcname));
+            namespaceId = SchemaNameGetSchemaOid(schemaname, false);
+            if (OidIsValid(namespaceId)) {
+                packageOid = PackageNameGetOid(pkgname, namespaceId);
+            }
+        }
+        if (!OidIsValid(packageOid)) {
+            const char* message = "function does not exist";
+            InsertErrorMessage(message, plpgsql_yylloc);
+            ereport(errstate, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                        errmsg("cross-database references are not implemented: %s", name)));
+            u_sess->plsql_cxt.have_error = true;
+        }
+    }
+    (void)MemoryContextSwitchTo(colCxt);
+}
+
+/*
+ * @brief is_datatype
+ *  check if a given type is a datatype
+ * @param name      constructed type name
+ * @return true     is datatype
+ * @return false    not a datatype
+ */
+static bool is_paren_friendly_datatype(TypeName *name)
+{
+    Type type_tup = LookupTypeNameExtended(NULL, name, NULL, false);
+    if (!HeapTupleIsValid(type_tup)) {
+        return false;
+    }
+    ReleaseSysCache(type_tup);
+
+    /* deal with internal type casts, e.g. timestamp(6) */
+    Oid typoid = LookupTypeNameOid(name);
+    bool preferred = false;
+    char category = TYPCATEGORY_INVALID;
+    get_type_category_preferred(typoid, &category, &preferred);
+    if (category != TYPCATEGORY_ARRAY && category != TYPCATEGORY_COMPOSITE
+        && category != TYPCATEGORY_TABLEOF && category != TYPCATEGORY_TABLEOF_VARCHAR
+        && category != TYPCATEGORY_TABLEOF_INTEGER) {
+        return false;
+    }
+    return true;
+}
+
+/*
+ * @brief init_array_parse_context
+ *  Initialize array parse context.
+ */
+static inline void init_array_parse_context(ArrayParseContext *context)
+{
+    context->list_left_bracket = NULL;
+    context->list_right_bracket = NULL;
+    context->list_array_state = NULL;
+    context->list_datatype = NULL;
+    context->array_is_empty = false;
+    context->array_is_nested = false;
+}
+
+/*
+ * @brief push_array_parse_stack
+ *  Push array parse context stacks.
+ * @param context       array parse context
+ * @param parenlevel    parentheses level, set -1 to push nothing
+ * @param state         array state flag, set -1 to push nothing
+ */
+static inline void push_array_parse_stack(ArrayParseContext *context, int parenlevel, int state)
+{
+    if (likely(parenlevel >= 0)) {
+        context->list_left_bracket = lcons_int(parenlevel, context->list_left_bracket);
+        context->list_right_bracket = lcons_int(parenlevel, context->list_right_bracket);
+    }
+    if (state >= 0) {
+        context->list_array_state = lcons_int(state, context->list_array_state);
+    }
+}
+
+/*
+ * @brief construct_array_start
+ *  Extracted from read_sql_constuct, start of T_VARRAY/T_TABLE array FSM.
+ * @param ds            sql string builder
+ * @param context       array state context
+ * @param var_type      element type
+ * @param tok           current token, should be T_VARRAY/T_TABLE
+ * @param parenlevel    parentheses stack
+ * @param loc           T_VARRAY starting location
+ */
+static bool construct_array_start(StringInfo ds, ArrayParseContext *context, PLpgSQL_type *var_type, int *tok,
+                                  int parenlevel, int loc)
+{
+    /* Save array token for datatype casts */
+    context->list_datatype = lcons(var_type, context->list_datatype);
+    *tok = yylex(); /* always yylex to parentheses */
+    plpgsql_push_back_token(*tok);
+    /* varray constructor */
+    if (*tok == '(') {
+        appendStringInfoString(ds, "ARRAY");
+        push_array_parse_stack(context, parenlevel, ARRAY_START);
+    } else if (*tok == '[') {
+        yyerror("syntax error");    /* typename + '[' is not allowed */
+        return false;   /* compiler happy */
+    } else {    /* coerce? no need for extra check, leave it to main parser */
+        plpgsql_append_source_text(ds, loc, yylloc);
+    }
+    return true;
+}
+
+/*
+ * @brief get_real_elemtype
+ *  Get the real element type from a table or array
+ * @param type              any type
+ * @return PLpgSQL_type*    element type
+ */
+static PLpgSQL_type *get_real_elemtype(PLpgSQL_type *type)
+{
+    HeapTuple type_tup = SearchSysCache1(TYPEOID, ObjectIdGetDatum(type->typoid));
+    if (!HeapTupleIsValid(type_tup)) {
+        ereport(ERROR, (errmodule(MOD_PLSQL),
+                        errcode(ERRCODE_CACHE_LOOKUP_FAILED),
+                        errmsg("cache lookup failed for type %u, type Oid is invalid", type->typoid)));
+    }
+    if (((Form_pg_type)GETSTRUCT(type_tup))->typcategory == TYPCATEGORY_ARRAY &&
+        type->collectionType == PLPGSQL_COLLECTION_NONE) {
+        type->collectionType = PLPGSQL_COLLECTION_ARRAY;
+    }
+    if (type->collectionType != PLPGSQL_COLLECTION_TABLE &&
+        type->collectionType != PLPGSQL_COLLECTION_ARRAY) {
+        /* Guarding condition(white list) */
+        ReleaseSysCache(type_tup);
+        return type;
+    }
+    PLpgSQL_type* typ = NULL;
+    Oid base_oid = ((Form_pg_type)GETSTRUCT(type_tup))->typelem;
+    HeapTuple base_type_tup = SearchSysCache1(TYPEOID, ObjectIdGetDatum(base_oid));
+    if (!HeapTupleIsValid(base_type_tup)) {
+        ereport(ERROR, (errmodule(MOD_PLSQL),
+                        errcode(ERRCODE_CACHE_LOOKUP_FAILED),
+                        errmsg("cache lookup failed for type %u, type Oid is invalid", base_oid)));
+    }
+    if (u_sess->plsql_cxt.curr_compile_context->plpgsql_curr_compile == NULL)
+    {
+        typ = build_datatype(base_type_tup, type->atttypmod, 0);
+    } else {
+        typ = build_datatype(base_type_tup, type->atttypmod,
+            u_sess->plsql_cxt.curr_compile_context->plpgsql_curr_compile->fn_input_collation);
+    }
+    typ->collectionType = type->collectionType;
+    ReleaseSysCache(base_type_tup);
+    ReleaseSysCache(type_tup);
+    pfree_ext(type);
+    return typ;
+}
+
+/*
+ * @brief construct_object_type
+ *  Construct object type to strings.
+ * @param ds            sql string builder
+ * @param context       array state context
+ * @param name          object typename
+ * @param tok           current token, should be T_WORD/T_CWORD
+ * @param parenlevel    parentheses stack
+ * @param curloc        current parsing location, usually the following token
+ * @param loc           T_WORD/T_CWORD starting location
+ */
+static bool construct_object_type(StringInfo ds, ArrayParseContext *context, TypeName *name, int *tok,
+                                  int parenlevel, int curloc, int loc)
+{
+    if (*tok != '(' || u_sess->attr.attr_sql.sql_compatibility != A_FORMAT) {
+        curloc = yylloc;    /* new token location */
+        plpgsql_append_source_text(ds, loc, curloc);
+        context->array_is_nested = false;
+        return true;
+    }
+
+    if (context->array_is_nested) {
+        push_array_parse_stack(context, parenlevel, ARRAY_ACCESS);
+        curloc = yylloc;    /* new token location */
+        plpgsql_append_source_text(ds, loc, curloc);
+        context->array_is_nested = false;
+        return true;
+    }
+
+    /*
+     * Support various datatype constructor. We expect the T_WORD with format like:
+     *   'var := foo(bar)' or inside other objects.
+     */
+    char *name_str = NameListToString(name->names);
+    int toksz = strlen(name_str);
+    if (yylloc - curloc != toksz || !is_paren_friendly_datatype(name)) { /* NOTE: curloc here is T_WORD/T_CWORD location */
+        curloc = yylloc;    /* new token location */
+        plpgsql_append_source_text(ds, loc, curloc);
+        pfree_ext(name_str);
+        return true;
+    }
+    PLpgSQL_type *type = parse_datatype(name_str, loc);\
+    pfree_ext(name_str);
+
+    type = get_real_elemtype(type);
+    if (type->collectionType == PLPGSQL_COLLECTION_ARRAY || \
+        type->collectionType == PLPGSQL_COLLECTION_TABLE) {
+        return construct_array_start(ds, context, type, tok, parenlevel, loc);
+    }
+    appendStringInfoString(ds, "ROW");
+    return true;
+}
+
+/*
+ * @brief construct_word
+ *  Construct T_WORD, extracted from read_sql_constuct.
+ * @param ds            sql string builder
+ * @param context       array state context
+ * @param tok           current token, should be T_WORD
+ * @param parenlevel    parentheses stack
+ * @param loc           location of T_WORD
+ */
+static bool construct_word(StringInfo ds, ArrayParseContext *context, int *tok, int parenlevel, int loc)
+{
+    char *name = NULL;
+    name = yylval.word.ident;
+    int curloc = yylloc;
+    *tok = yylex();
+    plpgsql_push_back_token(*tok);
+    return construct_object_type(ds, context, makeTypeName(name), tok, parenlevel, curloc, loc);
+}
+
+/*
+ * @brief construct_cword
+ *  Construct T_CWORD, extracted from read_sql_constuct.
+ * @param ds            sql string builder
+ * @param context       array state context
+ * @param tok           current token, should be T_CWORD
+ * @param parenlevel    parentheses stack
+ * @param loc           location of T_CWORD
+ */
+static bool construct_cword(StringInfo ds, ArrayParseContext *context, int *tok, int parenlevel, int loc)
+{
+    int nnames = 0;
+    List *idents = yylval.cword.idents;
+    char *word1 = NULL;
+    char *word2 = NULL;
+    char *word3 = NULL;
+    if (list_length(idents) == 2) {
+        word1 = strVal(linitial(idents));
+        word2 = strVal(lsecond(idents));
+    } else if (list_length(idents) == 3) {
+        word1 = strVal(linitial(idents));
+        word2 = strVal(lsecond(idents));
+        word3 = strVal(lthird(idents));
+    } else {
+        yyerror("syntax error");
+    }
+    if (u_sess->attr.attr_sql.sql_compatibility != A_FORMAT) {
+        int dno = -1;
+        char *name = NameListToString(idents);
+        if (plpgsql_ns_lookup(plpgsql_ns_top(), false, word1, word2, word3, &nnames) == NULL) {
+            dno = plpgsql_pkg_add_unknown_var_to_namespace(yylval.cword.idents);
+        }
+        if (dno != -1) {
+            appendStringInfoString(ds, name);
+            appendStringInfoString(ds, " ");
+        }
+        pfree_ext(name);
+        /* This originally was a fall through to default branch */
+        *tok = yylex();
+        int curloc = yylloc;
+        plpgsql_push_back_token(*tok);
+        plpgsql_append_source_text(ds, loc, curloc);
+        return true;
+    }
+    int curloc = yylloc;
+    *tok = yylex();
+    plpgsql_push_back_token(*tok);
+    return construct_object_type(ds, context, makeTypeNameFromNameList(idents), tok, parenlevel, curloc, loc);
 }
 
 /* Convenience routine to read an expression with one possible terminator */
@@ -4121,20 +7042,24 @@ read_sql_stmt(const char *sqlstart)
  *				(this is only interesting if until2 or until3 isn't zero)
  */
 static PLpgSQL_expr *
-read_sql_construct5(int until,
+read_sql_construct6(int until,
                    int until2,
                    int until3,
                    int until4,
                    int until5,
+                   int until6,
                    const char *expected,
                    const char *sqlstart,
                    bool isexpression,
                    bool valid_sql,
                    bool trim,
                    int *startloc,
-                   int *endtoken)
+                   int *endtoken,
+                   DList* tokenstack,
+                   bool issaveexpr)
 {
-    int					tok;
+    int					tok = 0;
+    int					prev_tok = 0;
     StringInfoData		ds;
     IdentifierLookup	save_IdentifierLookup;
     int					startlocation = -1;
@@ -4148,34 +7073,44 @@ read_sql_construct5(int until,
      */
     char				buf[NAMEDATALEN + 128];
     bool				ds_changed = false;
-    List				*list_left_bracket = 0;
-    List*				list_right_bracket = 0;
+    ArrayParseContext	context;
+    List				*idents = 0;
     const char			left_bracket[2] = "[";
     const char			right_bracket[2] = "]";
-    const char			left_brack[2] = "(";
-    const char			right_brack[2] = ")";
+    const char			left_parentheses[2] = "(";
+    const char			right_parentheses[2] = ")";
     int					loc = 0;
     int					curloc = 0;
+    int					brack_cnt = 0;
+     /* mark if there are 2 table of index by var call functions in an expr */
+    int tableof_func_dno = -1;
+    int tableof_var_dno = -1;
+    bool is_have_tableof_index_var = false;
+    List* tableof_index_list = NIL;
 
+    PLpgSQL_compile_context* curr_compile = u_sess->plsql_cxt.curr_compile_context;
     /*
      * ds will do a lot of enlarge, which need to relloc the space, and the old space 
      * will be return to current context. So if we don't switch the context, the original 
      * context will be Plpgsql function context, which has a long term life cycle, 
      * may cause memory accumulation.
      */
-    oldCxt = MemoryContextSwitchTo(u_sess->plsql_cxt.compile_tmp_cxt);
+    oldCxt = MemoryContextSwitchTo(curr_compile->compile_tmp_cxt);
     initStringInfo(&ds);
     MemoryContextSwitchTo(oldCxt);
 
     appendStringInfoString(&ds, sqlstart);
 
     /* special lookup mode for identifiers within the SQL text */
-    save_IdentifierLookup = u_sess->plsql_cxt.plpgsql_IdentifierLookup;
-    u_sess->plsql_cxt.plpgsql_IdentifierLookup = IDENTIFIER_LOOKUP_EXPR;
+    save_IdentifierLookup = curr_compile->plpgsql_IdentifierLookup;
+    curr_compile->plpgsql_IdentifierLookup = IDENTIFIER_LOOKUP_EXPR;
 
+    init_array_parse_context(&context);
     for (;;)
     {
+        prev_tok = tok;
         tok = yylex();
+        tokenstack = push_token_stack(tok, tokenstack);
         loc = yylloc;
         if (startlocation < 0)			/* remember loc of first token */
             startlocation = yylloc;
@@ -4189,13 +7124,15 @@ read_sql_construct5(int until,
             break;
         if (tok == until5 && parenlevel == 0)
             break;
+        if (tok == until6 && parenlevel == 0)
+            break;
         if (tok == '(' || tok == '[')
             parenlevel++;
         else if (tok == ')' || tok == ']')
         {
             parenlevel--;
             if (parenlevel < 0)
-                yyerror("mismatched parentheses");
+                yyerror("mismatched parentheses", true);
         }
         /*
          * End of function definition is an error, and we don't expect to
@@ -4205,19 +7142,24 @@ read_sql_construct5(int until,
         if (tok == 0 || tok == ';')
         {
             if (parenlevel != 0)
-                yyerror("mismatched parentheses");
-            if (isexpression)
+                yyerror("mismatched parentheses", true);
+            if (isexpression) {
+                const char* message = "missing something at end of SQL expression";
+                InsertErrorMessage(message, plpgsql_yylloc);
                 ereport(ERROR,
                         (errcode(ERRCODE_SYNTAX_ERROR),
                          errmsg("missing \"%s\" at end of SQL expression",
                                 expected),
                          parser_errposition(yylloc)));
-            else
+            } else {
+                const char* message = "missing something at end of SQL expression";
+                InsertErrorMessage(message, plpgsql_yylloc);
                 ereport(ERROR,
                         (errcode(ERRCODE_SYNTAX_ERROR),
                          errmsg("missing \"%s\" at end of SQL statement",
                                 expected),
                          parser_errposition(yylloc)));
+            }
         }
 
         switch (tok)
@@ -4254,83 +7196,563 @@ read_sql_construct5(int until,
                 appendStringInfo(&ds, " __gsdb_cursor_attri_%d_rowcount__ ", yylval.ival);
                 ds_changed = true;
                 break;
+            case T_PACKAGE_CURSOR_NOTFOUND:
+                appendStringInfo(&ds, " %s.__gsdb_cursor_attri_%d_notfound__ ",
+                    yylval.wdatum.ident, yylval.wdatum.dno);
+                ds_changed = true;
+                break;
+            case T_PACKAGE_CURSOR_ISOPEN:
+                appendStringInfo(&ds, " %s.__gsdb_cursor_attri_%d_isopen__ ",
+                    yylval.wdatum.ident, yylval.wdatum.dno);
+                ds_changed = true;
+                break;
+            case T_PACKAGE_CURSOR_ROWCOUNT:
+                appendStringInfo(&ds, " %s.__gsdb_cursor_attri_%d_rowcount__ ",
+                    yylval.wdatum.ident, yylval.wdatum.dno);
+                ds_changed = true;
+                break;
+            case T_PACKAGE_CURSOR_FOUND:
+                appendStringInfo(&ds, " %s.__gsdb_cursor_attri_%d_found__ ",
+                    yylval.wdatum.ident, yylval.wdatum.dno);
+                ds_changed = true;
+                break;
             case T_VARRAY_VAR:
+                idents = yylval.wdatum.idents;
+                if (idents == NIL) {
+                    AddNamespaceIfPkgVar(yylval.wdatum.ident, save_IdentifierLookup);
+                }
                 tok = yylex();
-                if('(' == tok)
-                {
-                    list_left_bracket = lcons_int(parenlevel,list_left_bracket);
-                    list_right_bracket = lcons_int(parenlevel,list_right_bracket);
-                }	
+                if (tok == '(' || tok == '[') {
+                    push_array_parse_stack(&context, parenlevel, ARRAY_ACCESS);
+                }
                 curloc = yylloc;
                 plpgsql_push_back_token(tok);
-                plpgsql_append_source_text(&ds, loc, curloc);
-                ds_changed = true;	
-                break;
-            case T_ARRAY_FIRST:
-                appendStringInfo(&ds, " ARRAY_LOWER(%s, 1) ", ((Value *)linitial(yylval.wdatum.idents))->val.str);
-                ds_changed = true;
-                break;
-            case T_ARRAY_LAST:
-                appendStringInfo(&ds, " ARRAY_UPPER(%s, 1) ", ((Value *)linitial(yylval.wdatum.idents))->val.str);
-                ds_changed = true;
-                break;
-            case T_ARRAY_COUNT:
-                appendStringInfo(&ds, " ARRAY_LENGTH(%s, 1) ", ((Value *)linitial(yylval.wdatum.idents))->val.str);
-                ds_changed = true;
-                break;
-            case ')':
-                if (list_right_bracket && list_right_bracket->length
-                    && linitial_int(list_right_bracket) == parenlevel)
-                {
-                    appendStringInfoString(&ds, right_bracket);
-                    list_right_bracket = list_delete_first(list_right_bracket);
-                }
-                else
-                    appendStringInfoString(&ds,right_brack);
-                ds_changed = true;
-                break;
-            case '(':
-                if (list_left_bracket && list_left_bracket->length
-                    && linitial_int(list_left_bracket) == parenlevel-1)
-                {
-                    appendStringInfoString(&ds, left_bracket);
-                    list_left_bracket = list_delete_first(list_left_bracket);
-                }
-                else
-                    appendStringInfoString(&ds, left_brack);
-                ds_changed = true;
-                break;
-            case T_VARRAY:
-                if ('(' == yylex() && ')' == yylex())
-                {
-                    snprintf(buf, sizeof(buf), " NULL ");
-                    appendStringInfoString(&ds, buf);
+                if (list_length(idents) >= 3) {
+                    plpgsql_cast_reference_list(idents, &ds, false);
                     ds_changed = true;
+                    break;
+                } else {
+                    plpgsql_append_source_text(&ds, loc, curloc);
+                    ds_changed = true;
+                    break;
                 }
-                else
-                {
-                    /* do nothing */
+            case T_ARRAY_FIRST:
+            {
+                Oid indexType = get_table_index_type(yylval.wdatum.datum, &tableof_func_dno);
+                if (indexType == VARCHAROID) {
+                    appendStringInfo(&ds, "ARRAY_VARCHAR_FIRST(");
+                    CastArrayNameToArrayFunc(&ds, yylval.wdatum.idents, false);
+                } else if (indexType == INT4OID) {
+                    appendStringInfo(&ds, "ARRAY_INTEGER_FIRST(");
+                    CastArrayNameToArrayFunc(&ds, yylval.wdatum.idents, false);
+                } else {
+                    appendStringInfo(&ds, "ARRAY_LOWER(");
+                    CastArrayNameToArrayFunc(&ds, yylval.wdatum.idents);
+                    appendStringInfo(&ds, "1 ");
                 }
+                
+                int tok = yylex();
+                if(tok == '(') {
+                    push_array_parse_stack(&context, -1, NOT_AN_ARRAY);
+                    parenlevel++;
+                    ds_changed = true;
+                    tokenstack = push_token_stack(tok, tokenstack);
+                } else {
+                    appendStringInfo(&ds, ") ");
+                    ds_changed = true;
+                    plpgsql_push_back_token(tok);
+                }
+                break;
+            }
+            case T_ARRAY_LAST:
+            {
+                Oid indexType = get_table_index_type(yylval.wdatum.datum, &tableof_func_dno);
+                if (indexType == VARCHAROID) {
+                    appendStringInfo(&ds, "ARRAY_VARCHAR_LAST(");
+                    CastArrayNameToArrayFunc(&ds, yylval.wdatum.idents, false);
+                } else if (indexType == INT4OID) {
+                    appendStringInfo(&ds, "ARRAY_INTEGER_LAST(");
+                    CastArrayNameToArrayFunc(&ds, yylval.wdatum.idents, false);
+                } else {
+                    appendStringInfo(&ds, "ARRAY_UPPER(");
+                    CastArrayNameToArrayFunc(&ds, yylval.wdatum.idents);
+                    appendStringInfo(&ds, "1 ");
+                }
+                
+                int tok = yylex();
+                if(tok == '(') {
+                    push_array_parse_stack(&context, -1, NOT_AN_ARRAY);
+                    parenlevel++;
+                    ds_changed = true;
+                    tokenstack = push_token_stack(tok, tokenstack);
+                } else {
+                    appendStringInfo(&ds, ") ");
+                    ds_changed = true;
+                    plpgsql_push_back_token(tok);
+                }
+                break;
+            }
+            case T_ARRAY_COUNT:
+            {
+                Oid indexType = get_table_index_type(yylval.wdatum.datum, &tableof_func_dno);
+                if (indexType == VARCHAROID || indexType == INT4OID) {
+                    appendStringInfo(&ds, "ARRAY_INDEXBY_LENGTH(");
+                    CastArrayNameToArrayFunc(&ds, yylval.wdatum.idents);
+                    appendStringInfo(&ds, "1 ");
+                } else {
+                    appendStringInfo(&ds, "ARRAY_LENGTH(");
+                    CastArrayNameToArrayFunc(&ds, yylval.wdatum.idents);
+                    appendStringInfo(&ds, "1 ");
+                }
+
+                int tok = yylex();
+                if(tok == '(') {
+                    push_array_parse_stack(&context, -1, NOT_AN_ARRAY);
+                    parenlevel++;
+                    ds_changed = true;
+                    tokenstack = push_token_stack(tok, tokenstack);
+                } else {
+                    appendStringInfo(&ds, ") ");
+                    ds_changed = true;
+                    plpgsql_push_back_token(tok);
+                }
+                break;
+            }
+            case T_ARRAY_EXISTS:
+            {
+                Oid indexType = get_table_index_type(yylval.wdatum.datum, &tableof_func_dno);
+                if (indexType == VARCHAROID) {
+                    appendStringInfo(&ds, "ARRAY_VARCHAR_EXISTS(");
+                    CastArrayNameToArrayFunc(&ds, yylval.wdatum.idents);
+                } else if (indexType == INT4OID) {
+                    appendStringInfo(&ds, "ARRAY_INTEGER_EXISTS(");
+                    CastArrayNameToArrayFunc(&ds, yylval.wdatum.idents);
+                } else {
+                    appendStringInfo(&ds, "ARRAY_EXISTS(");
+                    CastArrayNameToArrayFunc(&ds, yylval.wdatum.idents);
+                }
+                
+                int tok = yylex();
+                if('(' == tok) {
+                    push_array_parse_stack(&context, -1, NOT_AN_ARRAY);
+                    parenlevel++;
+                    ds_changed = true;
+                    tokenstack = push_token_stack(tok, tokenstack);
+                } else {
+                    plpgsql_push_back_token(tok);
+                    yyerror("syntax error");
+                }
+                break;
+            }
+            case T_ARRAY_PRIOR:
+            {
+                Oid indexType = get_table_index_type(yylval.wdatum.datum, &tableof_func_dno);
+                if (indexType == VARCHAROID) {
+                    appendStringInfo(&ds, "ARRAY_VARCHAR_PRIOR(");
+                    CastArrayNameToArrayFunc(&ds, yylval.wdatum.idents);
+                } else if (indexType == INT4OID) {
+                    appendStringInfo(&ds, "ARRAY_INTEGER_PRIOR(");
+                    CastArrayNameToArrayFunc(&ds, yylval.wdatum.idents);
+                } else {
+                    appendStringInfo(&ds, "ARRAY_PRIOR(");
+                    CastArrayNameToArrayFunc(&ds, yylval.wdatum.idents);
+                }
+
+                int tok = yylex();
+                if('(' == tok) {
+                    push_array_parse_stack(&context, -1, NOT_AN_ARRAY);
+                    parenlevel++;
+                    ds_changed = true;
+                    tokenstack = push_token_stack(tok, tokenstack);
+                } else {
+                    plpgsql_push_back_token(tok);
+                    yyerror("syntax error");
+                }
+                break;
+            }
+            case T_ARRAY_NEXT:
+            {
+                Oid indexType = get_table_index_type(yylval.wdatum.datum, &tableof_func_dno);
+                if (indexType == VARCHAROID) {
+                    appendStringInfo(&ds, "ARRAY_VARCHAR_NEXT(");
+                    CastArrayNameToArrayFunc(&ds, yylval.wdatum.idents);
+                } else if (indexType == INT4OID) {
+                    appendStringInfo(&ds, "ARRAY_INTEGER_NEXT(");
+                    CastArrayNameToArrayFunc(&ds, yylval.wdatum.idents);
+                } else {
+                    appendStringInfo(&ds, "ARRAY_NEXT(");
+                    CastArrayNameToArrayFunc(&ds, yylval.wdatum.idents);
+                }
+
+                int tok = yylex();
+                if('(' == tok) {
+                    push_array_parse_stack(&context, -1, NOT_AN_ARRAY);
+                    parenlevel++;
+                    ds_changed = true;
+                    tokenstack = push_token_stack(tok, tokenstack);
+                } else {
+                    plpgsql_push_back_token(tok);
+                    yyerror("syntax error");
+                }
+                break;
+            }
+            case ']':
+                brack_cnt--;
+                /* fall through */
+            case ')':
+                if (context.list_right_bracket && context.list_right_bracket->length
+                    && linitial_int(context.list_right_bracket) == parenlevel) {
+                    /* append bracket instead of parentheses */
+                    appendStringInfoString(&ds, right_bracket);
+                    ds_changed = true;
+                    context.list_right_bracket = list_delete_first(context.list_right_bracket);
+
+                    if (context.array_is_empty) {
+                        /* NOTE: empty array state will remain ARRAY_START until now */
+                        PLpgSQL_type *type = (PLpgSQL_type *)linitial(context.list_datatype);
+                        plpgsql_append_object_typename(&ds, type);
+                        appendStringInfoString(&ds, left_bracket);
+                        appendStringInfoString(&ds, right_bracket);
+                        context.array_is_empty = false;
+                    }
+
+                    /*
+                     * N-D Array accessing pattern:
+                     * If another pair of brackets(parentheses) are right behind an array
+                     * access statment like 'array(i)' or 'array[i], they are very likely
+                     * to be part of the array statement too. Therefore, we need to make
+                     * sure we interpret them as brackets.
+                     */
+                    if (IS_ARRAY_STATE(context.list_array_state, ARRAY_ACCESS)) {
+                        tok = yylex();
+                        plpgsql_push_back_token(tok);
+                        if (tok == '(' || tok == '[') { /* array(1)(1) */
+                            push_array_parse_stack(&context, parenlevel, -1);
+                            break;
+                        } else if (tok == '.') { /* array(1).col(1) */
+                            context.array_is_nested = true;
+                        }
+                    } else {
+                        /* It is important to pop the array dno stack at the end. */
+                        context.list_datatype = list_delete_first(context.list_datatype);
+                    }
+
+                    /* always pop the array state stack, including ARRAY_ACCESS */
+                    context.list_array_state = list_delete_first(context.list_array_state);
+                } else {
+                    /* pop excess array state stack, see case '(' below */
+                    if (IS_ARRAY_STATE(context.list_array_state, NOT_AN_ARRAY)) {
+                        context.list_array_state = list_delete_first(context.list_array_state);
+                    }
+
+                    if (tok ==']') {
+                        appendStringInfoString(&ds, right_bracket);
+                    } else {
+                        appendStringInfoString(&ds, right_parentheses);
+                    }
+                }
+                ds_changed = true;
+                break;
+            case '[':
+                brack_cnt++;
+                /* fall through */
+            case '(':
+                if (context.list_left_bracket && context.list_left_bracket->length
+                    && linitial_int(context.list_left_bracket) == parenlevel - 1) {
+                    appendStringInfoString(&ds, left_bracket);
+                    context.list_left_bracket = list_delete_first(context.list_left_bracket);
+
+                    /* in the case of '()' or '[]', we need to append NULL */
+                    prev_tok = tok;
+                    tok = yylex();
+                    plpgsql_push_back_token(tok);
+                    if ((prev_tok == '(' && tok == ')') || (prev_tok == '[' && tok == ']')) {
+                        if (IS_ARRAY_STATE(context.list_array_state, ARRAY_ACCESS)) {
+                            yyerror("empty index");
+#ifndef ENABLE_MULTIPLE_NODES
+                            if (u_sess->attr.attr_common.plsql_show_all_error) {
+                                u_sess->plsql_cxt.have_error = true;
+                                tok = yylex(); // lex ) or ]
+                                tok = yylex(); // lex ;
+                                return NULL;
+                            }
+#endif
+                        }
+                        context.array_is_empty = true;
+                    } else if (IS_ARRAY_STATE(context.list_array_state, ARRAY_START)) {
+                        SET_ARRAY_STATE(context.list_array_state, ARRAY_ELEMENT);
+                        /* always append left parentheses at start of each element */
+                        appendStringInfoString(&ds, left_parentheses);
+                    }
+                } else {
+                    /* array state stack up with none  */
+                    if (IS_ARRAY_STATE(context.list_array_state, ARRAY_ELEMENT) ||
+                        IS_ARRAY_STATE(context.list_array_state, NOT_AN_ARRAY)) {
+                        context.list_array_state = lcons_int(NOT_AN_ARRAY, context.list_array_state);
+                    }
+
+                    if (tok =='[') {
+                        appendStringInfoString(&ds, left_bracket);
+                    } else {
+                        appendStringInfoString(&ds, left_parentheses);
+                    }
+                }
+                ds_changed = true;
+                break;
+            case '.':
+                tok = yylex();
+                plpgsql_push_back_token(tok);
+                curloc = yylloc;
+                if (context.array_is_nested && tok != T_WORD && tok != T_CWORD) {
+                    context.list_array_state = list_delete_first(context.list_array_state);
+                    context.array_is_nested = false;
+                }
+                plpgsql_append_source_text(&ds, loc, curloc);
+                ds_changed = true;
+                break;
+            case T_TABLE_VAR:
+            {
+                /* 
+                 * table var name may be schema.pkg.table_var
+                 * so the name length should NAMEDATALEN with quotation marks *3
+                 */
+                const int tablevar_namelen = NAMEDATALEN * 3 + 6;
+                char tableName1[tablevar_namelen] = {0};
+                idents = yylval.wdatum.idents;
+                if (idents == NIL) {
+                    AddNamespaceIfPkgVar(yylval.wdatum.ident, save_IdentifierLookup);
+                }
+                copy_table_var_indents(tableName1, yylval.wdatum.ident, tablevar_namelen);
+                PLpgSQL_datum* datum = yylval.wdatum.datum;
+                int var_dno = yylval.wdatum.dno;
+                if (datum->dtype == PLPGSQL_DTYPE_VAR) {
+                    check_autonomous_nest_tablevar((PLpgSQL_var*)datum);
+                }
+                tok = yylex();
+                if('(' == tok) {
+                    push_array_parse_stack(&context, parenlevel, ARRAY_ACCESS);
+                    tableof_index_list = lappend_int(tableof_index_list, ((PLpgSQL_var*)datum)->dno);
+                } else if (u_sess->attr.attr_sql.sql_compatibility == A_FORMAT && K_MULTISET == tok) {
+                    Oid typeOid = get_table_type(datum);
+                    read_multiset(&ds, tableName1, typeOid);
+                    ds_changed = true;
+                    break;
+                } else {
+                    PLpgSQL_var* var = (PLpgSQL_var*)datum;
+                    if (OidIsValid(var->datatype->tableOfIndexType) && 
+                        (',' == tok || ')' == tok || ';' == tok)) {
+                        is_have_tableof_index_var = true;
+                        /* tableof_var_dno is  only used for args */
+                        if (',' == tok || ')' == tok) {
+                            tableof_var_dno = var_dno;
+                        }
+                    }
+                }
+
+                curloc = yylloc;
+                plpgsql_push_back_token(tok);
+                if (list_length(idents) >= 3) {
+                    plpgsql_cast_reference_list(idents, &ds, false);
+                    ds_changed = true;
+                    break;
+                } else {
+                    plpgsql_append_source_text(&ds, loc, curloc);
+                    ds_changed = true;
+                    break;
+                }
+            }
+            case T_PACKAGE_VARIABLE:
+            {
+                int type_flag = -1;
+                get_datum_tok_type(yylval.wdatum.datum, &type_flag);
+                idents = yylval.wdatum.idents;
+
+                if (type_flag == PLPGSQL_TOK_TABLE_VAR) {
+                    /*
+                     * table var name may be schema.pkg.table_var
+                     * so the name length should NAMEDATALEN with quotation marks *3
+                     */
+                    const int tablevar_namelen = NAMEDATALEN * 3 + 6;
+
+                    char tableName1[tablevar_namelen] = {0};
+                    idents = yylval.wdatum.idents;
+                    copy_table_var_indents(tableName1, yylval.wdatum.ident, tablevar_namelen);
+                    PLpgSQL_datum* datum = yylval.wdatum.datum;
+                    tok = yylex();
+                    if('(' == tok)
+                    {
+                        push_array_parse_stack(&context, parenlevel, NOT_AN_ARRAY);
+                    } else if (u_sess->attr.attr_sql.sql_compatibility == A_FORMAT && K_MULTISET == tok) {
+                        Oid typeOid = get_table_type(datum);
+                        read_multiset(&ds, tableName1, typeOid);
+                        ds_changed = true;
+                        break;
+                    }
+                    curloc = yylloc;
+                    plpgsql_push_back_token(tok);
+                    if (PkgVarNeedCast(idents)) {
+                        plpgsql_cast_reference_list(idents, &ds, true);
+                    } else {
+                        plpgsql_append_source_text(&ds, loc, curloc);
+                    }
+                    ds_changed = true;
+                    break;
+                } else if (type_flag == PLPGSQL_TOK_VARRAY_VAR) {
+                    tok = yylex();
+                    if (tok == '(' || tok == '[') {
+                        push_array_parse_stack(&context, parenlevel, ARRAY_ACCESS);
+                    }
+                    curloc = yylloc;
+                    plpgsql_push_back_token(tok);
+                    if (PkgVarNeedCast(idents)) {
+                        plpgsql_cast_reference_list(idents, &ds, true);
+                    } else {
+                        plpgsql_append_source_text(&ds, loc, curloc);
+                    }
+                    ds_changed = true;
+                    break;
+                } else {
+                    tok = yylex();
+                    curloc = yylloc;
+                    plpgsql_push_back_token(tok);
+
+                    if (PkgVarNeedCast(idents)) {
+                        plpgsql_cast_reference_list(idents, &ds, true);
+                    } else {
+                        plpgsql_append_source_text(&ds, loc, curloc);
+                    }
+
+                    ds_changed = true;
+                    break;
+                }
+            }
+            case T_TABLE:
+            {
+                int dno = yylval.wdatum.datum->dno;
+                PLpgSQL_var *var = (PLpgSQL_var *)u_sess->plsql_cxt.curr_compile_context->plpgsql_Datums[dno];
+                /* table of index by only support: a = a(); */
+                if ((OidIsValid(var->datatype->tableOfIndexType) && var->nest_table == NULL) ||
+                   	(var->nest_table != NULL && var->isIndexByTblOf)) {
+                    TokenData* temptokendata = build_token_data(tok);
+                    int first_tok = yylex();
+                    DList* tokenstack = NULL;
+                    TokenData* temptokendata1 = build_token_data(first_tok);
+                    tokenstack = dlappend(tokenstack, temptokendata1);
+                    if (first_tok != '(') {
+                        yyerror("table of index by does not support syntax");
+                    }
+
+                    int second_tok = yylex();
+                    temptokendata1 = build_token_data(second_tok);
+                    if (second_tok != ')') {
+                        yyerror("table of index by does not support syntax");
+                    }
+                    tokenstack = dlappend(tokenstack, temptokendata1);
+                    /* restore yylex */
+                    push_back_token_stack(tokenstack);
+                    yylloc = temptokendata->lloc;
+                    yylval = temptokendata->lval;
+                    u_sess->plsql_cxt.curr_compile_context->plpgsql_yyleng = temptokendata->leng;
+                }
+                ds_changed = construct_array_start(&ds, &context, var->datatype, &tok, parenlevel, loc);
+                break;
+            }
+            case T_VARRAY:
+            {
+                if (u_sess->attr.attr_sql.sql_compatibility != A_FORMAT) {
+                    /* non A_FORMAT case, append 'NULL' and leave it. */
+                    int first_tok = yylex();
+                    tokenstack= push_token_stack(first_tok, tokenstack);
+                    
+                    int second_tok = yylex();
+                    tokenstack = push_token_stack(first_tok, tokenstack);
+                    if (first_tok == '(' && second_tok == ')') {
+                        snprintf(buf, sizeof(buf), " NULL ");
+                        appendStringInfoString(&ds, buf);
+                    }
+                    ds_changed = true;
+                    break;
+                }
+                int dno = yylval.wdatum.datum->dno;
+                PLpgSQL_var *var = (PLpgSQL_var *)u_sess->plsql_cxt.curr_compile_context->plpgsql_Datums[dno];
+                ds_changed = construct_array_start(&ds, &context, var->datatype, &tok, parenlevel, loc);
+                break;
+            }
+            case T_DATUM:
+                idents = yylval.wdatum.idents;
+                if(prev_tok != '.' && list_length(idents) >= 3) {
+                    plpgsql_cast_reference_list(idents, &ds, false);
+                    ds_changed = true;
+                    break;
+                } else {
+                    tok = yylex();
+                    curloc = yylloc;
+                    plpgsql_push_back_token(tok);
+                    plpgsql_append_source_text(&ds, loc, curloc);
+                    ds_changed = true;
+                    break;
+                }
+            case T_WORD:
+                AddNamespaceIfPkgVar(yylval.word.ident, save_IdentifierLookup);
+                ds_changed = construct_word(&ds, &context, &tok, parenlevel, loc);
+                break;
+            case T_CWORD:
+                ds_changed = construct_cword(&ds, &context, &tok, parenlevel, loc);
                 break;
             default:
                 tok = yylex();
 
                 if(tok > INT_MAX)
                 {
-                    ereport(ERROR,
+                    const char* message = "token value is bigger than INT_MAX";
+                    InsertErrorMessage(message, plpgsql_yylloc);
+                    ereport(errstate,
                             (errcode(ERRCODE_UNDEFINED_FUNCTION),
                              errmsg("token value %d is bigger than INT_MAX ", tok)));
                 }
 
                 curloc = yylloc;
                 plpgsql_push_back_token(tok);
-                plpgsql_append_source_text(&ds, loc, curloc);
+                if (tok == T_VARRAY_VAR && pushed_bulk_exception()) {
+                    plpgsql_append_source_text(&ds, loc, curloc - 4);
+                } else {
+                    plpgsql_append_source_text(&ds, loc, curloc);
+                }
                 ds_changed = true;
                 break;
         }
+
+        /* peek one token */
+        tok = yylex();
+        plpgsql_push_back_token(tok);
+
+        /* we are expecting an element, but a seperator/end of array is found, need coerce */
+        if ((tok == ',' || tok == ')') && IS_ARRAY_STATE(context.list_array_state, ARRAY_ELEMENT)) {
+            SET_ARRAY_STATE(context.list_array_state, ARRAY_COERCE);
+        }
+
+        /* this is done after seperator is appended, get next element */
+        if (IS_ARRAY_STATE(context.list_array_state, ARRAY_SEPERATOR)) {
+            /* always append left parentheses at start of each element */
+            appendStringInfoString(&ds, left_parentheses);
+            /* Note: we assume that all seperators takes EXACTLY ONE iteration to process */
+            SET_ARRAY_STATE(context.list_array_state, ARRAY_ELEMENT);
+        }
+
+        /* add coerce at the end of each element, then append the seperator next iteration */
+        if (IS_ARRAY_STATE(context.list_array_state, ARRAY_COERCE)) {
+            /* always append right parentheses at end of each element */
+            appendStringInfoString(&ds, right_parentheses);
+            plpgsql_append_object_typename(&ds, (PLpgSQL_type *)linitial(context.list_datatype));
+            SET_ARRAY_STATE(context.list_array_state, ARRAY_SEPERATOR);
+        }
     }
 
-    u_sess->plsql_cxt.plpgsql_IdentifierLookup = save_IdentifierLookup;
+    if (brack_cnt != 0) {
+        yyerror("mismatched brackets");
+    }
+
+    curr_compile->plpgsql_IdentifierLookup = save_IdentifierLookup;
 
     if (startloc)
         *startloc = startlocation;
@@ -4355,6 +7777,20 @@ read_sql_construct5(int until,
         while (ds.len > 0 && scanner_isspace(ds.data[ds.len - 1]))
             ds.data[--ds.len] = '\0';
     }
+    if (issaveexpr) {
+        oldCxt = MemoryContextSwitchTo(curr_compile->compile_cxt);
+    }
+
+    if (tableof_index_list != NULL && tableof_func_dno != -1) {
+        ListCell* cell = NULL;
+        foreach (cell, tableof_index_list) {
+            int dno = lfirst_int(cell);
+            if (dno != tableof_func_dno) {
+                yyerror("do not support more than 2 table of index by variables call functions in an expr");
+            }
+        }
+    }
+    list_free_ext(tableof_index_list);
 
     expr = (PLpgSQL_expr *)palloc0(sizeof(PLpgSQL_expr));
     expr->dtype			= PLPGSQL_DTYPE_EXPR;
@@ -4364,13 +7800,150 @@ read_sql_construct5(int until,
     expr->ns			= plpgsql_ns_top();
     expr->isouttype 		= false;
     expr->idx			= (uint32)-1;
+    expr->out_param_dno = -1;
+    expr->is_have_tableof_index_var = is_have_tableof_index_var;
+    expr->tableof_var_dno = tableof_var_dno;
+    expr->is_have_tableof_index_func = tableof_func_dno != -1 ? true : false;
+    expr->tableof_func_dno = tableof_func_dno;
 
     pfree_ext(ds.data);
 
     if (valid_sql)
         check_sql_expr(expr->query, startlocation, strlen(sqlstart));
 
+    if (issaveexpr) {
+        MemoryContextSwitchTo(oldCxt);
+    }
+
     return expr;
+}
+
+/*
+ * read multiset grammer
+ */
+static void read_multiset(StringInfoData* ds, char* tableName1, Oid typeOid1)
+{
+    /*
+     * table var name may be schema.pkg.table_var
+     * so the name length should NAMEDATALEN with quotation marks *3
+     */
+    const int tablevar_namelen = NAMEDATALEN * 3 + 6;
+
+    /* len = funcname + tablename1 + tablename2 */
+    const int funclen = tablevar_namelen * 2 + 128;
+    char funcName[funclen] = {0};
+    int tok1 = yylex();
+    errno_t rc = EOK;
+    bool isTableVar = false;
+    int tok_type = -1;
+
+    switch (tok1)
+    {
+        case K_UNION:
+            rc = snprintf_s(funcName, sizeof(funcName), sizeof(funcName) - 1, " array_union");
+            securec_check_ss(rc, "", "");
+            break;
+        case K_INTERSECT:
+            rc = snprintf_s(funcName, sizeof(funcName), sizeof(funcName) - 1, " array_intersect");
+            securec_check_ss(rc, "", "");
+            break;
+        case K_EXCEPT:
+            rc = snprintf_s(funcName, sizeof(funcName), sizeof(funcName) - 1, " array_except");
+            securec_check_ss(rc, "", "");
+            break;
+        default:
+            yyerror("unexpected keyword after multiset.");
+    }
+
+    int suffixlen = tablevar_namelen * 2 + 64;
+    char suffix[suffixlen] = {0};
+    int tok2 = yylex();
+    int tok3;
+    Oid typeOid2 = InvalidOid;
+    char tableName2[tablevar_namelen] = {0};
+    if (K_DISTINCT == tok2) {
+        tok3 = yylex();
+        tok_type = -1;
+        if (tok3 == T_PACKAGE_VARIABLE) {
+            get_datum_tok_type(yylval.wdatum.datum, &tok_type);
+        }
+        isTableVar = (tok3 == T_TABLE_VAR) || (tok_type == PLPGSQL_TOK_TABLE_VAR);
+        if (isTableVar) {
+            typeOid2 = get_table_type(yylval.wdatum.datum);
+            copy_table_var_indents(tableName2, yylval.wdatum.ident, tablevar_namelen);
+            rc = snprintf_s(suffix, sizeof(suffix), sizeof(suffix) - 1, "_distinct(\"%s\", \"%s\")", tableName1, tableName2);
+            securec_check_ss(rc, "", "");
+        } else {
+            yyerror("unexpected keyword after distinct.");
+        }
+    } else if (K_ALL == tok2) {
+        tok3 = yylex();
+        tok_type = -1;
+        if (tok3 == T_PACKAGE_VARIABLE) {
+            get_datum_tok_type(yylval.wdatum.datum, &tok_type);
+        }
+        isTableVar = (tok3 == T_TABLE_VAR) || (tok_type == PLPGSQL_TOK_TABLE_VAR);
+        if (isTableVar) {
+            typeOid2 = get_table_type(yylval.wdatum.datum);
+            copy_table_var_indents(tableName2, yylval.wdatum.ident, tablevar_namelen);
+            rc = snprintf_s(suffix, sizeof(suffix), sizeof(suffix) - 1, "(\"%s\", \"%s\")", tableName1, tableName2);
+            securec_check_ss(rc, "", "");
+        } else {
+            yyerror("unexpected keyword after all.");
+        }
+    } else {
+        tok_type = -1;
+        if (tok2 == T_PACKAGE_VARIABLE) {
+            get_datum_tok_type(yylval.wdatum.datum, &tok_type);
+        }
+        isTableVar = (tok2 == T_TABLE_VAR) || (tok_type == PLPGSQL_TOK_TABLE_VAR);
+        if (isTableVar) {
+            typeOid2 = get_table_type(yylval.wdatum.datum);
+            copy_table_var_indents(tableName2, yylval.wdatum.ident, tablevar_namelen);
+            rc = snprintf_s(suffix, sizeof(suffix), sizeof(suffix) - 1, "(\"%s\", \"%s\")", tableName1, tableName2);
+            securec_check_ss(rc, "", "");
+        } else {
+            yyerror("unexpected type after multiset.");
+        }
+    }
+
+    if (typeOid1 != typeOid2) {
+        ereport(errstate,
+            (errcode(ERRCODE_DATATYPE_MISMATCH),
+            errmsg("%s and %s type are not match.", tableName1, tableName2)));
+        u_sess->plsql_cxt.have_error = true;
+    }
+    strlcat(funcName, suffix, sizeof(funcName));
+    appendStringInfoString(ds, funcName);
+}
+
+static bool copy_table_var_indents(char* tableName, char* idents, int tablevar_namelen)
+{
+    List* namelist = NIL;
+    ListCell* l = NULL;
+    errno_t rc = 0;
+    StringInfoData	ds;
+    initStringInfo(&ds);
+
+    if (!SplitIdentifierString(idents, '.', &namelist))
+        ereport(ERROR, (errcode(ERRCODE_INVALID_NAME), errmsg("invalid name syntax")));
+
+    if (namelist == NIL)
+        ereport(ERROR, (errcode(ERRCODE_INVALID_NAME), errmsg("invalid name syntax")));
+
+    foreach (l, namelist) {
+        char* curname = (char*)lfirst(l);
+        appendStringInfoString(&ds, curname);
+        if (l->next != NULL) {
+            appendStringInfoString(&ds, "\".\"");
+        }
+    }
+    rc = snprintf_s(tableName, tablevar_namelen, tablevar_namelen - 1, "%s", ds.data);
+    securec_check_ss(rc, "", "");
+    pfree_ext(ds.data);
+    list_free_ext(namelist);
+
+    return true;
 }
 
 /*
@@ -4400,8 +7973,190 @@ read_sql_construct(int until,
                    int *startloc,
                    int *endtoken)
 {
-    return read_sql_construct5(until, until2, until3, until3, 0,
+    return read_sql_construct6(until, until2, until3, until3, 0, 0,
                                expected, sqlstart, isexpression, valid_sql, trim, startloc, endtoken);
+}
+/*
+ * get function declare or definition string in package.
+ */
+static char * 
+get_proc_str(int tok)
+{
+    int     blocklevel = 0;
+    int     pre_tok = 0;
+    if (u_sess->plsql_cxt.curr_compile_context->plpgsql_curr_compile_package == NULL) {
+        yyerror("not allowed create procedure in function or procedure.");
+    }
+    tok = yylex(); 
+    StringInfoData      ds;  
+    bool is_defining_proc = false;
+    char * spec_proc_str = NULL;
+    int loc = yylloc;
+    int curloc = yylloc;
+    MemoryContext oldCxt = MemoryContextSwitchTo(u_sess->plsql_cxt.curr_compile_context->compile_tmp_cxt);
+    initStringInfo(&ds);
+    MemoryContextSwitchTo(oldCxt);
+    if (u_sess->parser_cxt.is_procedure==false){
+        appendStringInfoString(&ds, " CREATE OR REPLACE FUNCTION ");
+    } else {
+        appendStringInfoString(&ds, " CREATE OR REPLACE PROCEDURE ");
+    }
+    u_sess->parser_cxt.in_package_function_compile = true;
+    while(true)
+    {    
+
+        if (tok == YYEOF) {
+            if (u_sess->parser_cxt.is_procedure==false){
+                yyerror("function is not ended correctly");
+                break;
+            } else {
+                yyerror("procedure is not ended correctly");
+                break;
+            }
+        }
+
+        if (tok == ';' && !is_defining_proc) 
+        {
+            break;
+        }
+        /* procedure or function can have multiple blocklevel*/
+        if (tok == K_BEGIN) 
+        {
+            blocklevel++;
+        }
+
+        /* if have is or as,it means in body*/
+        if ((tok == K_IS || tok == K_AS) && !is_defining_proc)
+        {
+            if (u_sess->plsql_cxt.curr_compile_context->plpgsql_curr_compile_package->is_spec_compiling) {
+                yyerror("not allow define function or procedure in package specification");
+                break;
+            }
+            is_defining_proc = true;
+        }
+
+        if (tok == K_END) 
+        {
+            tok = yylex();
+            /* process end loop*/
+            if (tok == K_LOOP) {
+                continue;
+            }
+            if (blocklevel == 1 && (pre_tok == ';' || pre_tok == K_BEGIN) && (tok == ';' || tok == 0))
+            {
+                curloc = yylloc;
+                plpgsql_append_source_text(&ds, loc, curloc);
+                break;
+            }
+            if (blocklevel > 1 && (pre_tok == ';' || pre_tok == K_BEGIN) && (tok == ';' || tok == 0))
+            {
+                blocklevel--;
+            }
+        }
+        pre_tok = tok;
+
+        tok = yylex();
+        curloc = yylloc;
+        plpgsql_append_source_text(&ds, loc, curloc);
+
+        loc = yylloc;
+    }    
+    u_sess->parser_cxt.in_package_function_compile = false;
+
+    /* 
+        To use the SQL Parser, we add a string to make SQL parser recognize. 
+        Package specification use SQL parser parse the string too.
+    */
+    if (is_defining_proc == false) {
+        appendStringInfoString(&ds, " AS BEGIN ");
+        appendStringInfoString(&ds, " END;\n");
+        u_sess->parser_cxt.isFunctionDeclare = true;
+    } else {
+        u_sess->parser_cxt.isFunctionDeclare = false;
+    }
+
+    spec_proc_str = pstrdup(ds.data);
+    pfree_ext(ds.data);
+    return spec_proc_str;
+}
+static char* get_init_proc(int tok) 
+{
+    int startlocation = yylloc;
+    char* init_package_str = NULL;
+    StringInfoData      ds;  
+    initStringInfo(&ds);
+    while(true)
+    {  
+        /* 
+          package instantiation still need a token 'END' as end,
+          but it's from package end, For details about how to instantiate
+          a package, see the package instantiation grammer.
+        */
+        if (tok == K_BEGIN)
+            startlocation = yylloc;
+        if (tok == YYEOF) {
+            yyerror("procedure is not ended correctly");
+            break;
+        }
+        if (tok == K_END) 
+        {
+            tok = yylex();
+            if (tok == ';' || tok == 0)
+            {
+                break;
+            }
+        }
+        tok = yylex();
+    } 
+    /*
+      package instantiation not need specify end.
+    */
+    plpgsql_append_source_text(&ds, startlocation, yylloc);
+    init_package_str = pstrdup(ds.data);
+    pfree_ext(ds.data);
+    return init_package_str;
+}
+
+/* get assign attrname of arrayelement */
+static char * get_attrname(int tok)
+{
+    if (tok == YYEMPTY || tok == '.') {
+        tok = plpgsql_yylex_single();
+    }
+    plpgsql_location_to_lineno(yylloc);
+    switch (tok) {
+	case T_ARRAY_FIRST:
+	case T_ARRAY_LAST:
+	case T_ARRAY_COUNT:
+	case T_ARRAY_EXTEND:
+    case T_CWORD:/* composite name not OK */
+        yyerror("syntax error");
+        break;
+    case T_REFCURSOR:
+	case T_VARRAY:
+	case T_VARRAY_VAR:
+    case T_TABLE:
+    case T_TABLE_VAR:
+	case T_RECORD:
+    case T_DATUM:
+        if (yylval.wdatum.idents != NIL) { /* composite name not OK */
+            yyerror("syntax error");
+        } else {
+            return yylval.wdatum.ident;
+        }
+        break;
+	case T_WORD:
+	    return yylval.word.ident;
+	    break;
+    default:
+        if (plpgsql_is_token_keyword(tok)) {
+            return pstrdup(yylval.keyword);
+        } else {
+            yyerror("missing or illegal attribute name");
+        }
+        break;
+    }
+    return NULL;
 }
 
 static PLpgSQL_type *
@@ -4410,11 +8165,11 @@ read_datatype(int tok)
     StringInfoData		ds;
     char			   *type_name;
     int					startlocation;
-    PLpgSQL_type		*result;
+    PLpgSQL_type		*result = NULL;
     int					parenlevel = 0;
 
     /* Should only be called while parsing DECLARE sections */
-    AssertEreport(u_sess->plsql_cxt.plpgsql_IdentifierLookup == IDENTIFIER_LOOKUP_DECLARE,
+    AssertEreport(u_sess->plsql_cxt.curr_compile_context->plpgsql_IdentifierLookup == IDENTIFIER_LOOKUP_DECLARE,
                         MOD_PLSQL,
                         "Should only be called while parsing DECLARE sections");
 
@@ -4428,9 +8183,17 @@ read_datatype(int tok)
      * If we have a simple or composite identifier, check for %TYPE
      * and %ROWTYPE constructs.
      */
-    if (tok == T_WORD)
+    bool iskeyword = plpgsql_is_token_keyword(tok);
+    if (tok == T_WORD || tok == T_VARRAY_VAR || tok == T_TABLE_VAR || iskeyword)
     {
-        char   *dtname = yylval.word.ident;
+        char   *dtname;
+        if (iskeyword) {
+            dtname = pstrdup(yylval.keyword);
+        } else if (tok == T_WORD) {
+            dtname = yylval.word.ident;
+        } else {
+            dtname = yylval.wdatum.ident;
+        }
 
         tok = yylex();
         if (tok == '%')
@@ -4440,8 +8203,12 @@ read_datatype(int tok)
                                K_TYPE, "type"))
             {
                 result = plpgsql_parse_wordtype(dtname);
-                if (result)
+                if (result) {
+                    if(iskeyword) {
+                        pfree_ext(dtname);
+                    }
                     return result;
+                }
             }
             else if (tok_is_keyword(tok, &yylval,
                                     K_ROWTYPE, "rowtype"))
@@ -4451,17 +8218,38 @@ read_datatype(int tok)
                             dtname, NULL, NULL, NULL);
                 if (ns && ns->itemtype == PLPGSQL_NSTYPE_VAR)
                 {
-                    PLpgSQL_var* var = (PLpgSQL_var*)u_sess->plsql_cxt.plpgsql_Datums[ns->itemno];
+                    PLpgSQL_var* var = (PLpgSQL_var*)u_sess->plsql_cxt.curr_compile_context->plpgsql_Datums[ns->itemno];
                     if(var && var->datatype 
                            && var->datatype->typoid == REFCURSOROID)
                     {
-                        return plpgsql_build_datatype(RECORDOID, -1, InvalidOid);
+#ifndef ENABLE_MULTIPLE_NODES
+                        if (OidIsValid(var->datatype->cursorCompositeOid))
+                            return build_type_from_cursor_var(var);
+                        else
+#endif
+                            return plpgsql_build_datatype(RECORDOID, -1, InvalidOid);
+                        
+                    }
+                } else if (ns && ns->itemtype == PLPGSQL_NSTYPE_ROW)
+                {
+                    PLpgSQL_row* row = (PLpgSQL_row*)u_sess->plsql_cxt.curr_compile_context->plpgsql_Datums[ns->itemno];
+                    if (row && row->rowtupdesc && row->rowtupdesc->tdtypeid != RECORDOID)
+                    {
+                        if (OidIsValid(row->rowtupdesc->tdtypeid))
+                            return plpgsql_build_datatype(row->rowtupdesc->tdtypeid, -1, InvalidOid);
                     }
                 }
                 result = plpgsql_parse_wordrowtype(dtname);
-                if (result)
+                if (result) {
+                    if(iskeyword) {
+                        pfree_ext(dtname);
+                    }
                     return result;
+                }
             }
+        }
+        if(iskeyword) {
+           pfree_ext(dtname);
         }
     }
     else if (tok == T_CWORD)
@@ -4475,6 +8263,24 @@ read_datatype(int tok)
             if (tok_is_keyword(tok, &yylval,
                                K_TYPE, "type"))
             {
+                /* find val.col%TYPE first */
+                HeapTuple tup = NULL;
+                tup = FindRowVarColType(dtnames);
+                if (tup != NULL) {
+                    Oid typOid = typeTypeId(tup);
+                    ReleaseSysCache(tup);
+                    return plpgsql_build_datatype(typOid, -1, InvalidOid);
+                }
+
+                /* find pkg.var%TYPE second */
+                PLpgSQL_datum* datum = GetPackageDatum(dtnames);
+                if (datum != NULL && datum->dtype == PLPGSQL_DTYPE_VAR) {
+                    Oid typOid =  ((PLpgSQL_var*)datum)->datatype->typoid;
+                    int32 typmod = ((PLpgSQL_var*)datum)->datatype->atttypmod;
+                    Oid collation = ((PLpgSQL_var*)datum)->datatype->collation;
+
+                    return plpgsql_build_datatype(typOid, typmod, collation);
+                }
                 result = plpgsql_parse_cwordtype(dtnames);
                 if (result)
                     return result;
@@ -4482,6 +8288,15 @@ read_datatype(int tok)
             else if (tok_is_keyword(tok, &yylval,
                                     K_ROWTYPE, "rowtype"))
             {
+                PLpgSQL_datum* datum = GetPackageDatum(dtnames);
+                if (datum != NULL && datum->dtype == PLPGSQL_DTYPE_ROW) {
+                    PLpgSQL_row* row = (PLpgSQL_row*)datum;
+                    if (row->rowtupdesc && row->rowtupdesc->tdtypeid != RECORDOID)
+                    {
+                        if (OidIsValid(row->rowtupdesc->tdtypeid))
+                            return plpgsql_build_datatype(row->rowtupdesc->tdtypeid, -1, InvalidOid);
+                    }
+                }
                 result = plpgsql_parse_cwordrowtype(dtnames);
                 if (result)
                     return result;
@@ -4494,13 +8309,14 @@ read_datatype(int tok)
         if (tok == 0)
         {
             if (parenlevel != 0)
-                yyerror("mismatched parentheses");
+                yyerror("mismatched parentheses", true);
             else
                 yyerror("incomplete data type declaration");
+            break;
         }
         /* Possible followers for datatype in a declaration */
         if (tok == K_COLLATE || tok == K_NOT ||
-            tok == '=' || tok == COLON_EQUALS || tok == K_DEFAULT)
+            tok == '=' || tok == COLON_EQUALS || tok == K_DEFAULT || tok == K_INDEX)
             break;
         /* Possible followers for datatype in a cursor_arg list */
         if ((tok == ',' || tok == ')') && parenlevel == 0)
@@ -4518,15 +8334,28 @@ read_datatype(int tok)
     plpgsql_append_source_text(&ds, startlocation, yylloc);
     type_name = ds.data;
 
-    if (type_name[0] == '\0')
-        yyerror("missing data type declaration");
+    if (type_name[0] == '\0') {
+#ifndef ENABLE_MULTIPLE_NODES
+        if (u_sess->attr.attr_common.plsql_show_all_error) {
+            const char* message = "missing data type declaration";
+            InsertErrorMessage(message, yylloc);
+        }
+#endif
+        ereport(ERROR,
+            (errcode(ERRCODE_DATATYPE_MISMATCH),
+                errmsg("missing data type declaration"),
+                parser_errposition(yylloc)));
+        if (tok == ';') {
+            plpgsql_push_back_token(tok);
+        }
+    } else {
+        u_sess->plsql_cxt.plpgsql_yylloc = plpgsql_yylloc;
+        result = parse_datatype(type_name, startlocation);
 
-    result = parse_datatype(type_name, startlocation);
+        pfree_ext(ds.data);
 
-    pfree_ext(ds.data);
-
-    plpgsql_push_back_token(tok);
-
+        plpgsql_push_back_token(tok);
+    }
     return result;
 }
 
@@ -4541,17 +8370,24 @@ make_execsql_stmt(int firsttoken, int location)
     PLpgSQL_rec			*rec = NULL;
     int					tok;
     int					prev_tok;
+    int                                 prev_prev_tok = 0;
+    int					curloc;
     bool				have_into = false;
+    bool				have_bulk_collect = false;
     bool				have_strict = false;
+    bool				array_begin = false;
     int					into_start_loc = -1;
     int					into_end_loc = -1;
     int					placeholders = 0;
+    int					parenlevel = 0;
+    List				*list_bracket = 0;		/* stack structure bracket tracker */
+    List				*list_bracket_loc = 0;	/* location tracker */
 
     initStringInfo(&ds);
 
     /* special lookup mode for identifiers within the SQL text */
-    save_IdentifierLookup = u_sess->plsql_cxt.plpgsql_IdentifierLookup;
-    u_sess->plsql_cxt.plpgsql_IdentifierLookup = IDENTIFIER_LOOKUP_EXPR;
+    save_IdentifierLookup = u_sess->plsql_cxt.curr_compile_context->plpgsql_IdentifierLookup;
+    u_sess->plsql_cxt.curr_compile_context->plpgsql_IdentifierLookup = IDENTIFIER_LOOKUP_EXPR;
 
     /*
      * Scan to the end of the SQL command.  Identify any INTO-variables
@@ -4581,15 +8417,37 @@ make_execsql_stmt(int firsttoken, int location)
      */
     tok = firsttoken;
 
+    /* For support InsertStmt:Insert into table_name values record_var */
+    bool insert_stmt = false;
+    bool prev_values = false;
+    bool insert_record = false;
+    bool insert_array_record = false; 
+    int values_end_loc = -1;
+    int before_semi_loc = -1;
+    PLpgSQL_row* row_data = NULL;
+    PLpgSQL_rec* rec_data = NULL;
+    PLpgSQL_var* array_data = NULL;
     for (;;)
     {
         prev_tok = tok;
         tok = yylex();
+        if (tok == COMMENTSTRING) {
+            prev_prev_tok = prev_tok;
+        }
 
         if (have_into && into_end_loc < 0)
             into_end_loc = yylloc;		/* token after the INTO part */
-        if (tok == ';')
+
+        /* Only support one record variable after insertstmt's values token */
+        if (insert_record && tok != ';' && tok != ' ') {
+            yyerror("unexpected record variable number in insert stmt.");
+        }
+
+        if (tok == ';') {
+            before_semi_loc = yylloc;
             break;
+        }
+
         if (tok == 0)
             yyerror("unexpected end of function definition");
 
@@ -4598,10 +8456,30 @@ make_execsql_stmt(int firsttoken, int location)
             placeholders++;
         }
 
+        if (tok == K_BULK) {
+            /* only A_FORMAT can use bulk collect into */
+            if (u_sess->attr.attr_sql.sql_compatibility != A_FORMAT) {
+                 yyerror("syntax error");
+            }
+
+            have_bulk_collect = true;
+            into_start_loc = yylloc; /* save BULK COLLECT INTO starting point */
+            tok = yylex();
+            if (tok != K_COLLECT) {
+                yyerror("expect \'COLLECT\' after \'BULK\'");
+            }
+            tok = yylex();
+            if (tok != K_INTO) {
+                yyerror("expect \'INTO\' after \'BULK COLLECT\'");
+            }
+        }
+
         if (tok == K_INTO)
         {
-            if (prev_tok == K_INSERT)
+            if (prev_tok == K_INSERT || (prev_tok == COMMENTSTRING && prev_prev_tok == K_INSERT)) {
+                insert_stmt = true;
                 continue;	/* INSERT INTO is not an INTO-target */
+            }
             if (firsttoken == K_ALTER)
                 continue;	/* ALTER ... INTO is not an INTO-target */
             if (prev_tok == K_MERGE)
@@ -4609,14 +8487,185 @@ make_execsql_stmt(int firsttoken, int location)
             if (have_into)
                 yyerror("INTO specified more than once");
             have_into = true;
-            into_start_loc = yylloc;
-            u_sess->plsql_cxt.plpgsql_IdentifierLookup = IDENTIFIER_LOOKUP_NORMAL;
-            read_into_target(&rec, &row, &have_strict);
-            u_sess->plsql_cxt.plpgsql_IdentifierLookup = IDENTIFIER_LOOKUP_EXPR;
+            if (!have_bulk_collect) {
+                into_start_loc = yylloc;
+            }
+            u_sess->plsql_cxt.curr_compile_context->plpgsql_IdentifierLookup = IDENTIFIER_LOOKUP_NORMAL;
+            read_into_target(&rec, &row, &have_strict, have_bulk_collect);
+            u_sess->plsql_cxt.curr_compile_context->plpgsql_IdentifierLookup = IDENTIFIER_LOOKUP_EXPR;
         }
+
+        if (tok == T_CWORD && prev_tok!=K_SELECT 
+                           && prev_tok!= K_PERFORM) {
+            List  *dtname = yylval.cword.idents;
+            tok = yylex();
+            if (tok == '(') {
+                plpgsql_push_back_token(tok);
+                continue;
+            }
+            plpgsql_push_back_token(tok);
+            plpgsql_pkg_add_unknown_var_to_namespace(dtname);
+            continue;
+        }
+
+        /*
+         * A_FORMAT VARRAY related handling
+         * To make parentheses-based varray access compatible with current
+         * PL/pgSQL array, we need to replace all parentheses with brackets.
+         * Like what we did in read_sql_contruct5(), we interpret the input
+         * query with array states.
+         *
+         * When array_begin is set to true, it means we have an array comming
+         * in next iteration, we need to append a bracket instead of parentheses.
+         * Or, array_begin is set to false that the query statement will remain
+         * unchanged.
+         */
+        if (u_sess->attr.attr_sql.sql_compatibility != A_FORMAT) {
+            continue;
+        }
+
+
+        /* Find 'values' position for InsertStmt */
+        if (insert_stmt && tok == T_WORD) {
+            if (pg_strcasecmp(yylval.word.ident, "values") == 0) {
+                tok = yylex();
+                if (tok == '(') {
+                    prev_values = false;
+                } else {
+                    prev_values = true;
+                }
+                plpgsql_push_back_token(tok);
+                continue;
+            }
+        }
+
+        /* Check the variable type after 'values' */
+        if (insert_stmt && prev_values && (tok == T_WORD || tok == T_VARRAY_VAR || tok == T_TABLE_VAR)) {
+            if (tok == T_WORD) {
+                PLpgSQL_nsitem* ns = plpgsql_ns_lookup(plpgsql_ns_top(), false, yylval.word.ident, NULL, NULL, NULL);
+                if (ns == NULL) {
+                    yyerror("insert an nonexistent variable.");
+                }
+
+                PLpgSQL_datum* datum = u_sess->plsql_cxt.curr_compile_context->plpgsql_Datums[ns->itemno];
+                insert_record = true;
+                prev_values = false;
+                values_end_loc = yylloc;
+                if (PLPGSQL_DTYPE_RECORD == datum->dtype 
+                        || PLPGSQL_DTYPE_ROW == datum->dtype) {
+                    row_data = (PLpgSQL_row*)datum;
+                    continue;
+                } else if (PLPGSQL_DTYPE_REC == datum->dtype) {
+                    rec_data = (PLpgSQL_rec*)datum;
+                    if (rec_data->tupdesc == NULL) {
+                        yyerror("unsupported insert into table from record type without desc, "
+                                "may need set behavior_compat_options to allow_procedure_compile_check.");
+                    }
+                    continue;
+                }
+
+                yyerror("unsupported insert into table from non record type.");
+            } else if (tok == T_VARRAY_VAR || tok == T_TABLE_VAR) {
+                if (yylval.wdatum.datum->dtype == PLPGSQL_DTYPE_VAR) {
+                    array_data = (PLpgSQL_var *) yylval.wdatum.datum;
+                    insert_array_record = true;
+                    prev_values = false;
+                    values_end_loc = yylloc;
+                    continue;
+                }
+                yyerror("unsupported insert into table from non record type.");
+            } else {
+                yyerror("unsupported insert into table from non record type.");
+            }
+        }
+
+        if (tok == '(' || tok == '[')
+            parenlevel++;
+        else if (tok == ')' || tok == ']')
+        {
+            parenlevel--;
+            if (parenlevel < 0)
+                yyerror("mismatched parentheses", true);
+        }
+
+        switch(tok) {
+            case T_VARRAY_VAR:
+                curloc = yylloc;    /* always save current location before yylex() */
+                tok = yylex();
+                if (tok == '(' || tok == '[')
+                    array_begin = true;
+                plpgsql_push_back_token(tok);
+                break;
+            case T_TABLE_VAR:
+                curloc = yylloc;    /* always save current location before yylex() */
+                tok = yylex();
+                if (tok == '(')
+                    array_begin = true;
+                else if (tok == '[') 
+                    yyerror("syntax error");
+
+                plpgsql_push_back_token(tok);
+                break;
+            case ']':
+            case ')':
+                if (list_bracket && linitial_int(list_bracket) == parenlevel) {
+                    prev_tok = tok;
+                    curloc = yylloc;    /* always save current location before yylex() */
+                    tok = yylex();
+                    if (tok == '(' || tok == '[' || tok == '.') {
+                        array_begin = true; /* N-D array access */
+                    }
+                    plpgsql_push_back_token(tok);
+
+                    /* stack pop */
+                    list_bracket = list_delete_first(list_bracket);
+                    if (prev_tok == ')') {
+                        /* append location of right bracket */
+                        list_bracket_loc = lappend_int(list_bracket_loc, curloc - location);
+                    }
+                }
+                break;
+            case '[':
+            case '(':
+                if (array_begin) {
+                    /* stack push */
+                    list_bracket = lcons_int(parenlevel - 1, list_bracket);
+                    if (tok == '(') {
+                        /* cancat location of left bracket */
+                        list_bracket_loc = lcons_int(yylloc - location, list_bracket_loc);
+                    }
+                    array_begin = false;
+                }
+                break;
+            case T_WORD:
+            case T_CWORD:
+                if (array_begin) {
+                    curloc = yylloc;    /* always save current location before yylex() */
+                    tok = yylex();
+                    if (tok != '(' && tok != '[') {
+                        array_begin = false;
+                    }
+                    plpgsql_push_back_token(tok);
+                }
+                break;
+            case '.':
+                if (array_begin) {
+                    curloc = yylloc;    /* always save current location before yylex() */
+                    tok = yylex();
+                    if (tok != T_WORD && tok != T_CWORD) {
+                        array_begin = false;
+                    }
+                    plpgsql_push_back_token(tok);
+                }
+                break;
+            default:
+                /* do nothing */
+                break;
+        }
+
     }
 
-    u_sess->plsql_cxt.plpgsql_IdentifierLookup = save_IdentifierLookup;
+    u_sess->plsql_cxt.curr_compile_context->plpgsql_IdentifierLookup = save_IdentifierLookup;
 
     if (have_into)
     {
@@ -4628,9 +8677,120 @@ make_execsql_stmt(int firsttoken, int location)
         plpgsql_append_source_text(&ds, location, into_start_loc);
         appendStringInfoSpaces(&ds, into_end_loc - into_start_loc);
         plpgsql_append_source_text(&ds, into_end_loc, yylloc);
-    }
-    else
+
+        if (parenlevel != 0 ||
+            list_length(list_bracket) != 0 ||
+            list_length(list_bracket_loc) % 2)
+        {
+            yyerror("mismatched parentheses");
+        }
+        plpgsql_process_stmt_array(&ds, list_bracket_loc);
+        list_free_ext(list_bracket_loc);
+    } else if (insert_record) {
+        /* Support grammar 'Insert into table_name values record_type' in Procedure.
+         * because SQL Parser does's support that, so record type will be broken into
+         * record variable's sub attribute variable for 'Insert into table_name 
+         * values(var,...).
+         */
+        plpgsql_append_source_text(&ds, location, values_end_loc);
+        appendStringInfoString(&ds, "(");
+        if (row_data != NULL) {
+        int nfields = row_data->nfields;
+            for (int i = 0; i < nfields; i++) {
+                appendStringInfo(&ds, "%s.%s", row_data->refname, row_data->fieldnames[i]);
+                if (i != (nfields - 1)) {
+                    appendStringInfoString(&ds, ",");
+                }
+            }
+        } else {
+            int nattr = rec_data->tupdesc->natts;
+            for (int i = 0; i < nattr; i++) {
+               Form_pg_attribute pg_att_form = rec_data->tupdesc->attrs[i];
+               appendStringInfo(&ds, "%s.%s", rec_data->refname, NameStr(pg_att_form->attname));
+               if (i != (nattr - 1)) {
+                   appendStringInfoString(&ds, ",");
+               }
+            }
+        }
+        appendStringInfoString(&ds, ")");
+    } else if (insert_array_record) {
+        /* Support grammar 'Insert into table_name values array[][]...' in Procedure.
+         * because SQL Parser does's support that, so record type will be broken into
+         * record variable's sub attribute variable for 'Insert into table_name 
+         * values(array[][].var,...).
+         */
+        Oid base_type_oid = get_element_type(array_data->datatype->typoid);
+        if (!OidIsValid(base_type_oid)) {
+           yyerror("invalid array's element type for insert.");
+        }
+
+        HeapTuple type_tuple = SearchSysCache1(TYPEOID, ObjectIdGetDatum(base_type_oid));     
+        if (!HeapTupleIsValid(type_tuple)) {
+            yyerror("invalid array's element type tuple for insert.");
+        }
+
+        Form_pg_type type_pg_type = (Form_pg_type)GETSTRUCT(type_tuple);
+        int rel_oid = type_pg_type->typrelid;
+        ReleaseSysCache(type_tuple);
+        HeapTuple rel_tuple = SearchSysCache1(RELOID, ObjectIdGetDatum(rel_oid));
+        if (!HeapTupleIsValid(rel_tuple)) {
+            yyerror("invalid type's rel tuple for insert.", true);
+            u_sess->plsql_cxt.have_error = true;
+        } else {
+
+            plpgsql_append_source_text(&ds, location, values_end_loc);
+            appendStringInfoString(&ds, "(");
+            int replace_start_poc = ds.len;
+            Form_pg_class rel_pg_class = (Form_pg_class) GETSTRUCT(rel_tuple);
+            int att_num = rel_pg_class->relnatts;
+            ReleaseSysCache(rel_tuple);
+
+            for (int i = 1; i <= att_num; i++) {
+                HeapTuple att_tuple = SearchSysCache2(ATTNUM, ObjectIdGetDatum(rel_oid), Int16GetDatum(i));
+                if (!HeapTupleIsValid(att_tuple)) {
+                    yyerror("invalid element att tuple for insert.");
+                }
+
+                Form_pg_attribute att_pg_attribute = (Form_pg_attribute)GETSTRUCT(att_tuple);
+                plpgsql_append_source_text(&ds, values_end_loc, before_semi_loc);
+                appendStringInfo(&ds, ".%s", att_pg_attribute->attname.data);
+                if (i != att_num) {
+                    appendStringInfoString(&ds, ",");
+                }
+
+                ReleaseSysCache(att_tuple);
+            }
+            int replace_end_poc = ds.len - 1;
+            appendStringInfoString(&ds, ")");
+
+            int bracket_level = 0;
+            /* replace table/array's '('/')' to '['/']' SQL supported */ 
+            for (int i = replace_start_poc; i <= replace_end_poc; i++) {
+                if (ds.data[i] == '(') {
+                    bracket_level++;
+                    if (bracket_level == 1) {
+                        ds.data[i] = '[';
+                    }
+                } else if (ds.data[i] == ')') {
+                    if (bracket_level == 1) {
+                        ds.data[i] = ']';
+                    }
+                    bracket_level--;
+                }
+            }
+        }
+    } else {
         plpgsql_append_source_text(&ds, location, yylloc);
+
+        if (parenlevel != 0 ||
+            list_length(list_bracket) != 0 ||
+            list_length(list_bracket_loc) % 2)
+        {
+            yyerror("mismatched parentheses");
+        }
+        plpgsql_process_stmt_array(&ds, list_bracket_loc);
+        list_free_ext(list_bracket_loc);
+    }
 
     /* trim any trailing whitespace, for neatness */
     while (ds.len > 0 && scanner_isspace(ds.data[ds.len - 1]))
@@ -4643,19 +8803,26 @@ make_execsql_stmt(int firsttoken, int location)
     expr->paramnos		= NULL;
     expr->ns			= plpgsql_ns_top();
     expr->idx			= (uint32)-1;
+    expr->out_param_dno = -1;
     pfree_ext(ds.data);
 
     check_sql_expr(expr->query, location, 0);
-
+#ifndef ENABLE_MULTIPLE_NODES
+    if (firsttoken == K_SELECT && u_sess->attr.attr_sql.sql_compatibility == A_FORMAT && ALLOW_PROCEDURE_COMPILE_CHECK) {
+        (void)getCursorTupleDesc(expr, false, true);
+    }
+#endif
     execsql = (PLpgSQL_stmt_execsql *)palloc(sizeof(PLpgSQL_stmt_execsql));
     execsql->cmd_type = PLPGSQL_STMT_EXECSQL;
     execsql->lineno  = plpgsql_location_to_lineno(location);
     execsql->sqlstmt = expr;
     execsql->into	 = have_into;
+    execsql->bulk_collect = have_bulk_collect;
     execsql->strict	 = have_strict;
     execsql->rec	 = rec;
     execsql->row	 = row;
     execsql->placeholders = placeholders;
+    execsql->sqlString = plpgsql_get_curline_query();
 
     return (PLpgSQL_stmt *) execsql;
 }
@@ -4682,6 +8849,9 @@ read_fetch_direction(void)
     fetch->how_many  = 1;
     fetch->expr		 = NULL;
     fetch->returns_multiple_rows = false;
+    fetch->bulk_collect = false;
+    fetch->has_direction = true;
+    fetch->sqlString = plpgsql_get_curline_query();
 
     tok = yylex();
     if (tok == 0)
@@ -4748,10 +8918,11 @@ read_fetch_direction(void)
         /* empty direction */
         check_FROM = false;
     }
-    else if (tok == T_DATUM)
+    else if (tok == T_DATUM || tok == T_PACKAGE_VARIABLE)
     {
         /* Assume there's no direction clause and tok is a cursor name */
         plpgsql_push_back_token(tok);
+        fetch->has_direction = false;
         check_FROM = false;
     }
     else
@@ -4832,37 +9003,46 @@ make_return_stmt(int location)
     newp->lineno   = plpgsql_location_to_lineno(location);
     newp->expr	  = NULL;
     newp->retvarno = -1;
+    newp->sqlString = plpgsql_get_curline_query();
 
-    if (u_sess->plsql_cxt.plpgsql_curr_compile->fn_retset)
+    if (u_sess->plsql_cxt.curr_compile_context->plpgsql_curr_compile->fn_retset)
     {
-        if (yylex() != ';')
-            ereport(ERROR,
+        if (yylex() != ';') {
+            const char* message = "RETURN cannot have a parameter in function returning set";
+            InsertErrorMessage(message, plpgsql_yylloc);
+            ereport(errstate,
                     (errcode(ERRCODE_DATATYPE_MISMATCH),
                      errmsg("RETURN cannot have a parameter in function returning set"),
                      errhint("Use RETURN NEXT or RETURN QUERY."),
                      parser_errposition(yylloc)));
+        }
     }
 
     // adapting A db, where return value is independent from OUT parameters 
-    else if (';' == (token = yylex()) && u_sess->plsql_cxt.plpgsql_curr_compile->out_param_varno >= 0)
-        newp->retvarno = u_sess->plsql_cxt.plpgsql_curr_compile->out_param_varno;
+    else if (';' == (token = yylex()) && u_sess->plsql_cxt.curr_compile_context->plpgsql_curr_compile->out_param_varno >= 0)
+        newp->retvarno = u_sess->plsql_cxt.curr_compile_context->plpgsql_curr_compile->out_param_varno;
     else
     {
         plpgsql_push_back_token(token);
-        if (u_sess->plsql_cxt.plpgsql_curr_compile->fn_rettype == VOIDOID)
+        if (u_sess->plsql_cxt.curr_compile_context->plpgsql_curr_compile->fn_rettype == VOIDOID)
         {
-            if (yylex() != ';')
-                ereport(ERROR,
+            if (yylex() != ';') {
+                const char* message = "RETURN cannot have a parameter in function returning void";
+                InsertErrorMessage(message, plpgsql_yylloc);
+                ereport(errstate,
                         (errcode(ERRCODE_DATATYPE_MISMATCH),
                          errmsg("RETURN cannot have a parameter in function returning void"),
                          parser_errposition(yylloc)));
+            }
         }
-        else if (u_sess->plsql_cxt.plpgsql_curr_compile->fn_retistuple)
+        else if (u_sess->plsql_cxt.curr_compile_context->plpgsql_curr_compile->fn_retistuple)
         {
             int     tok = yylex();
             if(tok < 0)
             {
-                ereport(ERROR,
+                const char* message = "token value is smaller than 0 ";
+                InsertErrorMessage(message, plpgsql_yylloc);
+                ereport(errstate,
                     (errcode(ERRCODE_SYNTAX_ERROR),
                      errmsg("token value %d is smaller than 0 ", tok)));
                 return NULL;
@@ -4876,17 +9056,23 @@ make_return_stmt(int location)
 
                 case T_DATUM:
                     if (yylval.wdatum.datum->dtype == PLPGSQL_DTYPE_ROW ||
-                        yylval.wdatum.datum->dtype == PLPGSQL_DTYPE_REC)
-                        newp->retvarno = yylval.wdatum.datum->dno;
-                    else
-                        ereport(ERROR,
+                        yylval.wdatum.datum->dtype == PLPGSQL_DTYPE_REC ||
+                        yylval.wdatum.datum->dtype == PLPGSQL_DTYPE_RECORD)
+                        newp->retvarno = yylval.wdatum.dno;
+                    else {
+                        const char* message = "RETURN must specify a record or row variable in function returning row";
+                        InsertErrorMessage(message, plpgsql_yylloc);
+                        ereport(errstate,
                                 (errcode(ERRCODE_DATATYPE_MISMATCH),
                                  errmsg("RETURN must specify a record or row variable in function returning row"),
                                  parser_errposition(yylloc)));
+                    }
                     break;
 
                 default:
-                    ereport(ERROR,
+                    const char* message = "RETURN must specify a record or row variable in function returning row";
+                    InsertErrorMessage(message, plpgsql_yylloc);
+                    ereport(errstate,
                             (errcode(ERRCODE_DATATYPE_MISMATCH),
                              errmsg("RETURN must specify a record or row variable in function returning row"),
                              parser_errposition(yylloc)));
@@ -4901,7 +9087,13 @@ make_return_stmt(int location)
              * Note that a well-formed expression is _required_ here;
              * anything else is a compile-time error.
              */
+            if (u_sess->attr.attr_sql.sql_compatibility == A_FORMAT) {
+                newp->retvarno = u_sess->plsql_cxt.curr_compile_context->plpgsql_curr_compile->out_param_varno;
+            }
             newp->expr = read_sql_expression(';', ";");
+            if (newp->expr->is_have_tableof_index_var) {
+                yyerror("table of index type is not supported as function return type.");
+            }
         }
     }
 
@@ -4914,44 +9106,57 @@ make_return_next_stmt(int location)
 {
     PLpgSQL_stmt_return_next *newp;
 
-    if (!u_sess->plsql_cxt.plpgsql_curr_compile->fn_retset)
-        ereport(ERROR,
+    if (!u_sess->plsql_cxt.curr_compile_context->plpgsql_curr_compile->fn_retset) {
+        const char* message = "cannot use RETURN NEXT in a non-SETOF function";
+        InsertErrorMessage(message, plpgsql_yylloc);
+        ereport(errstate,
                 (errcode(ERRCODE_DATATYPE_MISMATCH),
                  errmsg("cannot use RETURN NEXT in a non-SETOF function"),
                  parser_errposition(location)));
+    }
 
     newp = (PLpgSQL_stmt_return_next *)palloc0(sizeof(PLpgSQL_stmt_return_next));
     newp->cmd_type	= PLPGSQL_STMT_RETURN_NEXT;
     newp->lineno		= plpgsql_location_to_lineno(location);
     newp->expr		= NULL;
     newp->retvarno	= -1;
+    newp->sqlString = plpgsql_get_curline_query();
 
-    if (u_sess->plsql_cxt.plpgsql_curr_compile->out_param_varno >= 0)
+    if (u_sess->plsql_cxt.curr_compile_context->plpgsql_curr_compile->out_param_varno >= 0)
     {
-        if (yylex() != ';')
-            ereport(ERROR,
+        if (yylex() != ';') {
+            const char* message = "RETURN NEXT cannot have a parameter in function with OUT parameters";
+            InsertErrorMessage(message, plpgsql_yylloc);
+            ereport(errstate,
                     (errcode(ERRCODE_DATATYPE_MISMATCH),
                      errmsg("RETURN NEXT cannot have a parameter in function with OUT parameters"),
                      parser_errposition(yylloc)));
-        newp->retvarno = u_sess->plsql_cxt.plpgsql_curr_compile->out_param_varno;
+        }
+        newp->retvarno = u_sess->plsql_cxt.curr_compile_context->plpgsql_curr_compile->out_param_varno;
     }
-    else if (u_sess->plsql_cxt.plpgsql_curr_compile->fn_retistuple)
+    else if (u_sess->plsql_cxt.curr_compile_context->plpgsql_curr_compile->fn_retistuple)
     {
         switch (yylex())
         {
             case T_DATUM:
                 if (yylval.wdatum.datum->dtype == PLPGSQL_DTYPE_ROW ||
+                    yylval.wdatum.datum->dtype == PLPGSQL_DTYPE_RECORD ||
                     yylval.wdatum.datum->dtype == PLPGSQL_DTYPE_REC)
-                    newp->retvarno = yylval.wdatum.datum->dno;
-                else
-                    ereport(ERROR,
+                    newp->retvarno = yylval.wdatum.dno;
+                else {
+                    const char* message = "RETURN NEXT must specify a record or row variable in function returning row";
+                    InsertErrorMessage(message, plpgsql_yylloc);
+                    ereport(errstate,
                             (errcode(ERRCODE_DATATYPE_MISMATCH),
                              errmsg("RETURN NEXT must specify a record or row variable in function returning row"),
                              parser_errposition(yylloc)));
+                }
                 break;
 
             default:
-                ereport(ERROR,
+                const char* message = "RETURN NEXT must specify a record or row variable in function returning row";
+                InsertErrorMessage(message, plpgsql_yylloc);
+                ereport(errstate,
                         (errcode(ERRCODE_DATATYPE_MISMATCH),
                          errmsg("RETURN NEXT must specify a record or row variable in function returning row"),
                          parser_errposition(yylloc)));
@@ -4973,15 +9178,19 @@ make_return_query_stmt(int location)
     PLpgSQL_stmt_return_query *newp;
     int			tok;
 
-    if (!u_sess->plsql_cxt.plpgsql_curr_compile->fn_retset)
-        ereport(ERROR,
+    if (!u_sess->plsql_cxt.curr_compile_context->plpgsql_curr_compile->fn_retset) {
+        const char* message = "cannot use RETURN QUERY in a non-SETOF function";
+        InsertErrorMessage(message, plpgsql_yylloc);
+        ereport(errstate,
                 (errcode(ERRCODE_DATATYPE_MISMATCH),
                  errmsg("cannot use RETURN QUERY in a non-SETOF function"),
                  parser_errposition(location)));
+    }
 
     newp = (PLpgSQL_stmt_return_query *)palloc0(sizeof(PLpgSQL_stmt_return_query));
     newp->cmd_type = PLPGSQL_STMT_RETURN_QUERY;
     newp->lineno = plpgsql_location_to_lineno(location);
+    newp->sqlString = plpgsql_get_curline_query();
 
     /* check for RETURN QUERY EXECUTE */
     if ((tok = yylex()) != K_EXECUTE)
@@ -5025,18 +9234,56 @@ NameOfDatum(PLwdatum *wdatum)
     return NameListToString(wdatum->idents);
 }
 
+/* convenience routine to copy the name of a T_DATUM */
+static char *
+CopyNameOfDatum(PLwdatum *wdatum)
+{
+    if (wdatum->ident)
+        return pstrdup(wdatum->ident);
+    AssertEreport(wdatum->idents != NIL,
+                        MOD_PLSQL,
+                        "It should not be null");
+    return NameListToString(wdatum->idents);
+}
+
+static void check_record_nest_tableof_index(PLpgSQL_datum* datum)
+{
+    if (datum->dtype == PLPGSQL_DTYPE_RECORD || datum->dtype == PLPGSQL_DTYPE_ROW) {
+        PLpgSQL_row* row = (PLpgSQL_row*)datum;
+        for (int i = 0; i < row->nfields; i++) {
+            PLpgSQL_datum* row_element = NULL; 
+            if (row->ispkg) {
+                row_element = (PLpgSQL_datum*)(row->pkg->datums[row->varnos[i]]);
+            } else {
+                row_element = (PLpgSQL_datum*)(u_sess->plsql_cxt.curr_compile_context->plpgsql_Datums[row->varnos[i]]);
+            }
+            /* Notice: do not deal record nest record nest table of index, because table of index type can not get */
+            if (row_element->dtype == PLPGSQL_DTYPE_VAR) {
+                PLpgSQL_var* var_element = (PLpgSQL_var*)row_element;
+                if (OidIsValid(var_element->datatype->tableOfIndexType)) {
+                    yyerror("record nested table of index variable do not support entire assign");
+                }
+            } 
+        }
+    }
+}
+
 static void
 check_assignable(PLpgSQL_datum *datum, int location)
 {
+    PLpgSQL_var *var = NULL;
     switch (datum->dtype)
     {
         case PLPGSQL_DTYPE_VAR:
-            if (((PLpgSQL_var *) datum)->isconst)
-                ereport(ERROR,
+            if (((PLpgSQL_var *) datum)->isconst) {
+                const char* message = "variable is declared CONSTANT";
+                InsertErrorMessage(message, plpgsql_yylloc);
+                ereport(errstate,
                         (errcode(ERRCODE_ERROR_IN_ASSIGNMENT),
                          errmsg("\"%s\" is declared CONSTANT",
                                 ((PLpgSQL_var *) datum)->refname),
                          parser_errposition(location)));
+            }
             break;
         case PLPGSQL_DTYPE_ROW:
             /* always assignable? */
@@ -5050,17 +9297,263 @@ check_assignable(PLpgSQL_datum *datum, int location)
             /* always assignable? */
             break;
         case PLPGSQL_DTYPE_ARRAYELEM:
-            /* always assignable? */
+            var = (PLpgSQL_var *)u_sess->plsql_cxt.curr_compile_context->plpgsql_Datums[((PLpgSQL_arrayelem *)datum)->arrayparentno];
+            if (var->isconst) {
+                const char* message = "array is declared CONSTANT";
+                InsertErrorMessage(message, plpgsql_yylloc);
+                ereport(errstate, (errcode(ERRCODE_ERROR_IN_ASSIGNMENT),
+                                errmsg("\"%s\" is declared CONSTANT", var->refname),
+                                parser_errposition(location)));
+                u_sess->plsql_cxt.have_error = true;
+            }
+            break;
+        case PLPGSQL_DTYPE_TABLEELEM:
+            var = (PLpgSQL_var *)u_sess->plsql_cxt.curr_compile_context->plpgsql_Datums[((PLpgSQL_tableelem *)datum)->tableparentno];
+            if (var->isconst) {
+                const char* message = "table is declared CONSTANT";
+                InsertErrorMessage(message, plpgsql_yylloc);
+                ereport(errstate, (errcode(ERRCODE_ERROR_IN_ASSIGNMENT),
+                                   errmsg("\"%s\" is declared CONSTANT", var->refname),
+                                   parser_errposition(location)));
+                u_sess->plsql_cxt.have_error = true;
+            }
+            break;
+        case PLPGSQL_DTYPE_UNKNOWN:
+            /* package variable? */
             break;
         default:
-            elog(ERROR, "unrecognized dtype: %d", datum->dtype);
+            elog(errstate, "unrecognized dtype: %d", datum->dtype);
             break;
     }
 }
 
+static Oid get_table_index_type(PLpgSQL_datum* datum, int *tableof_func_dno)
+{
+    PLpgSQL_var* var = (PLpgSQL_var*)datum;
+    if (OidIsValid(var->datatype->tableOfIndexType) && tableof_func_dno != NULL) {
+        if (*tableof_func_dno == -1) {
+            *tableof_func_dno = var->dno;
+        } else if (*tableof_func_dno != var->dno) {
+            yyerror("do not support more than 2 table of index by variables call functions in an expr");
+        }
+    }
+   
+    return var->datatype->tableOfIndexType;
+}
+
+static void check_bulk_into_type(PLpgSQL_row* row)
+{
+    if (row->nfields == 0) {
+        char errormsg[128] = {0};
+        errno_t rc = EOK;
+        rc = snprintf_s(errormsg, sizeof(errormsg), sizeof(errormsg) - 1,
+            "bulk collect into target can't be null.");
+        securec_check_ss(rc, "", "");
+        yyerror(errormsg);
+    }
+
+    for (int i = 0; i < row->nfields; i++) {
+        PLpgSQL_var* var = (PLpgSQL_var*)u_sess->plsql_cxt.curr_compile_context->plpgsql_Datums[row->varnos[i]];
+        if (var->datatype != NULL && var->datatype->collectionType == PLPGSQL_COLLECTION_TABLE && var->datatype->tableOfIndexType == VARCHAROID) {
+            char errormsg[128] = {0};
+            errno_t rc = EOK;
+            rc = snprintf_s(errormsg, sizeof(errormsg), sizeof(errormsg) - 1,
+                "index by varchar type %s don't support bulk collect into.", var->refname);
+            securec_check_ss(rc, "", "");
+            yyerror(errormsg);
+        }
+    }
+}
+
+static void check_tableofindex_args(int tableof_var_dno, Oid argtype)
+{
+    if (tableof_var_dno < 0 || u_sess->plsql_cxt.curr_compile_context == NULL) {
+        return ;
+    }
+    PLpgSQL_datum* tableof_var_datum = u_sess->plsql_cxt.curr_compile_context->plpgsql_Datums[tableof_var_dno];
+    if (tableof_var_datum == NULL) {
+        return ;
+    } else if (tableof_var_datum->dtype == PLPGSQL_DTYPE_VAR) {
+        PLpgSQL_var* var = (PLpgSQL_var*)tableof_var_datum;
+        Oid base_oid = InvalidOid;
+        Oid indexby_oid = InvalidOid;
+        
+        if (isTableofType(argtype, &base_oid, &indexby_oid)) {
+            if (var->datatype->tableOfIndexType != indexby_oid ||
+                var->datatype->typoid != base_oid) {
+                yyerror("procedure table of arg types not match");
+            }
+        }
+    } else if (tableof_var_datum->dtype == PLPGSQL_DTYPE_RECORD) {
+        check_record_nest_tableof_index(tableof_var_datum);
+    }  
+}
+
+static void check_table_index(PLpgSQL_datum* datum, char* funcName)
+{
+    PLpgSQL_var* var = (PLpgSQL_var*)datum;
+    if (var->datatype->tableOfIndexType == VARCHAROID) {
+        char errormsg[128] = {0};
+        errno_t rc = EOK;
+        rc = snprintf_s(errormsg, sizeof(errormsg), sizeof(errormsg) - 1,
+            "index by varchar type don't support %s function", funcName);
+        securec_check_ss(rc, "", "");
+        yyerror(errormsg);
+    }
+}
+/*
+ * check if the table type has index by,
+ * return real type
+ */
+static Oid get_table_type(PLpgSQL_datum* datum)
+{
+    PLpgSQL_var* var = (PLpgSQL_var*)datum;
+    if (OidIsValid(var->datatype->tableOfIndexType)) {
+        yyerror("multiset don't support index by table of type.");
+    }
+    Oid typeOid = var->datatype->typoid;
+    if (!OidIsValid(typeOid)) {
+        ereport(errstate,
+            (errcode(ERRCODE_UNDEFINED_OBJECT),
+            errmsg("type %s type Oid is invalid.", var->datatype->typname)));
+        u_sess->plsql_cxt.have_error = true;
+    }
+    return typeOid;
+}
+
+/* get the attrno of attribute when assign value to arrary element attibute. */
+static AttrNumber get_assign_attrno(PLpgSQL_datum* target,  char* attrname)
+{
+    int nsubscripts = 0;
+    Oid parenttypoid;
+    int32 arraytypmod;
+    Oid arraytypoid;
+    Oid elemtypoid;
+    AttrNumber attrno = -1;
+    PLpgSQL_arrayelem* arrayelem = NULL;
+    PLpgSQL_tableelem* tableelem = NULL;
+
+    /*
+     * To handle constructs like x[1][2] := something, we have to
+     * be prepared to deal with a chain of arrayelem datums. Chase
+     * back to find the base array datum.
+     */
+    if (target->dtype == PLPGSQL_DTYPE_ARRAYELEM) {
+        do {
+            arrayelem = (PLpgSQL_arrayelem*)target;
+            if (nsubscripts >= MAXDIM) {
+                const char* message = "number of array dimensions exceeds the maximum allowed in assignment.";
+                InsertErrorMessage(message, plpgsql_yylloc);
+                ereport(errstate,
+                    (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+                        errmodule(MOD_PLSQL),
+                        errmsg("number of array dimensions exceeds the maximum allowed in assignment."),
+                        errdetail("number of array dimensions (%d) exceeds the maximum allowed (%d) in assignment. ",
+                            nsubscripts + 1, MAXDIM),
+                        errcause("too large array dimensions"),
+                        erraction("reduce the array dimensions")));
+                u_sess->plsql_cxt.have_error = true;
+            }
+            nsubscripts++;
+            target = u_sess->plsql_cxt.curr_compile_context->plpgsql_Datums[arrayelem->arrayparentno];
+        } while (target->dtype == PLPGSQL_DTYPE_ARRAYELEM);
+    } else {
+        do {
+            tableelem = (PLpgSQL_tableelem*)target;
+            if (nsubscripts >= MAXDIM) {
+                const char* message = "number of array dimensions exceeds the maximum allowed in assignment.";
+                InsertErrorMessage(message, plpgsql_yylloc);
+                ereport(errstate,
+                    (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+                        errmodule(MOD_PLSQL),
+                        errmsg("number of array dimensions exceeds the maximum allowed in assignment."),
+                        errdetail("number of array dimensions (%d) exceeds the maximum allowed (%d) in assignment. ",
+                            nsubscripts + 1, MAXDIM),
+                        errcause("too large array dimensions"),
+                        erraction("reduce the array dimensions")));
+                u_sess->plsql_cxt.have_error = true;
+            }
+            nsubscripts++;
+            target = u_sess->plsql_cxt.curr_compile_context->plpgsql_Datums[tableelem->tableparentno];
+        } while (target->dtype == PLPGSQL_DTYPE_TABLEELEM);
+    }
+    /* array element type must be PLPGSQL_DTYPE_VAR, otherwise user referencing array incorrectly. */
+    if (target->dtype != PLPGSQL_DTYPE_VAR) {
+        const char* message = "subscripted object in assignment is not an array";
+        InsertErrorMessage(message, plpgsql_yylloc);
+        ereport(errstate,
+            (errcode(ERRCODE_DATATYPE_MISMATCH),
+                errmodule(MOD_PLSQL),
+                errmsg("subscripted object in assignment is not an array"),
+                errdetail("subscripted variable in assignment is not an array"),
+                errcause("incorrectly referencing variables"),
+                erraction("modify assign variable")));
+        u_sess->plsql_cxt.have_error = true;
+    }
+
+	/* get the array element typoid */
+    PLpgSQL_var* var = (PLpgSQL_var*)target;
+    parenttypoid = var->datatype->typoid;
+    arraytypmod = var->datatype->atttypmod;
+    arraytypoid = getBaseTypeAndTypmod(parenttypoid, &arraytypmod);
+    elemtypoid = get_element_type(arraytypoid);
+    if (!OidIsValid(elemtypoid)) {
+        const char* message = "subscripted object in assignment is not an array";
+        InsertErrorMessage(message, plpgsql_yylloc);
+        ereport(errstate,
+            (errcode(ERRCODE_DATATYPE_MISMATCH),
+                errmodule(MOD_PLSQL),
+                errmsg("subscripted object in assignment is not an array"),
+                errdetail("subscripted variable \"%s\" in assignment is not an array", var->refname),
+                errcause("incorrectly referencing variables"),
+                erraction("modify assign variable")));
+        u_sess->plsql_cxt.have_error = true;
+    }
+
+	/* get tupledesc by typoid */
+    TupleDesc elemtupledesc =
+        lookup_rowtype_tupdesc_noerror(elemtypoid, arraytypmod,true);
+    if (elemtupledesc == NULL){
+        const char* message = "array element type is not composite in assignment";
+        InsertErrorMessage(message, plpgsql_yylloc);
+        ereport(ERROR,
+            (errcode(ERRCODE_ARRAY_SUBSCRIPT_ERROR),
+                errmodule(MOD_PLSQL),
+                errmsg("array element type is not composite in assignment"),
+                errdetail("array variable \"%s\" must be composite when assign value to attibute", var->refname),
+                errcause("incorrectly referencing variables"),
+                erraction("modify assign variable")));
+    }
+
+	/* search the matched attribute */
+    for (int i = 0; i < elemtupledesc->natts; i++) {
+        if (namestrcmp(&(elemtupledesc->attrs[i]->attname), attrname) == 0) {
+            attrno = i;
+            break;
+        }
+    }
+    ReleaseTupleDesc(elemtupledesc);
+
+	/* attrno = -1 means there is no matched attribute */
+    if (attrno == -1) {
+        const char* message = "attribute does not exists";
+        InsertErrorMessage(message, plpgsql_yylloc);
+        ereport(errstate,
+        (errcode(ERRCODE_ARRAY_SUBSCRIPT_ERROR),
+            errmodule(MOD_PLSQL),
+            errmsg("attribute \"%s\" does not exist", attrname),
+            errdetail("attribute \"%s\" does not exist in array variable \"%s\"", attrname, var->refname),
+            errcause("incorrectly referencing variables"),
+            erraction("modify assign variable")));
+        u_sess->plsql_cxt.have_error = true;
+	}
+
+    return attrno;
+}
+
 /*
  * Brief		: support array variable as select into and using out target. 
- * Description	: if an array element is detected, add it to the u_sess->plsql_cxt.plpgsql_Datums[]
+ * Description	: if an array element is detected, add it to the u_sess->plsql_cxt.curr_compile_context->plpgsql_Datums[]
  *				  and return true, else return false.  
  * Notes		: 
  */ 
@@ -5074,7 +9567,9 @@ read_into_using_add_arrayelem(char **fieldnames, int *varnos, int *nfields, int 
     /* validation of arguments */
     if ((NULL == fieldnames) || (NULL == varnos) || (NULL == nfields) || (NULL == tok))
     {
-        ereport(ERROR,
+        const char* message = "pointer is null in read_into_add_arrayelem function!";
+        InsertErrorMessage(message, plpgsql_yylloc);
+        ereport(errstate,
                 (errcode(ERRCODE_UNEXPECTED_NULL_VALUE),
                  errmsg(" pointer is null in read_into_add_arrayelem function! ")));
         return false;
@@ -5096,17 +9591,98 @@ read_into_using_add_arrayelem(char **fieldnames, int *varnos, int *nfields, int 
         /* get the array index expression */
         newp->subscript = read_sql_expression(toktmp, &tokExpected[0]);
         
-        if(NULL == newp->subscript)
-            ereport(ERROR,
+        if(NULL == newp->subscript) {
+            const char* message = " error near arrary name!";
+            InsertErrorMessage(message, plpgsql_yylloc);
+            ereport(errstate,
                 (errcode(ERRCODE_SYNTAX_ERROR),
                   errmsg(" error near arrary name! ")));
+            u_sess->plsql_cxt.have_error = true;
+        }
+        newp->assignattrno = -1;
 
+        *tok = yylex();
+        if (*tok == '.'){
+            
+            newp->assignattrno = get_assign_attrno((PLpgSQL_datum *)newp, get_attrname(*tok));
+            *tok = yylex();
+            if(*tok == '.') {
+                yyerror("assign value to deep level attribute is not supported in SELECT/FETCH INTO method");
+            }
+        }
         plpgsql_adddatum((PLpgSQL_datum *)newp);
 
         fieldnames[*nfields]   = pstrdup("arrayelem");
         varnos[(*nfields)++]   = newp->dno;
 
+        /* is an array element, return true */
+        return true;
+    }
+
+    return false;
+}
+
+/*
+ * Brief		: support array variable as select into and using out target. 
+ * Description	: if an array element is detected, add it to the u_sess->plsql_cxt.curr_compile_context->plpgsql_Datums[]
+ *				  and return true, else return false.  
+ * Notes		: 
+ */ 
+static bool 
+read_into_using_add_tableelem(char **fieldnames, int *varnos, int *nfields, int tmpdno, int *tok)
+{
+    PLpgSQL_tableelem *newp = NULL;
+    char           tokExpected[2];
+    int            toktmp = 0;
+
+    /* validation of arguments */
+    if ((NULL == fieldnames) || (NULL == varnos) || (NULL == nfields) || (NULL == tok))
+    {
+        const char* message = " pointer is null in read_into_add_arrayelem function!";
+        InsertErrorMessage(message, plpgsql_yylloc);
+        ereport(errstate,
+                (errcode(ERRCODE_UNEXPECTED_NULL_VALUE),
+                 errmsg(" pointer is null in read_into_add_arrayelem function! ")));
+        u_sess->plsql_cxt.have_error = true;
+        return false;
+    }
+
+    if (('[' == *tok) || ('(' == *tok))
+    {
+        if ('[' == *tok)
+            toktmp = ']';
+        else
+            toktmp = ')';
+
+        tokExpected[0] = (char)toktmp;
+        tokExpected[1] = '\0';
+
+        newp = (PLpgSQL_tableelem *)palloc0(sizeof(PLpgSQL_tableelem));
+        newp->tableparentno = tmpdno;
+        newp->dtype      = PLPGSQL_DTYPE_TABLEELEM;
+        /* get the array index expression */
+        newp->subscript = read_sql_expression(toktmp, &tokExpected[0]);
+        
+        if(NULL == newp->subscript) {
+            const char* message = " error near arrary name!";
+            InsertErrorMessage(message, plpgsql_yylloc);
+            ereport(errstate,
+                (errcode(ERRCODE_SYNTAX_ERROR),
+                  errmsg(" error near arrary name! ")));
+            u_sess->plsql_cxt.have_error = true;
+        }
+        newp->assignattrno = -1;
+
         *tok = yylex();
+        if (*tok == '.'){
+            *tok = yylex();
+            newp->assignattrno = get_assign_attrno((PLpgSQL_datum *)newp, get_attrname(*tok));
+            *tok = yylex();
+        }
+        plpgsql_adddatum((PLpgSQL_datum *)newp);
+
+        fieldnames[*nfields]   = pstrdup("arrayelem");
+        varnos[(*nfields)++]   = newp->dno;
 
         /* is an array element, return true */
         return true;
@@ -5120,7 +9696,7 @@ read_into_using_add_arrayelem(char **fieldnames, int *varnos, int *nfields, int 
  * INTO keyword.
  */
 static void
-read_into_target(PLpgSQL_rec **rec, PLpgSQL_row **row, bool *strict)
+read_into_target(PLpgSQL_rec **rec, PLpgSQL_row **row, bool *strict, bool bulk_collect)
 {
     int			tok;
 
@@ -5129,12 +9705,14 @@ read_into_target(PLpgSQL_rec **rec, PLpgSQL_row **row, bool *strict)
     *row = NULL;
     if (strict)
         *strict = true;
-
     tok = yylex();
     if (strict && tok == K_STRICT)
     {
         *strict = true;
         tok = yylex();
+    } else if (strict && bulk_collect) {
+        /* bulk into target can be assigned null */
+        *strict = false;
     }
 
     /*
@@ -5148,17 +9726,22 @@ read_into_target(PLpgSQL_rec **rec, PLpgSQL_row **row, bool *strict)
     {
         case T_DATUM:
         case T_VARRAY_VAR:
+        case T_TABLE_VAR:
+        case T_PACKAGE_VARIABLE:
             if (yylval.wdatum.datum->dtype == PLPGSQL_DTYPE_ROW
             || yylval.wdatum.datum->dtype == PLPGSQL_DTYPE_RECORD)
             {
                 check_assignable(yylval.wdatum.datum, yylloc);
                 *row = (PLpgSQL_row *) yylval.wdatum.datum;
 
-                if ((tok = yylex()) == ',')
-                    ereport(ERROR,
+                if ((tok = yylex()) == ',') {
+                    const char* message = "record or row variable cannot be part of multiple-item INTO list";
+                    InsertErrorMessage(message, plpgsql_yylloc);
+                    ereport(errstate,
                             (errcode(ERRCODE_SYNTAX_ERROR),
                              errmsg("record or row variable cannot be part of multiple-item INTO list"),
                              parser_errposition(yylloc)));
+                }
                 plpgsql_push_back_token(tok);
             }
             else if (yylval.wdatum.datum->dtype == PLPGSQL_DTYPE_REC)
@@ -5166,24 +9749,25 @@ read_into_target(PLpgSQL_rec **rec, PLpgSQL_row **row, bool *strict)
                 check_assignable(yylval.wdatum.datum, yylloc);
                 *rec = (PLpgSQL_rec *) yylval.wdatum.datum;
 
-                if ((tok = yylex()) == ',')
-                    ereport(ERROR,
+                if ((tok = yylex()) == ',') {
+                    const char* message = "record or row variable cannot be part of multiple-item INTO list";
+                    InsertErrorMessage(message, plpgsql_yylloc);
+                    ereport(errstate,
                             (errcode(ERRCODE_SYNTAX_ERROR),
                              errmsg("record or row variable cannot be part of multiple-item INTO list"),
                              parser_errposition(yylloc)));
+                }
                 plpgsql_push_back_token(tok);
             }
             else
             {
-                *row = read_into_array_scalar_list(NameOfDatum(&(yylval.wdatum)),
-                                             yylval.wdatum.datum, yylloc);
+                *row = read_into_array_table_scalar_list(NameOfDatum(&(yylval.wdatum)),
+                                             yylval.wdatum.datum, yylval.wdatum.dno, yylloc, bulk_collect);
             }
             break;
-
         case  T_PLACEHOLDER:
                 *row = read_into_placeholder_scalar_list(yylval.word.ident, yylloc);
             break;
-
         default:
             /* just to give a better message than "syntax error" */
             current_token_is_not_variable(tok);
@@ -5227,30 +9811,35 @@ read_using_target(List  **in_expr, PLpgSQL_row **out_row)
             {
                 case T_DATUM:
                     tempvar = pstrdup(NameOfDatum(&(yylval.wdatum)));
-                    tempdno = yylval.wdatum.datum->dno;
+                    tempdno = yylval.wdatum.dno;
                     plpgsql_push_back_token(tok);
                     tempexpr  =read_sql_construct(',',';',',',", or ;","SELECT ",true,true,true,NULL,&tok);
                     tempexpr->isouttype = true;
                     *in_expr=lappend((*in_expr), tempexpr);
 
-                    if (!read_into_using_add_arrayelem(out_fieldnames, out_varnos, &out_nfields,tempdno,&tok)) 
+                    if (!read_into_using_add_arrayelem(out_fieldnames, out_varnos, &out_nfields, tempdno, &tok)) 
                     {
                         out_fieldnames[out_nfields] = tempvar;
                         out_varnos[out_nfields++]	= tempdno;
                     }
                     else
                     {
-                        if (isin)
-                            ereport(ERROR,
+                        if (isin) {
+                            const char* message = " using can't support array parameter with in out ";
+                            InsertErrorMessage(message, plpgsql_yylloc);
+                            ereport(errstate,
                                 (errcode(ERRCODE_SYNTAX_ERROR),
                                     errmsg(" using can't support array parameter with in out !")));
+                        }
 
                     }
 
                     break;
 
                 default:
-                    ereport(ERROR,
+                    const char* message = "not all the parameters are scalar variables.";
+                    InsertErrorMessage(message, plpgsql_yylloc);
+                    ereport(errstate,
                             (errcode(ERRCODE_SYNTAX_ERROR),
                                     errmsg("not all the parameters are scalar variables.")));
             }
@@ -5284,6 +9873,7 @@ read_using_target(List  **in_expr, PLpgSQL_row **out_row)
         (*out_row)->nfields = out_nfields;
         (*out_row)->fieldnames = (char **)palloc(sizeof(char *) * out_nfields);
         (*out_row)->varnos = (int *)palloc(sizeof(int) * out_nfields);
+        (*out_row)->isImplicit = true;
         while (--out_nfields >= 0)
         {
             (*out_row)->fieldnames[out_nfields] = out_fieldnames[out_nfields];
@@ -5302,6 +9892,7 @@ read_using_target(List  **in_expr, PLpgSQL_row **out_row)
 static PLpgSQL_row *
 read_into_scalar_list(char *initial_name,
                       PLpgSQL_datum *initial_datum,
+                      int initial_dno,
                       int initial_location)
 {
     int				 nfields;
@@ -5312,17 +9903,22 @@ read_into_scalar_list(char *initial_name,
 
     check_assignable(initial_datum, initial_location);
     fieldnames[0] = initial_name;
-    varnos[0]	  = initial_datum->dno;
+    varnos[0]	  = initial_dno;
     nfields		  = 1;
 
     while ((tok = yylex()) == ',')
     {
         /* Check for array overflow */
-        if (nfields >= 1024)
-            ereport(ERROR,
+        if (nfields >= 1024) {
+            const char* message = "too many INTO variables specified.";
+            InsertErrorMessage(message, plpgsql_yylloc);
+            ereport(errstate,
                     (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
                      errmsg("too many INTO variables specified"),
                      parser_errposition(yylloc)));
+            u_sess->plsql_cxt.have_error = true;
+            break;
+        }
 
         tok = yylex();
         switch (tok)
@@ -5330,14 +9926,19 @@ read_into_scalar_list(char *initial_name,
             case T_DATUM:
                 check_assignable(yylval.wdatum.datum, yylloc);
                 if (yylval.wdatum.datum->dtype == PLPGSQL_DTYPE_ROW ||
-                    yylval.wdatum.datum->dtype == PLPGSQL_DTYPE_REC)
-                    ereport(ERROR,
+                    yylval.wdatum.datum->dtype == PLPGSQL_DTYPE_REC) {
+                    const char* message = "variable is not a scalar variable";
+                    InsertErrorMessage(message, plpgsql_yylloc);
+                    ereport(errstate,
                             (errcode(ERRCODE_SYNTAX_ERROR),
                              errmsg("\"%s\" is not a scalar variable",
                                     NameOfDatum(&(yylval.wdatum))),
                              parser_errposition(yylloc)));
+                    u_sess->plsql_cxt.have_error = true;
+                    break;
+                }
                 fieldnames[nfields] = NameOfDatum(&(yylval.wdatum));
-                varnos[nfields++]	= yylval.wdatum.datum->dno;
+                varnos[nfields++]	= yylval.wdatum.dno;
                 break;
 
             default:
@@ -5361,6 +9962,7 @@ read_into_scalar_list(char *initial_name,
     row->nfields = nfields;
     row->fieldnames = (char **)palloc(sizeof(char *) * nfields);
     row->varnos = (int *)palloc(sizeof(int) * nfields);
+    row->isImplicit = true;
     while (--nfields >= 0)
     {
         row->fieldnames[nfields] = fieldnames[nfields];
@@ -5379,9 +9981,11 @@ read_into_scalar_list(char *initial_name,
  * scalars.
  */
 static PLpgSQL_row *
-read_into_array_scalar_list(char *initial_name,
+read_into_array_table_scalar_list(char *initial_name,
                       PLpgSQL_datum *initial_datum,
-                      int initial_location)
+                      int initial_dno,
+                      int initial_location,
+                      bool bulk_collect)
 {
     int				 nfields = 0;
     char			*fieldnames[1024] = {NULL};
@@ -5390,15 +9994,25 @@ read_into_array_scalar_list(char *initial_name,
     int				 tok;
     int				 toktmp = 0;
     int 			 tmpdno = 0;
+    int              type_flag = -1;
+    bool             isarrayelem = false;
     char* 			 nextname = NULL;
 
     check_assignable(initial_datum, initial_location);
-    tmpdno = yylval.wdatum.datum->dno;
+
+    tmpdno = initial_dno;
     tok = yylex();
-    if (!read_into_using_add_arrayelem(fieldnames, varnos, &nfields, tmpdno, &tok))
+    get_datum_tok_type(initial_datum, &type_flag);
+
+    if (type_flag == PLPGSQL_TOK_TABLE_VAR) {
+        isarrayelem = read_into_using_add_tableelem(fieldnames, varnos, &nfields, tmpdno, &tok);
+    } else {
+        isarrayelem = read_into_using_add_arrayelem(fieldnames, varnos, &nfields, tmpdno, &tok);
+    }
+    if (!isarrayelem)
     {
         fieldnames[0] = initial_name;
-        varnos[0]	  = initial_datum->dno;
+        varnos[0]	  = initial_dno;
         nfields		  = 1;
     }
     while (',' == tok)
@@ -5406,7 +10020,9 @@ read_into_array_scalar_list(char *initial_name,
         /* Check for array overflow */
         if (nfields >= 1024)
         {
-            ereport(ERROR,
+            const char* message = "too many INTO variables specified";
+            InsertErrorMessage(message, plpgsql_yylloc);
+            ereport(errstate,
                     (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
                      errmsg("too many INTO variables specified"),
                      parser_errposition(yylloc)));
@@ -5414,6 +10030,7 @@ read_into_array_scalar_list(char *initial_name,
         }
 
         toktmp = yylex();
+        type_flag = -1;
 
         switch (toktmp)
         {
@@ -5421,30 +10038,129 @@ read_into_array_scalar_list(char *initial_name,
                 check_assignable(yylval.wdatum.datum, yylloc);
                 
                 if (yylval.wdatum.datum->dtype == PLPGSQL_DTYPE_ROW ||
-                    yylval.wdatum.datum->dtype == PLPGSQL_DTYPE_REC)
-                    ereport(ERROR,
+                    yylval.wdatum.datum->dtype == PLPGSQL_DTYPE_REC) {
+                    const char* message = "it not a scalar variable";
+                    InsertErrorMessage(message, plpgsql_yylloc);
+                    ereport(errstate,
                             (errcode(ERRCODE_SYNTAX_ERROR),
                              errmsg("\"%s\" is not a scalar variable",
                                     NameOfDatum(&(yylval.wdatum))),
                             parser_errposition(yylloc)));
+                }
 
-                tmpdno = yylval.wdatum.datum->dno;
+                tmpdno = yylval.wdatum.dno;
                 nextname = NameOfDatum(&(yylval.wdatum));
                 fieldnames[nfields] = nextname;
                 varnos[nfields++] = tmpdno;
                 tok = yylex();
                 break;
+            case T_PACKAGE_VARIABLE:
+                check_assignable(yylval.wdatum.datum, yylloc);
+                
+                if (yylval.wdatum.datum->dtype == PLPGSQL_DTYPE_ROW ||
+                    yylval.wdatum.datum->dtype == PLPGSQL_DTYPE_REC) {
+                    const char* message = "it not a scalar variable";
+                    InsertErrorMessage(message, plpgsql_yylloc);
+                    ereport(errstate,
+                            (errcode(ERRCODE_SYNTAX_ERROR),
+                             errmsg("\"%s\" is not a scalar variable",
+                                    NameOfDatum(&(yylval.wdatum))),
+                            parser_errposition(yylloc)));
+                    u_sess->plsql_cxt.have_error = true;
+                }
+
+                tmpdno = yylval.wdatum.dno;
+                nextname = NameOfDatum(&(yylval.wdatum));
+                type_flag = -1;
+                get_datum_tok_type(yylval.wdatum.datum, &type_flag);
+                if (type_flag == -1) {
+                    fieldnames[nfields] = nextname;
+                    varnos[nfields++] = tmpdno;
+                    tok = yylex();
+                    break;
+                } else if (type_flag == PLPGSQL_TOK_TABLE_VAR) {
+                    tok = yylex();
+                    if (tok < -1)
+                        return NULL;
+                    if (!read_into_using_add_tableelem(fieldnames, varnos, &nfields, tmpdno, &tok))
+                    {
+                        if (bulk_collect) {
+                            fieldnames[nfields] = nextname;
+                            varnos[nfields++] = tmpdno;
+                            break;
+                        }
+                        const char* message = "error when read table var subscript";
+                        InsertErrorMessage(message, plpgsql_yylloc);
+                        ereport(errstate,
+                            (errcode(ERRCODE_SYNTAX_ERROR),
+                             errmsg(" error when read table var subscript! ")));
+                        u_sess->plsql_cxt.have_error = true;
+                        return NULL;
+                    }		
+                    break;
+                } else {
+                    tok = yylex();
+                    if (tok < -1)
+                        return NULL;
+                    if (!read_into_using_add_arrayelem(fieldnames, varnos, &nfields, tmpdno, &tok))
+                    {
+                        if (bulk_collect) {
+                            fieldnames[nfields] = nextname;
+                            varnos[nfields++] = tmpdno;
+                            break;
+                        }
+                        const char* message = "error when read array var subscript";
+                        InsertErrorMessage(message, plpgsql_yylloc);
+                        ereport(errstate,
+                            (errcode(ERRCODE_SYNTAX_ERROR),
+                             errmsg(" error when read array var subscript! ")));
+                        u_sess->plsql_cxt.have_error = true;
+                        return NULL;
+                    }		
+                    break;
+                }
             case T_VARRAY_VAR:
                 check_assignable(yylval.wdatum.datum, yylloc);
-                tmpdno = yylval.wdatum.datum->dno;
+                tmpdno = yylval.wdatum.dno;
+                nextname = NameOfDatum(&(yylval.wdatum));
                 tok = yylex();
                 if (tok < -1)
                     return NULL;
                 if (!read_into_using_add_arrayelem(fieldnames, varnos, &nfields, tmpdno, &tok))
                 {
-                    ereport(ERROR,
+                    if (bulk_collect) {
+                        fieldnames[nfields] = nextname;
+                        varnos[nfields++] = tmpdno;
+                        break;
+                    }
+                    const char* message = "error near arrary name!";
+                    InsertErrorMessage(message, plpgsql_yylloc);
+                    ereport(errstate,
                         (errcode(ERRCODE_SYNTAX_ERROR),
                          errmsg(" error near arrary name! ")));
+                    return NULL;
+                }
+                break;
+            case T_TABLE_VAR:
+                check_assignable(yylval.wdatum.datum, yylloc);
+                tmpdno = yylval.wdatum.dno;
+                nextname = NameOfDatum(&(yylval.wdatum));
+                tok = yylex();
+                if (tok < -1)
+                    return NULL;
+                if (!read_into_using_add_tableelem(fieldnames, varnos, &nfields, tmpdno, &tok))
+                {
+                    if (bulk_collect) {
+                        fieldnames[nfields] = nextname;
+                        varnos[nfields++] = tmpdno;
+                        break;
+                    }
+                    const char* message = "error near table name";
+                    InsertErrorMessage(message, plpgsql_yylloc);
+                    ereport(errstate,
+                        (errcode(ERRCODE_SYNTAX_ERROR),
+                         errmsg(" error near table name! ")));
+                    u_sess->plsql_cxt.have_error = true;
                     return NULL;
                 }		
                 break;
@@ -5473,6 +10189,7 @@ read_into_array_scalar_list(char *initial_name,
     row->nfields = nfields;
     row->fieldnames = (char**)palloc(sizeof(char *) * nfields);
     row->varnos = (int*)palloc(sizeof(int) * nfields);
+    row->isImplicit = true;
     while (--nfields >= 0)
     {
         row->fieldnames[nfields] = fieldnames[nfields];
@@ -5483,8 +10200,6 @@ read_into_array_scalar_list(char *initial_name,
 
     return row;
 }
-
-
 
 /*
  * Given the first datum and name in the INTO list, continue to read
@@ -5505,11 +10220,16 @@ read_into_placeholder_scalar_list(char *initial_name,
     while ((tok = yylex()) == ',')
     {
         /* Check for array overflow */
-        if ( intoplaceholders >= 1024 )
-            ereport(ERROR,
+        if ( intoplaceholders >= 1024 ) {
+            const char* message = "too many INTO placeholders specified";
+            InsertErrorMessage(message, plpgsql_yylloc);
+            ereport(errstate,
                     (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
                      errmsg("too many INTO placeholders specified"),
                      parser_errposition(yylloc)));
+            u_sess->plsql_cxt.have_error = true;
+            break;
+        }
 
         tok = yylex();
         switch (tok)
@@ -5519,7 +10239,9 @@ read_into_placeholder_scalar_list(char *initial_name,
                 break;
 
             default:
-                ereport(ERROR,
+                const char* message = "invalid placeholder specified";
+                InsertErrorMessage(message, plpgsql_yylloc);
+                ereport(errstate,
                         (errcode(ERRCODE_SYNTAX_ERROR),
                          errmsg("invalid placeholder specified"),
                          parser_errposition(yylloc)));
@@ -5543,6 +10265,7 @@ read_into_placeholder_scalar_list(char *initial_name,
     row->varnos = NULL;
     row->intoplaceholders = intoplaceholders;
     row->intodatums = NULL;
+    row->isImplicit = true;
 
     plpgsql_adddatum((PLpgSQL_datum *)row);
 
@@ -5561,13 +10284,14 @@ read_into_placeholder_scalar_list(char *initial_name,
 static PLpgSQL_row *
 make_scalar_list1(char *initial_name,
                   PLpgSQL_datum *initial_datum,
+                  int initial_dno,
                   int lineno, int location)
 {
     PLpgSQL_row		*row;
 
     check_assignable(initial_datum, location);
 
-    row = (PLpgSQL_row *)palloc(sizeof(PLpgSQL_row));
+    row = (PLpgSQL_row *)palloc0(sizeof(PLpgSQL_row));
     row->dtype = PLPGSQL_DTYPE_ROW;
     row->refname = pstrdup("*internal*");
     row->lineno = lineno;
@@ -5576,7 +10300,8 @@ make_scalar_list1(char *initial_name,
     row->fieldnames = (char **)palloc(sizeof(char *));
     row->varnos = (int *)palloc(sizeof(int));
     row->fieldnames[0] = initial_name;
-    row->varnos[0] = initial_datum->dno;
+    row->varnos[0] = initial_dno;
+    row->isImplicit = true;
 
     plpgsql_adddatum((PLpgSQL_datum *)row);
 
@@ -5613,7 +10338,7 @@ check_sql_expr(const char *stmt, int location, int leaderlen)
     ErrorContextCallback  syntax_errcontext;
     MemoryContext oldCxt;
 
-    if (!u_sess->plsql_cxt.plpgsql_check_syntax)
+    if (!u_sess->plsql_cxt.curr_compile_context->plpgsql_check_syntax)
         return;
 
     cbarg.location = location;
@@ -5624,7 +10349,8 @@ check_sql_expr(const char *stmt, int location, int leaderlen)
     syntax_errcontext.previous = t_thrd.log_cxt.error_context_stack;
     t_thrd.log_cxt.error_context_stack = &syntax_errcontext;
 
-    oldCxt = MemoryContextSwitchTo(u_sess->plsql_cxt.compile_tmp_cxt);
+    oldCxt = MemoryContextSwitchTo(u_sess->plsql_cxt.curr_compile_context->compile_tmp_cxt);
+    u_sess->plsql_cxt.plpgsql_yylloc = plpgsql_yylloc;
     (void) raw_parser(stmt);
     MemoryContextSwitchTo(oldCxt);
 
@@ -5688,12 +10414,15 @@ parse_datatype(const char *string, int location)
     syntax_errcontext.previous = t_thrd.log_cxt.error_context_stack;
     t_thrd.log_cxt.error_context_stack = &syntax_errcontext;
 
+
     /*
      * parseTypeString is only for getting type_id and typemod, who are both scalars, 
      * so memory used in it is all temp.
      */
-    oldCxt = MemoryContextSwitchTo(u_sess->plsql_cxt.compile_tmp_cxt);
+    oldCxt = MemoryContextSwitchTo(u_sess->plsql_cxt.curr_compile_context->compile_tmp_cxt);
 
+
+    u_sess->plsql_cxt.plpgsql_yylloc = plpgsql_yylloc;
     /* Let the main parser try to parse it under standard SQL rules */
     parseTypeString(string, &type_id, &typmod);
 
@@ -5703,8 +10432,729 @@ parse_datatype(const char *string, int location)
     t_thrd.log_cxt.error_context_stack = syntax_errcontext.previous;
 
     /* Okay, build a PLpgSQL_type data structure for it */
+    if (u_sess->plsql_cxt.curr_compile_context->plpgsql_curr_compile == NULL)
+    {
+        return plpgsql_build_datatype(type_id, typmod, 0);
+    }
+
     return plpgsql_build_datatype(type_id, typmod,
-                                  u_sess->plsql_cxt.plpgsql_curr_compile->fn_input_collation);
+                                  u_sess->plsql_cxt.curr_compile_context->plpgsql_curr_compile->fn_input_collation);
+}
+
+/* Build a arrary_type by elem_type. */
+static PLpgSQL_type * build_array_type_from_elemtype(PLpgSQL_type *elem_type)
+{
+    PLpgSQL_type *arrary_type;
+    Oid arraytypoid = get_array_type(elem_type->typoid);
+    if (arraytypoid == InvalidOid) {
+        ereport(errstate,
+            (errmodule(MOD_PLSQL),
+            errcode(ERRCODE_UNDEFINED_OBJECT),
+            errmsg("array type not found"),
+            errdetail("array type of \"%s\" does not exist.", elem_type->typname),
+            errcause("undefined object"),
+            erraction("check typename")));
+    }
+    if (u_sess->plsql_cxt.curr_compile_context->plpgsql_curr_compile == NULL) {
+        arrary_type = plpgsql_build_datatype(arraytypoid, elem_type->atttypmod, 0);
+    } else {
+        arrary_type = plpgsql_build_datatype(arraytypoid, elem_type->atttypmod,
+            u_sess->plsql_cxt.curr_compile_context->plpgsql_curr_compile->fn_input_collation);
+    }
+    return arrary_type;
+}
+
+static PLpgSQL_var* plpgsql_build_nested_variable(PLpgSQL_var *nest_table, bool isconst, char* name, int lineno)
+{
+    PLpgSQL_var *build_nest_table = NULL;
+    PLpgSQL_type *new_var_type = NULL;
+    char nestname[NAMEDATALEN] = {0};
+    errno_t rc = EOK;
+    rc = snprintf_s(nestname, sizeof(nestname), sizeof(nestname) - 1, "%s_nest", name);
+    securec_check_ss(rc, "", "");
+    /* set nested table type */
+    new_var_type = build_array_type_from_elemtype(nest_table->datatype);
+    new_var_type->tableOfIndexType = nest_table->datatype->tableOfIndexType;
+    new_var_type->collectionType = nest_table->datatype->collectionType;
+    build_nest_table = (PLpgSQL_var *)plpgsql_build_variable(nestname, lineno, new_var_type, true);
+    build_nest_table->isconst = isconst;
+    build_nest_table->default_val = NULL;
+    build_nest_table->nest_layers = nest_table->nest_layers;
+    if (nest_table->nest_table != NULL) {
+        build_nest_table->nest_table = plpgsql_build_nested_variable(nest_table->nest_table, isconst, name, lineno);
+    }
+    return build_nest_table;
+}
+
+static int get_nest_tableof_layer(PLpgSQL_var *var, const char *typname, int errstate)
+{
+    int depth = 0;
+    while (var != NULL) {
+        depth++;
+        var = var->nest_table;
+    }
+    if (depth + 1 > MAXDIM) {
+        ereport(errstate,
+            (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+                errmodule(MOD_PLSQL),
+                errmsg("Layer number of nest tableof type exceeds the maximum allowed."),
+                errdetail("Define nest tableof type \"%s\" layers (%d) exceeds the maximum allowed (%d).", typname, depth + 1, MAXDIM),
+                errcause("too many nested layers"),
+                erraction("check define of table of type")));
+        u_sess->plsql_cxt.have_error = true;
+    }
+    return depth + 1;
+}
+
+static void getPkgFuncTypeName(char* typname, char** functypname, char** pkgtypname)
+{
+    if (u_sess->plsql_cxt.curr_compile_context->plpgsql_curr_compile != NULL) {
+        *functypname = CastPackageTypeName(typname,
+            u_sess->plsql_cxt.curr_compile_context->plpgsql_curr_compile->fn_oid, false);
+        if (strlen(*functypname) >= NAMEDATALEN) {
+            const char* message = "record name too long";
+            InsertErrorMessage(message, plpgsql_yylloc, true);
+            ereport(ERROR,
+                (errcode(ERRCODE_NAME_TOO_LONG),
+                    errmsg("type name too long"),
+                    errdetail("record name %s with func oid %d should be less the %d letters.",
+                        typname, u_sess->plsql_cxt.curr_compile_context->plpgsql_curr_compile->fn_oid, NAMEDATALEN)));
+        }
+    } 
+    if (u_sess->plsql_cxt.curr_compile_context->plpgsql_curr_compile_package != NULL) {
+        *pkgtypname = CastPackageTypeName(typname,
+            u_sess->plsql_cxt.curr_compile_context->plpgsql_curr_compile_package->pkg_oid, true);
+        if (strlen(*pkgtypname) >= NAMEDATALEN) {
+            const char* message = "record name too long";
+            InsertErrorMessage(message, plpgsql_yylloc, true);
+            ereport(ERROR,
+                (errcode(ERRCODE_NAME_TOO_LONG),
+                    errmsg("type name too long"),
+                    errdetail("record name %s with package name %s should be less the %d letters.",
+                        typname, u_sess->plsql_cxt.curr_compile_context->plpgsql_curr_compile_package->pkg_signature, NAMEDATALEN)));
+        }
+    }
+}
+
+/* 
+ * look up composite type from namespace
+ */
+static PLpgSQL_nsitem* lookupCompositeType(char* functypname, char* pkgtypname)
+{
+    PLpgSQL_nsitem* ns = NULL;
+    /* if compile func, search func namesapce first */
+    if (functypname != NULL) {
+        ns = plpgsql_ns_lookup(plpgsql_ns_top(), false, functypname, NULL, NULL, NULL);
+        if (ns != NULL || pkgtypname == NULL) {
+            return ns;
+        }
+    }
+
+    /* next search package namespace */
+    PLpgSQL_package* pkg = u_sess->plsql_cxt.curr_compile_context->plpgsql_curr_compile_package;
+    ns = plpgsql_ns_lookup(pkg->public_ns, false, pkgtypname, NULL, NULL, NULL);
+    if (ns != NULL) {
+        return ns;
+    }
+
+    /* may compile pkg spec now, search top again */
+    ns = plpgsql_ns_lookup(plpgsql_ns_top(), false, pkgtypname, NULL, NULL, NULL);
+    if (ns != NULL) {
+        return ns;
+    }
+
+    /* if compile package body, search private namespace */
+    if (!pkg->is_spec_compiling) {
+        /* private type should cast '$' */
+        StringInfoData  castTypName;
+        initStringInfo(&castTypName);
+        appendStringInfoString(&castTypName, "$");
+        appendStringInfoString(&castTypName, pkgtypname);
+ 
+        /* search private namespace, when complie, it is the top */
+        ns = plpgsql_ns_lookup(plpgsql_ns_top(), false, castTypName.data, NULL, NULL, NULL);
+        pfree_ext(castTypName.data);
+    }
+
+    return ns;
+}
+
+static Oid getOldTypeOidByTypeName(char** typname, char** schamaName, char* functypname, char* pkgtypname, Oid* pkgoid)
+{
+    Oid nameSpaceOid = InvalidOid;
+    if (u_sess->plsql_cxt.curr_compile_context->plpgsql_curr_compile != NULL) {
+        *pkgoid = u_sess->plsql_cxt.curr_compile_context->plpgsql_curr_compile->fn_oid;
+        *typname = functypname;
+        if (u_sess->plsql_cxt.curr_compile_context->plpgsql_curr_compile->fn_searchpath != NULL) {
+            nameSpaceOid = linitial_oid(u_sess->plsql_cxt.curr_compile_context->plpgsql_curr_compile->fn_searchpath->schemas);
+        }
+    } else {
+        *pkgoid = u_sess->plsql_cxt.curr_compile_context->plpgsql_curr_compile_package->pkg_oid;
+        *typname = pkgtypname;
+        nameSpaceOid = u_sess->plsql_cxt.curr_compile_context->plpgsql_curr_compile_package->namespaceOid;
+    }
+
+    if (OidIsValid(nameSpaceOid)) {
+        *schamaName = get_namespace_name(nameSpaceOid);
+    } else {
+        nameSpaceOid = getCurrentNamespace();
+    }
+
+    Oid oldtypeoid = GetSysCacheOid2(TYPENAMENSP, PointerGetDatum(*typname),
+        ObjectIdGetDatum(nameSpaceOid));
+    return oldtypeoid;
+}
+
+static RangeVar* createRangeVarForCompositeType(char* schamaName, char* typname)
+{
+    RangeVar *r = makeNode(RangeVar);
+    r->catalogname = NULL;
+    r->schemaname = schamaName;
+    r->relname = pstrdup(typname);
+    r->relpersistence = RELPERSISTENCE_PERMANENT;
+    r->location = -1;
+    r->ispartition = false;
+    r->isbucket = false;
+    r->buckets = NIL;
+    return r;
+}
+
+static void buildDependencyForCompositeType(Oid newtypeoid)
+{
+    ObjectAddress myself, referenced;
+    if (u_sess->plsql_cxt.curr_compile_context->plpgsql_curr_compile != NULL) {
+        myself.classId = ProcedureRelationId;
+        myself.objectId = u_sess->plsql_cxt.curr_compile_context->plpgsql_curr_compile->fn_oid;
+        myself.objectSubId = 0;
+    } else {
+        myself.classId = PackageRelationId;
+        myself.objectId = u_sess->plsql_cxt.curr_compile_context->plpgsql_curr_compile_package->pkg_oid;
+        myself.objectSubId = 0;
+    }
+    referenced.classId = TypeRelationId;
+    referenced.objectId = newtypeoid;
+    referenced.objectSubId = 0;
+    recordDependencyOn(&referenced, &myself, DEPENDENCY_AUTO);
+    CommandCounterIncrement();
+}
+
+static bool checkDuplicateAttrName(TupleDesc tupleDesc)
+{
+    int attrnum = tupleDesc->natts;
+    for (int i = 0; i < attrnum; i++) {
+        Form_pg_attribute attr1 = tupleDesc->attrs[i];
+        for (int j = i + 1; j < attrnum; j++) {
+            Form_pg_attribute attr2 = tupleDesc->attrs[j];
+            if (strcmp(NameStr(attr1->attname), NameStr(attr2->attname)) == 0) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+#ifndef ENABLE_MULTIPLE_NODES
+static bool checkAllAttrName(TupleDesc tupleDesc)
+{
+    int attrnum = tupleDesc->natts;
+    for (int i = 0; i < attrnum; i++) {
+        Form_pg_attribute pg_att_form = tupleDesc->attrs[i];
+        char* att_name = NameStr(pg_att_form->attname);
+        if (strcmp(att_name, "?column?") != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+#endif
+static Oid createCompositeTypeForCursor(PLpgSQL_var* var, PLpgSQL_expr* expr)
+{
+#ifdef ENABLE_MULTIPLE_NODES
+    return InvalidOid;
+#endif
+    TupleDesc tupleDesc = getCursorTupleDesc(expr, false);
+    if (tupleDesc == NULL || tupleDesc->natts == 0) {
+        return InvalidOid;
+    }
+    /* 
+     * if cursor is select a,a from t1, cannot have same attr name.
+     */
+    bool isHaveDupName = checkDuplicateAttrName(tupleDesc);
+    if (isHaveDupName) {
+        return InvalidOid;
+    }
+
+    /* concatenate name string with function name for composite type, which to avoid conflict. */
+    char* functypname = NULL;
+    char* pkgtypname = NULL;
+    char* typname = NULL;
+    char* schamaname = NULL;
+    Oid pkgoid = InvalidOid;
+    getPkgFuncTypeName(var->refname, &functypname, &pkgtypname);
+    Oid oldtypeoid = getOldTypeOidByTypeName(&typname, &schamaname, functypname, pkgtypname, &pkgoid);
+    Oid newtypeoid = InvalidOid;
+    if (OidIsValid(oldtypeoid)) {
+            /* already build one, just use it */
+            newtypeoid = oldtypeoid;
+    } else {
+        RangeVar* r = createRangeVarForCompositeType(schamaname, typname);
+
+        List* codeflist = NULL;
+        int attrnum = tupleDesc->natts;
+        for (int i = 0; i < attrnum; i++) {
+            ColumnDef *n = makeNode(ColumnDef);
+            Form_pg_attribute attr = tupleDesc->attrs[i];
+            n->colname = pstrdup(NameStr(attr->attname));
+            n->typname = makeTypeNameFromOid(attr->atttypid, attr->atttypmod);
+            n->inhcount = 0;
+            n->is_local = true;
+            n->is_not_null = false;
+            n->is_from_type = false;
+            n->storage = 0;
+            n->raw_default = NULL;
+            n->cooked_default = NULL;
+            n->collClause = NULL;
+            n->clientLogicColumnRef=NULL;
+            n->collOid = InvalidOid;
+            n->constraints = NIL;
+            codeflist = lappend(codeflist, (Node*)n);
+        }
+        DefineCompositeType(r, codeflist);
+        newtypeoid = GetSysCacheOid2(TYPENAMENSP, PointerGetDatum(typname),
+            ObjectIdGetDatum(getCurrentNamespace()));
+        pfree_ext(r);
+        ListCell* cell = NULL;
+        foreach (cell, codeflist) {
+            ColumnDef* n = (ColumnDef*)lfirst(cell);
+            pfree_ext(n->colname);
+        }
+        list_free_deep(codeflist);
+
+        /* build dependency on created composite type. */
+        buildDependencyForCompositeType(newtypeoid);
+    }
+    
+    pfree_ext(functypname);
+    pfree_ext(pkgtypname);
+    return newtypeoid;
+}
+
+#ifndef ENABLE_MULTIPLE_NODES
+static PLpgSQL_type* build_type_from_cursor_var(PLpgSQL_var* var)
+{
+    PLpgSQL_type *newp = NULL;
+    Oid typeOid = var->datatype->cursorCompositeOid;
+    /* build datatype of the created composite type. */
+    newp = plpgsql_build_datatype(typeOid, -1, InvalidOid);
+    newp->dtype = PLPGSQL_DTYPE_COMPOSITE;
+    newp->ttype = PLPGSQL_TTYPE_ROW;
+
+    /* add the composite type to datum and namespace. */
+    int varno = plpgsql_adddatum((PLpgSQL_datum*)newp);
+    plpgsql_ns_additem(PLPGSQL_NSTYPE_COMPOSITE, varno, var->datatype->typname );
+
+    return newp;
+}
+#endif
+
+/*
+ * Build a composite type by execute SQL, when record type is nested.
+ */
+static PLpgSQL_type* build_type_from_record_var(int dno)
+{
+    PLpgSQL_type *newp = NULL;
+    PLpgSQL_rec_type * var_type = (PLpgSQL_rec_type *)u_sess->plsql_cxt.curr_compile_context->plpgsql_Datums[dno];
+
+    /* concatenate name string with function name for composite type, which to avoid conflict. */
+    char*  functypname = NULL;
+    char*  pkgtypname = NULL;
+    getPkgFuncTypeName(var_type->typname, &functypname, &pkgtypname);
+    /* look up composite type from namespace, if exists, we have already build one. */
+    PLpgSQL_nsitem* ns = lookupCompositeType(functypname, pkgtypname);
+    
+    if (ns == NULL) {
+        /* we need to build a composite type, and drop any remaining types. */
+        Oid newtypeoid = InvalidOid;
+        char* typname;
+        char* schamaname = NULL;
+        Oid pkgoid = InvalidOid;
+        
+        Oid oldtypeoid = getOldTypeOidByTypeName(&typname, &schamaname, functypname, pkgtypname, &pkgoid);
+        if (OidIsValid(oldtypeoid)) {
+            /* already build one, just use it */
+            if(IsPackageDependType(oldtypeoid, pkgoid)) {
+                newtypeoid = oldtypeoid;
+            } else {
+                ereport(errstate,
+                    (errmodule(MOD_PLSQL),
+                        errcode(ERRCODE_DUPLICATE_OBJECT),
+                        errmsg("duplicate type name"),
+                        errdetail("type name of \"%s\" duplicated with an existed type when build package or function type.", typname),
+                        errcause("duplicate type name"),
+                        erraction("modify type name")));
+            }
+        } else {
+            RangeVar* r = createRangeVarForCompositeType(schamaname, typname);
+            List* codeflist = NULL;
+            int attrnum = var_type->attrnum;
+            for (int i = 0; i < attrnum; i++) {
+                ColumnDef *n = makeNode(ColumnDef);
+                n->colname = pstrdup(var_type->attrnames[i]);
+                n->typname = make_typename_from_datatype(var_type->types[i]);
+                n->inhcount = 0;
+                n->is_local = true;
+                n->is_not_null = false;
+                n->is_from_type = false;
+                n->storage = 0;
+                n->raw_default = NULL;
+                n->cooked_default = NULL;
+                n->collClause = NULL;
+                n->clientLogicColumnRef=NULL;
+                n->collOid = InvalidOid;
+                n->constraints = NIL;
+                codeflist = lappend(codeflist, (Node*)n);
+            }
+
+            DefineCompositeType(r, codeflist);
+            newtypeoid = GetSysCacheOid2(TYPENAMENSP, PointerGetDatum(typname),
+                ObjectIdGetDatum(getCurrentNamespace()));
+            pfree_ext(r);
+            list_free_deep(codeflist);
+
+            /* build dependency on created composite type. */
+            buildDependencyForCompositeType(newtypeoid);
+        }
+
+        /* build datatype of the created composite type. */
+        newp = plpgsql_build_datatype(newtypeoid, -1, InvalidOid);
+        newp->dtype = PLPGSQL_DTYPE_COMPOSITE;
+        newp->ttype = PLPGSQL_TTYPE_ROW;
+
+        /* add the composite type to datum and namespace. */
+        int varno = plpgsql_adddatum((PLpgSQL_datum*)newp);
+        plpgsql_ns_additem(PLPGSQL_NSTYPE_COMPOSITE, varno, typname);
+
+    } else {
+        /* we have already build one, just take it from datums. */
+        if (ns->itemtype == PLPGSQL_NSTYPE_COMPOSITE) {
+            newp = (PLpgSQL_type*)(u_sess->plsql_cxt.curr_compile_context->plpgsql_Datums[ns->itemno]);
+            /* build a new one, avoid conflict by array or table of */
+            newp = plpgsql_build_datatype(newp->typoid, -1, InvalidOid);
+            newp->dtype = PLPGSQL_DTYPE_COMPOSITE;
+            newp->ttype = PLPGSQL_TTYPE_ROW;
+        } else {
+            ereport(errstate,
+                (errcode(ERRCODE_DUPLICATE_OBJECT),
+                    errmsg("duplicate declaration"),
+                    errdetail("record %s is duplicate with other objects.", var_type->typname)));
+            u_sess->plsql_cxt.have_error = true;
+        }
+    }
+    pfree_ext(functypname);
+    pfree_ext(pkgtypname);
+    return newp;
+}
+
+static Oid plpgsql_build_package_record_type(const char* typname, List* list, bool add2namespace)
+{
+    Oid oldtypeoid = InvalidOid;
+    Oid newtypeoid = InvalidOid;
+    char* schamaName = NULL;
+    Oid pkgNamespaceOid = u_sess->plsql_cxt.curr_compile_context->plpgsql_curr_compile_package->namespaceOid;
+    if (OidIsValid(pkgNamespaceOid)) {
+        schamaName = get_namespace_name(pkgNamespaceOid);
+    } else {
+        pkgNamespaceOid = getCurrentNamespace();
+    }
+    char* casttypename = CastPackageTypeName(typname,
+        u_sess->plsql_cxt.curr_compile_context->plpgsql_curr_compile_package->pkg_oid, true,
+        u_sess->plsql_cxt.curr_compile_context->plpgsql_curr_compile_package->is_spec_compiling);
+    if (strlen(casttypename) >= NAMEDATALEN ) {
+        ereport(errstate,
+            (errcode(ERRCODE_NAME_TOO_LONG),
+                errmsg("type name too long"),
+                errdetail("record name %s with package name %s should be less the %d letters.",
+                    typname,
+                    u_sess->plsql_cxt.curr_compile_context->plpgsql_curr_compile_package->pkg_signature,
+                    NAMEDATALEN)));
+        u_sess->plsql_cxt.have_error = true;
+        pfree_ext(casttypename);
+    }
+
+    oldtypeoid = GetSysCacheOid2(TYPENAMENSP, PointerGetDatum(casttypename), ObjectIdGetDatum(pkgNamespaceOid));
+    if (OidIsValid(oldtypeoid)) {
+        /* already build on, just use it */
+        if(IsPackageDependType(oldtypeoid, u_sess->plsql_cxt.curr_compile_context->plpgsql_curr_compile_package->pkg_oid)) {
+            newtypeoid = oldtypeoid;
+        } else {
+            ereport(errstate,
+                (errmodule(MOD_PLSQL),
+                    errcode(ERRCODE_DUPLICATE_OBJECT),
+                    errmsg("duplicate type name"),
+                    errdetail("type name of \"%s\" duplicated with an existed type when build package type.", casttypename),
+                    errcause("duplicate type name"),
+                    erraction("modify package type name")));
+        }
+    } else {
+        RangeVar *r = makeNode(RangeVar);
+        r->catalogname = NULL;
+        r->schemaname = schamaName;
+        r->relname = pstrdup(casttypename);
+        r->relpersistence = RELPERSISTENCE_PERMANENT;
+        r->location = -1;
+        r->ispartition = false;
+        r->isbucket = false;
+        r->buckets = NIL;
+
+        List* codeflist = NULL;
+        ListCell* cell = NULL;
+        PLpgSQL_rec_attr* attr = NULL;
+    
+        foreach (cell, list) {
+            attr = (PLpgSQL_rec_attr*)lfirst(cell);
+            codeflist = lappend(codeflist, make_columnDef_from_attr(attr));
+        }
+
+        DefineCompositeType(r, codeflist);
+    
+        newtypeoid = GetSysCacheOid2(TYPENAMENSP, PointerGetDatum(casttypename),
+            ObjectIdGetDatum(getCurrentNamespace()));
+
+        /* build dependency on created composite type. */
+        ObjectAddress myself, referenced;
+        myself.classId = PackageRelationId;
+        myself.objectId = u_sess->plsql_cxt.curr_compile_context->plpgsql_curr_compile_package->pkg_oid;
+        myself.objectSubId = 0;
+        referenced.classId = TypeRelationId;
+        referenced.objectId = newtypeoid;
+        referenced.objectSubId = 0;
+        recordDependencyOn(&referenced, &myself, DEPENDENCY_AUTO);
+        CommandCounterIncrement();
+        pfree_ext(r);
+        list_free_deep(codeflist);
+    }
+
+    PLpgSQL_type *newtype = NULL;
+    newtype = plpgsql_build_datatype(newtypeoid, -1, InvalidOid);
+    newtype->dtype = PLPGSQL_DTYPE_COMPOSITE;
+    newtype->ttype = PLPGSQL_TTYPE_ROW;
+
+    int varno = plpgsql_adddatum((PLpgSQL_datum*)newtype);
+
+    plpgsql_ns_additem(PLPGSQL_NSTYPE_COMPOSITE, varno, casttypename);
+    pfree_ext(casttypename);
+
+    return newtypeoid;
+}
+
+static void  plpgsql_build_package_array_type(const char* typname,Oid elemtypoid, char arraytype)
+{
+    char typtyp;
+    char* casttypename = CastPackageTypeName(typname, u_sess->plsql_cxt.curr_compile_context->plpgsql_curr_compile_package->pkg_oid, true,
+        u_sess->plsql_cxt.curr_compile_context->plpgsql_curr_compile_package->is_spec_compiling);
+    if (strlen(casttypename) >= NAMEDATALEN ) {
+        ereport(errstate,
+            (errcode(ERRCODE_NAME_TOO_LONG),
+                errmsg("type name too long"),
+                errdetail("array or nested table type name %s with package name %s should be less the %d letters.",
+                    typname, u_sess->plsql_cxt.curr_compile_context->plpgsql_curr_compile_package->pkg_signature, NAMEDATALEN)));
+        u_sess->plsql_cxt.have_error = true;
+    }
+
+    Oid pkgNamespaceOid = u_sess->plsql_cxt.curr_compile_context->plpgsql_curr_compile_package->namespaceOid;
+    if (!OidIsValid(pkgNamespaceOid)) {
+        pkgNamespaceOid = getCurrentNamespace();
+    }
+
+    Oid oldtypeoid = GetSysCacheOid2(TYPENAMENSP, PointerGetDatum(casttypename),
+        ObjectIdGetDatum(pkgNamespaceOid));
+    if (OidIsValid(oldtypeoid)) {
+        /* alread build one, just return */
+        if(IsPackageDependType(oldtypeoid, u_sess->plsql_cxt.curr_compile_context->plpgsql_curr_compile_package->pkg_oid)) {
+            return;
+        } else {
+            ereport(errstate,
+                (errmodule(MOD_PLSQL),
+                    errcode(ERRCODE_DUPLICATE_OBJECT),
+                    errmsg("duplicate type name"),
+                    errdetail("type name of \"%s\" duplicated with an existed type when build package type.", casttypename),
+                    errcause("duplicate type name"),
+                    erraction("modify package type name")));
+        }
+    }
+
+    if (arraytype == TYPCATEGORY_TABLEOF ||
+        arraytype == TYPCATEGORY_TABLEOF_VARCHAR ||
+        arraytype == TYPCATEGORY_TABLEOF_INTEGER) {
+        elemtypoid = get_array_type(elemtypoid);
+        typtyp = TYPTYPE_TABLEOF;
+    } else {
+        typtyp = TYPTYPE_BASE;
+    }
+    Oid ownerId = InvalidOid;
+    ownerId = GetUserIdFromNspId(pkgNamespaceOid);
+    if (!OidIsValid(ownerId)) {
+        ownerId = GetUserId();
+    }
+
+    Oid typoid = TypeCreate(InvalidOid, /* force the type's OID to this */
+        casttypename,               /* Array type name */
+        pkgNamespaceOid,               /* Same namespace as parent */
+        InvalidOid,                 /* Not composite, no relationOid */
+        0,                          /* relkind, also N/A here */
+        ownerId,                    /* owner's ID */
+        -1,                         /* Internal size (varlena) */
+        typtyp,               /* Not composite - typelem is */
+        arraytype,          /* type-category (array or table of) */
+        false,                      /* array types are never preferred */
+        DEFAULT_TYPDELIM,           /* default array delimiter */
+        F_ARRAY_IN,                 /* array input proc */
+        F_ARRAY_OUT,                /* array output proc */
+        F_ARRAY_RECV,               /* array recv (bin) proc */
+        F_ARRAY_SEND,               /* array send (bin) proc */
+        InvalidOid,                 /* typmodin procedure - none */
+        InvalidOid,                 /* typmodout procedure - none */
+        F_ARRAY_TYPANALYZE,         /* array analyze procedure */
+        elemtypoid,               /* array element type - the rowtype */
+        false,                       /* yes, this is an array type */
+        InvalidOid,                 /* this has no array type */
+        InvalidOid,                 /* domain base type - irrelevant */
+        NULL,                       /* default value - none */
+        NULL,                       /* default binary representation */
+        false,                      /* passed by reference */
+        'd',                        /* alignment - must be the largest! */
+        'x',                        /* fully TOASTable */
+        -1,                         /* typmod */
+        0,                          /* array dimensions for typBaseType */
+        false,                      /* Type NOT NULL */
+        get_typcollation(elemtypoid));
+
+    CommandCounterIncrement();
+
+    /* build dependency on created composite type. */
+    ObjectAddress myself, referenced;
+    myself.classId = PackageRelationId;
+    myself.objectId = u_sess->plsql_cxt.curr_compile_context->plpgsql_curr_compile_package->pkg_oid;
+    myself.objectSubId = 0;
+    referenced.classId = TypeRelationId;
+    referenced.objectId = typoid;
+    referenced.objectSubId = 0;
+    recordDependencyOn(&referenced, &myself, DEPENDENCY_AUTO);
+    CommandCounterIncrement();
+    pfree_ext(casttypename);
+}
+
+static void plpgsql_build_package_refcursor_type(const char* typname)
+{
+    CreateSynonymStmt stmt;
+    stmt.replace = true;
+    Node* lc = NULL;
+    List* synList = NULL;
+    List* objList = NULL;
+    
+    char* casttypename = CastPackageTypeName(typname, u_sess->plsql_cxt.curr_compile_context->plpgsql_curr_compile_package->pkg_oid, true,
+        u_sess->plsql_cxt.curr_compile_context->plpgsql_curr_compile_package->is_spec_compiling);
+    if (strlen(casttypename) >= NAMEDATALEN ) {
+        ereport(errstate,
+            (errcode(ERRCODE_NAME_TOO_LONG),
+                errmsg("type name too long"),
+                errdetail("cursor type name %s with package name %s should be less the %d letters.",
+                    typname, u_sess->plsql_cxt.curr_compile_context->plpgsql_curr_compile_package->pkg_signature, NAMEDATALEN)));
+        u_sess->plsql_cxt.have_error = true;
+    }
+
+    Oid pkgNamespaceOid = u_sess->plsql_cxt.curr_compile_context->plpgsql_curr_compile_package->namespaceOid;
+    if (!OidIsValid(pkgNamespaceOid)) {
+        pkgNamespaceOid = getCurrentNamespace();
+    }
+
+    HeapTuple tuple = NULL;
+    tuple = SearchSysCache2(SYNONYMNAMENSP, PointerGetDatum(casttypename), ObjectIdGetDatum(pkgNamespaceOid));
+    if (HeapTupleIsValid(tuple)) {
+        Oid synOid = HeapTupleGetOid(tuple);
+        if(IsPackageDependType(synOid, u_sess->plsql_cxt.curr_compile_context->plpgsql_curr_compile_package->pkg_oid, true)) {
+            ReleaseSysCache(tuple);
+            return;
+        } else {
+            ReleaseSysCache(tuple);
+            ereport(errstate,
+                (errmodule(MOD_PLSQL),
+                    errcode(ERRCODE_DUPLICATE_OBJECT),
+                    errmsg("duplicate type name"),
+                    errdetail("type name of \"%s\" duplicated with an existed type when build package type.", casttypename),
+                    errcause("duplicate type name"),
+                    erraction("modify package type name")));
+        }
+    }
+
+    char* pkgSchemaName = NULL;
+    if (OidIsValid(pkgNamespaceOid)) {
+        pkgSchemaName = get_namespace_name(pkgNamespaceOid);
+        lc = (Node*)makeString(pkgSchemaName);
+        synList = lappend(synList, lc);
+    }
+
+    lc = (Node*)makeString(casttypename);
+    synList = lappend(synList, lc);
+
+    lc = (Node*)makeString("pg_catalog");
+    objList = lappend(objList, lc);
+    lc = (Node*)makeString("refcursor");
+    objList = lappend(objList, lc);
+
+    stmt.synName = synList;
+    stmt.objName = objList;
+
+    CreateSynonym(&stmt);
+
+    CommandCounterIncrement();
+
+    tuple = NULL;
+    tuple = SearchSysCache2(SYNONYMNAMENSP, PointerGetDatum(casttypename), ObjectIdGetDatum(pkgNamespaceOid));
+    if (!HeapTupleIsValid(tuple)) {
+        ereport(ERROR, (errcode(ERRCODE_UNDEFINED_OBJECT), errmsg("synonym \"%s\" does not exist", casttypename)));
+    }
+    Oid synOid = HeapTupleGetOid(tuple);
+    ReleaseSysCache(tuple);
+
+    /* build dependency on Synonym. */
+    ObjectAddress myself, referenced;
+    myself.classId = PackageRelationId;
+    myself.objectId = u_sess->plsql_cxt.curr_compile_context->plpgsql_curr_compile_package->pkg_oid;
+    myself.objectSubId = 0;
+    referenced.classId = PgSynonymRelationId;
+    referenced.objectId = synOid;
+    referenced.objectSubId = 0;
+    recordDependencyOn(&referenced, &myself, DEPENDENCY_AUTO);
+    CommandCounterIncrement();
+
+    pfree_ext(casttypename);
+    pfree_ext(pkgSchemaName);
+
+}
+
+static Node* make_columnDef_from_attr(PLpgSQL_rec_attr* attr)
+{
+    ColumnDef *n = makeNode(ColumnDef);
+    n->colname = pstrdup(attr->attrname);
+    n->typname = make_typename_from_datatype(attr->type);
+    n->inhcount = 0;
+    n->is_local = true;
+    n->is_not_null = false;
+    n->is_from_type = false;
+    n->storage = 0;
+    n->raw_default = NULL;
+    n->cooked_default = NULL;
+    n->collClause = NULL;
+    n->clientLogicColumnRef=NULL;
+    n->collOid = InvalidOid;
+    n->constraints = NIL;
+
+    return (Node*)n;
+}
+
+static TypeName* make_typename_from_datatype(PLpgSQL_type* datatype)
+{
+    return makeTypeNameFromOid(datatype->typoid, datatype->atttypmod);
 }
 
 /*
@@ -5715,19 +11165,39 @@ check_labels(const char *start_label, const char *end_label, int end_location)
 {
     if (end_label)
     {
-        if (!start_label)
-            ereport(ERROR,
+        if (!start_label) {
+            const char* message = "end label specified for unlabelled block";
+            InsertErrorMessage(message, plpgsql_yylloc);
+            ereport(errstate,
                     (errcode(ERRCODE_SYNTAX_ERROR),
                      errmsg("end label \"%s\" specified for unlabelled block",
                             end_label),
                      parser_errposition(end_location)));
+        }
 
-        if (strcmp(start_label, end_label) != 0)
-            ereport(ERROR,
+        if (start_label == NULL || end_label == NULL) {
+            if (errstate == NOTICE) {
+                u_sess->plsql_cxt.have_error = true;
+                return;
+            } else {
+                const char* message = "end label specified for unlabelled block";
+                InsertErrorMessage(message, plpgsql_yylloc);
+                ereport(errstate,
                     (errcode(ERRCODE_SYNTAX_ERROR),
                      errmsg("end label \"%s\" differs from block's label \"%s\"",
                             end_label, start_label),
                      parser_errposition(end_location)));
+            }
+        }
+        if (strcmp(start_label, end_label) != 0) {
+            const char* message = "end label differs from block's label";
+            InsertErrorMessage(message, plpgsql_yylloc);
+            ereport(errstate,
+                    (errcode(ERRCODE_SYNTAX_ERROR),
+                     errmsg("end label \"%s\" differs from block's label \"%s\"",
+                            end_label, start_label),
+                     parser_errposition(end_location)));
+        }
     }
 }
 
@@ -5757,12 +11227,15 @@ read_cursor_args(PLpgSQL_var *cursor, int until, const char *expected)
     if (cursor->cursor_explicit_argrow < 0)
     {
         /* No arguments expected */
-        if (tok == '(')
-            ereport(ERROR,
+        if (tok == '(') {
+            const char* message = "cursor has no arguments";
+            InsertErrorMessage(message, plpgsql_yylloc);
+            ereport(errstate,
                     (errcode(ERRCODE_SYNTAX_ERROR),
                      errmsg("cursor \"%s\" has no arguments",
                             cursor->refname),
                      parser_errposition(yylloc)));
+        }
 
         if (tok != until)
             yyerror("syntax error");
@@ -5771,17 +11244,40 @@ read_cursor_args(PLpgSQL_var *cursor, int until, const char *expected)
     }
 
     /* Else better provide arguments */
-    if (tok != '(')
-        ereport(ERROR,
+    if (tok != '(') {
+        const char* message = "cursor has arguments";
+        InsertErrorMessage(message, plpgsql_yylloc);
+        ereport(errstate,
                 (errcode(ERRCODE_SYNTAX_ERROR),
                  errmsg("cursor \"%s\" has arguments",
                         cursor->refname),
                  parser_errposition(yylloc)));
+    }
+
+    bool isPkgCur = cursor->ispkg &&
+        (u_sess->plsql_cxt.curr_compile_context->plpgsql_curr_compile_package == NULL
+        || u_sess->plsql_cxt.curr_compile_context->plpgsql_curr_compile_package->pkg_oid != cursor->pkg->pkg_oid);
+    if (isPkgCur) {
+        ereport(errstate,
+            (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+            errmsg("package cursor with arguments is only supported to be opened in the same package."),
+            errdetail("cursor \"%s.%s\" is only supported to be opened in the package \"%s\"",
+                cursor->pkg->pkg_signature,
+                cursor->varname == NULL ? cursor->refname : cursor->varname,
+                cursor->pkg->pkg_signature),
+            errcause("feature not supported"),
+            erraction("define this cursor without arguments or open this cursor in same package"),
+            parser_errposition(yylloc)));
+    }
 
     /*
      * Read the arguments, one by one.
      */
-    row = (PLpgSQL_row *) u_sess->plsql_cxt.plpgsql_Datums[cursor->cursor_explicit_argrow];
+    if (cursor->ispkg) {
+        row = (PLpgSQL_row *) cursor->pkg->datums[cursor->cursor_explicit_argrow];
+    } else {
+        row = (PLpgSQL_row *) u_sess->plsql_cxt.curr_compile_context->plpgsql_Datums[cursor->cursor_explicit_argrow];
+    }
     argv = (char **) palloc0(row->nfields * sizeof(char *));
 
     for (argc = 0; argc < row->nfields; argc++)
@@ -5801,11 +11297,11 @@ read_cursor_args(PLpgSQL_var *cursor, int until, const char *expected)
             IdentifierLookup save_IdentifierLookup;
 
             /* Read the argument name, ignoring any matching variable */
-            save_IdentifierLookup = u_sess->plsql_cxt.plpgsql_IdentifierLookup;
-            u_sess->plsql_cxt.plpgsql_IdentifierLookup = IDENTIFIER_LOOKUP_DECLARE;
+            save_IdentifierLookup = u_sess->plsql_cxt.curr_compile_context->plpgsql_IdentifierLookup;
+            u_sess->plsql_cxt.curr_compile_context->plpgsql_IdentifierLookup = IDENTIFIER_LOOKUP_DECLARE;
             yylex();
             argname = yylval.str;
-            u_sess->plsql_cxt.plpgsql_IdentifierLookup = save_IdentifierLookup;
+            u_sess->plsql_cxt.curr_compile_context->plpgsql_IdentifierLookup = save_IdentifierLookup;
 
             /* Match argument name to cursor arguments */
             for (argpos = 0; argpos < row->nfields; argpos++)
@@ -5813,12 +11309,15 @@ read_cursor_args(PLpgSQL_var *cursor, int until, const char *expected)
                 if (strcmp(row->fieldnames[argpos], argname) == 0)
                     break;
             }
-            if (argpos == row->nfields)
-                ereport(ERROR,
+            if (argpos == row->nfields) {
+                const char* message = "cursor has no argument named";
+                InsertErrorMessage(message, plpgsql_yylloc);
+                ereport(errstate,
                         (errcode(ERRCODE_SYNTAX_ERROR),
                          errmsg("cursor \"%s\" has no argument named \"%s\"",
                                 cursor->refname, argname),
                          parser_errposition(yylloc)));
+            }
 
             /*
              * Eat the ":=". We already peeked, so the error should never
@@ -5833,12 +11332,15 @@ read_cursor_args(PLpgSQL_var *cursor, int until, const char *expected)
         else
             argpos = argc;
 
-        if (argv[argpos] != NULL)
-            ereport(ERROR,
+        if (argv[argpos] != NULL) {
+            const char* message = "value for parameter of cursor specified more than once";
+            InsertErrorMessage(message, plpgsql_yylloc);
+            ereport(errstate,
                     (errcode(ERRCODE_SYNTAX_ERROR),
                      errmsg("value for parameter \"%s\" of cursor \"%s\" specified more than once",
                             row->fieldnames[argpos], cursor->refname),
                      parser_errposition(arglocation)));
+        }
 
         /*
          * Read the value expression. To provide the user with meaningful
@@ -5858,19 +11360,25 @@ read_cursor_args(PLpgSQL_var *cursor, int until, const char *expected)
 
         argv[argpos] = item->query + strlen(sqlstart);
 
-        if (endtoken == ')' && !(argc == row->nfields - 1))
-            ereport(ERROR,
+        if (endtoken == ')' && !(argc == row->nfields - 1)) {
+            const char* message = "not enough arguments for cursor";
+            InsertErrorMessage(message, plpgsql_yylloc);
+            ereport(errstate,
                     (errcode(ERRCODE_SYNTAX_ERROR),
                      errmsg("not enough arguments for cursor \"%s\"",
                             cursor->refname),
                      parser_errposition(yylloc)));
+        }
 
-        if (endtoken == ',' && (argc == row->nfields - 1))
-            ereport(ERROR,
+        if (endtoken == ',' && (argc == row->nfields - 1)) {
+            const char* message = "too many arguments for cursor";
+            InsertErrorMessage(message, plpgsql_yylloc);
+            ereport(errstate,
                     (errcode(ERRCODE_SYNTAX_ERROR),
                      errmsg("too many arguments for cursor \"%s\"",
                             cursor->refname),
                      parser_errposition(yylloc)));
+        }
     }
 
     /* Make positional argument list */
@@ -5902,6 +11410,7 @@ read_cursor_args(PLpgSQL_var *cursor, int until, const char *expected)
     expr->paramnos		= NULL;
     expr->ns            = plpgsql_ns_top();
     expr->idx			= (uint32)-1;
+    expr->out_param_dno = -1;
     pfree_ext(ds.data);
 
     /* Next we'd better find the until token */
@@ -5976,6 +11485,7 @@ make_case(int location, PLpgSQL_expr *t_expr,
     newp->t_varno = 0;
     newp->case_when_list = case_when_list;
     newp->have_else = (else_stmts != NIL);
+    newp->sqlString = plpgsql_get_curline_query();
     /* Get rid of list-with-NULL hack */
     if (list_length(else_stmts) == 1 && linitial(else_stmts) == NULL)
         newp->else_stmts = NIL;
@@ -5998,7 +11508,7 @@ make_case(int location, PLpgSQL_expr *t_expr,
 
         /* use a name unlikely to collide with any user names */
         snprintf(varname, sizeof(varname), "__Case__Variable_%d__",
-                 u_sess->plsql_cxt.plpgsql_nDatums);
+                 u_sess->plsql_cxt.curr_compile_context->plpgsql_nDatums);
 
         /*
          * We don't yet know the result datatype of t_expr.  Build the
@@ -6009,7 +11519,7 @@ make_case(int location, PLpgSQL_expr *t_expr,
                                    plpgsql_build_datatype(INT4OID,
                                                           -1,
                                                           InvalidOid),
-                                   true);
+                                   true, true);
         newp->t_varno = t_var->dno;
 
         foreach(l, case_when_list)
@@ -6042,7 +11552,7 @@ make_case(int location, PLpgSQL_expr *t_expr,
 }
 
 static PLpgSQL_stmt *
-make_callfunc_stmt_no_arg(const char *sqlstart, int location)
+make_callfunc_stmt_no_arg(const char *sqlstart, int location, bool withsemicolon, List* funcNameList)
 {
     char *cp[3] = {0};
     HeapTuple proctup = NULL;
@@ -6061,22 +11571,29 @@ make_callfunc_stmt_no_arg(const char *sqlstart, int location)
      * the function make_callfunc_stmt_no_arg is only to assemble a sql statement, 
      * so the context is set to tmp context. 
      */
-    oldCxt = MemoryContextSwitchTo(u_sess->plsql_cxt.compile_tmp_cxt);
+    oldCxt = MemoryContextSwitchTo(u_sess->plsql_cxt.curr_compile_context->compile_tmp_cxt);
     /* get the function's name. */
-    plpgsql_parser_funcname(sqlstart, cp, 3);
-
-    if (cp[2] != NULL && cp[2][0] != '\0')
-        funcname = list_make3(makeString(cp[0]), makeString(cp[1]), makeString(cp[2]));
-    else if (cp[1] && cp[1][0] != '\0')
-        funcname = list_make2(makeString(cp[0]), makeString(cp[1]));
-    else
-        funcname = list_make1(makeString(cp[0]));
+    if (funcNameList == NULL) {
+        plpgsql_parser_funcname(sqlstart, cp, 3);
+    } else {
+        funcname = funcNameList;
+    }
+    if (funcNameList == NULL) {
+        if (cp[2] != NULL && cp[2][0] != '\0')
+            funcname = list_make3(makeString(cp[0]), makeString(cp[1]), makeString(cp[2]));
+        else if (cp[1] && cp[1][0] != '\0')
+            funcname = list_make2(makeString(cp[0]), makeString(cp[1]));
+        else
+            funcname = list_make1(makeString(cp[0]));
+    }
 
     /* search the function */
     clist = FuncnameGetCandidates(funcname, -1, NIL, false, false, false);
     if (clist == NULL)
     {
-        ereport(ERROR,
+        const char* message = "function doesn't exist";
+        InsertErrorMessage(message, plpgsql_yylloc);
+        ereport(errstate,
                 (errcode(ERRCODE_UNDEFINED_FUNCTION),
                  errmsg("function \"%s\" doesn't exist ", sqlstart)));
     }
@@ -6087,17 +11604,25 @@ make_callfunc_stmt_no_arg(const char *sqlstart, int location)
     /* function may be deleted after clist be searched. */
     if (!HeapTupleIsValid(proctup))
     {
-        ereport(ERROR,
+        const char* message = "function doesn't exist";
+        InsertErrorMessage(message, plpgsql_yylloc);
+        ereport(errstate,
                 (errcode(ERRCODE_UNDEFINED_FUNCTION),
                 errmsg("function \"%s\" doesn't exist ", sqlstart)));
     }
     /* get the all args informations, only "in" parameters if p_argmodes is null */
     narg = get_func_arg_info(proctup,&p_argtypes, &p_argnames, &p_argmodes);
+    int default_args = ((Form_pg_proc)GETSTRUCT(proctup))->pronargdefaults;
     ReleaseSysCache(proctup);
-    if (narg != 0)
-        ereport(ERROR,
+
+    // For function with default values, SQL will handle the arg with default value.
+    if (narg != 0 && narg > default_args) {
+        const char* message = "function has no enough parameters";
+        InsertErrorMessage(message, plpgsql_yylloc);
+        ereport(errstate,
                 (errcode(ERRCODE_UNDEFINED_FUNCTION),
                  errmsg("function %s has no enough parameters", sqlstart)));
+    }
 
     initStringInfo(&func_inparas);
 
@@ -6112,8 +11637,9 @@ make_callfunc_stmt_no_arg(const char *sqlstart, int location)
     appendStringInfoString(&func_inparas, ")");
 
     /* read the end token */
-    yylex();
-
+    if (!withsemicolon) {
+        yylex();
+    }
     (void)MemoryContextSwitchTo(oldCxt);
 
     /* generate the expression */
@@ -6124,12 +11650,14 @@ make_callfunc_stmt_no_arg(const char *sqlstart, int location)
     expr->paramnos = NULL;
     expr->ns = plpgsql_ns_top();
     expr->idx = (uint32)-1;
+    expr->out_param_dno = -1;
 
     PLpgSQL_stmt_perform *perform = NULL;
     perform = (PLpgSQL_stmt_perform*)palloc0(sizeof(PLpgSQL_stmt_perform));
     perform->cmd_type = PLPGSQL_STMT_PERFORM;
     perform->lineno = plpgsql_location_to_lineno(location);
     perform->expr = expr;
+    perform->sqlString = plpgsql_get_curline_query();
 
     return (PLpgSQL_stmt *)perform;
 }
@@ -6198,13 +11726,384 @@ parse_lob_open_close(int location)
 		expr->paramnos = NULL;
 		expr->ns = plpgsql_ns_top();
         expr->idx = (uint32)-1;
+        expr->out_param_dno = -1;
 
 		perform = (PLpgSQL_stmt_perform*)palloc0(sizeof(PLpgSQL_stmt_perform));
 		perform->cmd_type = PLPGSQL_STMT_PERFORM;
 		perform->lineno = plpgsql_location_to_lineno(location);
 		perform->expr = expr;
+        perform->sqlString = plpgsql_get_curline_query();
 		return (PLpgSQL_stmt *)perform;
 	}
 	yyerror("syntax error");
 	return NULL;
 }
+
+static void raw_parse_package_function(char* proc_str)
+{
+    if (u_sess->plsql_cxt.curr_compile_context->plpgsql_curr_compile_package != NULL)
+    {
+        List* raw_parsetree_list = NULL;
+        u_sess->plsql_cxt.plpgsql_yylloc = plpgsql_yylloc;
+        u_sess->plsql_cxt.rawParsePackageFunction = true;
+        raw_parsetree_list = raw_parser(proc_str);
+        CreateFunctionStmt* stmt;
+        u_sess->plsql_cxt.rawParsePackageFunction = false;
+        int rc = 0;
+        if (raw_parsetree_list == NULL) {
+            return;
+        }
+        stmt = (CreateFunctionStmt *)linitial(raw_parsetree_list);
+        stmt->queryStr = proc_str;
+        if (u_sess->plsql_cxt.curr_compile_context->plpgsql_curr_compile_package->is_spec_compiling) {
+            stmt->isPrivate = false;
+        } else {
+            stmt->isPrivate = true;
+        }
+        if (u_sess->parser_cxt.isFunctionDeclare) {
+            stmt->isFunctionDeclare = true;
+        } else {
+            stmt->isFunctionDeclare = false;
+        }
+
+        rc = CompileWhich();
+        if (rc == PLPGSQL_COMPILE_PACKAGE) {
+            stmt->startLineNumber = u_sess->plsql_cxt.procedure_start_line;
+            stmt->firstLineNumber = u_sess->plsql_cxt.procedure_first_line;
+        }
+        /* check function name */
+        CheckDuplicateFunctionName(stmt->funcname);
+        List *proc_list = u_sess->plsql_cxt.curr_compile_context->plpgsql_curr_compile_package->proc_list;
+        u_sess->plsql_cxt.curr_compile_context->plpgsql_curr_compile_package->proc_list = lappend(proc_list,stmt);
+    } else {
+        yyerror("kerword PROCEDURE only use in package compile");
+    }
+}
+
+static void CheckDuplicateFunctionName(List* funcNameList)
+{
+    char* schemaname = NULL;
+    char* pkgname = NULL;
+    char* funcname = NULL;
+    DeconstructQualifiedName(funcNameList, &schemaname, &funcname, &pkgname);
+    if (plpgsql_ns_lookup(plpgsql_ns_top(), true, funcname, NULL, NULL, NULL) != NULL)
+        yyerror("duplicate declaration");
+}
+
+static void IsInPublicNamespace(char* varname) {
+    if (u_sess->plsql_cxt.curr_compile_context->plpgsql_curr_compile == NULL && 
+        u_sess->plsql_cxt.curr_compile_context->plpgsql_curr_compile_package != NULL) {
+        PLpgSQL_package* pkg = u_sess->plsql_cxt.curr_compile_context->plpgsql_curr_compile_package;
+        if (plpgsql_ns_lookup(pkg->public_ns, true, varname, NULL, NULL, NULL) != NULL) {
+            const char* message = "duplicate declaration";
+            InsertErrorMessage(message, plpgsql_yylloc);
+            ereport(errstate,
+                (errmodule(MOD_PLSQL), errcode(ERRCODE_SYNTAX_ERROR),
+                    errmsg("duplicate declaration"),
+                    errdetail("name \"%s\" already defined", varname),
+                    errcause("name maybe defined in public variable or type"),
+                    erraction("rename variable or type")));
+        }
+    }
+}
+
+static void AddNamespaceIfNeed(int dno, char* ident)
+{
+    if (getCompileStatus() != COMPILIE_PKG_FUNC) {
+        return;
+    }
+
+    if (ident == NULL) {
+        yyerror("null string when add package type to procedure namespace");
+    }
+
+    if (plpgsql_ns_lookup(plpgsql_ns_top(), true, ident, NULL, NULL, NULL) != NULL) {
+        return;
+    }
+
+    if (dno == -1) {
+        plpgsql_ns_additem(PLPGSQL_NSTYPE_REFCURSOR, 0, ident);
+        return;
+    }
+
+    PLpgSQL_datum* datum = u_sess->plsql_cxt.curr_compile_context->plpgsql_Datums[dno];
+    switch(datum->dtype) {
+        case PLPGSQL_DTYPE_RECORD_TYPE : {
+            plpgsql_ns_additem(PLPGSQL_NSTYPE_RECORD, dno, ident);
+        } break;
+        case PLPGSQL_DTYPE_VARRAY : {
+            plpgsql_ns_additem(PLPGSQL_NSTYPE_VARRAY, dno, ident);
+        } break;
+        case PLPGSQL_DTYPE_TABLE : {
+            plpgsql_ns_additem(PLPGSQL_NSTYPE_TABLE, dno, ident);
+        } break;
+        default : {
+            yyerror("not recognized type when add package type to procedure namespace");
+        } break;
+    }
+
+    return;
+}
+
+static void AddNamespaceIfPkgVar(const char* ident, IdentifierLookup save_IdentifierLookup)
+{
+    if (getCompileStatus() != COMPILIE_PKG_FUNC) {
+        return;
+    }
+
+    /* only declare session need to add */
+    if (save_IdentifierLookup != IDENTIFIER_LOOKUP_DECLARE) {
+        return;
+    }
+
+    if (ident == NULL) {
+        yyerror("null string when add package variable to procedure namespace");
+    }
+
+    if (plpgsql_ns_lookup(plpgsql_ns_top(), true, ident, NULL, NULL, NULL) != NULL) {
+        return;
+    }
+
+    PLpgSQL_nsitem* ns = NULL;
+    PLpgSQL_compile_context* curr_compile = u_sess->plsql_cxt.curr_compile_context;
+    if (curr_compile->plpgsql_curr_compile_package != NULL) {
+        PLpgSQL_package* pkg = curr_compile->plpgsql_curr_compile_package;
+        ns = plpgsql_ns_lookup(pkg->public_ns, false, ident, NULL, NULL, NULL);
+        if (ns == NULL) {
+            ns = plpgsql_ns_lookup(pkg->private_ns, false, ident, NULL, NULL, NULL);
+        }
+    }
+    if (ns != NULL && (ns->itemtype == PLPGSQL_NSTYPE_VAR || ns->itemtype == PLPGSQL_NSTYPE_ROW)) {
+        plpgsql_ns_additem(ns->itemtype, ns->itemno, ident);
+    }
+
+    return;
+}
+
+static void get_datum_tok_type(PLpgSQL_datum* target, int* tok_flag)
+{
+    if (target->dtype == PLPGSQL_DTYPE_VAR) {
+        PLpgSQL_var* var = (PLpgSQL_var*)(target);
+        if (var != NULL && var->datatype != NULL &&
+            var->datatype->typinput.fn_oid == F_ARRAY_IN) {
+            if (var->datatype->collectionType == PLPGSQL_COLLECTION_TABLE) {
+                *tok_flag = PLPGSQL_TOK_TABLE_VAR;
+            } else {
+                *tok_flag = PLPGSQL_TOK_VARRAY_VAR;
+            }
+        } else if (var != NULL && var->datatype &&
+            var->datatype->typinput.fn_oid == F_DOMAIN_IN) {
+            HeapTuple type_tuple =
+                SearchSysCache1(TYPEOID, ObjectIdGetDatum(var->datatype->typoid));
+            if (HeapTupleIsValid(type_tuple)) {
+                Form_pg_type type_form = (Form_pg_type)GETSTRUCT(type_tuple);
+                if (F_ARRAY_OUT == type_form->typoutput) {
+                    *tok_flag = PLPGSQL_TOK_VARRAY_VAR;
+                }
+            }
+            ReleaseSysCache(type_tuple);
+        }
+    }
+}
+
+static void plpgsql_cast_reference_list(List* idents, StringInfoData* ds, bool isPkgVar)
+{
+    char* word = NULL;
+    if (isPkgVar) {
+        word = strVal(linitial(idents));
+        appendStringInfoString(ds, "(");
+        appendStringInfoString(ds, word);
+        appendStringInfoString(ds, ".");
+        word = strVal(lsecond(idents));
+        appendStringInfoString(ds, word);
+        word = strVal(lthird(idents));
+        appendStringInfoString(ds, ".");
+        appendStringInfoString(ds, word);
+        appendStringInfoString(ds, ")");
+        word = strVal(lfourth(idents));
+        appendStringInfoString(ds, ".");
+        appendStringInfoString(ds, word);
+        appendStringInfoString(ds, " ");
+    } else {
+        word = strVal(linitial(idents));
+        appendStringInfoString(ds, "(");
+        appendStringInfoString(ds, word);
+        appendStringInfoString(ds, ".");
+        word = strVal(lsecond(idents));
+        appendStringInfoString(ds, word);
+        appendStringInfoString(ds, ")");
+        word = strVal(lthird(idents));
+        appendStringInfoString(ds, ".");
+        appendStringInfoString(ds, word);
+        if (list_length(idents) == 4) {
+            word = strVal(lfourth(idents));
+            appendStringInfoString(ds, ".");
+            appendStringInfoString(ds, word);
+        }
+        appendStringInfoString(ds, " ");
+    }
+}
+
+static void CastArrayNameToArrayFunc(StringInfoData* ds, List* idents, bool needDot)
+{
+    char* arrayName1 = NULL;
+    char* arrayName2 = NULL;
+    char* arrayName3 = NULL;
+
+    switch (list_length(idents)) {
+        case 2: {
+            arrayName1 = strVal(linitial(idents));
+            appendStringInfo(ds, "\"%s\"", arrayName1);
+        } break;
+        case 3: {
+            arrayName1 = strVal(linitial(idents));
+            arrayName2 = strVal(lsecond(idents));
+            appendStringInfo(ds, "\"%s\".\"%s\"", arrayName1, arrayName2);
+        } break;
+        case 4: {
+            arrayName1 = strVal(linitial(idents));
+            arrayName2 = strVal(lsecond(idents));
+            arrayName3 = strVal(lthird(idents));
+            appendStringInfo(ds, "\"%s\".\"%s\".\"%s\"", arrayName1, arrayName2, arrayName3);
+        } break;
+        default: {
+            yyerror("syntax error of array functions");
+        } break;
+    }
+
+    if (needDot) {
+        appendStringInfo(ds, ", ");
+    } else {
+        appendStringInfo(ds, " ");
+    }
+
+    return;
+}
+
+static bool PkgVarNeedCast(List* idents)
+{
+    /* only pkg.row.col1.col2 need cast */
+    if (list_length(idents) != 4) {
+        return false;
+    }
+
+    char* word1 = strVal(linitial(idents));
+    char* word2 = strVal(lsecond(idents));
+    char* word3 = strVal(lthird(idents));
+    PLpgSQL_nsitem* ns = NULL;
+    int nnames = 0;
+
+    ns = plpgsql_ns_lookup(plpgsql_ns_top(), false, word1, word2, word3, &nnames);
+    /* nnames = 2, means pkg.row.col2.col2 form */
+    if (nnames == 2) {
+        return true;
+    }
+
+    return false;
+
+}
+
+static void check_autonomous_nest_tablevar(PLpgSQL_var* var)
+{
+    if (unlikely(var->ispkg && var->nest_table != NULL &&
+                 u_sess->plsql_cxt.curr_compile_context->plpgsql_curr_compile != NULL &&
+                 u_sess->plsql_cxt.curr_compile_context->plpgsql_curr_compile->is_autonomous)) {
+        ereport(errstate, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                           errmsg("Un-support feature: nest tableof variable %s not support pass through autonm function",
+                                  var->varname)));
+    }
+}
+
+static void SetErrorState() 
+{
+#ifndef ENABLE_MULTIPLE_NODES
+        if (u_sess->attr.attr_common.plsql_show_all_error) {
+            errstate = NOTICE;
+        } else {
+            errstate = ERROR;
+        }
+#else
+        errstate = ERROR;
+#endif
+}
+
+static bool need_build_row_for_func_arg(PLpgSQL_rec **rec, PLpgSQL_row **row, int out_arg_num, int all_arg, int *varnos, char *p_argmodes)
+{
+    /* out arg number > 1 should build a row */
+    if (out_arg_num > 1) {
+        return true;
+    }
+
+    /* no row or rec, should build a row */
+    if (*rec == NULL && *row == NULL) {
+        return true;
+    }
+
+    /* no out arg, need not build */
+    if (out_arg_num == 0) {
+        return false;
+    }
+  
+    PLpgSQL_compile_context* curr_compile = u_sess->plsql_cxt.curr_compile_context;
+    PLpgSQL_datum *tempDatum = NULL;
+    for (int i = 0; i < all_arg; i++) {
+        if (p_argmodes[i] == 'i') {
+            continue;
+        }
+
+        /* out param no destination */
+        if (varnos[i] == -1) {
+            *rec = NULL;
+            *row = NULL;
+            return false;
+        }
+
+        tempDatum = curr_compile->plpgsql_Datums[varnos[i]];
+        /* the out param is the rec or row */
+        if (tempDatum == (PLpgSQL_datum*)(*rec) || tempDatum == (PLpgSQL_datum*)(*row)) {
+            return false;
+        }
+        /* the out param is scalar, need build row */
+        if (tempDatum->dtype == PLPGSQL_DTYPE_VAR
+            || tempDatum->dtype == PLPGSQL_DTYPE_RECFIELD
+            || tempDatum->dtype == PLPGSQL_DTYPE_ASSIGNLIST) {
+            return true;
+        }
+
+        /* need not build a new row, but need to replace the correct row */
+        if (tempDatum->dtype == PLPGSQL_DTYPE_ROW || tempDatum->dtype == PLPGSQL_DTYPE_RECORD) {
+            *row = (PLpgSQL_row *)tempDatum;
+            return false;
+        }
+        if (tempDatum->dtype == PLPGSQL_DTYPE_REC) {
+            *rec = (PLpgSQL_rec *)tempDatum;
+            return false;
+        }
+
+        /* arrive here, means out param invalid, set row and rec to null*/
+        *rec = NULL;
+        *row = NULL;
+        return false;
+    }
+
+    /* should not arrive here */
+    *rec = NULL;
+    *row = NULL;
+    return false;
+}
+
+#ifndef ENABLE_MULTIPLE_NODES
+static void BuildForQueryVariable(PLpgSQL_expr* expr, PLpgSQL_row **row, PLpgSQL_rec **rec,
+    const char* refname, int lineno)
+{
+    TupleDesc desc = getCursorTupleDesc(expr, true);
+    if (desc == NULL || desc->natts == 0 || checkAllAttrName(desc)) {
+        PLpgSQL_type dtype;
+        dtype.ttype = PLPGSQL_TTYPE_REC;
+        *rec = (PLpgSQL_rec *)
+        plpgsql_build_variable(refname, lineno, &dtype, true);
+    } else {
+        *row = build_row_from_tuple_desc(refname, lineno, desc);
+    }
+}
+#endif

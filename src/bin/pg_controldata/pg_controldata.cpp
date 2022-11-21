@@ -30,27 +30,6 @@
 #define FirstNormalTransactionId ((TransactionId)3)
 #define TransactionIdIsNormal(xid) ((xid) >= FirstNormalTransactionId)
 
-/* transform old version LSN into new version. */
-#define XLogRecPtrSwap(x) (((uint64)((x).xlogid)) << 32 | (x).xrecoff)
-
-/*
- * TransactionIdLogicallyPrecedes --- is id1 logically < id2?
- */
-bool TransactionIdLogicallyPrecedes(TransactionId id1, TransactionId id2)
-{
-    /*
-     * If either ID is a permanent XID then we can just do unsigned
-     * comparison.	If both are normal, do a modulo-2^31 comparison.
-     */
-    int32 diff;
-
-    if (!TransactionIdIsNormal(id1) || !TransactionIdIsNormal(id2))
-        return (id1 < id2);
-
-    diff = (int32)(id1 - id2);
-    return (diff < 0);
-}
-
 static void usage(const char* progname)
 {
     printf(_("%s displays control information of a openGauss database cluster.\n\n"), progname);
@@ -228,7 +207,7 @@ int main(int argc, char* argv[])
         printf(_("WARNING: possible byte ordering mismatch\n"
                  "The byte ordering used to store the pg_control file might not match the one\n"
                  "used by this program.  In that case the results below would be incorrect, and\n"
-                 "the PostgreSQL installation would be incompatible with this data directory.\n"));
+                 "the openGauss installation would be incompatible with this data directory.\n"));
     printf(_("Catalog version number:               %u\n"), ControlFile.catalog_version_no);
     printf(_("Database system identifier:           %s\n"), sysident_str);
     printf(_("Database cluster state:               %s\n"), dbState(ControlFile.state));

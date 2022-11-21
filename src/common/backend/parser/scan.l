@@ -39,16 +39,28 @@
 #include "parser/scanner.h"
 #include "parser/scansup.h"
 #include "mb/pg_wchar.h"
-
+#include "utils/pl_package.h"
+#include "utils/plpgsql.h"
+#include <string.h>
 
 /* Avoid exit() on fatal scanner errors (a bit ugly -- see yy_fatal_error) */
 #undef fprintf
 #define fprintf(file, fmt, msg)  ereport(ERROR, (errmsg_internal("%s", msg)))
 
+bool		case_sensitive_ident = false;
+
 /*
  * Set the type of YYSTYPE.
  */
 #define YYSTYPE core_YYSTYPE
+
+/*
+ * define core_yylex for flex >= 2.6
+ */
+#if FLEX_MAJOR_VERSION >= 2 && FLEX_MINOR_VERSION >= 6
+#define YY_DECL int core_yylex \
+               (YYSTYPE * yylval_param, YYLTYPE * yylloc_param , yyscan_t yyscanner)
+#endif
 
 /*
  * Set the type of yyextra.  All state variables used by the scanner should
@@ -67,6 +79,7 @@ long getDynaParamSeq(const char *string, bool initflag, bool placeholder, core_y
  */
 #define SET_YYLLOC()  (*(yylloc) = yytext - yyextra->scanbuf)
 
+#define COMMENT_NOT_IGNORED()  (yyextra->is_hint_str || yyextra->include_ora_comment)
 /*
  * Advance yylloc by the given number of bytes.
  */
@@ -150,6 +163,7 @@ extern void core_yyset_column(int column_no, yyscan_t yyscanner);
 %x xui
 %x xus
 %x xeu
+%x SPARQL
 
 /*
  * In order to make the world safe for Windows and Mac clients as well as
@@ -173,10 +187,10 @@ space			[ \t\n\r\f]
 horiz_space		[ \t\f]
 newline			[\n\r]
 non_newline		[^\n\r]
-
 comment			("--"{non_newline}*)
 
 whitespace		({space}+|{comment})
+whitespace_only	({space}+)
 
 /*
  * SQL requires at least one newline in the whitespace separating
@@ -188,6 +202,12 @@ whitespace		({space}+|{comment})
 special_whitespace		({space}+|{comment}{newline})
 horiz_whitespace		({horiz_space}|{comment})
 whitespace_with_newline	({horiz_whitespace}*{newline}{special_whitespace}*)
+
+/*
+ * string for cypher and sparql
+ */ 
+gs_string ([""][^""\\\n]*[""])|([''][^''\\\n]*[''])
+gs_string_fail ([""][^""\\\n]*)|([''][^''\\\n]*)
 
 /*
  * To ensure that {quotecontinue} can be scanned without having to back up
@@ -315,6 +335,8 @@ dot_dot			\.\.
 colon_equals	":="
 para_equals	"=>"
 
+add_equals		"+="
+
 /*
  * "self" is the set of chars that should be returned as single-character
  * tokens.  "op_chars" is the set of chars that can make up "Op" tokens,
@@ -325,8 +347,8 @@ para_equals	"=>"
  * If you change either set, adjust the character lists appearing in the
  * rule for "operator"!
  */
-self			[,()\[\].;\:\+\-\*\/\%\^\<\>\=]
-op_chars		[\~\!\@\#\^\&\|\`\?\+\-\*\/\%\<\>\=]
+self			[,()\[\].;\:\+\-\*\/\%\^\<\>\=\@]
+op_chars		[\~\!\#\^\&\|\`\?\+\-\*\/\%\<\>\=\@]
 operator		{op_chars}+
 
 /* we no longer allow unary minus in numbers.
@@ -345,12 +367,55 @@ decimalfail		{digit}+\.\.
 real			({integer}|{decimal})[Ee][-+]?{digit}+
 realfail1		({integer}|{decimal})[Ee]
 realfail2		({integer}|{decimal})[Ee][-+]
+snapvers		({digit}+(\.{digit}+)*)
 
 param			\${integer}
 
 newParam		:({identifier}|{integer})
 
 newArray		:({integer}{space}*\])
+
+/*
+ * SPARQL tokens
+ */
+qvar                         \?{identifier}
+q_iri_ref                    "<"([^<>"{}|^`\001-\040\\])*">"
+q_iri_ref_fail               "<"([^<>"{}|^`\001-\040\\])*
+
+PN_LOCAL_ESC                 [\\][_~.!$&''()*+,;=/?#@%-]
+PN_LOCAL_ESC_X               {PN_LOCAL_ESC}|([%][0-9A-Fa-f][0-9A-Fa-f])
+PN_LOCAL_ESC_X_FAIL          (([%][0-9A-Fa-f])|[%])|[\\]
+PN_CHARS_BASE                [A-Za-z\x7f-\xfe]|{xeunicode}
+PN_CHARS_BASE_FAIL           {xeunicodefail}
+PN_CHARS_U_09                [A-Za-z0-9_\x7f-\xfe]|{xeunicode}
+PN_CHARS_U_09_C_PLX          [A-Za-z0-9_\x7f-\xfe:]|{xeunicode}|{PN_LOCAL_ESC_X}
+PN_CHARS_U_09_C_PLX_FAIL     {xeunicodefail}|{PN_LOCAL_ESC_X_FAIL}
+PN_CHARS                     [A-Za-z0-9_\x7f-\xfe-]|{xeunicode}
+PN_CHARS_FAIL                {xeunicodefail}
+PN_CHARS_C_PLX               ([A-Za-z0-9_\x7f-\xfe:-]|{xeunicode}|{PN_LOCAL_ESC_X})
+PN_CHARS_C_PLX_FAIL          ({PN_LOCAL_ESC_X_FAIL}|{xeunicodefail})
+PN_PREFIX                    {PN_CHARS_BASE}(([.]*{PN_CHARS})*)
+PN_PREFIX_FAIL               ({PN_CHARS_BASE}(([.]*{PN_CHARS})*[.]*\\))|[\\]|({PN_CHARS_BASE}(([.]*{PN_CHARS})*[.]*))|({PN_CHARS_BASE_FAIL})|({PN_CHARS_BASE}(([.]*{PN_CHARS})*([.]*{PN_CHARS_FAIL})))
+PN_LOCAL                      {PN_CHARS_U_09_C_PLX}(([.]*{PN_CHARS_C_PLX})*)
+PN_LOCAL_FAIL                ({PN_CHARS_U_09_C_PLX}(([.]*{PN_CHARS_C_PLX})*[.]*))|({PN_CHARS_U_09_C_PLX_FAIL})|({PN_CHARS_U_09_C_PLX}(([.]*{PN_CHARS_C_PLX})*([.]*{PN_CHARS_C_PLX_FAIL})))
+qname                        ({PN_PREFIX}?)":"{PN_LOCAL}
+qname_fail                   (({PN_PREFIX}?)":"{PN_LOCAL_FAIL})|({PN_PREFIX}?)|({PN_PREFIX_FAIL})
+qname_ns                     ({PN_PREFIX}?)":"
+langtag                       "@"([a-zA-Z]+)(("-"([a-zA-Z0-9]+))*)
+langtag_fail                 "@"([a-zA-Z]+)(("-"([a-zA-Z0-9]+))*)("-")+
+blank_node_label             "_:"{PN_LOCAL}  
+blank_node_label_fail        "_:"{PN_LOCAL_FAIL}?
+sparql_string                ([""][^""\\\n]*[""])|([''][^''\\\n]*[''])
+sparql_string_fail           ([""][^""\\\n]*)|([''][^''\\\n]*)
+_AT "@@"
+
+_CARET_CARET	"^^"
+equals_greater	"=>"
+less_equals		"<="
+greater_equals	">="
+less_greater	"<>"
+not_equals		"!="
+equals_tilde	"=~"
 
 other			.
 
@@ -369,7 +434,17 @@ other			.
 
 %%
 
-{whitespace}	{
+{whitespace_only}	{
+					/* ignore */
+				}
+{comment}		{
+					if (yyextra->include_ora_comment)
+					{
+						SET_YYLLOC();
+						addlit(yytext, yyleng, yyscanner);
+						yylval->str = litbufdup(yyscanner);
+						return COMMENTSTRING;
+					}
 					/* ignore */
 				}
 
@@ -380,7 +455,7 @@ other			.
 					BEGIN(xc);
 					/* Put back any characters past slash-star; see above */
 					yyless(2);
-					if (yyextra->is_hint_str)
+					if (COMMENT_NOT_IGNORED())
 					{
 						startlit();
 						addlit(yytext, yyleng, yyscanner);
@@ -391,7 +466,7 @@ other			.
 					(yyextra->xcdepth)++;
 					/* Put back any characters past slash-star; see above */
 					yyless(2);
-					if (yyextra->is_hint_str)
+					if (COMMENT_NOT_IGNORED())
 					{
 						addlit(yytext, yyleng, yyscanner);
 					}
@@ -403,7 +478,7 @@ other			.
 					else
 						(yyextra->xcdepth)--;
 
-					if (yyextra->is_hint_str)
+					if (COMMENT_NOT_IGNORED())
 					{	
 						addlit(yytext, yyleng, yyscanner);
 						yylval->str = litbufdup(yyscanner);
@@ -413,27 +488,27 @@ other			.
 		}
 
 <xc>{xcinside}	{
-					if (yyextra->is_hint_str)
+					if (COMMENT_NOT_IGNORED())
 					{
 						addlit(yytext, yyleng, yyscanner);
 					}
 		}
 
 <xc>{op_chars}	{
-					if (yyextra->is_hint_str)
+					if (COMMENT_NOT_IGNORED())
 					{
 						addlit(yytext, yyleng, yyscanner);
 					}
 		}
 
 <xc>\*+		{
-					if (yyextra->is_hint_str)
+					if (COMMENT_NOT_IGNORED())
 					{
 						addlit(yytext, yyleng, yyscanner);
 					}
 		}
 
-<xc><<EOF>>		{ yyerror("unterminated /* comment"); }
+<xc><<EOF>>		{ yyerror("unterminated /* comment"); return 0;}
 
 {xbstart}		{
 					/* Binary bit type.
@@ -463,7 +538,7 @@ other			.
 <xb>{quotecontinue}	{
 					/* ignore */
 				}
-<xb><<EOF>>		{ yyerror("unterminated bit string literal"); }
+<xb><<EOF>>		{ yyerror("unterminated bit string literal"); return 0;}
 
 {xhstart}		{
 					/* Hexadecimal bit type.
@@ -485,7 +560,7 @@ other			.
 					yyextra->is_hint_str = false;
 					return XCONST;
 		}
-<xh><<EOF>>		{ yyerror("unterminated hexadecimal string literal"); }
+<xh><<EOF>>		{ yyerror("unterminated hexadecimal string literal"); return 0;}
 
 {xnstart}		{
 					/* National character.
@@ -659,7 +734,7 @@ other			.
 					/* This is only needed for \ just before EOF */
 					addlitchar(yytext[0], yyscanner);
 				}
-<xq,xe,xus><<EOF>>		{ yyerror("unterminated quoted string"); }
+<xq,xe,xus><<EOF>>		{ yyerror("unterminated quoted string"); return 0;}
 
 {dolqdelim}		{
 					SET_YYLLOC();
@@ -706,7 +781,7 @@ other			.
 					/* This is only needed for $ inside the quoted text */
 					addlitchar(yytext[0], yyscanner);
 				}
-<xdolq><<EOF>>	{ yyerror("unterminated dollar-quoted string"); }
+<xdolq><<EOF>>	{ yyerror("unterminated dollar-quoted string"); return 0;}
 
 {xdstart}		{
 					SET_YYLLOC();
@@ -725,7 +800,7 @@ other			.
 					if (yyextra->literallen == 0)
 						yyerror("zero-length delimited identifier");
 					ident = litbufdup(yyscanner);
-					if (yyextra->literallen >= NAMEDATALEN)
+					if (yyextra->literallen >= NAMEDATALEN && u_sess->parser_cxt.is_load_copy == false)
 						truncate_identifier(ident, yyextra->literallen, yyextra->warnOnTruncateIdent);
 					yylval->str = ident;
 					yyextra->ident_quoted = true;
@@ -741,7 +816,7 @@ other			.
 						yyerror("zero-length delimited identifier");
 					ident = litbuf_udeescape('\\', yyscanner);
 					identlen = strlen(ident);
-					if (identlen >= NAMEDATALEN)
+					if (identlen >= NAMEDATALEN && u_sess->parser_cxt.is_load_copy == false)
 						truncate_identifier(ident, identlen, yyextra->warnOnTruncateIdent);
 					yylval->str = ident;
 					/* throw back all but the quote */
@@ -759,7 +834,7 @@ other			.
 						yyerror("zero-length delimited identifier");
 					ident = litbuf_udeescape(yytext[yyleng - 2], yyscanner);
 					identlen = strlen(ident);
-					if (identlen >= NAMEDATALEN)
+					if (identlen >= NAMEDATALEN && u_sess->parser_cxt.is_load_copy == false)
 						truncate_identifier(ident, identlen, yyextra->warnOnTruncateIdent);
 					yylval->str = ident;
 					yyextra->ident_quoted = false;
@@ -772,7 +847,7 @@ other			.
 <xd,xui>{xdinside}	{
 					addlit(yytext, yyleng, yyscanner);
 				}
-<xd,xui><<EOF>>		{ yyerror("unterminated quoted identifier"); }
+<xd,xui><<EOF>>		{ yyerror("unterminated quoted identifier"); return 0;}
 
 {xufailed}	{
 					char		   *ident;
@@ -794,7 +869,7 @@ other			.
 					return TYPECAST;
 				}
 
-{plus_join}	{
+{plus_join}	    {
 					SET_YYLLOC();
 					yyextra->is_hint_str = false;
 					return ORA_JOINOP;
@@ -817,7 +892,11 @@ other			.
 					yyextra->is_hint_str = false;
 					return PARA_EQUALS;
 				}
-
+				
+{add_equals}	{
+						SET_YYLLOC();
+						return ADD_EQUALS;
+				}
 {self}			{
 					SET_YYLLOC();
 					/*
@@ -830,14 +909,16 @@ other			.
 							yyextra->paren_depth++;
 						else if (yytext[0] == ')' && yyextra->paren_depth > 0)
 							yyextra->paren_depth--;
-						else if (yytext[0] == ';' && yyextra->paren_depth == 0 && !yyextra->in_slash_proc_body)
+						else if (yytext[0] == ';' && yyextra->paren_depth == 0 && !yyextra->in_slash_proc_body) {
 							yyextra->query_string_locationlist = lappend_int(yyextra->query_string_locationlist, *yylloc);
+                            /* reset is_createstmt to parse next sql */
+                            yyextra->is_createstmt = false;
+                        }
 					}
 					yyextra->is_hint_str = false;
 					return yytext[0];
-				}
-
-{operator}		{
+				}			
+{operator}      {
 					/*
 					 * Check for embedded slash-star or dash-dash; those
 					 * are comment starts, so operator must stop there.
@@ -875,7 +956,7 @@ other			.
 
 						for (ic = nchars-2; ic >= 0; ic--)
 						{
-							if (strchr("~!@#^&|`?%", yytext[ic]))
+							if (strchr("~!#^&|`?%", yytext[ic]))
 								break;
 						}
 						if (ic >= 0)
@@ -896,7 +977,7 @@ other			.
 						 * that the "self" rule would have.
 						 */
 						if (nchars == 1 &&
-							strchr(",()[].;:+-*/%^<>=", yytext[0]))
+							strchr(",()[].;:+-*/%^<>=@", yytext[0]))
 						{
 							yyextra->is_hint_str = false;
 							return yytext[0];
@@ -930,20 +1011,10 @@ other			.
 					yyextra->is_hint_str = false;
 					return Op;
 				}
-{newArray}		{
-					yyless(1);
-					yyextra->is_hint_str = false;
-					return yytext[0];
-				}
+
 {param}			{
 					SET_YYLLOC();
 					yylval->ival = getDynaParamSeq(yytext + 1, false, false, yyscanner);
-					yyextra->is_hint_str = false;
-					return PARAM;
-				}
-{newParam}		{
-					SET_YYLLOC();
-					yylval->ival = getDynaParamSeq(yytext + 1, false, true, yyscanner);
 					yyextra->is_hint_str = false;
 					return PARAM;
 				}
@@ -992,9 +1063,21 @@ other			.
 					yyextra->is_hint_str = false;
 					return FCONST;
 				}
+{snapvers}		{
+					SET_YYLLOC();
+					yylval->str = pstrdup(yytext);
+					for (int i = strlen(yylval->str) - 1; i > 0; i--)
+					{
+						if (yylval->str[i] == '.')
+						{
+							yylval->str[i] = DB4AI_SNAPSHOT_VERSION_SEPARATOR;
+						}
+					}
+					yyextra->is_hint_str = false;
+					return VCONST;
+				}
 
-
-{identifier}	{
+{identifier} {
 					const ScanKeyword *keyword;
 					char		   *ident;
 
@@ -1006,6 +1089,7 @@ other			.
 												yyextra->num_keywords);
 
 					yyextra->is_hint_str = false;
+					bool isPlpgsqlKeyword = yyextra->isPlpgsqlKeyWord;
 
 					if (keyword != NULL)
 					{
@@ -1021,29 +1105,37 @@ other			.
 							/* Create trigger don't need set dolqstart */
 							yyextra->is_createstmt = false;
 						}
-						else if ((keyword->value == PROCEDURE || keyword->value == FUNCTION)
-								 && yyextra->is_createstmt)
+						else if ((keyword->value == (isPlpgsqlKeyword? yyextra->plKeywordValue->procedure : PROCEDURE) ||
+						    keyword->value == (isPlpgsqlKeyword? yyextra->plKeywordValue->function : FUNCTION))
+							&& (yyextra->is_createstmt))
 						{
 							/* Make yyextra->dolqstart not NULL means its in a proc with $$. */
 							yyextra->dolqstart = "";
 						}
-						else if (keyword->value == BEGIN_P)
+						else if (keyword->value == (isPlpgsqlKeyword? yyextra->plKeywordValue->begin : BEGIN_P))
 						{
-							/* cases that have to be a trans stmt and fall quickly */
-							if (yyg->yy_hold_char == ';' || /* found ';' after 'begin' */
-								yyg->yy_hold_char == '\0')  /* found '\0' after 'begin' */
-								return BEGIN_NON_ANOYBLOCK;
-							/* look for other transaction stmt */
-							if (is_trans_stmt(yyextra->scanbuf, yyextra->scanbuflen))
-								return BEGIN_NON_ANOYBLOCK;
+                            if (!(u_sess->parser_cxt.isCreateFuncOrProc || u_sess->plsql_cxt.curr_compile_context != NULL)) {
+                                /* cases that have to be a trans stmt and fall quickly */
+                                if (yyg->yy_hold_char == ';' || /* found ';' after 'begin' */
+                                    yyg->yy_hold_char == '\0')  /* found '\0' after 'begin' */
+                                    return BEGIN_NON_ANOYBLOCK;
+                                /* look for other transaction stmt */
+                                if (is_trans_stmt(yyextra->scanbuf, yyextra->scanbuflen))
+                                    return BEGIN_NON_ANOYBLOCK;
+                            }
 						}
-						else if (keyword->value == SELECT ||
-								 keyword->value == UPDATE||
-								 keyword->value == INSERT ||
-								 keyword->value == DELETE_P ||
+						else if (keyword->value == (isPlpgsqlKeyword? yyextra->plKeywordValue->select : SELECT) ||
+								 keyword->value == (isPlpgsqlKeyword? yyextra->plKeywordValue->update : UPDATE) ||
+								 keyword->value == (isPlpgsqlKeyword? yyextra->plKeywordValue->insert : INSERT) ||
+								 keyword->value == (isPlpgsqlKeyword? yyextra->plKeywordValue->Delete : DELETE_P) ||
 								 keyword->value == MERGE)
 						{
 							yyextra->is_hint_str = true;
+						}
+
+						if(!strcmp(keyword->name,"SPARQL") || !strcmp(keyword->name,"sparql"))
+						{
+							BEGIN(SPARQL);
 						}
 
 						return keyword->value;
@@ -1058,13 +1150,281 @@ other			.
 					yyextra->ident_quoted = false;
 					return IDENT;
 				}
-
 {other}			{
 					SET_YYLLOC();
 					yyextra->is_hint_str = false;
 					return yytext[0];
 				}
+<SPARQL>"<"			{ 
+					SET_YYLLOC();
+					return yytext[0];
+				}
+<SPARQL>","			{ 
+					SET_YYLLOC();
+					return yytext[0];
+				}
+<SPARQL>">"		{
+					SET_YYLLOC();
+					return yytext[0];
+				}
+<SPARQL>"\{"		{
+					SET_YYLLOC();
+					return yytext[0];
+				}
+<SPARQL>"\}"		{
+					SET_YYLLOC();
+					return yytext[0];
+				}
+<SPARQL>"\|"		{
+					SET_YYLLOC();
+					return yytext[0];
+				}
+<SPARQL>"\?"		{
+					SET_YYLLOC();
+					return yytext[0];
+				}
+<SPARQL>{_CARET_CARET}		{
+					SET_YYLLOC();
+					return _CARET_CARET;
+				}
+<SPARQL>{less_equals}	{
+					SET_YYLLOC();
+					return LESS_EQUALS;
+				}
 
+<SPARQL>{greater_equals} {
+					SET_YYLLOC();
+					return GREATER_EQUALS;
+				}
+
+<SPARQL>{less_greater}	{
+					/* We accept both "<>" and "!=" as meaning NOT_EQUALS */
+					SET_YYLLOC();
+					return NOT_EQUALS;
+				}
+
+<SPARQL>{not_equals}	{
+					/* We accept both "<>" and "!=" as meaning NOT_EQUALS */
+					SET_YYLLOC();
+					return NOT_EQUALS;
+				}
+<SPARQL>{integer}		{
+					SET_YYLLOC();
+					return process_integer_literal(yytext, yylval);
+				}
+<SPARQL>{decimal}		{
+					SET_YYLLOC();
+					yylval->str = pstrdup(yytext);
+					return FCONST;
+				}
+<SPARQL>{decimalfail}	{
+					/* throw back the .., and treat as integer */
+					yyless(yyleng - 2);
+					SET_YYLLOC();
+					return process_integer_literal(yytext, yylval);
+				}
+<SPARQL>{real}			{
+					SET_YYLLOC();
+					yylval->str = pstrdup(yytext);
+					return FCONST;
+				}
+<SPARQL>{realfail1}		{
+					/*
+					 * throw back the [Ee], and treat as {decimal}.  Note
+					 * that it is possible the input is actually {integer},
+					 * but since this case will almost certainly lead to a
+					 * syntax error anyway, we don't bother to distinguish.
+					 */
+					yyless(yyleng - 1);
+					SET_YYLLOC();
+					yylval->str = pstrdup(yytext);
+					return FCONST;
+				}
+<SPARQL>{realfail2}		{
+					/* throw back the [Ee][+-], and proceed as above */
+					yyless(yyleng - 2);
+					SET_YYLLOC();
+					yylval->str = pstrdup(yytext);
+					return FCONST;
+				}
+<SPARQL>{identifier}	{
+					const ScanKeyword *keyword;
+					char	   *ident;
+
+					SET_YYLLOC();
+
+					/* Is it a keyword? */
+					keyword = ScanKeywordLookup(yytext,
+												yyextra->keywords,
+												yyextra->num_keywords);
+					if (keyword != NULL)
+					{
+						if (case_sensitive_ident)
+							yylval->keyword = pstrdup(yytext);
+						else
+							yylval->keyword = keyword->name;
+						return keyword->value;
+					}
+					
+					/*
+					 * No.  Convert the identifier to lower case, and truncate
+					 * if necessary.
+					 */
+					if (case_sensitive_ident)
+					{
+						ident = pstrdup(yytext);
+						truncate_identifier(ident, yyleng, true);
+					}
+					else
+					{
+						ident = downcase_truncate_identifier(yytext, yyleng,
+															 true);
+					}
+					yylval->str = ident;
+					return IDENT;
+				}
+<SPARQL>{q_iri_ref}			{
+					SET_YYLLOC();
+					yylval->str = pstrdup(yytext);
+					return Q_IRI_REF;
+				}
+<SPARQL>{q_iri_ref_fail}		{
+					yyerror("unterminated IRI");
+				}
+<SPARQL>{qname}			{
+					SET_YYLLOC();
+					yylval->str = pstrdup(yytext);
+					return QNAME;
+				}
+<SPARQL>{qname_ns}			{
+					SET_YYLLOC();
+					yylval->str = pstrdup(yytext);
+					return QNAME_NS;
+				}	
+<SPARQL>{qname_fail}		{
+					yyerror("unterminated qname");
+				}
+<SPARQL>{blank_node_label}			{
+					SET_YYLLOC();
+					yylval->str = pstrdup(yytext);
+					return BLANK_NODE_LABEL;
+				}
+<SPARQL>{blank_node_label_fail}		{
+					yyerror("unterminated blank_node");
+				}
+<SPARQL>{qvar}			{
+					SET_YYLLOC();
+					yylval->str = pstrdup(yytext);
+					return QVAR;
+				}
+<SPARQL>{langtag}			{
+					SET_YYLLOC();
+					yylval->str = pstrdup(yytext);
+                  return LANGTAG;
+				}
+<SPARQL>{langtag_fail}		{yyerror("unterminated longtag");}
+<SPARQL>{sparql_string}		{
+					SET_YYLLOC();
+					yylval->str = pstrdup(yytext);
+					return SPARQL_STRING;
+				}	
+<SPARQL>{sparql_string_fail}		{
+					yyerror("unterminated sparql string");
+				}
+<SPARQL>{whitespace}		{
+					/*ignore*/
+				}
+<SPARQL>{_AT}		{
+					SET_YYLLOC();
+					return _AT;
+				}
+<SPARQL>{self}			{
+					SET_YYLLOC();
+					return yytext[0];
+				}
+
+<SPARQL>{operator}		{
+					/*
+					 * Check for embedded slash-star or dash-dash; those
+					 * are comment starts, so operator must stop there.
+					 * Note that slash-star or dash-dash at the first
+					 * character will match a prior rule, not this one.
+					 */
+					int			nchars = yyleng;
+					char	   *slashstar = strstr(yytext, "/*");
+					char	   *dashdash = strstr(yytext, "--");
+
+					if (slashstar && dashdash)
+					{
+						/* if both appear, take the first one */
+						if (slashstar > dashdash)
+							slashstar = dashdash;
+					}
+					else if (!slashstar)
+						slashstar = dashdash;
+					if (slashstar)
+						nchars = slashstar - yytext;
+
+					/*
+					 * For SQL compatibility, '+' and '-' cannot be the
+					 * last char of a multi-char operator unless the operator
+					 * contains chars that are not in SQL operators.
+					 * The idea is to lex '=-' as two operators, but not
+					 * to forbid operator names like '?-' that could not be
+					 * sequences of SQL operators.
+					 */
+					while (nchars > 1 &&
+						   (yytext[nchars - 1] == '+' ||
+							yytext[nchars - 1] == '-'))
+					{
+						int			ic;
+
+						for (ic = nchars - 2; ic >= 0; ic--)
+						{
+							if (strchr("~!@#^&|`?%", yytext[ic]))
+								break;
+						}
+						if (ic >= 0)
+							break; /* found a char that makes it OK */
+						nchars--; /* else remove the +/-, and check again */
+					}
+
+					SET_YYLLOC();
+
+					if (nchars < yyleng)
+					{
+						/* Strip the unwanted chars from the token */
+						yyless(nchars);
+						/*
+						 * If what we have left is only one char, and it's
+						 * one of the characters matching "self", then
+						 * return it as a character token the same way
+						 * that the "self" rule would have.
+						 */
+						if (nchars == 1 &&
+							strchr(",()[].;:+-*/%^<>=", yytext[0]))
+							return yytext[0];
+					}
+
+					/*
+					 * Complain if operator is too long.  Unlike the case
+					 * for identifiers, we make this an error not a notice-
+					 * and-truncate, because the odds are we are looking at
+					 * a syntactic mistake anyway.
+					 */
+					if (nchars >= NAMEDATALEN)
+						yyerror("operator too long");
+
+					yylval->str = pstrdup(yytext);
+					return Op;
+				}
+<SPARQL><<EOF>>		{ SET_YYLLOC();
+					yyterminate(); }
+<SPARQL>(.)		{
+					BEGIN(INITIAL);
+					SET_YYLLOC();
+					return yytext[0];
+				}	
 <<EOF>>			{
 					SET_YYLLOC();
 					yyterminate();
@@ -1129,22 +1489,60 @@ void
 scanner_yyerror(const char *message, core_yyscan_t yyscanner)
 {
 	const char *loc = yyextra->scanbuf + *yylloc;
-
-	if (*loc == YY_END_OF_BUFFER_CHAR)
-	{
-		ereport(ERROR,
+	u_sess->plsql_cxt.have_error = true; 
+    int errstate = 0;
+	int lines = 0;
+	int rc = CompileWhich();
+#ifndef ENABLE_MULTIPLE_NODES
+        if (rc != PLPGSQL_COMPILE_NULL && u_sess->attr.attr_common.plsql_show_all_error) {
+            lines = GetProcedureLineNumberInPackage(u_sess->plsql_cxt.curr_compile_context->core_yy->scanbuf, u_sess->plsql_cxt.plpgsql_yylloc);
+            addErrorList(message, lines);
+        }
+        if (u_sess->attr.attr_common.plsql_show_all_error && rc != PLPGSQL_COMPILE_NULL) {
+            errstate = NOTICE;
+        } else {
+            errstate = ERROR;
+        }
+#else
+        errstate = ERROR;
+#endif 
+    if (rc == PLPGSQL_COMPILE_PACKAGE_PROC) {
+		PLpgSQL_function* func = u_sess->plsql_cxt.curr_compile_context->plpgsql_curr_compile;
+		if (*loc == YY_END_OF_BUFFER_CHAR)
+		{
+            ereport(errstate,
+                (errmodule(MOD_PLSQL), errcode(ERRCODE_SYNTAX_ERROR),
+                    errmsg("%s at end of input when compile function %s", _(message), func->fn_signature),
+                    errdetail("syntax error"),
+                    errcause("The package declaration contains a character string error."),
+                    erraction("Check character string")));
+		}
+		else
+		{
+            ereport(errstate,
+                (errmodule(MOD_PLSQL), errcode(ERRCODE_SYNTAX_ERROR),
+                    errmsg("%s at or near \"%s\" when compile function %s", _(message), loc, func->fn_signature),
+                    errdetail("syntax error"),
+                    errcause("The package declaration contains a character string error."),
+                    erraction("Check character string")));
+		}
+	} else {
+		if (*loc == YY_END_OF_BUFFER_CHAR)
+		{
+			ereport(errstate,
 				(errcode(ERRCODE_SYNTAX_ERROR),
 				 /* translator: %s is typically the translation of "syntax error" */
 				 errmsg("%s at end of input", _(message)),
 				 lexer_errposition()));
-	}
-	else
-	{
-		ereport(ERROR,
+		}
+		else
+		{
+			ereport(errstate,
 				(errcode(ERRCODE_SYNTAX_ERROR),
 				 /* translator: first %s is typically the translation of "syntax error" */
 				 errmsg("%s at or near \"%s\"", _(message), loc),
 				 lexer_errposition()));
+		}
 	}
 }
 
@@ -1177,6 +1575,9 @@ scanner_init(const char *str,
 	yyext->dolqstart = NULL;
 	yyext->is_hint_str = false;
 	yyext->parameter_list = NIL;
+	yyext->include_ora_comment = false;
+	yyext->func_param_begin = 0;
+	yyext->func_param_end = 0;
 
 	/*
 	 * Make a scan buffer with special termination needed by flex.
@@ -1192,6 +1593,10 @@ scanner_init(const char *str,
 	yyext->literalbuf = (char *) palloc(yyext->literalalloc);
 	yyext->literallen = 0;
 	yyext->warnOnTruncateIdent = true;
+
+    /* plpgsql keyword params */
+    yyext->isPlpgsqlKeyWord = false;
+    yyext->plKeywordValue = NULL;
 
 	// Added CALL for procedure and function
 	getDynaParamSeq("init", true, true, NULL);
@@ -1639,6 +2044,8 @@ getDynaParamSeq(const char *string, bool initflag, bool placeholder, core_yyscan
 
 	if (initflag)
 	{ 
+		u_sess->parser_cxt.is_load_copy = false;
+		u_sess->parser_cxt.col_list = NULL;
 		u_sess->parser_cxt.has_dollar = false;
 		u_sess->parser_cxt.has_placeholder = false;
 		return 0;
@@ -1661,6 +2068,12 @@ getDynaParamSeq(const char *string, bool initflag, bool placeholder, core_yyscan
 				errmsg("It is forbidden to use placeholder and dollar quoting together.")));
 
 
+	if(u_sess->parser_cxt.is_load_copy == true){
+		if (yyextra->ident_quoted)
+			u_sess->parser_cxt.copy_fieldname = pstrdup(string);
+		else
+			u_sess->parser_cxt.copy_fieldname = pg_strtolower(pstrdup(string));
+	}
 	foreach(cell, yyextra->parameter_list)
 	{
 		result++;
@@ -1746,4 +2159,16 @@ is_trans_stmt(const char *haystack, int haystack_len)
 	 *    it is a anaynomous block stmt
 	 */
 	return found_non_blank_char ? false : true;
+}
+
+void addErrorList(const char* message, int lines)
+{
+    PLpgSQL_error* erritem;
+    MemoryContext oldcxt;
+    oldcxt = MemoryContextSwitchTo(SESS_GET_MEM_CXT_GROUP(MEMORY_CONTEXT_OPTIMIZER));
+    erritem = (PLpgSQL_error*)palloc(sizeof(PLpgSQL_error));
+    erritem->errmsg = pstrdup(message);
+    erritem->line = lines;
+    u_sess->plsql_cxt.errorList = lappend(u_sess->plsql_cxt.errorList, erritem);
+    MemoryContextSwitchTo(oldcxt);
 }

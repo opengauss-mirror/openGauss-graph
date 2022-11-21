@@ -320,6 +320,13 @@ const PGLZ_Strategy* const PGLZ_strategy_always = &strategy_always_data;
 #define HIST_START_LEN (sizeof(PGLZ_HistEntry*) * PGLZ_HISTORY_LISTS)
 #define HIST_ENTRIES_LEN (sizeof(PGLZ_HistEntry) * PGLZ_HISTORY_SIZE)
 
+#ifndef FRONTEND
+#define hist_start (u_sess->utils_cxt.hist_start)
+#define hist_entries (u_sess->utils_cxt.hist_entries)
+#else
+static PGLZ_HistEntry *hist_start[PGLZ_HISTORY_LISTS];
+static PGLZ_HistEntry hist_entries[PGLZ_HISTORY_SIZE];
+#endif
 /* ----------
  * pglz_find_match -
  *
@@ -498,7 +505,7 @@ bool pglz_compress(const char* source, int32 slen, PGLZ_Header* dest, const PGLZ
      * Initialize the history lists to empty.  We do not need to zero the
      * u_sess->utils_cxt.hist_entries[] array; its entries are initialized as they are used.
      */
-    errno_t rc = memset_s(u_sess->utils_cxt.hist_start, HIST_START_LEN, 0, HIST_START_LEN);
+    errno_t rc = memset_s(hist_start, HIST_START_LEN, 0, HIST_START_LEN);
     securec_check(rc, "\0", "\0");
 
     /*
@@ -527,7 +534,7 @@ bool pglz_compress(const char* source, int32 slen, PGLZ_Header* dest, const PGLZ
         /*
          * Try to find a match in the history
          */
-        if (pglz_find_match(u_sess->utils_cxt.hist_start, dp, dend, &match_len, &match_off, good_match, good_drop)) {
+        if (pglz_find_match(hist_start, dp, dend, &match_len, &match_off, good_match, good_drop)) {
             /*
              * Create the tag and add history entries for all matched
              * characters.
@@ -535,7 +542,7 @@ bool pglz_compress(const char* source, int32 slen, PGLZ_Header* dest, const PGLZ
             pglz_out_tag(ctrlp, ctrlb, ctrl, bp, match_len, match_off);
             while (match_len--) {
                 pglz_hist_add(
-                    u_sess->utils_cxt.hist_start, u_sess->utils_cxt.hist_entries, hist_next, hist_recycle, dp, dend);
+                    hist_start, hist_entries, hist_next, hist_recycle, dp, dend);
                 dp++; /* Do not do this ++ in the line above! */
                       /* The macro would do it four times - Jan.	*/
             }
@@ -546,7 +553,7 @@ bool pglz_compress(const char* source, int32 slen, PGLZ_Header* dest, const PGLZ
              */
             pglz_out_literal(ctrlp, ctrlb, ctrl, bp, *dp);
             pglz_hist_add(
-                u_sess->utils_cxt.hist_start, u_sess->utils_cxt.hist_entries, hist_next, hist_recycle, dp, dend);
+                hist_start, hist_entries, hist_next, hist_recycle, dp, dend);
             dp++; /* Do not do this ++ in the line above! */
                   /* The macro would do it four times - Jan.	*/
         }
@@ -575,7 +582,7 @@ bool pglz_compress(const char* source, int32 slen, PGLZ_Header* dest, const PGLZ
  *		Decompresses source into dest.
  * ----------
  */
-void pglz_decompress(const PGLZ_Header* source, char* dest)
+int32 pglz_decompress(const PGLZ_Header* source, char* dest)
 {
     const unsigned char* sp = NULL;
     const unsigned char* srcend = NULL;
@@ -657,10 +664,16 @@ void pglz_decompress(const PGLZ_Header* source, char* dest)
     /*
      * Check we decompressed the right amount.
      */
-    if (dp != destend || sp != srcend)
+    if (dp != destend || sp != srcend) {
+#ifndef FRONTEND
         ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED), errmsg("compressed data is corrupt")));
+#else
+        return -1;
+#endif
+    }
 
     /*
      * That's it.
      */
+    return (char*) dp - dest;
 }

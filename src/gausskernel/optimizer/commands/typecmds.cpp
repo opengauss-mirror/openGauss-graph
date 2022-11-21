@@ -6,6 +6,7 @@
  * Portions Copyright (c) 2020 Huawei Technologies Co.,Ltd.
  * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
+ * Portions Copyright (c) 2021, openGauss Contributors
  *
  *
  * IDENTIFICATION
@@ -39,6 +40,7 @@
 #include "access/xact.h"
 #include "catalog/catalog.h"
 #include "catalog/dependency.h"
+#include "catalog/gs_package.h"
 #include "catalog/heap.h"
 #include "catalog/indexing.h"
 #include "catalog/pg_authid.h"
@@ -51,8 +53,10 @@
 #include "catalog/pg_proc.h"
 #include "catalog/pg_proc_fn.h"
 #include "catalog/pg_range.h"
+#include "catalog/pg_synonym.h"
 #include "catalog/pg_type.h"
 #include "catalog/pg_type_fn.h"
+#include "catalog/gs_db_privilege.h"
 #include "commands/defrem.h"
 #include "commands/tablecmds.h"
 #include "commands/typecmds.h"
@@ -66,6 +70,7 @@
 #include "parser/parse_expr.h"
 #include "parser/parse_func.h"
 #include "parser/parse_type.h"
+#include "storage/tcap.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
@@ -161,7 +166,6 @@ void DefineType(List* names, List* parameters)
     Oid resulttype;
     ListCell* pl = NULL;
     Oid typowner = InvalidOid;
-    AclResult aclresult;
 
     /*
      * isalter is true, change the owner of the objects as the owner of the
@@ -182,8 +186,13 @@ void DefineType(List* names, List* parameters)
      */
     /* Convert list of names to a name and namespace */
     typeNamespace = QualifiedNameGetCreationNamespace(names, &typname);
+    /*
+     * anyResult is true, explain that the current user is granted create any type permission
+     */
+    bool anyResult = CheckCreatePrivilegeInNamespace(typeNamespace, GetUserId(), CREATE_ANY_TYPE);
+
     if (u_sess->attr.attr_sql.enforce_a_behavior) {
-        typowner = GetUserIdFromNspId(typeNamespace);
+        typowner = GetUserIdFromNspId(typeNamespace, false, anyResult);
 
         if (!OidIsValid(typowner))
             typowner = GetUserId();
@@ -193,15 +202,9 @@ void DefineType(List* names, List* parameters)
     } else {
         typowner = GetUserId();
     }
-    /* XXX this is unnecessary given the superuser check above */
-    /* Check we have creation rights in target namespace */
-    aclresult = pg_namespace_aclcheck(typeNamespace, GetUserId(), ACL_CREATE);
-    if (aclresult != ACLCHECK_OK)
-        aclcheck_error(aclresult, ACL_KIND_NAMESPACE, get_namespace_name(typeNamespace));
+
     if (isalter) {
-        aclresult = pg_namespace_aclcheck(typeNamespace, typowner, ACL_CREATE);
-        if (aclresult != ACLCHECK_OK)
-            aclcheck_error(aclresult, ACL_KIND_NAMESPACE, get_namespace_name(typeNamespace));
+        (void)CheckCreatePrivilegeInNamespace(typeNamespace, typowner, CREATE_ANY_TYPE);
     }
 
     /*
@@ -1037,9 +1040,15 @@ void DefineEnum(CreateEnumStmt* stmt)
 
     /* Convert list of names to a name and namespace */
     enumNamespace = QualifiedNameGetCreationNamespace(stmt->typname, &enumName);
-
+    /*
+     * anyResult is true, explain that the current user is granted create any type permission
+     */
+    bool anyResult = false;
+    if (!IsSysSchema(enumNamespace)) {
+        anyResult = HasSpecAnyPriv(GetUserId(), CREATE_ANY_TYPE, false);
+    }
     if (u_sess->attr.attr_sql.enforce_a_behavior) {
-        typowner = GetUserIdFromNspId(enumNamespace);
+        typowner = GetUserIdFromNspId(enumNamespace, false, anyResult);
 
         if (!OidIsValid(typowner))
             typowner = GetUserId();
@@ -1050,12 +1059,10 @@ void DefineEnum(CreateEnumStmt* stmt)
     }
     /* Check we have creation rights in target namespace */
     aclresult = pg_namespace_aclcheck(enumNamespace, GetUserId(), ACL_CREATE);
-    if (aclresult != ACLCHECK_OK)
+    if (aclresult != ACLCHECK_OK && !anyResult)
         aclcheck_error(aclresult, ACL_KIND_NAMESPACE, get_namespace_name(enumNamespace));
     if (isalter) {
-        aclresult = pg_namespace_aclcheck(enumNamespace, typowner, ACL_CREATE);
-        if (aclresult != ACLCHECK_OK)
-            aclcheck_error(aclresult, ACL_KIND_NAMESPACE, get_namespace_name(enumNamespace));
+        (void)CheckCreatePrivilegeInNamespace(enumNamespace, typowner, CREATE_ANY_TYPE);
     }
 
     /*
@@ -1237,24 +1244,31 @@ void DefineRange(CreateRangeStmt* stmt)
 
     /* Convert list of names to a name and namespace */
     typeNamespace = QualifiedNameGetCreationNamespace(stmt->typname, &typname);
+    /*
+     * anyResult is true, explain that the current user is granted create any typepermission
+     */
+    bool anyResult = false;
+    if (!IsSysSchema(typeNamespace)) {
+        anyResult = HasSpecAnyPriv(GetUserId(), CREATE_ANY_TYPE, false);
+    }
     if (u_sess->attr.attr_sql.enforce_a_behavior) {
-        typowner = GetUserIdFromNspId(typeNamespace);
+        typowner = GetUserIdFromNspId(typeNamespace, false, anyResult);
 
-        if (!OidIsValid(typowner))
+        if (!OidIsValid(typowner)) {
             typowner = GetUserId();
-        else if (typowner != GetUserId())
+        }
+        else if (typowner != GetUserId()) {
             isalter = true;
+        }
     } else {
         typowner = GetUserId();
     }
     /* Check we have creation rights in target namespace */
     aclresult = pg_namespace_aclcheck(typeNamespace, GetUserId(), ACL_CREATE);
-    if (aclresult != ACLCHECK_OK)
+    if (aclresult != ACLCHECK_OK && !anyResult)
         aclcheck_error(aclresult, ACL_KIND_NAMESPACE, get_namespace_name(typeNamespace));
     if (isalter) {
-        aclresult = pg_namespace_aclcheck(typeNamespace, typowner, ACL_CREATE);
-        if (aclresult != ACLCHECK_OK)
-            aclcheck_error(aclresult, ACL_KIND_NAMESPACE, get_namespace_name(typeNamespace));
+        (void)CheckCreatePrivilegeInNamespace(typeNamespace, typowner, CREATE_ANY_TYPE);
     }
 
     /*
@@ -1474,6 +1488,7 @@ static void makeRangeConstructors(const char* name, Oid nmspace, Oid rangeOid, O
          */
         procOid = ProcedureCreate(name, /* name: same as range type */
             nmspace,                    /* namespace */
+            InvalidOid,                 /* package oid default invalid oid*/
             false,                      /* not A db compatible */
             false,                      /* replace */
             false,                      /* returns set */
@@ -1501,7 +1516,8 @@ static void makeRangeConstructors(const char* name, Oid nmspace, Oid rangeOid, O
             false,
             false,
             false,
-            false);
+            false,
+            NULL);
 
         /*
          * Make the constructors internally-dependent on the range type so
@@ -1768,7 +1784,7 @@ static Oid findRangeSubOpclass(List* opcname, Oid subtype)
     Oid opInputType;
 
     if (opcname != NIL) {
-        opcid = get_opclass_oid(BTREE_AM_OID, opcname, false);
+        opcid = get_opclass_oid(BTREE_AM_OID, opcname, false); 
 
         /*
          * Verify that the operator class accepts this datatype. Note we will
@@ -1782,7 +1798,7 @@ static Oid findRangeSubOpclass(List* opcname, Oid subtype)
                         NameListToString(opcname),
                         format_type_be(subtype))));
     } else {
-        opcid = GetDefaultOpClass(subtype, BTREE_AM_OID);
+        opcid = GetDefaultOpClass(subtype, BTREE_AM_OID); 
         if (!OidIsValid(opcid)) {
             /* We spell the error message identically to GetIndexOpClass */
             ereport(ERROR,
@@ -1904,6 +1920,132 @@ Oid AssignTypeArrayOid(void)
     return type_array_oid;
 }
 
+/*
+ * DefineRange
+ *		Registers a new table of type.
+ * create typy A as table of B, there are B and _B in pg_type
+ * add oid of _B in element
+ */
+void DefineTableOfType(const TableOfTypeStmt* stmt)
+{
+    char* typname = NULL;
+    Oid typeNamespace;
+    Oid typoid;
+    AclResult aclresult;
+    Oid typowner = InvalidOid;
+    /*
+     * isalter is true, change the owner of the objects as the owner of the
+     * namespace, if the owner of the namespce has the same name as the namescpe
+     */
+    bool isalter = false;
+
+    /* Convert list of names to a name and namespace */
+    typeNamespace = QualifiedNameGetCreationNamespace(stmt->typname, &typname);
+    if (u_sess->attr.attr_sql.enforce_a_behavior) {
+        typowner = GetUserIdFromNspId(typeNamespace);
+
+        if (!OidIsValid(typowner))
+            typowner = GetUserId();
+        else if (typowner != GetUserId())
+            isalter = true;
+    } else {
+        typowner = GetUserId();
+    }
+    /* Check we have creation rights in target namespace */
+    aclresult = pg_namespace_aclcheck(typeNamespace, GetUserId(), ACL_CREATE);
+    if (aclresult != ACLCHECK_OK)
+        aclcheck_error(aclresult, ACL_KIND_NAMESPACE, get_namespace_name(typeNamespace));
+    if (isalter) {
+        aclresult = pg_namespace_aclcheck(typeNamespace, typowner, ACL_CREATE);
+        if (aclresult != ACLCHECK_OK)
+            aclcheck_error(aclresult, ACL_KIND_NAMESPACE, get_namespace_name(typeNamespace));
+    }
+
+    /*
+     * Check for collision with an existing type name.	If there is one and
+     * it's an autogenerated array, we can rename it out of the way.
+     */
+    typoid = GetSysCacheOid2(TYPENAMENSP, CStringGetDatum(typname), ObjectIdGetDatum(typeNamespace));
+    if (OidIsValid(typoid)) {
+        if (!moveArrayTypeName(typoid, typname, typeNamespace))
+            ereport(ERROR, (errcode(ERRCODE_DUPLICATE_OBJECT), errmsg("type \"%s\" already exists", typname)));
+    }
+
+    /* look up the referenced type name */
+    Oid typeOid = typenameTypeId(NULL, stmt->reftypname);
+    /* Must have a referenced type */
+    if (!OidIsValid(typeOid))
+        ereport(ERROR, (errcode(ERRCODE_SYNTAX_ERROR), errmsg("referenced type does not exist")));
+
+#ifndef ENABLE_MULTIPLE_NODES
+    /* don't allow package or procedure type as table of base type */
+    if (IsPackageDependType(typeOid, InvalidOid)) {
+        ereport(ERROR,
+            (errcode(ERRCODE_WRONG_OBJECT_TYPE),
+                errmodule(MOD_PLSQL),
+                errmsg("type %s doesn't support table type.", TypeNameToString(stmt->reftypname)),
+                errdetail("\"%s\" is a package or procedure type", TypeNameToString(stmt->reftypname)),
+                errcause("feature not supported"),
+                erraction("check type name")));
+    }
+#endif
+    
+    HeapTuple type_tup = SearchSysCache1(TYPEOID, ObjectIdGetDatum(typeOid));
+    if (!HeapTupleIsValid(type_tup)) {
+        ereport(ERROR,
+            (errmodule(MOD_PLSQL),
+                errcode(ERRCODE_CACHE_LOOKUP_FAILED),
+                errmsg("cache lookup failed for type %u, type Oid is invalid", typeOid)));
+    }
+
+    if (((Form_pg_type)GETSTRUCT(type_tup))->typtype == TYPTYPE_TABLEOF) {
+        ereport(ERROR,
+            (errcode(ERRCODE_WRONG_OBJECT_TYPE),
+                errmsg("table type does not support nested table.")));
+    }
+
+    Oid refTypeOid = ((Form_pg_type)GETSTRUCT(type_tup))->typarray;
+    if (!OidIsValid(refTypeOid)) {
+        ereport(ERROR,
+            (errcode(ERRCODE_WRONG_OBJECT_TYPE),
+                errmsg("type %s doesn't support table type.", (((Form_pg_type)GETSTRUCT(type_tup))->typname).data)));
+    }
+    ReleaseSysCache(type_tup);
+
+    /* Create the pg_type entry */
+    typoid = TypeCreate(InvalidOid, /* no predetermined type OID */
+        typname,                    /* type name */
+        typeNamespace,              /* namespace */
+        InvalidOid,                 /* relation oid (n/a here) */
+        0,                          /* relation kind (ditto) */
+        typowner,                   /* owner's ID */
+        -1,                         /* internal size (always varlena) */
+        TYPTYPE_TABLEOF,            /* type-type (table of type) */
+        TYPCATEGORY_TABLEOF,        /* type-category (table of type) */
+        false,                      /* table of types are never preferred */
+        DEFAULT_TYPDELIM,           /* array element delimiter */
+        F_ARRAY_IN,                 /* array input proc */
+        F_ARRAY_OUT,                /* array output proc */
+        F_ARRAY_RECV,               /* array recv (bin) proc */
+        F_ARRAY_SEND,               /* array send (bin) proc */
+        InvalidOid,                 /* typmodin procedure - none */
+        InvalidOid,                 /* typmodout procedure - none */
+        F_ARRAY_TYPANALYZE,         /* array analyze procedure */
+        refTypeOid,                 /* element type ID - none */
+        false,                      /* this is not an array type */
+        InvalidOid,                 /* array type we are about to create */
+        InvalidOid,                 /* base type ID (only for domains) */
+        NULL,                       /* never a default type value */
+        NULL,                       /* no binary form available either */
+        false,                      /* never passed by value */
+        'd',                        /* alignment */
+        'x',                        /* TOAST strategy (always extended) */
+        -1,                         /* typMod (Domains only) */
+        0,                          /* Array dimensions of typbasetype */
+        false,                      /* Type NOT NULL */
+        InvalidOid);                /* type's collation (ranges never have one) */
+}
+
 /* -------------------------------------------------------------------
  * DefineCompositeType
  *
@@ -1944,7 +2086,7 @@ Oid DefineCompositeType(RangeVar* typevar, List* coldeflist)
      * check is here mainly to get a better error message about a "type"
      * instead of below about a "relation".
      */
-    typeNamespace = RangeVarGetAndCheckCreationNamespace(createStmt->relation, NoLock, NULL);
+    typeNamespace = RangeVarGetAndCheckCreationNamespace(createStmt->relation, NoLock, NULL, RELKIND_COMPOSITE_TYPE);
     RangeVarAdjustRelationPersistence(createStmt->relation, typeNamespace);
     old_type_oid =
         GetSysCacheOid2(TYPENAMENSP, CStringGetDatum(createStmt->relation->relname), ObjectIdGetDatum(typeNamespace));
@@ -2952,6 +3094,8 @@ void RenameType(RenameStmt* stmt)
         ereport(ERROR, (errcode(ERRCODE_CACHE_LOOKUP_FAILED), errmsg("cache lookup failed for type %u", typeOid)));
     typTup = (Form_pg_type)GETSTRUCT(tup);
 
+    TrForbidAccessRbObject(TypeRelationId, typeOid, NameStr(typTup->typname));
+
     /* check permissions on type */
     AclResult aclresult = pg_type_aclcheck(typeOid, GetUserId(), ACL_ALTER);
     if (aclresult != ACLCHECK_OK && !pg_type_ownercheck(typeOid, GetUserId())) {
@@ -2980,6 +3124,19 @@ void RenameType(RenameStmt* stmt)
                 errmsg("cannot alter array type %s", format_type_be(typeOid)),
                 errhint("You can alter type %s, which will alter the array type as well.",
                     format_type_be(typTup->typelem))));
+
+#ifndef ENABLE_MULTIPLE_NODES
+    /* don't allow to alter package or procedure type */
+    if (IsPackageDependType(typeTypeId(tup), InvalidOid)) {
+        ereport(ERROR,
+            (errcode(ERRCODE_WRONG_OBJECT_TYPE),
+                errmodule(MOD_PLSQL),
+                errmsg("Not allowed to alter type \"%s\"", TypeNameToString(typname)),
+                errdetail("\"%s\" is a package or procedure type", TypeNameToString(typname)),
+                errcause("feature not supported"),
+                erraction("check type name")));
+    }
+#endif
 
     /*
      * If type is composite we need to rename associated pg_class entry too.
@@ -3019,6 +3176,8 @@ void AlterTypeOwner(List* names, Oid newOwnerId, ObjectType objecttype)
             (errcode(ERRCODE_UNDEFINED_OBJECT), errmsg("type \"%s\" does not exist", TypeNameToString(typname))));
     typeOid = typeTypeId(tup);
 
+    TrForbidAccessRbObject(TypeRelationId, typeOid, NameStr(((Form_pg_type)GETSTRUCT(tup))->typname));
+
     /* Copy the syscache entry so we can scribble on it below */
     newtup = (HeapTuple)tableam_tops_copy_tuple(tup);
     ReleaseSysCache(tup);
@@ -3047,6 +3206,19 @@ void AlterTypeOwner(List* names, Oid newOwnerId, ObjectType objecttype)
                 errmsg("cannot alter array type %s", format_type_be(typeOid)),
                 errhint("You can alter type %s, which will alter the array type as well.",
                     format_type_be(typTup->typelem))));
+
+#ifndef ENABLE_MULTIPLE_NODES
+    /* don't allow to alter package or procedure type */
+    if (IsPackageDependType(typeTypeId(tup), InvalidOid)) {
+        ereport(ERROR,
+            (errcode(ERRCODE_WRONG_OBJECT_TYPE),
+                errmodule(MOD_PLSQL),
+                errmsg("Not allowed to alter type \"%s\"", TypeNameToString(typname)),
+                errdetail("\"%s\" is a package or procedure type", TypeNameToString(typname)),
+                errcause("feature not supported"),
+                erraction("check type name")));
+    }
+#endif
 
     /*
      * If the new owner is the same as the existing owner, consider the
@@ -3146,6 +3318,99 @@ void AlterTypeOwnerInternal(Oid typeOid, Oid newOwnerId, bool hasDependEntry)
 }
 
 /*
+ * AlterTypeOwnerByPkg - change package type owner
+ *
+ * This is currently only used to propagate ALTER PACKAGE OWNER to a
+ * package. Package will build types, and add to pg_type.
+ * It assumes the caller has done all needed checks.
+ */
+void AlterTypeOwnerByPkg(Oid pkgOid, Oid newOwnerId)
+{
+    if (!OidIsValid(pkgOid)) {
+        return;
+    }
+
+    Relation depRel;
+    ScanKeyData key[2];
+    SysScanDesc scan;
+    HeapTuple tup;
+    const int keyNumber = 2;
+    bool isPkgDepTyp = false;
+    Form_pg_depend depTuple = NULL;
+
+    depRel = heap_open(DependRelationId, RowExclusiveLock);
+    ScanKeyInit(&key[0], Anum_pg_depend_refclassid,
+        BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(PackageRelationId));
+    ScanKeyInit(&key[1], Anum_pg_depend_refobjid,
+        BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(pkgOid));
+    scan = systable_beginscan(depRel, DependReferenceIndexId, true, NULL, keyNumber, key);
+
+    while (HeapTupleIsValid(tup = systable_getnext(scan))) {
+        depTuple = (Form_pg_depend)GETSTRUCT(tup);
+        isPkgDepTyp = (depTuple->deptype == DEPENDENCY_AUTO) &&
+            (depTuple->classid == TypeRelationId || depTuple->classid == PgSynonymRelationId);
+        if (!isPkgDepTyp) {
+            continue;
+        }
+        if (depTuple->classid == TypeRelationId) {
+            AlterTypeOwnerInternal(depTuple->objid, newOwnerId, false);
+        } else {
+            AlterSynonymOwnerByOid(depTuple->objid, newOwnerId);
+        }
+    }
+
+    systable_endscan(scan);
+    heap_close(depRel, RowExclusiveLock);
+    return;
+}
+
+/*
+ * AlterTypeOwnerByFunc - change func type owner
+ *
+ * This is currently only used to propagate ALTER FUNCTION OWNER
+ * Procedure will build types when the type is nested, and add to pg_type.
+ * It assumes the caller has done all needed checks.
+ */
+void AlterTypeOwnerByFunc(Oid funcOid, Oid newOwnerId)
+{
+#ifdef ENABLE_MULTIPLE_NODES
+    /* procedure type will only be build in centralized mode */
+    return;
+#endif
+    if (!OidIsValid(funcOid)) {
+        return;
+    }
+
+    Relation depRel;
+    ScanKeyData key[2];
+    SysScanDesc scan;
+    HeapTuple tup;
+    const int keyNumber = 2;
+    bool isFuncDepTyp = false;
+    Form_pg_depend depTuple = NULL;
+
+    depRel = heap_open(DependRelationId, RowExclusiveLock);
+    ScanKeyInit(&key[0], Anum_pg_depend_refclassid,
+        BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(ProcedureRelationId));
+    ScanKeyInit(&key[1], Anum_pg_depend_refobjid,
+        BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(funcOid));
+    scan = systable_beginscan(depRel, DependReferenceIndexId, true, NULL, keyNumber, key);
+
+    while (HeapTupleIsValid(tup = systable_getnext(scan))) {
+        depTuple = (Form_pg_depend)GETSTRUCT(tup);
+        isFuncDepTyp = (depTuple->deptype == DEPENDENCY_AUTO) && depTuple->classid == TypeRelationId;
+        if (!isFuncDepTyp) {
+            continue;
+        }
+        AlterTypeOwnerInternal(depTuple->objid, newOwnerId, false);
+    }
+
+    systable_endscan(scan);
+    heap_close(depRel, RowExclusiveLock);
+    return;
+}
+
+/*
  * Execute ALTER TYPE SET SCHEMA
  */
 void AlterTypeNamespace(List* names, const char* newschema, ObjectType objecttype)
@@ -3158,6 +3423,21 @@ void AlterTypeNamespace(List* names, const char* newschema, ObjectType objecttyp
     /* Make a TypeName so we can use standard type lookup machinery */
     typname = makeTypeNameFromNameList(names);
     typeOid = typenameTypeId(NULL, typname);
+
+#ifndef ENABLE_MULTIPLE_NODES
+    /* don't allow to alter package or procedure type */
+    if (IsPackageDependType(typeOid, InvalidOid)) {
+        ereport(ERROR,
+            (errcode(ERRCODE_WRONG_OBJECT_TYPE),
+                errmodule(MOD_PLSQL),
+                errmsg("Not allowed to alter type \"%s\"", TypeNameToString(typname)),
+                errdetail("\"%s\" is a package or procedure type", TypeNameToString(typname)),
+                errcause("feature not supported"),
+                erraction("check type name")));
+    }
+#endif
+
+    TrForbidAccessRbObject(TypeRelationId, typeOid);
 
     /* Don't allow ALTER DOMAIN on a type */
     if (objecttype == OBJECT_DOMAIN && get_typtype(typeOid) != TYPTYPE_DOMAIN)
@@ -3251,7 +3531,6 @@ Oid AlterTypeNamespaceInternal(
     /* Detect whether type is a composite type (but not a table rowtype) */
     isCompositeType =
         (typform->typtype == TYPTYPE_COMPOSITE && get_rel_relkind(typform->typrelid) == RELKIND_COMPOSITE_TYPE);
-
     /* Enforce not-table-type if requested */
     if (typform->typtype == TYPTYPE_COMPOSITE && !isCompositeType && errorOnTableType)
         ereport(ERROR,

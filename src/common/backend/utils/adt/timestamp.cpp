@@ -5,6 +5,7 @@
  *
  * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
+ * Portions Copyright (c) 2021, openGauss Contributors
  *
  *
  * IDENTIFICATION
@@ -143,7 +144,8 @@ void CheckTimeValidity(struct pg_tm* tm);
 static int WhetherFebLeapYear(struct pg_tm* tm);
 static int WhetherSmallMon(struct pg_tm* tm);
 static int WhetherBigMon(struct pg_tm* tm);
-static int daydiff_timestamp(const struct pg_tm* tm, const struct pg_tm* tm1, const struct pg_tm* tm2);
+static int daydiff_timestamp(const struct pg_tm* tm, const struct pg_tm* tm1, const struct pg_tm* tm2,
+                             bool day_fix = false);
 
 void timestamp_FilpSign(pg_tm* tm);
 void timestamp_CalculateFields(TimestampTz* dt1, TimestampTz* dt2, fsec_t* fsec, pg_tm* tm, pg_tm* tm1, pg_tm* tm2);
@@ -678,7 +680,7 @@ Datum timestamp_transform(PG_FUNCTION_ARGS)
 
 /* timestamp_scale()
  * Adjust time type for specified scale factor.
- * Used by PostgreSQL type system to stuff columns.
+ * Used by openGauss type system to stuff columns.
  */
 Datum timestamp_scale(PG_FUNCTION_ARGS)
 {
@@ -897,7 +899,7 @@ Datum timestamptztypmodout(PG_FUNCTION_ARGS)
 
 /* timestamptz_scale()
  * Adjust time type for specified scale factor.
- * Used by PostgreSQL type system to stuff columns.
+ * Used by openGauss type system to stuff columns.
  */
 Datum timestamptz_scale(PG_FUNCTION_ARGS)
 {
@@ -1257,7 +1259,7 @@ Datum interval_transform(PG_FUNCTION_ARGS)
 
 /* interval_scale()
  * Adjust interval type for specified fields.
- * Used by PostgreSQL type system to stuff columns.
+ * Used by openGauss type system to stuff columns.
  */
 Datum interval_scale(PG_FUNCTION_ARGS)
 {
@@ -1426,6 +1428,14 @@ static void AdjustIntervalForTypmod(Interval* interval, int32 typmod)
     }
 }
 
+#ifdef GS_GRAPH
+/* Make the EncodeSpecialTimestamp() callable from other files */
+void call_EncodeSpecialTimestamp(Timestamp dt, char* str) 
+{
+    EncodeSpecialTimestamp(dt, str);
+}
+#endif /* GS_GRAPH */
+
 /* EncodeSpecialTimestamp()
  * Convert reserved timestamp data type to string.
  */
@@ -1569,7 +1579,7 @@ bool TimestampDifferenceExceeds(TimestampTz start_time, TimestampTz stop_time, i
 /*
  * Convert a time_t to TimestampTz.
  *
- * We do not use time_t internally in Postgres, but this is provided for use
+ * We do not use time_t internally in openGauss, but this is provided for use
  * by functions that need to interpret, say, a stat(2) result.
  *
  * To avoid having the function's ABI vary depending on the width of time_t,
@@ -3197,7 +3207,7 @@ Datum interval_avg(PG_FUNCTION_ARGS)
  * @in tm1 : timestmap1
  * @in tm2 : timestamp2
  */
-static int daydiff_timestamp(const struct pg_tm* tm, const struct pg_tm* tm1, const struct pg_tm* tm2)
+static int daydiff_timestamp(const struct pg_tm* tm, const struct pg_tm* tm1, const struct pg_tm* tm2, bool day_fix)
 {
     int result = 0;
     int tm1_days_of_year = 0, tm2_days_of_year = 0;
@@ -3259,6 +3269,18 @@ static int daydiff_timestamp(const struct pg_tm* tm, const struct pg_tm* tm1, co
     }
     result = tm1_days_of_year - tm2_days_of_year;
 
+    if (!day_fix) {
+        return result;
+    }
+
+    int tm1_secs_of_day = tm1->tm_hour * 60 * 60 + tm1->tm_min * 60 + tm1->tm_sec;
+    int tm2_secs_of_day = tm2->tm_hour * 60 * 60 + tm2->tm_min * 60 + tm2->tm_sec;
+
+    if (result < 0 && tm1_secs_of_day > tm2_secs_of_day) {
+        return result + 1;
+    } else if (result > 0 && tm1_secs_of_day < tm2_secs_of_day) {
+        return result - 1;
+    }
     return result;
 }
 
@@ -3271,6 +3293,14 @@ Datum timestamp_diff(PG_FUNCTION_ARGS)
     text* units = PG_GETARG_TEXT_PP(0);
     TimestampTz dt1 = PG_GETARG_TIMESTAMP(2);
     TimestampTz dt2 = PG_GETARG_TIMESTAMP(1);
+    int64 result = PointerGetDatum(0);
+
+    result = timestamp_diff_internal(units, dt1, dt2);
+    PG_RETURN_INT64(result);
+}
+
+int64 timestamp_diff_internal(text *units, TimestampTz dt1, TimestampTz dt2, bool day_fix)
+{
     char* lowunits = NULL;
     int64 result = PointerGetDatum(0);
     int64 sec_result;
@@ -3318,37 +3348,36 @@ Datum timestamp_diff(PG_FUNCTION_ARGS)
                 result = (tm->tm_year * MONTHS_PER_YEAR + tm->tm_mon) / 3;
                 break;
             case DTK_DAY:
-                result = daydiff_timestamp(tm, tm1, tm2);
+                result = daydiff_timestamp(tm, tm1, tm2, day_fix);
                 break;
             case DTK_WEEK:
-                result = daydiff_timestamp(tm, tm1, tm2) / 7;
+                result = daydiff_timestamp(tm, tm1, tm2, day_fix) / 7;
                 break;
             case DTK_HOUR:
 #ifdef HAVE_INT64_TIMESTAMP
-                result = daydiff_timestamp(tm, tm1, tm2) * INT64CONST(24) + tm->tm_hour;
+                result = daydiff_timestamp(tm, tm1, tm2, day_fix) * INT64CONST(24) + tm->tm_hour;
 #else
-                result = daydiff_timestamp(tm, tm1, tm2) * HOURS_PER_DAY + tm->tm_hour;
+                result = daydiff_timestamp(tm, tm1, tm2, day_fix) * HOURS_PER_DAY + tm->tm_hour;
 #endif
                 break;
             case DTK_MINUTE: {
 #ifdef HAVE_INT64_TIMESTAMP
-                result = (daydiff_timestamp(tm, tm1, tm2) * INT64CONST(24) + tm->tm_hour) * INT64CONST(60) + tm->tm_min;
+                result = (daydiff_timestamp(tm, tm1, tm2, day_fix) * INT64CONST(24) + tm->tm_hour) *
+                         INT64CONST(60) + tm->tm_min;
 #else
-                result = (daydiff_timestamp(tm, tm1, tm2) * HOURS_PER_DAY + tm->tm_hour) * (double)MINS_PER_HOUR +
-                         tm->tm_min;
+                result = (daydiff_timestamp(tm, tm1, tm2, day_fix) * HOURS_PER_DAY + tm->tm_hour) *
+                         (double)MINS_PER_HOUR + tm->tm_min;
 #endif
             } break;
             case DTK_SECOND: {
 #ifdef HAVE_INT64_TIMESTAMP
-                result =
-                    ((daydiff_timestamp(tm, tm1, tm2) * INT64CONST(24) + tm->tm_hour) * INT64CONST(60) + tm->tm_min) *
-                        INT64CONST(60) +
-                    tm->tm_sec;
+                result = ((daydiff_timestamp(tm, tm1, tm2, day_fix) * INT64CONST(24) + tm->tm_hour) *
+                             INT64CONST(60) + tm->tm_min) *
+                         INT64CONST(60) + tm->tm_sec;
 #else
-                result = ((daydiff_timestamp(tm, tm1, tm2) * HOURS_PER_DAY + tm->tm_hour) * (double)MINS_PER_HOUR +
-                             tm->tm_min) *
-                             (double)SECS_PER_MINUTE +
-                         tm->tm_sec;
+                result = ((daydiff_timestamp(tm, tm1, tm2, day_fix) * HOURS_PER_DAY + tm->tm_hour) *
+                             (double)MINS_PER_HOUR + tm->tm_min) *
+                         (double)SECS_PER_MINUTE + tm->tm_sec;
 #endif
             } break;
             case DTK_MICROSEC:
@@ -3359,9 +3388,8 @@ Datum timestamp_diff(PG_FUNCTION_ARGS)
                  */
                 {
 #ifdef HAVE_INT64_TIMESTAMP
-                    sec_result = ((daydiff_timestamp(tm, tm1, tm2) * INT64CONST(24) + tm->tm_hour) * INT64CONST(60) +
-                                     tm->tm_min) *
-                                     INT64CONST(60) +
+                    sec_result = ((daydiff_timestamp(tm, tm1, tm2, day_fix) * INT64CONST(24) + tm->tm_hour) *
+                                     INT64CONST(60) + tm->tm_min) * INT64CONST(60) +
                                  tm->tm_sec;
                     if (unlikely((int128)sec_result * INT64CONST(1000000) > (int128)INT64_MAX ||
                                  (int128)sec_result * INT64CONST(1000000) + (int128)fsec > (int128)INT64_MAX ||
@@ -3374,11 +3402,9 @@ Datum timestamp_diff(PG_FUNCTION_ARGS)
                     }
                     result = sec_result * INT64CONST(1000000) + fsec;
 #else
-                    sec_result =
-                        ((daydiff_timestamp(tm, tm1, tm2) * HOURS_PER_DAY + tm->tm_hour) * (double)MINS_PER_HOUR +
-                            tm->tm_min) *
-                            (double)SECS_PER_MINUTE +
-                        tm->tm_sec;
+                    sec_result = ((daydiff_timestamp(tm, tm1, tm2, day_fix) * HOURS_PER_DAY + tm->tm_hour) *
+                                     (double)MINS_PER_HOUR + tm->tm_min) *
+                                 (double)SECS_PER_MINUTE + tm->tm_sec;
                     if (unlikely((int128)sec_result * (double)USECS_PER_SEC > (int128)INT64_MAX ||
                                  (int128)sec_result * (double)USECS_PER_SEC + (int128)fsec > (int128)INT64_MAX ||
                                  (int128)sec_result * (double)USECS_PER_SEC < (int128)INT64_MIN ||
@@ -3404,8 +3430,7 @@ Datum timestamp_diff(PG_FUNCTION_ARGS)
                 errcode(ERRCODE_INVALID_PARAMETER_VALUE),
                 errmsg("timestamp with time zone units \"%s\" not recognized", lowunits)));
     }
-
-    PG_RETURN_INT64(result);
+    return result;
 }
 
 /* timestamp_age()
@@ -3842,6 +3867,39 @@ Datum interval_trunc(PG_FUNCTION_ARGS)
     }
 
     PG_RETURN_INTERVAL_P(result);
+}
+
+/* timestamp_trunc_alias()
+ * truncate timestamp to specified units
+ *
+ * reuse from timestamp_trunc and
+ * provide "trunc" interface for truncating date
+ */
+Datum timestamp_trunc_alias(PG_FUNCTION_ARGS)
+{
+    return DirectFunctionCall2(timestamp_trunc, PG_GETARG_DATUM(1), PG_GETARG_DATUM(0));
+}
+
+/* timestamptz_trunc_alias()
+ * truncate timestamptz to specified units
+ *
+ * reuse from timestamptz_trunc and
+ * provide "trunc" interface for truncating date
+ */
+Datum timestamptz_trunc_alias(PG_FUNCTION_ARGS)
+{
+    return DirectFunctionCall2(timestamptz_trunc, PG_GETARG_DATUM(1), PG_GETARG_DATUM(0));
+}
+
+/* interval_trunc_alias()
+ * extract specified field from interval
+ *
+ * reuse from interval_trunc and
+ * provide "trunc" interface for extracting interval
+ */
+Datum interval_trunc_alias(PG_FUNCTION_ARGS)
+{
+    return DirectFunctionCall2(interval_trunc, PG_GETARG_DATUM(1), PG_GETARG_DATUM(0));
 }
 
 /* isoweek2j()
@@ -5778,13 +5836,17 @@ void WalReplicationTimestampToString(WalReplicationTimestampInfo *timeStampInfo,
     TimestampTz timeout, TimestampTz lastTimestamp, TimestampTz heartbeat)
 {
     // timestamptz_to_str returns char[MAXTIMESTAMPLEN + 1]
-    errno_t rc;
-    rc = memcpy_s(timeStampInfo->nowTimeStamp, MAXTIMESTAMPLEN + 1, timestamptz_to_str(nowtime), MAXTIMESTAMPLEN + 1);
-    securec_check(rc, "\0", "\0");    
+    errno_t rc = memcpy_s(timeStampInfo->nowTimeStamp, MAXTIMESTAMPLEN + 1, timestamptz_to_str(nowtime),
+                          MAXTIMESTAMPLEN + 1);
+    securec_check(rc, "\0", "\0");
     rc = memcpy_s(timeStampInfo->timeoutStamp, MAXTIMESTAMPLEN + 1, timestamptz_to_str(timeout), MAXTIMESTAMPLEN + 1);
-    securec_check(rc, "\0", "\0");    
-    rc = memcpy_s(timeStampInfo->lastRecStamp, MAXTIMESTAMPLEN + 1, timestamptz_to_str(lastTimestamp), MAXTIMESTAMPLEN + 1);
-    securec_check(rc, "\0", "\0");    
-    rc = memcpy_s(timeStampInfo->heartbeatStamp, MAXTIMESTAMPLEN + 1, timestamptz_to_str(heartbeat), MAXTIMESTAMPLEN + 1);
-    securec_check(rc, "\0", "\0");    
+    securec_check(rc, "\0", "\0");
+    rc = memcpy_s(timeStampInfo->lastRecStamp, MAXTIMESTAMPLEN + 1, timestamptz_to_str(lastTimestamp),
+                  MAXTIMESTAMPLEN + 1);
+    securec_check(rc, "\0", "\0");
+    rc = memcpy_s(timeStampInfo->heartbeatStamp, MAXTIMESTAMPLEN + 1, timestamptz_to_str(heartbeat),
+                  MAXTIMESTAMPLEN + 1);
+    securec_check(rc, "\0", "\0");
 }
+
+

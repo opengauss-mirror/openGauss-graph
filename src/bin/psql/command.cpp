@@ -1,5 +1,5 @@
 /*
- * psql - the PostgreSQL interactive terminal
+ * psql - the openGauss interactive terminal
  *
  * Copyright (c) 2000-2012, PostgreSQL Global Development Group
  *
@@ -63,6 +63,10 @@
 #include <time.h>
 #include "pgtime.h"
 
+#ifdef ENABLE_UT
+#define static
+#endif
+
 /* functions for use in this file */
 static backslashResult exec_command(const char* cmd, PsqlScanState scan_state, PQExpBuffer query_buf);
 static bool do_edit(const char* filename_arg, PQExpBuffer query_buf, int lineno, bool* edited);
@@ -75,8 +79,10 @@ static void minimal_error_message(PGresult* res);
 
 static void printSSLInfo(void);
 
+#ifndef ENABLE_LITE_MODE
 /* Show notice about when the password expired time will come. */
 static void show_password_notify(PGconn* conn);
+#endif
 
 #ifdef WIN32
 static void checkWin32Codepage(void);
@@ -86,7 +92,6 @@ static void checkWin32Codepage(void);
 static void clear_sensitive_memory(char* strings, bool freeflag);
 
 extern void check_env_value(const char* input_env_value);
-static char* GetEnvStr(const char* env);
 
 /* ----------
  * HandleSlashCmds:
@@ -801,14 +806,12 @@ static backslashResult exec_command(const char* cmd, PsqlScanState scan_state, P
             if (NULL != dencrypt_key) {
                 tmpkeylen = strlen(dencrypt_key);
 
-                if (KEY_LEN == tmpkeylen) {
-                    isIllegal = check_key((const char*)dencrypt_key, KEY_LEN);
-                    if (isIllegal) {
-                        rc = memset_s(pset.decryptInfo.Key, KEY_MAX_LEN, 0, KEY_MAX_LEN);
-                        securec_check_c(rc, "\0", "\0");
-                        rc = strncpy_s((char*)pset.decryptInfo.Key, KEY_MAX_LEN, dencrypt_key, KEY_MAX_LEN - 1);
-                        securec_check_c(rc, dencrypt_key, "\0");
-                    }
+                isIllegal = check_input_password(dencrypt_key);
+                if (isIllegal) {
+                    rc = memset_s(pset.decryptInfo.Key, KEY_MAX_LEN, 0, KEY_MAX_LEN);
+                    securec_check_c(rc, "\0", "\0");
+                    rc = strncpy_s((char*)pset.decryptInfo.Key, KEY_MAX_LEN, dencrypt_key, KEY_MAX_LEN - 1);
+                    securec_check_c(rc, dencrypt_key, "\0");
                 }
                 rc = memset_s(dencrypt_key, tmpkeylen, 0, tmpkeylen);
                 securec_check_c(rc, dencrypt_key, "\0");
@@ -827,14 +830,15 @@ static backslashResult exec_command(const char* cmd, PsqlScanState scan_state, P
                                 strcmp(cmd, "include_relative") == 0 || strcmp(cmd, "include_relative+") == 0);
             expand_tilde(&fname);
             /* Database Security: Data importing/dumping support AES128. */
-            if ((pset.decryptInfo.encryptInclude == true && KEY_LEN == tmpkeylen && isIllegal) ||
+            if ((pset.decryptInfo.encryptInclude == true && isIllegal) ||
                 (pset.decryptInfo.encryptInclude == false)) {
                 success = (process_file(fname, false, include_relative) == EXIT_SUCCESS);
             } else {
-                psql_error("\\%s: Missing the key or the key is illegal,must be letters or numbers and the length must "
-                           "be %d\n",
+                psql_error("\\%s: Missing the key or the key is illegal,must be %d~%d bytes and "
+                    "contain at least three kinds of characters!\n",
                     cmd,
-                    KEY_LEN);
+                    MIN_KEY_LEN,
+                    MAX_KEY_LEN);
             }
             free(fname);
             fname = NULL;
@@ -1588,8 +1592,9 @@ static bool do_connect(char* dbname, char* user, char* host, char* port)
          * a new password, or give up.
          */
         if (NULL == password && (strstr(PQerrorMessage(n_conn), "password") != NULL) && pset.getPassword != TRI_NO) {
+            /* Get latest user name from current connection */
+            password = prompt_for_password(PQuser(n_conn));
             PQfinish(n_conn);
-            password = prompt_for_password(user);
             continue;
         }
 
@@ -1691,9 +1696,12 @@ void connection_warnings(bool in_startup)
             printf("%s (%s)\n", pset.progname, PG_VERSION);
 #endif
         }
+
+#ifndef ENABLE_LITE_MODE
         /* show notice message when the password expired time will come. */
         if (in_startup)
             (void)show_password_notify(pset.db);
+#endif
 
         if (pset.sversion / 100 != client_ver / 100)
             printf(_("WARNING: %s version %d.%d, server version %d.%d.\n"
@@ -2077,6 +2085,41 @@ static bool do_edit(const char* filename_arg, PQExpBuffer query_buf, int lineno,
     return !error;
 }
 
+int ProcessFileInternal(char **fileName, bool useRelativePath, char *relPath, int relPathSize, FILE **fd)
+{
+    errno_t rc = EOK;
+    if (strcmp(*fileName, "-") != 0) {
+        canonicalize_path(*fileName);
+
+        /*
+         * If we were asked to resolve the pathname relative to the location
+         * of the currently executing script, and there is one, and this is a
+         * relative pathname, then prepend all but the last pathname component
+         * of the current script to this pathname.
+         */
+        if (useRelativePath && (pset.inputfile != NULL) &&
+            !is_absolute_path(*fileName) && !has_drive_prefix(*fileName)) {
+            rc = strcpy_s(relPath, relPathSize, pset.inputfile);
+            check_strcpy_s(rc);
+            get_parent_directory(relPath);
+            join_path_components(relPath, relPath, *fileName);
+            canonicalize_path(relPath);
+            *fileName = relPath;
+        }
+
+        *fd = fopen(*fileName, PG_BINARY_R);
+
+        if (*fd == NULL) {
+            psql_error("%s: %s\n", *fileName, strerror(errno));
+            return EXIT_FAILURE;
+        }
+    } else {
+        *fd = stdin;
+        *fileName = "<stdin>"; /* for future error messages */
+    }
+
+    return EXIT_SUCCESS;
+}
 /*
  * process_file
  *
@@ -2098,33 +2141,8 @@ int process_file(char* filename, bool single_txn, bool use_relative_path)
     if (NULL == filename)
         return EXIT_FAILURE;
 
-    if (strcmp(filename, "-") != 0) {
-        canonicalize_path(filename);
-
-        /*
-         * If we were asked to resolve the pathname relative to the location
-         * of the currently executing script, and there is one, and this is a
-         * relative pathname, then prepend all but the last pathname component
-         * of the current script to this pathname.
-         */
-        if (use_relative_path && NULL != pset.inputfile && !is_absolute_path(filename) && !has_drive_prefix(filename)) {
-            strlcpy(relpath, pset.inputfile, sizeof(relpath));
-            get_parent_directory(relpath);
-            join_path_components(relpath, relpath, filename);
-            canonicalize_path(relpath);
-
-            filename = relpath;
-        }
-
-        fd = fopen(filename, PG_BINARY_R);
-
-        if (NULL == fd) {
-            psql_error("%s: %s\n", filename, strerror(errno));
-            return EXIT_FAILURE;
-        }
-    } else {
-        fd = stdin;
-        filename = "<stdin>"; /* for future error messages */
+    if (ProcessFileInternal(&filename, use_relative_path, relpath, sizeof(relpath), &fd) == EXIT_FAILURE) {
+        return EXIT_FAILURE;
     }
 
     oldfilename = pset.inputfile;
@@ -2197,6 +2215,52 @@ static const char* _align2string(enum printFormat in)
     return "unknown";
 }
 
+static bool setToptFormat(const char* value, size_t vallen, printQueryOpt* popt, bool quiet)
+{
+    if (value == NULL)
+        ;
+    else if (pg_strncasecmp("unaligned", value, vallen) == 0)
+        popt->topt.format = PRINT_UNALIGNED;
+    else if (pg_strncasecmp("aligned", value, vallen) == 0)
+        popt->topt.format = PRINT_ALIGNED;
+    else if (pg_strncasecmp("wrapped", value, vallen) == 0)
+        popt->topt.format = PRINT_WRAPPED;
+    else if (pg_strncasecmp("html", value, vallen) == 0)
+        popt->topt.format = PRINT_HTML;
+    else if (pg_strncasecmp("latex", value, vallen) == 0)
+        popt->topt.format = PRINT_LATEX;
+    else if (pg_strncasecmp("troff-ms", value, vallen) == 0)
+        popt->topt.format = PRINT_TROFF_MS;
+    else {
+        psql_error("\\pset: allowed formats are unaligned, aligned, wrapped, html, latex, troff-ms\n");
+        return false;
+    }
+
+    if (!quiet)
+        printf(_("Output format is %s.\n"), _align2string(popt->topt.format));
+
+    return true;
+}
+
+static bool setFeedBack(const char* value, printQueryOpt* popt, bool quiet)
+{
+    if (value != NULL) {
+        popt->topt.feedback = ParseVariableBool(value);
+    } else {
+        popt->topt.feedback = !popt->topt.feedback;
+    }
+
+    if (!quiet) {
+        if (popt->topt.feedback) {
+            puts(_("Showing rows count feedback."));
+        } else {
+            puts(_("Rows count feedback is off."));
+        }
+    }
+
+    return true;
+}
+
 bool do_pset(const char* param, const char* value, printQueryOpt* popt, bool quiet)
 {
     size_t vallen = 0;
@@ -2208,27 +2272,16 @@ bool do_pset(const char* param, const char* value, printQueryOpt* popt, bool qui
 
     /* set format */
     if (strcmp(param, "format") == 0) {
-        if (NULL == value)
-            ;
-        else if (pg_strncasecmp("unaligned", value, vallen) == 0)
-            popt->topt.format = PRINT_UNALIGNED;
-        else if (pg_strncasecmp("aligned", value, vallen) == 0)
-            popt->topt.format = PRINT_ALIGNED;
-        else if (pg_strncasecmp("wrapped", value, vallen) == 0)
-            popt->topt.format = PRINT_WRAPPED;
-        else if (pg_strncasecmp("html", value, vallen) == 0)
-            popt->topt.format = PRINT_HTML;
-        else if (pg_strncasecmp("latex", value, vallen) == 0)
-            popt->topt.format = PRINT_LATEX;
-        else if (pg_strncasecmp("troff-ms", value, vallen) == 0)
-            popt->topt.format = PRINT_TROFF_MS;
-        else {
-            psql_error("\\pset: allowed formats are unaligned, aligned, wrapped, html, latex, troff-ms\n");
+        if(!setToptFormat(value, vallen, popt, quiet)) {
             return false;
         }
+    }
 
-        if (!quiet)
-            printf(_("Output format is %s.\n"), _align2string(popt->topt.format));
+    /* set feedback rows  */
+    else if (strcmp(param, "feedback") == 0) {
+        if(!setFeedBack(value, popt, quiet)) {
+            return false;
+        }
     }
 
     /* set table line style */
@@ -2666,6 +2719,7 @@ static void minimal_error_message(PGresult* res)
     destroyPQExpBuffer(msg);
 }
 
+#ifndef ENABLE_LITE_MODE
 /* Show notice message when the password expired time will come. */
 static void show_password_notify(PGconn* conn)
 {
@@ -2730,8 +2784,11 @@ static void show_password_notify(PGconn* conn)
 
     PQclear(res1);
     PQclear(res2);
+    free((void *)date1);
+    free((void *)date2);
     return;
 }
+#endif
 
 extern void client_server_version_check(PGconn* conn)
 {
@@ -2763,31 +2820,6 @@ extern void client_server_version_check(PGconn* conn)
 
     PQclear(res);
     return;
-}
-
-/*
- * GetEnvStr
- *
- * Note: malloc space for get the return of getenv() function, then return the malloc space.
- *         so, this space need be free.
- */
-static char* GetEnvStr(const char* env)
-{
-    char* tmpvar = NULL;
-    const char* temp = getenv(env);
-    errno_t rc = 0;
-    if (temp != NULL) {
-        size_t len = strlen(temp);
-        if (0 == len)
-            return NULL;
-        tmpvar = (char*)malloc(len + 1);
-        if (tmpvar != NULL) {
-            rc = strcpy_s(tmpvar, len + 1, temp);
-            securec_check_c(rc, "\0", "\0");
-            return tmpvar;
-        }
-    }
-    return NULL;
 }
 
 #ifdef ENABLE_UT

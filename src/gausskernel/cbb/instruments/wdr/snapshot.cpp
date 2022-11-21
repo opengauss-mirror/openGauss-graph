@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2020 Huawei Technologies Co.,Ltd.
+ * Portions Copyright (c) 2021, openGauss Contributors
  *
  * openGauss is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
@@ -38,11 +39,14 @@
 #include "storage/latch.h"
 #include "storage/ipc.h"
 #include "workload/workload.h"
+#include "catalog/pg_authid.h"
 #include "catalog/pg_database.h"
 #include "gssignal/gs_signal.h"
+#include "utils/acl.h"
 #include "utils/guc.h"
 #include "utils/ps_status.h"
 #include "utils/elog.h"
+#include "utils/numeric.h"
 #include "utils/memprot.h"
 #include "utils/builtins.h"
 #include "tcop/dest.h"
@@ -63,7 +67,6 @@
 #include "pgxc/groupmgr.h"
 
 const int PGSTAT_RESTART_INTERVAL = 60;
-#define MAX_INT ((unsigned)(-1) >> 1)
 #define COUNT_ARRAY_SIZE(array) (sizeof((array)) / sizeof(*(array)))
 
 using namespace std;
@@ -87,7 +90,7 @@ void init_curr_snapid(void);
 void CreateTable(const char** views, int numViews, bool ismultidbtable);
 void InitTables(void);
 void CreateSnapStatTables(void);
-void CreateIndexes(void);
+void CreateIndexes(const char* views);
 void CreateSequence(void);
 void UpdateSnapEndTime(uint64 curr_snapid);
 void GetQueryStr(StringInfoData& query, const char* viewname, uint64 curr_snapid, const char* dbname);
@@ -106,7 +109,7 @@ char* GetTableColAttr(const char* viewname, bool onlyViewCol, bool addType);
 
 /*
  * select these views in a different database gives the same result,
- * We just need to snapshot these views under postgres database
+ * We just need to snapshot these views under openGauss database
  */
 static const char* sharedViews[] = {"global_os_runtime", "global_os_threads", "global_instance_time",
     "summary_workload_sql_count", "summary_workload_sql_elapse_time", "global_workload_transaction",
@@ -172,6 +175,33 @@ static char* GetCurrentTimeStampString()
 {
     return Datum_to_string(TimestampGetDatum(GetCurrentTimestamp()), TIMESTAMPTZOID, false);
 }
+/* check node group is exist */
+static bool CheckNodeGroup()
+{
+#ifndef ENABLE_MULTIPLE_NODES
+    return true;
+#endif
+    errno_t rc;
+    SPI_STACK_LOG("connect", NULL, NULL);
+    if ((rc = SPI_connect()) != SPI_OK_CONNECT) {
+        ereport(ERROR,
+            (errmodule(MOD_WDR_SNAPSHOT),
+            errcode(ERRCODE_SPI_CONNECTION_FAILURE),
+            errmsg("SPI_connect failed: %s", SPI_result_code_string(rc)),
+            errdetail("SPI_connect failed in function CheckNodeGroup"),
+            errcause("System error."),
+            erraction("Analyze the error message before the error")));
+    }
+    Datum colval;
+    bool isnull = false;
+    const char* query =
+        "select count(*) from pgxc_group WHERE in_redistribution='n' and is_installation = TRUE;";
+    colval = GetDatumValue(query, 0, 0, &isnull);
+    SPI_STACK_LOG("finish", NULL, NULL);
+    SPI_finish();
+    return !isnull && (colval != 0);
+}
+
 /* 1. during redistribution, will set 'in_redistribution' field to 'y'
  *    in pgxc_group table, exit snapshot thread to avoid dead lock issue
  * 2. during upgrade, snapshot table can be modified,
@@ -184,7 +214,7 @@ static void check_snapshot_thd_exit()
     start_xact_command();
     PushActiveSnapshot(GetTransactionSnapshot());
     char* redis_group = PgxcGroupGetInRedistributionGroup();
-    if (redis_group != NULL) {
+    if (redis_group != NULL || !CheckNodeGroup()) {
         need_exit = true;
         u_sess->attr.attr_common.ExitOnAnyError = true;
     }
@@ -196,9 +226,9 @@ static void check_snapshot_thd_exit()
          * we sleep several minute before exit.
          */
         const int SLEEP_GAP = 5;
-        ereport(LOG, (errmsg("snapshot thread will exit during redistribution or upgrade")));
+        ereport(LOG, (errmsg("snapshot thread will exit during redistribution, upgrade or init group")));
         SnapshotNameSpace::SleepCheckInterrupt(SLEEP_GAP);
-        ereport(LOG, (errmsg("snapshot thread is exited during redistribution or upgrade")));
+        ereport(LOG, (errmsg("snapshot thread is exited during redistribution, upgrade or init group")));
 
         gs_thread_exit(0);
     }
@@ -221,11 +251,18 @@ static bool CheckMemProtectInit()
         errno_t rc;
         start_xact_command();
         PushActiveSnapshot(GetTransactionSnapshot());
+        SPI_STACK_LOG("connect", NULL, NULL);
         if ((rc = SPI_connect()) != SPI_OK_CONNECT)
-            ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
-                errmsg("SPI_connect failed: %s", SPI_result_code_string(rc))));
+            ereport(ERROR,
+                (errmodule(MOD_WDR_SNAPSHOT),
+                errcode(ERRCODE_SPI_CONNECTION_FAILURE),
+                errmsg("SPI_connect failed: %s", SPI_result_code_string(rc)),
+                errdetail("SPI_connect failed in function CheckMemProtectInit"),
+                errcause("System error."),
+                erraction("Analyze the error message before the error")));
         const char *query = "select * from DBE_PERF.global_memory_node_detail";
         (void)SnapshotNameSpace::ExecuteQuery(query, SPI_OK_SELECT);
+        SPI_STACK_LOG("finish", query, NULL);
         SPI_finish();
         PopActiveSnapshot();
         finish_xact_command();
@@ -233,6 +270,7 @@ static bool CheckMemProtectInit()
     }
     PG_CATCH();
     {
+        SPI_STACK_LOG("finish", NULL, NULL);
         SPI_finish();
         (void)MemoryContextSwitchTo(currentCtx);
         ErrorData *edata = CopyErrorData();
@@ -268,7 +306,17 @@ void kill_snapshot_remote()
     FreeParallelFunctionState(state);
     pfree_ext(buf.data);
 }
-
+static void CheckPermission()
+{
+    if (!superuser() && !has_rolreplication(GetUserId()) &&
+        !is_member_of_role(GetUserId(), DEFAULT_ROLE_REPLICATION)) {
+        ereport(ERROR, (errmodule(MOD_WDR_SNAPSHOT), errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+            errmsg("permission denied for terminate snapshot thread"),
+            errdetail("only system admin or replication role or a member of the gs_role_replication role"
+                "can terminate snapshot thread"),
+            errcause("The user does not have system admin privilege"), erraction("Grant system admin to user")));
+    } 
+}
 /*
  * kill snapshot thread
  * There will be deadlocks between snapshot thread and redistribution,
@@ -278,10 +326,7 @@ void kill_snapshot_remote()
  */
 Datum kill_snapshot(PG_FUNCTION_ARGS)
 {
-    if (!superuser() && !has_rolreplication(GetUserId())) {
-        ereport(ERROR, (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE), errmsg("only system admin can kill snapshot thread")));
-    }
-
+    CheckPermission();
 #ifdef ENABLE_MULTIPLE_NODES
     if (IS_PGXC_COORDINATOR) {
 #endif
@@ -297,8 +342,10 @@ Datum kill_snapshot(PG_FUNCTION_ARGS)
             int err = 0;
             uint32 old_snapshot_thread_counter = pg_atomic_read_u32(&g_instance.stat_cxt.snapshot_thread_counter);
             if ((err = gs_signal_send(g_instance.pid_cxt.SnapshotPID, SIGTERM)) != 0) {
-                ereport(ERROR,
-                    (errcode(ERRCODE_OPERATE_FAILED), errmsg("kill snapshot thread failed %s", gs_strerror(err))));
+                ereport(ERROR, (errmodule(MOD_WDR_SNAPSHOT), errcode(ERRCODE_OPERATE_FAILED),
+                    errmsg("terminate snapshot thread failed"),
+                    errdetail("N/A"), errcause("Execution failed due to: %s", gs_strerror(err)),
+                    erraction("check if snapshot thread exists")));
             } else {
                 int wait_times = 0;
                 /* wait snapshot thread is exit.
@@ -311,9 +358,12 @@ Datum kill_snapshot(PG_FUNCTION_ARGS)
                 while (g_instance.pid_cxt.SnapshotPID != 0 &&
                        g_instance.stat_cxt.snapshot_thread_counter == old_snapshot_thread_counter) {
                     if (wait_times++ > MAX_RETRY_COUNT) {
-                        ereport(ERROR,
-                            (errcode(ERRCODE_OPERATE_FAILED),
-                                errmsg("kill snapshot thread failed, exceeds MAX_RETRY_COUNT(%d)", MAX_RETRY_COUNT)));
+                        ereport(ERROR, (errmodule(MOD_WDR_SNAPSHOT), errcode(ERRCODE_OPERATE_FAILED),
+                            errmsg("terminate snapshot thread failed"),
+                            errdetail("wait time(%d), exceeds MAX_RETRY_COUNT(%d)", wait_times, MAX_RETRY_COUNT),
+                            errcause("restart wdr snapshot thread timeout"
+                                "or The thread did not respond to the kill signal"),
+                            erraction("Check the wdr snapshot thread is restarted")));
                     }
                     pg_usleep(SLEEP_GAP);
                 }
@@ -340,9 +390,9 @@ static void ReloadInfo()
         t_thrd.perf_snap_cxt.got_SIGHUP = false;
         ProcessConfigFile(PGC_SIGHUP);
     }
-    if (u_sess->sig_cxt.got_PoolReload) {
+    if (IsGotPoolReload()) {
         processPoolerReload();
-        u_sess->sig_cxt.got_PoolReload = false;
+        ResetGotPoolReload(false);
     }
 }
 
@@ -354,7 +404,12 @@ static void set_lock_timeout()
     const char* timeout_sql = "set lockwait_timeout = 3000";
     if ((rc = SPI_execute(timeout_sql, false, 0)) != SPI_OK_UTILITY) {
         ereport(ERROR,
-            (errcode(ERRCODE_INTERNAL_ERROR), errmsg("set lockwait_timeout failed:  %s", SPI_result_code_string(rc))));
+            (errmodule(MOD_WDR_SNAPSHOT),
+            errcode(ERRCODE_INTERNAL_ERROR),
+            errmsg("set lockwait_timeout failed"),
+            errdetail("error code: %s", SPI_result_code_string(rc)),
+            errcause("System error."),
+            erraction("Contact engineer to support.")));
     }
 }
 
@@ -368,7 +423,12 @@ Datum create_wdr_snapshot(PG_FUNCTION_ARGS)
     /* ensure limited access to create the snapshot */
     if (!superuser()) {
         ereport(ERROR,
-            (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE), errmsg("Superuser privilege is need to operate snapshot")));
+            (errmodule(MOD_WDR_SNAPSHOT),
+            errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+            errmsg("permission denied for create WDR Snapshot"),
+            errdetail("Superuser privilege is need to operate snapshot"),
+            errcause("The user does not have system admin privilege"),
+            erraction("Grant system admin to user")));
     }
     if (!u_sess->attr.attr_common.enable_wdr_snapshot) {
         ereport(WARNING, (errcode(ERRCODE_WARNING), errmsg("GUC parameter 'enable_wdr_snapshot' is off")));
@@ -379,16 +439,27 @@ Datum create_wdr_snapshot(PG_FUNCTION_ARGS)
         ereport(NOTICE, (errmsg("take snapshot must be on CCN node")));
         PG_RETURN_TEXT_P(cstring_to_text("WDR snapshot request can't be executed"));
     }
+    int err = 0;
     for (uint32 ntries = 0;; ntries++) {
         if (g_instance.pid_cxt.SnapshotPID == 0) {
             if (ntries >= maxTryCount) {
                 ereport(ERROR,
-                    (errcode(ERRCODE_OPERATE_FAILED),
-                        errmsg("WDR snapshot request can not be accepted, please retry later")));
+                    (errmodule(MOD_WDR_SNAPSHOT),
+                    errcode(ERRCODE_OPERATE_FAILED),
+                    errmsg("WDR snapshot request can not be accepted, please retry later"),
+                    errdetail("N/A"),
+                    errcause("wdr snapshot thread does not exist"),
+                    erraction("Check if wdr snapshot thread exists")));
             }
-        } else if (gs_signal_send(g_instance.pid_cxt.SnapshotPID, SIGINT) != 0) {
+        } else if ((err = gs_signal_send(g_instance.pid_cxt.SnapshotPID, SIGINT)) != 0) {
             if (ntries >= maxTryCount) {
-                ereport(ERROR, (errcode(ERRCODE_OPERATE_FAILED), errmsg("Cannot respond to WDR snapshot request")));
+                ereport(ERROR,
+                    (errmodule(MOD_WDR_SNAPSHOT),
+                    errcode(ERRCODE_OPERATE_FAILED),
+                    errmsg("Cannot respond to WDR snapshot request"),
+                    errdetail("N/A"),
+                    errcause("Execution failed due to: %s", gs_strerror(err)),
+                    erraction("Check if wdr snapshot thread exists")));
             }
         } else {
             break;
@@ -406,9 +477,7 @@ Datum create_wdr_snapshot(PG_FUNCTION_ARGS)
  */
 bool SnapshotNameSpace::ExecuteQuery(const char* query, int SPI_OK_STAT)
 {
-    if (query == NULL) {
-        ereport(ERROR, (errcode(ERRCODE_DATA_EXCEPTION), errmsg("query is NULL")));
-    }
+    Assert(query != NULL);
 
     if (SPI_execute(query, false, 0) != SPI_OK_STAT) {
         ereport(WARNING, (errcode(ERRCODE_DATA_EXCEPTION), errmsg("invalid query : %s", query)));
@@ -429,13 +498,14 @@ Datum GetDatumValue(const char* query, uint32 row, uint32 col, bool* isnull)
 {
     Datum colval;
     bool tmp_isnull = false;
-
-    if (query == NULL) {
-        ereport(ERROR, (errcode(ERRCODE_DATA_EXCEPTION), errmsg("query is null")));
-    }
+    Assert(query != NULL);
 
     if (!SnapshotNameSpace::ExecuteQuery(query, SPI_OK_SELECT)) {
-        ereport(ERROR, (errcode(ERRCODE_DATA_EXCEPTION), errmsg("this query can not get datum values")));
+        ereport(ERROR, (errmodule(MOD_WDR_SNAPSHOT), errcode(ERRCODE_DATA_EXCEPTION),
+            errmsg("query(%s) can not get datum values", query),
+            errdetail("An error occurred in function GetDatumValue"),
+            errcause("System error."),
+            erraction("Check whether the query can be executed")));
     }
 
     /* if row and col out of the size of query values, we return the values is null */
@@ -470,7 +540,9 @@ void SnapshotNameSpace::CreateSequence(void)
     Datum colval;
     bool isnull = false;
     const char* query_seq_sql =
-        "select count(*) from pg_statio_all_sequences where schemaname = 'snapshot' and relname = 'snap_seq'";
+        "select count(*) from pg_class c left join pg_namespace n"
+        " on n.oid = c.relnamespace"
+        " where n.nspname = 'snapshot' and c.relname = 'snap_seq'";
     colval = GetDatumValue(query_seq_sql, 0, 0, &isnull);
     if (isnull) {
         colval = 0;
@@ -478,7 +550,11 @@ void SnapshotNameSpace::CreateSequence(void)
     if (!colval) {
         const char* create_seq_sql = "create sequence snapshot.snap_seq CYCLE";
         if (!SnapshotNameSpace::ExecuteQuery(create_seq_sql, SPI_OK_UTILITY)) {
-            ereport(ERROR, (errcode(ERRCODE_DATA_EXCEPTION), errmsg("create sequence failed")));
+            ereport(ERROR, (errmodule(MOD_WDR_SNAPSHOT), errcode(ERRCODE_DATA_EXCEPTION),
+                errmsg("create sequence failed"),
+                errdetail("query(%s) execute failed", create_seq_sql),
+                errcause("System error."),
+                erraction("Check if sequence can be created")));
         }
     }
 }
@@ -491,10 +567,8 @@ void SnapshotNameSpace::init_curr_snapid(void)
     if (isnull) {
         colval = 0;
     }
-    t_thrd.perf_snap_cxt.curr_snapid = DatumGetInt32(colval);
-    if (t_thrd.perf_snap_cxt.curr_snapid >= MAX_INT - 1) {
-        t_thrd.perf_snap_cxt.curr_snapid = 0;
-    }
+    /* MAX value of the snapshot.snap_seq is MAX INT64 */
+    t_thrd.perf_snap_cxt.curr_snapid = numeric_int16_internal(DatumGetNumeric(colval));
 }
 /*
  * UpdateSnapEndTime -- update snapshot end time stamp
@@ -511,16 +585,17 @@ void SnapshotNameSpace::UpdateSnapEndTime(uint64 curr_snapid)
         GetCurrentTimeStampString(),
         curr_snapid);
     if (!SnapshotNameSpace::ExecuteQuery(query.data, SPI_OK_UPDATE)) {
-        ereport(ERROR, (errcode(ERRCODE_DATA_EXCEPTION), errmsg("update snapshot end time stamp filled")));
+        ereport(ERROR, (errmodule(MOD_WDR_SNAPSHOT), errcode(ERRCODE_DATA_EXCEPTION),
+            errmsg("update snapshot end time stamp filled"),
+            errdetail("query(%s) execute failed", query.data),
+            errcause("System error."),
+            erraction("Check whether the snapshot retry is successful")));
     }
     pfree_ext(query.data);
 }
 
 void SnapshotNameSpace::SetSnapshotSize(uint32* max_snap_size)
 {
-    if (u_sess->attr.attr_common.wdr_snapshot_interval == 0) {
-        ereport(ERROR, (errcode(ERRCODE_DATA_EXCEPTION), errmsg("wdr_snapshot_interval is 0")));
-    }
     const int HOUR_OF_DAY = 24;
     const int MINUTE_Of_HOUR = 60;
     /*
@@ -539,14 +614,14 @@ void SnapshotNameSpace::GetQueryData(const char* query, bool with_column_name, L
         list_free_deep(*cstring_values);
     }
     /* Establish SPI connection and get query execution result */
-    if (query == NULL) {
-        ereport(ERROR, (errcode(ERRCODE_DATA_EXCEPTION), errmsg("query is null")));
-    }
-
-    ereport(DEBUG1, (errmodule(MOD_INSTR), errmsg("[Instruments/Report] query: %s", query)));
+    ereport(DEBUG1, (errmodule(MOD_WDR_SNAPSHOT), errmsg("[Instruments/Report] query: %s", query)));
 
     if (SPI_execute(query, false, 0) != SPI_OK_SELECT) {
-        ereport(ERROR, (errcode(ERRCODE_DATA_EXCEPTION), errmsg("invalid query")));
+        ereport(ERROR, (errmodule(MOD_WDR_SNAPSHOT), errcode(ERRCODE_DATA_EXCEPTION),
+            errmsg("query can not get datum values"),
+            errdetail("query(%s) execute failed", query),
+            errcause("System error."),
+            erraction("Check whether the query can be executed")));
     }
     /* get colname */
     if (with_column_name) {
@@ -569,6 +644,35 @@ void SnapshotNameSpace::GetQueryData(const char* query, bool with_column_name, L
         *cstring_values = lappend(*cstring_values, row_string);
     }
 }
+
+#if ((defined(ENABLE_MULTIPLE_NODES)) || (defined(ENABLE_PRIVATEGAUSS)))
+/*
+ * SnapshotView
+ * Since the snapshot table can be queried only when the parameter is on,
+ * the view is created during snapshot initialization.
+ * when the parameter is off, an empty view is provided.
+ */
+static void SnapshotView()
+{
+    const char* createSnapshotviewdrop = "drop view if exists SYS.ADM_HIST_SNAPSHOT";
+    if (SPI_execute(createSnapshotviewdrop, false, 0) != SPI_OK_UTILITY) {
+        ereport(ERROR, (errmodule(MOD_WDR_SNAPSHOT), errcode(ERRCODE_DATA_EXCEPTION),
+            errmsg("drop view failed"),
+            errdetail("query(%s) execute failed", createSnapshotviewdrop),
+            errcause("System error."),
+            erraction("Check whether the query can be executed")));
+    }
+    const char* createSnapshotview = "CREATE OR REPLACE VIEW SYS.ADM_HIST_SNAPSHOT AS "
+        "SELECT s.snapshot_id AS SNAP_ID, s.start_ts AS BEGIN_INTERVAL_TIME FROM SNAPSHOT.SNAPSHOT s";
+    if (SPI_execute(createSnapshotview, false, 0) != SPI_OK_UTILITY) {
+        ereport(ERROR, (errmodule(MOD_WDR_SNAPSHOT), errcode(ERRCODE_DATA_EXCEPTION),
+            errmsg("CREATE VIEW failed"),
+            errdetail("query(%s) execute failed", createSnapshotview),
+            errcause("System error."),
+            erraction("Check whether the query can be executed")));
+    }
+}
+#endif
 /*
  * take_snapshot
  * All the snapshot processes are executed here,
@@ -588,15 +692,18 @@ void SnapshotNameSpace::take_snapshot()
         uint32 max_snap_size = 0;
         SnapshotNameSpace::SetSnapshotSize(&max_snap_size);
         /* connect SPI to execute query */
+        SPI_STACK_LOG("connect", NULL, NULL);
         if ((rc = SPI_connect()) != SPI_OK_CONNECT) {
-            ereport(
-                ERROR, (errcode(ERRCODE_INTERNAL_ERROR), errmsg("SPI_connect failed: %s", SPI_result_code_string(rc))));
+            ereport(ERROR, (errmodule(MOD_WDR_SNAPSHOT), errcode(ERRCODE_INTERNAL_ERROR),
+                errmsg("SPI_connect failed: %s", SPI_result_code_string(rc)),
+                errdetail("N/A"), errcause("System error."),
+                erraction("Check whether the snapshot retry is successful")));
         }
         set_lock_timeout();
         SnapshotNameSpace::init_curr_table_size();
         while (t_thrd.perf_snap_cxt.curr_table_size >= max_snap_size) {
             bool isnull = false;
-            const char* sql = "select min(snapshot_id) from snapshot.snapshot";
+            const char* sql = "select snapshot_id from snapshot.snapshot order by start_ts limit 1";
             Datum colval = GetDatumValue(sql, 0, 0, &isnull);
             if (isnull) {
                 colval = 0;
@@ -607,21 +714,25 @@ void SnapshotNameSpace::take_snapshot()
         SnapshotNameSpace::init_curr_snapid();
         appendStringInfo(&query,
             "INSERT INTO snapshot.snapshot(snapshot_id, start_ts) "
-            "values (%lu, '%s')",
-            t_thrd.perf_snap_cxt.curr_snapid,
+            "values (%lu, '%s')", t_thrd.perf_snap_cxt.curr_snapid,
             GetCurrentTimeStampString());
         if (SPI_execute(query.data, false, 0) == SPI_OK_INSERT) {
             SnapshotNameSpace::InsertTablesData(t_thrd.perf_snap_cxt.curr_snapid);
             t_thrd.perf_snap_cxt.curr_table_size++;
         } else {
-            ereport(ERROR, (errcode(ERRCODE_DATA_EXCEPTION), errmsg("invalid query: %s", query.data)));
+            ereport(ERROR, (errcode(ERRCODE_DATA_EXCEPTION),
+                errmsg("query(%s) execute failed", query.data),
+                errdetail("N/A"), errcause("System error."),
+                erraction("Check whether the snapshot retry is successful")));
         }
         SnapshotNameSpace::UpdateSnapEndTime(t_thrd.perf_snap_cxt.curr_snapid);
+        SPI_STACK_LOG("finish", query.data, NULL);
         pfree_ext(query.data);
         SPI_finish();
     }
     PG_CATCH();
     {
+        SPI_STACK_LOG("finish", query.data, NULL);
         pfree_ext(query.data);
         SPI_finish();
         /* Carry on with error handling. */
@@ -657,7 +768,11 @@ void SnapshotNameSpace::DeleteTablesData(const char** views, int numViews, uint6
         resetStringInfo(&query);
         appendStringInfo(&query, "delete from snapshot.snap_%s where snapshot_id = %lu", views[i], snapid);
         if (!SnapshotNameSpace::ExecuteQuery(query.data, SPI_OK_DELETE)) {
-            ereport(ERROR, (errcode(ERRCODE_DATA_EXCEPTION), errmsg("clean table of snap_%s is failed", views[i])));
+            ereport(ERROR, (errmodule(MOD_WDR_SNAPSHOT), errcode(ERRCODE_DATA_EXCEPTION),
+                errmsg("clean table of snap_%s is failed", views[i]), 
+                errdetail("N/A"),
+                errcause("System error."),
+                erraction("Check whether the snapshot retry is successful")));
         }
     }
     pfree_ext(query.data);
@@ -676,7 +791,11 @@ void SnapshotNameSpace::GetAnalyzeList(List** analyzeTableList)
         tableName);
     colval = GetDatumValue(query.data, 0, 0, &isnull);
     if (!colval) {
-        ereport(ERROR, (errcode(ERRCODE_DATA_EXCEPTION), errmsg("WDR snapshot analyze table:%s not exist", tableName)));
+        ereport(ERROR, (errmodule(MOD_WDR_SNAPSHOT), errcode(ERRCODE_DATA_EXCEPTION),
+            errmsg("analyze table failed"),
+            errdetail("table(%s) not exist", tableName),
+            errcause("System error."),
+            erraction("Check whether the snapshot retry is successful")));
     }
     MemoryContext old_context = MemoryContextSwitchTo(t_thrd.perf_snap_cxt.PerfSnapMemCxt);
     Oid* relationObjectId = (Oid*)palloc(sizeof(Oid));
@@ -729,9 +848,11 @@ void SnapshotNameSpace::InsertOneTableData(const char** views, int numViews, uin
             views[i],
             GetCurrentTimeStampString());
         if (!SnapshotNameSpace::ExecuteQuery(query.data, SPI_OK_INSERT)) {
-            ereport(ERROR,
-                (errcode(ERRCODE_DATA_EXCEPTION),
-                    errmsg("insert into tables_snap_timestamp start time stamp is failed")));
+            ereport(ERROR, (errmodule(MOD_WDR_SNAPSHOT), errcode(ERRCODE_DATA_EXCEPTION),
+                errmsg("insert into tables_snap_timestamp start time stamp is failed"),
+                errdetail("query(%s) execute failed", query.data),
+                errcause("System error."),
+                erraction("Check whether the snapshot retry is successful")));
         }
 
         CHECK_FOR_INTERRUPTS();
@@ -748,7 +869,12 @@ void SnapshotNameSpace::InsertOneTableData(const char** views, int numViews, uin
         pfree(colAttr);
         pfree(snapColAttr);
         if (!SnapshotNameSpace::ExecuteQuery(query.data, SPI_OK_INSERT)) {
-            ereport(ERROR, (errcode(ERRCODE_DATA_EXCEPTION), errmsg("insert into snap_%s is failed", views[i])));
+            ereport(ERROR, (errmodule(MOD_WDR_SNAPSHOT), errcode(ERRCODE_DATA_EXCEPTION),
+                errmsg("insert data failed"),
+                errdetail("query(%s) execute failed", query.data),
+                errcause("System error."),
+                erraction("Check whether the snapshot retry is successful "
+                    "and check whether the query can be executed")));
         }
         CHECK_FOR_INTERRUPTS();
 
@@ -757,13 +883,19 @@ void SnapshotNameSpace::InsertOneTableData(const char** views, int numViews, uin
         appendStringInfo(&query,
             "update snapshot.tables_snap_timestamp set end_ts = '%s' "
             "where snapshot_id = %lu and db_name = '%s' and tablename = 'snap_%s'",
-            GetCurrentTimeStampString(),
-            snapid,
-            dbName,
-            views[i]);
+            GetCurrentTimeStampString(), snapid, dbName, views[i]);
+        if (views == lastStatViews) {
+            appendStringInfo(&query,
+            " and start_ts = (select max(start_ts) from snapshot.tables_snap_timestamp "
+            "where snapshot_id = %lu and db_name = '%s' and tablename = 'snap_%s')",
+            snapid, dbName, views[i]);
+        }
         if (!SnapshotNameSpace::ExecuteQuery(query.data, SPI_OK_UPDATE)) {
-            ereport(ERROR,
-                (errcode(ERRCODE_DATA_EXCEPTION), errmsg("update tables_snap_timestamp end time stamp is failed")));
+            ereport(ERROR, (errmodule(MOD_WDR_SNAPSHOT), errcode(ERRCODE_DATA_EXCEPTION),
+                errmsg("update tables_snap_timestamp end time stamp is failed"),
+                errdetail("query(%s) execute failed", query.data),
+                errcause("System error."),
+                erraction("Check whether the snapshot retry is successful")));
         }
     }
     pfree_ext(dbName);
@@ -772,7 +904,9 @@ void SnapshotNameSpace::InsertOneTableData(const char** views, int numViews, uin
 
 void SnapshotNameSpace::InsertTablesData(uint64 snapid)
 {
-    int numViews = COUNT_ARRAY_SIZE(dbRelatedViews);
+    int numViews = COUNT_ARRAY_SIZE(lastStatViews);
+    SnapshotNameSpace::InsertOneTableData(lastStatViews, numViews, snapid);
+    numViews = COUNT_ARRAY_SIZE(dbRelatedViews);
     SnapshotNameSpace::InsertOneDbTables(dbRelatedViews, numViews, snapid);
     numViews = COUNT_ARRAY_SIZE(sharedViews);
     SnapshotNameSpace::InsertOneTableData(sharedViews, numViews, snapid);
@@ -789,17 +923,22 @@ static void DeleteStatTableDate(uint64 curr_min_snapid)
 
     appendStringInfo(&query, "delete from snapshot.snapshot where snapshot_id = %lu", curr_min_snapid);
     if (!SnapshotNameSpace::ExecuteQuery(query.data, SPI_OK_DELETE)) {
-        ereport(ERROR,
-            (errcode(ERRCODE_DATA_EXCEPTION),
-                errmsg("clean snapshot id %lu is failed in snapshot table", curr_min_snapid)));
+        ereport(ERROR, (errmodule(MOD_WDR_SNAPSHOT), errcode(ERRCODE_DATA_EXCEPTION),
+            errmsg("clean snapshot id %lu is failed in snapshot table", curr_min_snapid),
+            errdetail("query(%s) execute failed", query.data),
+            errcause("System error."),
+            erraction("Check whether the snapshot retry is successful"
+                " and check whether the query can be executed")));
     }
 
     resetStringInfo(&query);
     appendStringInfo(&query, "delete from snapshot.tables_snap_timestamp where snapshot_id = %lu", curr_min_snapid);
     if (!SnapshotNameSpace::ExecuteQuery(query.data, SPI_OK_DELETE)) {
-        ereport(ERROR,
-            (errcode(ERRCODE_DATA_EXCEPTION),
-                errmsg("clean snapshot id %lu is failed in tables_snap_timestamp table", curr_min_snapid)));
+        ereport(ERROR, (errmodule(MOD_WDR_SNAPSHOT), errcode(ERRCODE_DATA_EXCEPTION),
+            errmsg("clean snapshot failed"),
+            errdetail("query(%s) execute failed", query.data),
+            errcause("System error."),
+            erraction("Check whether the snapshot retry is successful")));
     }
     pfree_ext(query.data);
 }
@@ -869,11 +1008,6 @@ static void CreateStatTable(const char* query, const char* tablename)
     bool isnull = false;
     StringInfoData sql;
     initStringInfo(&sql);
-    if (query == NULL || tablename == NULL) {
-        ereport(ERROR,
-            (errcode(ERRCODE_DATA_EXCEPTION),
-                errmsg("query or the tablename is null when snapshot create stat table")));
-    }
 
     /* if the table is not created ,we will create it */
     appendStringInfo(
@@ -881,7 +1015,11 @@ static void CreateStatTable(const char* query, const char* tablename)
     colval = GetDatumValue(sql.data, 0, 0, &isnull);
     if (!DatumGetInt32(colval)) {
         if (!SnapshotNameSpace::ExecuteQuery(query, SPI_OK_UTILITY)) {
-            ereport(ERROR, (errcode(ERRCODE_DATA_EXCEPTION), errmsg("can not create snapshot stat table")));
+            ereport(ERROR, (errmodule(MOD_WDR_SNAPSHOT), errcode(ERRCODE_DATA_EXCEPTION),
+                errmsg("can not create snapshot stat table"),
+                errdetail("query(%s) execute failed", sql.data),
+                errcause("System error."),
+                erraction("Check whether the query can be executed")));
         }
     }
     pfree_ext(sql.data);
@@ -903,6 +1041,20 @@ void SnapshotNameSpace::CreateSnapStatTables(void)
     CreateStatTable(createSnapshot, tablename2);
 }
 
+static void DropIndexes(const char* indexName)
+{
+    StringInfoData query;
+    initStringInfo(&query);
+    appendStringInfo(&query, "drop index IF EXISTS snapshot.%s", indexName);
+    if (!SnapshotNameSpace::ExecuteQuery(query.data, SPI_OK_UTILITY)) {
+        pfree_ext(query.data);
+        ereport(ERROR, (errmodule(MOD_WDR_SNAPSHOT), errcode(ERRCODE_DATA_EXCEPTION),
+            errmsg("create index failed"), errdetail("drop index snapshot.%s execute error", indexName),
+            errcause("System error."), erraction("Check whether the query can be executed")));
+    }
+    pfree_ext(query.data);
+}
+
 void SnapshotNameSpace::InitTables()
 {
     SnapshotNameSpace::CreateSnapStatTables();
@@ -915,7 +1067,13 @@ void SnapshotNameSpace::InitTables()
     SnapshotNameSpace::CreateTable(lastDbRelatedViews, numViews, false);
     numViews = COUNT_ARRAY_SIZE(lastStatViews);
     SnapshotNameSpace::CreateTable(lastStatViews, numViews, true);
-    SnapshotNameSpace::CreateIndexes();
+    DropIndexes("snap_summary_statio_indexes_name");
+    DropIndexes("snap_summary_statio_tables_name");
+    DropIndexes("snap_summary_stat_indexes_name");
+    DropIndexes("snap_class_info_name");
+#if ((defined(ENABLE_MULTIPLE_NODES)) || (defined(ENABLE_PRIVATEGAUSS)))
+    SnapshotView();
+#endif
 }
 
 void SnapshotNameSpace::CreateTable(const char** views, int numViews, bool isSharedViews)
@@ -945,10 +1103,16 @@ void SnapshotNameSpace::CreateTable(const char** views, int numViews, bool isSha
                     snapColAttrType);
             }
             if (!SnapshotNameSpace::ExecuteQuery(query.data, SPI_OK_UTILITY)) {
-                ereport(ERROR, (errcode(ERRCODE_DATA_EXCEPTION), errmsg("create WDR snapshot data table failed")));
+                ereport(ERROR, (errmodule(MOD_WDR_SNAPSHOT), errcode(ERRCODE_DATA_EXCEPTION),
+                    errmsg("create WDR snapshot data table failed"),
+                    errdetail("query(%s) execute error", query.data),
+                    errcause("System error."),
+                    erraction("Check whether the query can be executed")));
             }
             pfree(snapColAttrType);
         }
+        /* create index on snapshot table */
+        SnapshotNameSpace::CreateIndexes(views[i]);
     }
     pfree_ext(query.data);
 }
@@ -1076,22 +1240,23 @@ void SnapshotNameSpace::InsertDatabaseData(const char* dbname, uint64 curr_snapi
         SnapshotNameSpace::GetQueryStr(query, views[i], curr_snapid, dbname);
         resetStringInfo(&sql);
         CHECK_FOR_INTERRUPTS();
-        appendStringInfo(&sql,
-            "INSERT INTO  snapshot.tables_snap_timestamp"
+        appendStringInfo(&sql, "INSERT INTO  snapshot.tables_snap_timestamp"
             "(snapshot_id, db_name, tablename, start_ts) "
             "values(%lu, '%s', 'snap_%s', '%s')",
-            curr_snapid,
-            dbname,
-            views[i],
-            GetCurrentTimeStampString());
+            curr_snapid, dbname, views[i], GetCurrentTimeStampString());
         if (!SnapshotNameSpace::ExecuteQuery(sql.data, SPI_OK_INSERT)) {
-            ereport(ERROR,
-                (errcode(ERRCODE_DATA_EXCEPTION), errmsg("insert into tables_snap_timestamp start time stamp failed")));
+            ereport(ERROR, (errmodule(MOD_WDR_SNAPSHOT), errcode(ERRCODE_DATA_EXCEPTION),
+                errmsg("insert into tables_snap_timestamp start time stamp failed"),
+                errdetail("query(%s) execute failed", sql.data), errcause("System error."),
+                erraction("Check whether the query can be executed")));
         }
 
         CHECK_FOR_INTERRUPTS();
         if (!SnapshotNameSpace::ExecuteQuery(query.data, SPI_OK_INSERT)) {
-            ereport(ERROR, (errcode(ERRCODE_DATA_EXCEPTION), errmsg("insert into snap_%s is failed", views[i])));
+            ereport(ERROR, (errmodule(MOD_WDR_SNAPSHOT), errcode(ERRCODE_DATA_EXCEPTION),
+                errmsg("insert into snap_%s is failed", views[i]),
+                errdetail("query(%s) execute failed", query.data), errcause("System error."),
+                erraction("Check whether the query can be executed")));
         }
 
         CHECK_FOR_INTERRUPTS();
@@ -1099,13 +1264,13 @@ void SnapshotNameSpace::InsertDatabaseData(const char* dbname, uint64 curr_snapi
         appendStringInfo(&sql,
             "update snapshot.tables_snap_timestamp set end_ts = '%s' "
             "where snapshot_id = %lu and db_name = '%s' and tablename = 'snap_%s'",
-            GetCurrentTimeStampString(),
-            curr_snapid,
-            dbname,
-            views[i]);
+            GetCurrentTimeStampString(), curr_snapid, dbname, views[i]);
         if (!SnapshotNameSpace::ExecuteQuery(sql.data, SPI_OK_UPDATE)) {
-            ereport(
-                ERROR, (errcode(ERRCODE_DATA_EXCEPTION), errmsg("update tables_snap_timestamp end time stamp failed")));
+            ereport(ERROR, (errmodule(MOD_WDR_SNAPSHOT), errcode(ERRCODE_DATA_EXCEPTION),
+                errmsg("update tables_snap_timestamp end time stamp failed"),
+                errdetail("query(%s) execute failed", sql.data),
+                errcause("System error."),
+                erraction("Check whether the query can be executed")));
         }
 
         resetStringInfo(&query);
@@ -1114,74 +1279,31 @@ void SnapshotNameSpace::InsertDatabaseData(const char* dbname, uint64 curr_snapi
     pfree_ext(sql.data);
 }
 
-static bool IsNeedCreateIndex(const char* indexName)
-{
-    Datum colval;
-    bool isNull = false;
-    StringInfoData query;
-
-    initStringInfo(&query);
-    /* check the index which is existing or not */
-    appendStringInfo(&query, "select count(*) from pg_class where relname = '%s' and relkind = 'i'", indexName);
-    colval = GetDatumValue(query.data, 0, 0, &isNull);
-    if (DatumGetInt32(colval)) {
-        return false;
-    }
-    pfree_ext(query.data);
-    return true;
-}
 /*
  In order to accelerate query for awr report, the index of some tables need to create
  The index is created immediately after whose table has existed at the start phase
 */
-void SnapshotNameSpace::CreateIndexes(void)
+void SnapshotNameSpace::CreateIndexes(const char* views)
 {
+    bool isnull = false;
     StringInfoData query;
     initStringInfo(&query);
-
-    /* snap_summary_statio_all_indexes */
-    if (IsNeedCreateIndex("snap_summary_statio_indexes_name")) {
-        appendStringInfo(&query,
-            "create index snap_summary_statio_indexes_name on"
-            " snapshot.snap_summary_statio_all_indexes(db_name, snap_schemaname, snap_relname, snap_indexrelname);");
-
-        if (!SnapshotNameSpace::ExecuteQuery(query.data, SPI_OK_UTILITY)) {
-            ereport(ERROR, (errcode(ERRCODE_DATA_EXCEPTION), errmsg("create index failed")));
-        }
-    }
-
-    /* snap_summary_statio_all_tables */
-    if (IsNeedCreateIndex("snap_summary_statio_tables_name")) {
+    appendStringInfo(&query,
+        "select count(*) from pg_indexes where schemaname = 'snapshot' and "
+        "tablename = 'snap_%s' and indexname = 'snap_%s_idx'",
+        views, views);
+    Datum indexNum = GetDatumValue(query.data, 0, 0, &isnull);
+    if (!DatumGetInt32(indexNum)) {
         resetStringInfo(&query);
-        appendStringInfo(&query,
-            "create index snap_summary_statio_tables_name on"
-            " snapshot.snap_summary_statio_all_tables(db_name, snap_schemaname, snap_relname);");
-
+        appendStringInfo(&query, "create index snapshot.snap_%s_idx on snapshot.snap_%s(snapshot_id)",
+            views, views);
         if (!SnapshotNameSpace::ExecuteQuery(query.data, SPI_OK_UTILITY)) {
-            ereport(ERROR, (errcode(ERRCODE_DATA_EXCEPTION), errmsg("create index failed")));
-        }
-    }
-
-    /* snap_summary_stat_all_indexes */
-    if (IsNeedCreateIndex("snap_summary_stat_indexes_name")) {
-        resetStringInfo(&query);
-        appendStringInfo(&query,
-            "create index snap_summary_stat_indexes_name on"
-            " snapshot.snap_summary_stat_all_indexes(db_name, snap_schemaname, snap_relname, snap_indexrelname);");
-
-        if (!SnapshotNameSpace::ExecuteQuery(query.data, SPI_OK_UTILITY)) {
-            ereport(ERROR, (errcode(ERRCODE_DATA_EXCEPTION), errmsg("create index failed")));
-        }
-    }
-
-    /* snap_class_vital_info */
-    if (IsNeedCreateIndex("snap_class_info_name")) {
-        resetStringInfo(&query);
-        appendStringInfo(&query,
-            "create index snap_class_info_name on"
-            " snapshot.snap_class_vital_info(db_name, snap_schemaname, snap_relname);");
-        if (!SnapshotNameSpace::ExecuteQuery(query.data, SPI_OK_UTILITY)) {
-            ereport(ERROR, (errcode(ERRCODE_DATA_EXCEPTION), errmsg("create index failed")));
+            pfree_ext(query.data);
+            ereport(ERROR, (errmodule(MOD_WDR_SNAPSHOT), errcode(ERRCODE_DATA_EXCEPTION),
+                errmsg("create WDR snapshot index failed"),
+                errdetail("create index snapshot.snap_%s_idx execute error", views),
+                errcause("System error."),
+                erraction("Check whether the query can be executed")));
         }
     }
     pfree_ext(query.data);
@@ -1290,7 +1412,8 @@ void SnapshotNameSpace::SetThrdCxt(void)
      * Create a resource owner to keep track of our resources (currently only
      * buffer pins).
      */
-    t_thrd.utils_cxt.CurrentResourceOwner = ResourceOwnerCreate(NULL, "Snapshot", MEMORY_CONTEXT_DFX);
+    t_thrd.utils_cxt.CurrentResourceOwner = ResourceOwnerCreate(NULL, "Snapshot",
+        THREAD_GET_MEM_CXT_GROUP(MEMORY_CONTEXT_DFX));
 }
 static void SetMyproc()
 {
@@ -1378,19 +1501,22 @@ static void analyze_snap_table()
     int rc = 0;
     start_xact_command();
     PushActiveSnapshot(GetTransactionSnapshot());
+    SPI_STACK_LOG("connect", NULL, NULL);
     if ((rc = SPI_connect()) != SPI_OK_CONNECT) {
-        ereport(ERROR,
-            (errcode(ERRCODE_INTERNAL_ERROR),
-                errmsg("analyze table, connection failed: %s", SPI_result_code_string(rc))));
+        ereport(ERROR, (errmodule(MOD_WDR_SNAPSHOT), errcode(ERRCODE_INTERNAL_ERROR),
+            errmsg("analyze table, connection failed: %s", SPI_result_code_string(rc)),
+            errdetail("SPI_connect failed in function analyze_snap_table"),
+            errcause("System error."),
+            erraction("Check whether the snapshot retry is successful")));
     }
     SnapshotNameSpace::GetAnalyzeList(&(analyzeTableList));
     set_lock_timeout();
     SnapshotNameSpace::AnalyzeTable(analyzeTableList);
+    SPI_STACK_LOG("finish", NULL, NULL);
     SPI_finish();
     PopActiveSnapshot();
     finish_xact_command();
 }
-
 void InitSnapshot()
 {
     /* Check if global_memory_node_detail view can do snapshot */
@@ -1400,13 +1526,17 @@ void InitSnapshot()
     PushActiveSnapshot(GetTransactionSnapshot());
     int rc = 0;
     /* connect SPI to execute query */
+    SPI_STACK_LOG("connect", NULL, NULL);
     if ((rc = SPI_connect()) != SPI_OK_CONNECT) {
-        ereport(ERROR,
-            (errcode(ERRCODE_INTERNAL_ERROR),
-                errmsg("snapshot thread SPI_connect failed: %s", SPI_result_code_string(rc))));
+        ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
+            errmsg("snapshot thread SPI_connect failed: %s", SPI_result_code_string(rc)),
+            errdetail("SPI_connect failed in function analyze_snap_table"),
+            errcause("System error."),
+            erraction("Check whether the snapshot retry is successful")));
     }
     set_lock_timeout();
     SnapshotNameSpace::InitTables();
+    SPI_STACK_LOG("finish", NULL, NULL);
     SPI_finish();
     PopActiveSnapshot();
     finish_xact_command();

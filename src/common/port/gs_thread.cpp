@@ -41,7 +41,7 @@
 #include "distributelayer/streamMain.h"
 #include "miscadmin.h"
 #include "libpq/libpq-be.h"
-#include "storage/smgr.h"
+#include "storage/smgr/smgr.h"
 #include "storage/latch.h"
 #include "storage/spin.h"
 #include "storage/cstore/cstore_mem_alloc.h"
@@ -51,7 +51,12 @@
 #include "gssignal/gs_signal.h"
 #include "utils/pg_locale.h"
 #include "gs_policy/policy_common.h"
+#ifdef ENABLE_GSS
+#include "gssapi/gssapi_krb5.h"
+#endif /* ENABLE_GSS */
+#ifdef KRB5
 #include "krb5.h"
+#endif
 #ifndef WIN32_ONLY_COMPILER
 #include "dynloader.h"
 #else
@@ -455,7 +460,9 @@ void gs_thread_exit(int code)
 
     CloseGTM();
 
-    CloseClientSocket(u_sess, true);
+    if (exitCode != STATUS_ERROR) {
+        CloseClientSocket(u_sess, true);
+    }
 
     gs_poll_close();
 
@@ -482,6 +489,12 @@ void gs_thread_exit(int code)
 
     if (t_thrd.bn != NULL) {
         t_thrd.bn->dead_end = true;
+    } else if (!t_thrd.is_inited) {
+        /* if thread has error befor get backend, get backend from childSlot. */
+        Backend* bn = GetBackend(t_thrd.child_slot);
+        if (bn != NULL) {
+            bn->dead_end = true;
+        }
     }
 
     /* release the signal slot in signal_base */

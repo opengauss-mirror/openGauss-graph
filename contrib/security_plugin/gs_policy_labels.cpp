@@ -36,6 +36,8 @@
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
 #include "utils/lsyscache.h"
+#include "gs_mask_policy.h"
+#include "gs_policy_plugin.h"
 
 static THR_LOCAL loaded_labels *all_labels = NULL;
 
@@ -135,35 +137,6 @@ bool scan_policy_labels(loaded_labels *tmp_labels)
     return label_type_found;
 }
 
-/*
- * get_label_tables
- *    return sets of existing labels from given labelname
- */
-bool get_label_tables(const char *label_name, policy_default_str_uset *label_tables)
-{
-    loaded_labels *tmp = get_policy_labels();
-    if (tmp == NULL) {
-        return false;
-    }
-    loaded_labels::const_iterator it = tmp->find(label_name);
-    if (it == tmp->end()) {
-        return false;
-    }
-
-    typed_labels::const_iterator fit = it->second->find(O_TABLE);
-    if (fit != it->second->end()) {
-        gs_policy_label_set::const_iterator tit = fit->second->begin();
-        gs_policy_label_set::const_iterator teit = fit->second->end();
-        for (; tit != teit; ++tit) {
-            gs_stl::gs_string value;
-            tit->get_fqdn_value(&value);
-            label_tables->insert(value.c_str());
-        }
-    }
-
-    return true;
-}
-
 bool is_label_exist(const char *name)
 {
     if (!strcasecmp(name, "all")) { /* any label */
@@ -180,40 +153,6 @@ loaded_labels *get_policy_labels()
 {
     load_policy_labels(true);
     return all_labels;
-}
-
-/*
- * is_labels_has_object
- *    this function is for other features (masking, auditing etc.)
- *    check given fqdn name is bound to labels, and this label is belong to policies
- *    CheckLabelBoundPolicy is the check function provided by other features that label is of policies
- *    labels means used labels in other features.
- */
-bool is_labels_has_object(const GsPolicyFQDN *fqdn, const policy_default_str_set *labels,
-                          bool (*CheckLabelBoundPolicy)(bool, const gs_stl::gs_string))
-{
-    static const PrivObject check_obj_types[] = {
-        O_VIEW,
-        O_TABLE,
-        O_COLUMN,
-        O_UNKNOWN
-    };
-    PolicyLabelItem object(0, fqdn->m_value_object, O_UNKNOWN);
-
-    for (uint8 i = 0; check_obj_types[i] != O_UNKNOWN; ++i) {
-        object.m_obj_type = check_obj_types[i];
-        if (check_obj_types[i] == O_COLUMN) {
-            int rc = snprintf_s(object.m_column, sizeof(object.m_column),
-                fqdn->m_value_object_attrib.size(), "%s", fqdn->m_value_object_attrib.c_str());
-            securec_check_ss(rc, "\0", "\0");
-        }
-
-        if (check_label_has_object(&object, CheckLabelBoundPolicy, false, labels)) {
-            return true;
-        }
-    }
-
-    return false;
 }
 
 bool load_policy_labels(bool reload)
@@ -255,13 +194,13 @@ bool check_label_has_object(const PolicyLabelItem *object,
         return false;
     }
     Assert(CheckLabelBoundPolicy != NULL);
-    loaded_labels *all_labels = get_policy_labels();
-    if (all_labels == NULL) {
+    loaded_labels *cur_all_labels = get_policy_labels();
+    if (cur_all_labels == NULL) {
         return false;
     }
 
-    loaded_labels::const_iterator it = all_labels->begin();
-    loaded_labels::const_iterator eit = all_labels->end();
+    loaded_labels::const_iterator it = cur_all_labels->begin();
+    loaded_labels::const_iterator eit = cur_all_labels->end();
     for (; it != eit; ++it) {
         /* for each item of loaded existing labels, and match labels */
         if (labels != NULL && labels->find(*(it->first)) == labels->end()) {
@@ -300,5 +239,42 @@ void clear_thread_local_label()
     if (all_labels != NULL) {
         delete all_labels;
         all_labels = NULL;
+    }
+}
+
+void verify_drop_column(AlterTableStmt *stmt)
+{
+    ListCell *lcmd = NULL;
+    foreach (lcmd, stmt->cmds) {
+        AlterTableCmd *cmd = (AlterTableCmd *)lfirst(lcmd);
+        switch (cmd->subtype) {
+            case AT_DropColumn: {
+                /* check by column */
+                PolicyLabelItem find_obj(stmt->relation->schemaname, stmt->relation->relname, cmd->name, O_COLUMN);
+                if (check_label_has_object(&find_obj, is_masking_has_object)) {
+                    char buff[512] = {0};
+                    int rc = snprintf_s(buff, sizeof(buff), sizeof(buff) - 1,
+                        "Column: %s is part of some resource label, can not be renamed.", find_obj.m_column);
+                    securec_check_ss(rc, "\0", "\0");
+                    gs_audit_issue_syslog_message("PGAUDIT", buff, AUDIT_POLICY_EVENT, AUDIT_FAILED);
+                    ereport(ERROR, (errcode(ERRCODE_WRONG_OBJECT_TYPE), errmsg("\"%s\"", buff)));
+                }
+                break;
+            }
+            case AT_AlterColumnType: {
+                PolicyLabelItem find_obj(stmt->relation->schemaname, stmt->relation->relname, cmd->name, O_COLUMN);
+                if (check_label_has_object(&find_obj, is_masking_has_object, true)) {
+                    char buff[512] = {0};
+                    int ret = snprintf_s(buff, sizeof(buff), sizeof(buff) - 1,
+                        "Column: %s is part of some masking policy, can not be changed.", find_obj.m_column);
+                    securec_check_ss(ret, "\0", "\0");
+                    gs_audit_issue_syslog_message("PGAUDIT", buff, AUDIT_POLICY_EVENT, AUDIT_FAILED);
+                    ereport(ERROR, (errcode(ERRCODE_WRONG_OBJECT_TYPE), errmsg("\"%s\"", buff)));
+                }
+                break;
+            }
+            default:
+                break;
+        }
     }
 }

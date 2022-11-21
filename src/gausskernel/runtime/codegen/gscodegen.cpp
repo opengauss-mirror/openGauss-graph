@@ -24,6 +24,7 @@
 #include "codegen/gscodegen.h"
 #include <unordered_set>
 
+#ifdef ENABLE_LLVM_COMPILE
 #include "llvm/ADT/Triple.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/Analysis/InstructionSimplify.h"
@@ -49,6 +50,8 @@
 #include "llvm/Transforms/Scalar.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/Transforms/Utils/Cloning.h"
+#include "llvm-c/Core.h"
+#endif
 
 #include "pgxc/pgxc.h"
 #include "utils/memutils.h"
@@ -202,7 +205,6 @@ llvm::LLVMContext& GsCodeGen::context()
 
 bool GsCodeGen::createNewModule()
 {
-
     /* If m_currentModule <> NULL, it indicates we either
      * compiled the module or haven't created the module yet.
      */
@@ -257,6 +259,32 @@ llvm::ExecutionEngine* GsCodeGen::createNewEngine(llvm::Module* module)
     return execEngine;
 }
 
+bool GsCodeGen::CheckPreloadModule(llvm::Module* mod)
+{
+    if (mod == NULL) {
+        ereport(LOG, (errmodule(MOD_LLVM), errmsg("Failed to ParseBitcodeFile.")));
+        return false;
+    }
+
+    const char* triple = mod->getTargetTriple().c_str();
+#ifdef __aarch64__
+    const char* cpu = "aarch64";
+#elif defined (__x86_64__)
+    const char* cpu = "x86_64";
+#else
+    const char* cpu = "generic";
+#endif
+
+    char* pos = strstr(const_cast<char*>(triple), cpu);
+    if (!pos) {
+        ereport(LOG, (errmodule(MOD_LLVM),
+                errmsg("Target triple (%s) was not matched on native CPU.", triple)));
+        return false;
+    }
+
+    return true;
+}
+
 bool GsCodeGen::parseIRFile(StringInfo filename)
 {
     llvm::Module* m_module = NULL;
@@ -299,10 +327,8 @@ bool GsCodeGen::parseIRFile(StringInfo filename)
             return false;
         }
         m_module = moduleOrErr.get().release();
-        if (m_module == NULL) {
-            ereport(LOG, (errmodule(MOD_LLVM), errmsg("Failed to ParseBitcodeFile.")));
+        if (!CheckPreloadModule(m_module))
             return false;
-        }
     }
     LLVM_CATCH("Failed to parse IR file.");
 
@@ -323,8 +349,18 @@ void GsCodeGen::loadIRFile()
     StringInfo filename = makeStringInfo();
     exec_path = gs_getenv_r("GAUSSHOME");
     if (NULL != exec_path && strcmp(exec_path, "\0") != 0) {
-        appendStringInfo(filename, "%s/share/llvmir/GaussDB_expr.ir", exec_path);
-        check_backend_env(exec_path);
+        char* exec_path_r = realpath(exec_path, NULL);
+        if (exec_path_r) {
+            appendStringInfo(filename, "%s/share/llvmir/GaussDB_expr.ir", exec_path_r);
+            check_backend_env(exec_path);
+            free(exec_path_r);
+        } else {
+            ereport(ERROR,
+                    (errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+                     errmodule(MOD_LLVM),
+                     errmsg("Got illegal enviroment parameter $GAUSSHOME, please set $GAUSSHOME as your "
+                            "installation directory!")));
+        }
     } else {
         ereport(ERROR,
             (errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
@@ -518,7 +554,11 @@ PointerType* GsCodeGen::getPtrType(Oid TypeID)
 Type* GsCodeGen::getType(const char* name)
 {
     Assert(NULL != m_currentModule && NULL != name);
+#if LLVM_MAJOR_VERSION == 12
+    return StructType::getTypeByName(context(), StringRef(name, strlen(name)));
+#else
     return m_currentModule->getTypeByName(StringRef(name, strlen(name)));
+#endif
 }
 
 PointerType* GsCodeGen::getPtrType(const char* name)
@@ -527,6 +567,15 @@ PointerType* GsCodeGen::getPtrType(const char* name)
     Type* type = getType(name);
 
     return PointerType::get(type, 0);
+}
+
+PointerType* GsCodeGen::getPtrPtrType(const char* name)
+{
+    Assert(NULL != name);
+    Type* type = getType(name);
+    Type* typePtr = PointerType::get(type, 0);
+
+    return PointerType::get(typePtr, 0);
 }
 
 llvm::Value* GsCodeGen::CastPtrToLlvmPtr(Type* type, const void* ptr)
@@ -939,7 +988,6 @@ void CodeGenProcessInitialize()
         PG_END_TRY();
     }
 }
-
 
 /**
  * @Description : Clean up LLVM enviroment resource

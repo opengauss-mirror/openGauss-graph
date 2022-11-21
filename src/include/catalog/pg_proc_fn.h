@@ -18,6 +18,7 @@
 
 extern Oid ProcedureCreate(const char *procedureName,
                 Oid procNamespace,
+                Oid propackageid,
                 bool isOraStyle,
                 bool replace,
                 bool returnsSet,
@@ -45,9 +46,27 @@ extern Oid ProcedureCreate(const char *procedureName,
                 bool  fenced,
                 bool  shippable,
                 bool  package,
-                bool  proIsProcedure);
+                bool  proIsProcedure,
+                const char *proargsrc,
+                bool  isPrivate = false);
 
 extern bool function_parse_error_transpose(const char *prosrc);
 
+extern bool isSameParameterList(List* parameterList1, List* parameterList2);
+extern char* getFuncName(List* funcNameList);
+
+#ifndef ENABLE_MULTIPLE_NODES
+extern char* ConvertArgModesToString(Datum proArgModes);
+extern bool IsProArgModesEqual(Datum argModes1, Datum argModes2);
+extern bool IsProArgModesEqualByTuple(HeapTuple tup, TupleDesc desc, oidvector* argModes);
+extern oidvector* ConvertArgModesToMd5Vector(Datum proArgModes);
+extern oidvector* MergeOidVector(oidvector* allArgTypes, oidvector* argModes);
+#endif
+
+extern oidvector* MakeMd5HashOids(oidvector* paramterTypes);
+
+extern oidvector* ProcedureGetArgTypes(HeapTuple tuple);
+
+extern Datum ProcedureGetAllArgTypes(HeapTuple tuple, bool* isNull);
 #endif   /* PG_PROC_FN_H */
 

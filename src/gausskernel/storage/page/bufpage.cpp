@@ -1,7 +1,7 @@
 /* -------------------------------------------------------------------------
  *
  * bufpage.cpp
- *	  POSTGRES standard buffer page code.
+ *	  openGauss standard buffer page code.
  *
  * Portions Copyright (c) 2020 Huawei Technologies Co.,Ltd.
  * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
@@ -24,6 +24,7 @@
 #include "utils/snapmgr.h"
 #include "utils/builtins.h"
 #include "utils/aiomem.h"
+#include "access/ustore/knl_upage.h"
 
 static const uint16 PAGE_CHECKSUM_MAGIC = 0xFFFF;
 
@@ -31,7 +32,6 @@ static const uint16 PAGE_CHECKSUM_MAGIC = 0xFFFF;
  *						Page support functions
  * ----------------------------------------------------------------
  */
-
 
 /*
  * PageIsVerified
@@ -64,12 +64,10 @@ bool PageIsVerified(Page page, BlockNumber blkno)
     /*
      * Don't verify page data unless the page passes basic non-zero test
      */
-    if (!PageIsNew(page)) {
-        if (PageIsChecksumByFNV1A(page)) {
-            checksum = pg_checksum_page((char*)page, blkno);
-            if (checksum != p->pd_checksum) {
-                checksum_failure = true;
-            }
+    if (CheckPageZeroCases((PageHeader)page)) {
+        checksum = pg_checksum_page((char*)page, blkno);
+        if (checksum != p->pd_checksum) {
+            checksum_failure = true;
         }
 
         /*
@@ -129,12 +127,6 @@ bool PageIsVerified(Page page, BlockNumber blkno)
     return false;
 }
 
-static inline bool CheckPageZeroCases(const PageHeader page)
-{
-    return page->pd_lsn.xlogid != 0 || page->pd_lsn.xrecoff != 0 || (page->pd_flags & ~PD_LOGICAL_PAGE) != 0 ||
-        page->pd_lower != 0 || page->pd_upper != 0 || page->pd_special != 0 || page->pd_pagesize_version != 0;
-}
-
 /*
  * PageHeaderIsValid
  *		Check that the header fields of a page appear valid.
@@ -153,20 +145,64 @@ bool PageHeaderIsValid(PageHeader page)
     /* Check normal case */
     if (PageGetPageSize(page) == BLCKSZ &&
         (PageGetPageLayoutVersion(page) == PG_COMM_PAGE_LAYOUT_VERSION ||
-            PageGetPageLayoutVersion(page) == PG_PAGE_4B_LAYOUT_VERSION ||
-            PageGetPageLayoutVersion(page) == PG_HEAP_PAGE_LAYOUT_VERSION) &&
+            PageGetPageLayoutVersion(page) == PG_HEAP_PAGE_LAYOUT_VERSION ||
+            PageGetPageLayoutVersion(page) == PG_SEGMENT_PAGE_LAYOUT_VERSION) &&
         (page->pd_flags & ~PD_VALID_FLAG_BITS) == 0 && page->pd_lower >= headersize &&
         page->pd_lower <= page->pd_upper && page->pd_upper <= page->pd_special && page->pd_special <= BLCKSZ &&
         page->pd_special == MAXALIGN(page->pd_special))
         return true;
 
-    /* Check all-zeroes case */
-    if (CheckPageZeroCases(page))
+    /*
+     * Check all-zeroes case for new page;
+     * Currently, pd_flags, lsn and checksum may be not zero even in new page. For example, a new page may be set
+     * PD_JUST_AFTER_FPW flag when redoing log_new_page; and then set checksum when flushing to disk. Segment-page
+     * storage also sets LSN when creating a new page.
+     * So we skip these three variables and test reset variables in the header.
+     */
+    if (page->pd_lower != 0 || page->pd_upper != 0 || page->pd_special != 0 || page->pd_pagesize_version != 0) {
         return false;
+    }
 
     pagebytes = (char*)page;
     headeroff =
         PageIs8BXidHeapVersion(page) ? offsetof(HeapPageHeaderData, pd_linp) : offsetof(PageHeaderData, pd_linp);
+    for (i = headeroff; i < BLCKSZ; i++) {
+        if (pagebytes[i] != 0)
+            return false;
+    }
+    return true;
+}
+
+/*
+ * UPageHeaderIsValid
+ *		Check that the header fields of a page appear valid.
+ *
+ * This is called when a page modify in memory.
+ * if a page has just been read in from disk, should use PageIsVerified
+ */
+bool UPageHeaderIsValid(const UHeapPageHeaderData* page)
+{
+    char* pagebytes = NULL;
+    int i;
+    uint16 headersize;
+    int headeroff;
+
+    headersize = SizeOfUHeapPageHeaderData;
+    /* Check normal case */
+    if (page->pd_lower >= headersize && page->pd_lower <= page->pd_upper &&
+        page->pd_upper <= page->pd_special && page->pd_special <= BLCKSZ &&
+        page->pd_special == MAXALIGN(page->pd_special))
+        return true;
+
+    /* Check all-zeroes case */
+    if (page->pd_lsn.xlogid != 0 || page->pd_lsn.xrecoff != 0 || (page->pd_flags & UHEAP_VALID_FLAG_BITS) != 0 ||
+        page->pd_lower != 0 || page->pd_upper != 0 || page->pd_special != 0 ||
+        page->td_count != 0 || page->pd_prune_xid != 0) {
+        return false;
+    }
+
+    pagebytes = (char*)page;
+    headeroff = offsetof(UHeapPageHeaderData, reserved);
     for (i = headeroff; i < BLCKSZ; i++) {
         if (pagebytes[i] != 0)
             return false;
@@ -232,42 +268,6 @@ Size PageGetExactFreeSpace(Page page)
     return (Size)(uint32)space;
 }
 
-
-static void upgrade_page_ver_4_to_5(Page page)
-{
-    HeapPageHeader phdr = (HeapPageHeader)page;
-
-    PageSetPageSizeAndVersion(page, BLCKSZ, PG_HEAP_PAGE_LAYOUT_VERSION);
-
-    phdr->pd_xid_base = 0;
-    phdr->pd_multi_base = 0;
-    ereport(DEBUG1, (errmsg("The page has been upgraded to version %d ", phdr->pd_pagesize_version)));
-    return;
-}
-
-/* Upgrade the page from PG_PAGE_4B_LAYOUT_VERSION(4) to PG_PAGE_LAYOUT_VERSION(5) */
-void PageLocalUpgrade(Page page)
-{
-    PageHeader phdr = (PageHeader)page;
-    errno_t rc = EOK;
-    Size movesize = phdr->pd_lower - SizeOfPageHeaderData;
-
-    Assert(PageIs4BXidVersion(page));
-
-    if (movesize > 0) {
-        rc = memmove_s((char*)page + SizeOfHeapPageHeaderData,
-            phdr->pd_upper - SizeOfHeapPageHeaderData,
-            (char*)page + SizeOfPageHeaderData,
-            phdr->pd_lower - SizeOfPageHeaderData);
-
-        securec_check(rc, "", "");
-    }
-
-    /* Update PageHeaderInfo */
-    phdr->pd_lower += SizeOfHeapPageUpgradeData;
-    upgrade_page_ver_4_to_5(page);
-}
-
 static inline void AllocPageCopyMem()
 {
     if (t_thrd.storage_cxt.pageCopy == NULL) {
@@ -282,62 +282,96 @@ static inline void AllocPageCopyMem()
         }
         ADIO_END();
     }
+    if (t_thrd.storage_cxt.segPageCopy == NULL) {
+        ADIO_RUN()
+        {
+            t_thrd.storage_cxt.segPageCopy = (char*)adio_align_alloc(BLCKSZ);
+        }
+        ADIO_ELSE()
+        {
+            t_thrd.storage_cxt.segPageCopy = (char*)MemoryContextAlloc(
+                THREAD_GET_MEM_CXT_GROUP(MEMORY_CONTEXT_STORAGE), BLCKSZ);
+        }
+        ADIO_END();
+    }
 }
 
 /*
- * Block data encrypt,We allocate the memory once for one Thread,this space
- * reused util Thread exit.
- * Since we have only shared lock on the
+ * Block data encrypt, We allocate the memory once for every single Thread, this space
+ * reused untill Thread exit.
+ * Since we only have shared lock on the
  * buffer, other processes might be updating hint bits in it, so we must
- * copy the page to private storage if we change it.
+ * copy the page to private storage if we are going to change it.
  */
-char* PageDataEncryptIfNeed(Page page)
+char* PageDataEncryptIfNeed(Page page, TdeInfo* tde_info, bool need_copy, bool is_segbuf)
 {
-    size_t plainLength;
+    size_t plainLength = 0;
     size_t cipherLength = 0;
-    uint16 headersize;
-    int ret = 0;
+    errno_t ret = 0;
+    int retval = 0;
+    TdePageInfo tde_page_info;
+    char* dst = NULL;
 
-    headersize = GetPageHeaderSize(page);
-    plainLength = (size_t)(BLCKSZ - headersize);
-
-    /* is encrypted Cluster */
-    if (!isEncryptedCluster() || PageIsNew(page)) {
+    if (PageIsNew(page) || !PageIsTDE(page) || !g_instance.attr.attr_security.enable_tde) {
         return (char*)page;
     }
+    Assert(!PageIsEncrypt(page));
 
-    AllocPageCopyMem();
+    plainLength = ((PageHeader)page)->pd_special - ((PageHeader)page)->pd_upper;
+    retval = RAND_priv_bytes(tde_info->iv, RANDOM_IV_LEN);
+    if (retval != 1) {
+        ereport(WARNING, (errmodule(MOD_SEC_TDE), errmsg("generate random iv for tde failed, errcode:%d", retval)));
+        return (char*)page;
+    }
+    if (need_copy) {
+        AllocPageCopyMem();
+        dst = is_segbuf ? t_thrd.storage_cxt.segPageCopy : t_thrd.storage_cxt.pageCopy;
+        ret = memcpy_s(dst, BLCKSZ, (char*)page, BLCKSZ);
+        securec_check(ret, "\0", "\0");
+    } else {
+        dst = (char*)page;
+    }
 
-    ret = memcpy_s(t_thrd.storage_cxt.pageCopy, BLCKSZ, (char*)page, BLCKSZ);
-    securec_check_c(ret, "\0", "\0");
-    encryptBlockOrCUData(PageGetContents(t_thrd.storage_cxt.pageCopy),
+    /* at this part, do the real encryption */
+    encryptBlockOrCUData(dst + ((PageHeader)dst)->pd_upper,
         plainLength,
-        PageGetContents(t_thrd.storage_cxt.pageCopy),
-        &cipherLength);
+        dst + ((PageHeader)dst)->pd_upper,
+        &cipherLength,
+        tde_info);
     Assert(plainLength == cipherLength);
-    PageSetEncrypt((Page)t_thrd.storage_cxt.pageCopy);
 
-    return t_thrd.storage_cxt.pageCopy;
+    ret = memset_s(&tde_page_info, sizeof(TdePageInfo), 0, sizeof(TdePageInfo));
+    securec_check(ret, "\0", "\0");
+    transformTdeInfoToPage(tde_info, &tde_page_info);
+    ret = memcpy_s(dst + BLCKSZ - sizeof(TdePageInfo), sizeof(TdePageInfo), &tde_page_info, sizeof(TdePageInfo));
+    securec_check(ret, "\0", "\0");
+
+    /* set the encryption flag */
+    PageSetEncrypt((Page)dst);
+    return dst;
 }
 
-/*
- * Block data encrypt,We allocate the memory once for one Thread,this space
- * reused util Thread exit.
- * Since we have only shared lock on the
- * buffer, other processes might be updating hint bits in it, so we must
- * copy the page to private storage if we change it.
- */
 void PageDataDecryptIfNeed(Page page)
 {
-    if (PageIsEncrypt(page)) {
-        uint16 headersize;
+    TdeInfo tde_info = {0};
+    TdePageInfo* tde_page_info = NULL;
 
-        headersize = GetPageHeaderSize(page);
+    /* whether this page is both TDE page and encrypted  */
+    if (PageIsEncrypt(page) && PageIsTDE(page)) {
         size_t plainLength = 0;
-        size_t cipherLength = (size_t)(BLCKSZ - headersize);
+        size_t cipherLength = ((PageHeader)page)->pd_special - ((PageHeader)page)->pd_upper;
+        tde_page_info = (TdePageInfo*)((char*)(page) + BLCKSZ - sizeof(TdePageInfo));
+        transformTdeInfoFromPage(&tde_info, tde_page_info);
 
-        decryptBlockOrCUData(PageGetContents(page), cipherLength, PageGetContents(page), &plainLength);
+        /* at this part, do the real decryption */
+        decryptBlockOrCUData(page + ((PageHeader)page)->pd_upper,
+            cipherLength,
+            page + ((PageHeader)page)->pd_upper,
+            &plainLength,
+            &tde_info);
         Assert(cipherLength == plainLength);
+
+        /* clear the encryption flag */
         PageClearEncrypt(page);
     }
 }
@@ -356,10 +390,10 @@ void PageDataDecryptIfNeed(Page page)
  * statically-allocated memory, so the caller must immediately write the
  * returned page and not refer to it again.
  */
-char* PageSetChecksumCopy(Page page, BlockNumber blkno)
+char* PageSetChecksumCopy(Page page, BlockNumber blkno, bool is_segbuf)
 {
     /* If we don't need a checksum, just return the passed-in data */
-    if (PageIsNew(page)) {
+    if (!CheckPageZeroCases((PageHeader)page)) {
         return (char*)page;
     }
 
@@ -371,15 +405,17 @@ char* PageSetChecksumCopy(Page page, BlockNumber blkno)
      */
     AllocPageCopyMem();
 
-    errno_t rc = memcpy_s(t_thrd.storage_cxt.pageCopy, BLCKSZ, (char*)page, BLCKSZ);
+    char *dst = is_segbuf ? t_thrd.storage_cxt.segPageCopy : t_thrd.storage_cxt.pageCopy;
+
+    errno_t rc = memcpy_s(dst, BLCKSZ, (char*)page, BLCKSZ);
     securec_check(rc, "", "");
 
     /* set page->pd_flags mark using FNV1A for checksum */
-    PageSetChecksumByFNV1A(t_thrd.storage_cxt.pageCopy);
+    PageSetChecksumByFNV1A(dst);
 
-    ((PageHeader)t_thrd.storage_cxt.pageCopy)->pd_checksum = pg_checksum_page(t_thrd.storage_cxt.pageCopy, blkno);
+    ((PageHeader)dst)->pd_checksum = pg_checksum_page(dst, blkno);
 
-    return t_thrd.storage_cxt.pageCopy;
+    return dst;
 }
 
 /*
@@ -391,7 +427,7 @@ char* PageSetChecksumCopy(Page page, BlockNumber blkno)
 void PageSetChecksumInplace(Page page, BlockNumber blkno)
 {
     /* If we don't need a checksum, just return */
-    if (PageIsNew(page)) {
+    if (!CheckPageZeroCases((PageHeader)page)) {
         return;
     }
 
@@ -399,4 +435,29 @@ void PageSetChecksumInplace(Page page, BlockNumber blkno)
     PageSetChecksumByFNV1A(page);
 
     ((PageHeader)page)->pd_checksum = pg_checksum_page((char*)page, blkno);
+}
+
+/*
+ * PageGetFreeSpaceForMultipleTuples
+ *	 Returns the size of the free (allocatable) space on a page,
+ *	 reduced by the space needed for multiple new line pointers.
+ *
+ * Note: this should usually only be used on index pages.  Use
+ * PageGetHeapFreeSpace on heap pages.
+ */
+Size PageGetFreeSpaceForMultipleTuples(Page page, int ntups)
+{
+    int space;
+
+    /*
+     * Use signed arithmetic here so that we behave sensibly if pd_lower >
+     * pd_upper.
+     */
+    space = (int)((PageHeader)page)->pd_upper - (int)((PageHeader)page)->pd_lower;
+
+    if (space < (int)(ntups * sizeof(ItemIdData)))
+        return 0;
+    space -= ntups * sizeof(ItemIdData);
+
+    return (Size) space;
 }

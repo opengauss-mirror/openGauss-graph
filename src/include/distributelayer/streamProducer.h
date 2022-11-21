@@ -33,6 +33,7 @@
 #define CSTRING_TYPE 3
 #define TID_TYPE 4
 #define FIXED_TYPE 5
+#define NAME_TYPE 6
 
 class StreamProducer : public StreamObj {
 public:
@@ -271,6 +272,8 @@ public:
     }
 
     void setUniqueSQLKey(uint64 unique_sql_id, Oid unique_user_id, uint32 unique_cn_id);
+    void setGlobalSessionId(GlobalSessionId* globalSessionId);
+    void getGlobalSessionId(GlobalSessionId* globalSessionId);
 
     /* The plan the producer thread will run. */
     PlannedStmt* m_plan;
@@ -455,6 +458,8 @@ private:
     /* The bucket map for redistribute. */
     uint2* m_bucketMap;
 
+    int    m_bucketCnt;
+
     /* boundary extracted from ExecNodes if redistribute by range/list */
     ExecBoundary* m_sliceBoundary;
 
@@ -500,6 +505,9 @@ private:
     uint64 m_uniqueSQLId;
     Oid m_uniqueSQLUserId;
     uint32 m_uniqueSQLCNId;
+
+    /* global session id */
+    GlobalSessionId m_globalSessionId;
 };
 
 extern THR_LOCAL StreamProducer* streamProducer;

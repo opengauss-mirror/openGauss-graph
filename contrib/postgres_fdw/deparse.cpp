@@ -46,6 +46,7 @@
 #include "catalog/pg_proc.h"
 #include "catalog/pg_type.h"
 #include "commands/defrem.h"
+#include "libpq/pqexpbuffer.h"
 #include "nodes/nodeFuncs.h"
 #include "optimizer/clauses.h"
 #include "optimizer/var.h"
@@ -711,7 +712,7 @@ static bool foreign_expr_walker(Node *node, foreign_glob_cxt *glob_cxt, foreign_
 }
 
 /*
- * Return true if given object is one of PostgreSQL's built-in objects.
+ * Return true if given object is one of openGauss's built-in objects.
  *
  * We use FirstBootstrapObjectId as the cutoff, so that we only consider
  * objects with hand-assigned OIDs to be "built in", not for instance any
@@ -1176,6 +1177,36 @@ static void deparseRelation(StringInfo buf, Relation rel)
     }
     if (relname == NULL) {
         relname = RelationGetRelationName(rel);
+    }
+
+    /* In current version, there are some unpredictable operations (delete/update, etc.) of foreign table built on
+     * partitioned table. We forbid all operations in this condition by default. */
+    if (!ENABLE_SQL_BETA_FEATURE(PARTITION_FDW_ON)) {
+        char parttype = PARTTYPE_NON_PARTITIONED_RELATION;
+        UserMapping* user = GetUserMapping(GetUserId(), table->serverid);
+        ForeignServer *server = GetForeignServer(table->serverid);
+        PGconn* conn = GetConnection(server, user, false);
+
+        PQExpBuffer query = createPQExpBuffer();
+        appendPQExpBuffer(query,
+            "SELECT c.parttype FROM pg_class c, pg_namespace n "
+            "WHERE c.relname = '%s' and c.relnamespace = n.oid and n.nspname = '%s'",
+            quote_identifier(relname), quote_identifier(nspname));
+
+        PGresult* res = pgfdw_exec_query(conn, query->data);
+        if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+            pgfdw_report_error(ERROR, res, conn, true, query->data);
+        }
+        /* res may be empty as the relname/nspname validation is not checked */
+        if (PQntuples(res) > 0) {
+            parttype = *PQgetvalue(res, 0, 0);
+        }
+        PQclear(res);
+        destroyPQExpBuffer(query);
+
+        if ((parttype == PARTTYPE_PARTITIONED_RELATION || parttype == PARTTYPE_SUBPARTITIONED_RELATION)) {
+            ereport(ERROR, (errmsg("could not operate foreign table on partitioned table")));
+        }
     }
 
     appendStringInfo(buf, "%s.%s", quote_identifier(nspname), quote_identifier(relname));
@@ -1800,7 +1831,7 @@ static void printRemoteParam(int paramindex, Oid paramtype, int32 paramtypmod, d
  * want the remote planner to generate a plan that depends on such a value
  * anyway.  Thus, we can't do something simple like "$1::paramtype".
  * Instead, we emit "((SELECT null::paramtype)::paramtype)".
- * In all extant versions of Postgres, the planner will see that as an unknown
+ * In all extant versions of openGauss, the planner will see that as an unknown
  * constant value, which is what we want.  This might need adjustment if we
  * ever make the planner flatten scalar subqueries.  Note: the reason for the
  * apparently useless outer cast is to ensure that the representation as a

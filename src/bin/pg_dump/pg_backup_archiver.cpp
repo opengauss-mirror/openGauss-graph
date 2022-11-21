@@ -118,8 +118,9 @@ const char* encrypt_salt;
 #define NO_SLOT (-1)
 static const int RESTORE_READ_CNT = 100;
 
-#define TEXT_DUMP_HEADER "--\n-- PostgreSQL database dump\n--\n\n"
-#define TEXT_DUMPALL_HEADER "--\n-- PostgreSQL database cluster dump\n--\n\n"
+#define PATCH_LEN 50
+#define TEXT_DUMP_HEADER "--\n-- openGauss database dump\n--\n\n"
+#define TEXT_DUMPALL_HEADER "--\n-- openGauss database cluster dump\n--\n\n"
 
 /* state needed to save/restore an archive's output target */
 typedef struct _outputContext {
@@ -188,6 +189,8 @@ static void setProcessIdentifier(ParallelStateEntry* pse, ArchiveHandle* AH);
 static void unsetProcessIdentifier(ParallelStateEntry* pse);
 static ParallelStateEntry* GetMyPSEntry(ParallelState* pstate);
 static void archive_close_connection(int code, void* arg);
+static void take_down_nsname_in_drop_stmt(const char *stmt, char *result, int len);
+static void get_role_password(RestoreOptions* opts);
 
 /*
  *	Wrapper functions.
@@ -293,6 +296,23 @@ void SetArchiveRestoreOptions(Archive* AHX, RestoreOptions* ropt)
     }
 }
 
+static void out_drop_stmt(ArchiveHandle* AH, const TocEntry* te)
+{
+    RestoreOptions* ropt = AH->ropt;
+
+    if (ropt->targetV1 || ropt->targetV5) {
+        char *result = (char *)pg_malloc(strlen(te->dropStmt) + PATCH_LEN);
+        errno_t tnRet = 0;
+        tnRet = memset_s(result, strlen(te->dropStmt) + PATCH_LEN, 0, strlen(te->dropStmt) + PATCH_LEN);
+        securec_check_c(tnRet, "\0", "\0");
+        take_down_nsname_in_drop_stmt(te->dropStmt, result, strlen(te->dropStmt) + PATCH_LEN);
+        
+        ahprintf(AH, "%s", result);
+        free(result);
+    } else {
+        ahprintf(AH, "%s", te->dropStmt);
+    }
+}
 /* Public */
 void RestoreArchive(Archive* AHX)
 {
@@ -381,6 +401,10 @@ void RestoreArchive(Archive* AHX)
          * obscure SQL when displaying errors
          */
         AH->noTocComments = 1;
+
+        if ((ropt->use_role != NULL) && (ropt->rolepassword == NULL)) {
+            get_role_password(ropt);
+        }
     }
 
     /*
@@ -417,7 +441,7 @@ void RestoreArchive(Archive* AHX)
     /*
      * Put the rand value to encrypt file for decrypt.
      */
-    if (('\0' != *AH->publicArc.rand) && (NULL == encrypt_salt)) {
+    if ((true == AHX->encryptfile) && (NULL == encrypt_salt)) {
         p = (char*)pg_malloc(RANDOM_LEN + 1);
         rc = memset_s(p, RANDOM_LEN + 1, 0, RANDOM_LEN + 1);
         securec_check_c(rc, "\0", "\0");
@@ -428,7 +452,7 @@ void RestoreArchive(Archive* AHX)
         p = NULL;
     }
 
-    (void)ahprintf(AH, "--\n-- PostgreSQL database dump\n--\n\n");
+    (void)ahprintf(AH, "--\n-- openGauss database dump\n--\n\n");
 
     if (AH->publicArc.verbose) {
         if (AH->archiveRemoteVersion != NULL) {
@@ -477,7 +501,7 @@ void RestoreArchive(Archive* AHX)
             }
 
             /* Otherwise, drop anything that's selected and has a dropStmt */
-            if (((te->reqs & (REQ_SCHEMA | REQ_DATA)) != 0) && (te->dropStmt != NULL)) {
+            if (((te->reqs & (REQ_SCHEMA | REQ_DATA)) != 0) && (te->dropStmt != NULL) && (strlen(te->dropStmt) != 0)) {
                 /* Show namespace if available */
                 if (te->nmspace) {
                     ahlog(AH, 1, "dropping %s \"%s.%s\"\n", te->desc, te->nmspace, te->tag);
@@ -488,7 +512,7 @@ void RestoreArchive(Archive* AHX)
                 _becomeOwner(AH, te);
                 _selectOutputSchema(AH, te->nmspace);
                 /* Drop it */
-                (void)ahprintf(AH, "%s", te->dropStmt);
+                out_drop_stmt(AH, te);
             }
         }
 
@@ -565,7 +589,7 @@ void RestoreArchive(Archive* AHX)
     if (AH->publicArc.verbose)
         dumpTimestamp(AH, "Completed on", time(NULL));
 
-    (void)ahprintf(AH, "--\n-- PostgreSQL database dump complete\n--\n\n");
+    (void)ahprintf(AH, "--\n-- openGauss database dump complete\n--\n\n");
 
     /*
      * Clean up & we're done.
@@ -577,6 +601,41 @@ void RestoreArchive(Archive* AHX)
 
     if (ropt->useDB)
         DisconnectDatabase(&AH->publicArc);
+}
+
+/*
+ * take_down_nsname_in_drop_stmt:
+ *	  for dump v5 to restore in v1, objects in drop stmt has nsname,
+ *	  this can make restore error, so take down the nsname of drop stmt.
+ * stmt : input string
+ * result : output result
+ */
+static void take_down_nsname_in_drop_stmt(const char *stmt, char *result, int len)
+{
+    char *first = strdup(stmt);	
+    char *p = NULL;
+    char *last = NULL;
+    int ret = 0;
+	
+    /* seperate string by ' ', if substring has '.', then drop the subsubstring before '.' */
+    while ((p = strsep(&first, " ")) != NULL) {
+        if (strchr(p, '.') != NULL) {
+            /* for cast object, should left the '(' */
+            if (strchr(p, '(') != NULL) {
+                p = strchr(p, '.');
+                *p = '(';
+            } else {
+                p = strchr(p, '.') + 1;
+            }
+        }
+        ret = strcat_s(result, len, p);
+        securec_check_c(ret, "\0", "\0");
+        ret = strcat_s(result, len, " ");
+        securec_check_c(ret, "\0", "\0");
+    }
+	
+    last = result + strlen(result) - 1;
+    *last = '\0';
 }
 
 /*
@@ -2454,6 +2513,16 @@ static teReqs _tocEntryRequired(TocEntry* te, teSection curSection, RestoreOptio
     if (ropt->no_security_labels && strcmp(te->desc, "SECURITY LABEL") == 0)
         return (teReqs)0;
 
+    /* If it's a subcription, maybe ignore it */
+    if (ropt->no_subscriptions && strcmp(te->desc, "SUBSCRIPTION") == 0) {
+        return (teReqs)0;
+    }
+
+    /* If it's a publication, maybe ignore it */
+    if (ropt->no_publications && strcmp(te->desc, "PUBLICATION") == 0) {
+        return (teReqs)0;
+    }
+
     /* Ignore it if section is not to be dumped/restored */
     switch (curSection) {
         case SECTION_PRE_DATA:
@@ -2686,7 +2755,6 @@ static void _doResetSessionAuth(ArchiveHandle* AH) {
     (void)destroyPQExpBuffer(cmd);
 }
 
-
 /*
  * Issue a SET default_with_oids command.  Caller is responsible
  * for updating state if appropriate.
@@ -2916,7 +2984,7 @@ static void _getObjectDescription(PQExpBuffer buf, TocEntry* te, ArchiveHandle* 
         strcmp(type, "TABLE") == 0 || strcmp(type, "SYNONYM") == 0 || strcmp(type, "VIEW") == 0 ||
         strcmp(type, "SEQUENCE") == 0 || strcmp(type, "TYPE") == 0 || strcmp(type, "FOREIGN TABLE") == 0 ||
         strcmp(type, "TEXT SEARCH DICTIONARY") == 0 || strcmp(type, "TEXT SEARCH CONFIGURATION") == 0 ||
-        strcmp(type, "MATERIALIZED VIEW") == 0) {
+        strcmp(type, "MATERIALIZED VIEW") == 0 || strcmp(type, "LARGE SEQUENCE") == 0) {
         (void)appendPQExpBuffer(buf, "%s ", type);
         if ((te->nmspace != NULL) && te->nmspace[0]) /* is null pre-7.3 */
             (void)appendPQExpBuffer(buf, "%s.", fmtId(te->nmspace));
@@ -2937,7 +3005,7 @@ static void _getObjectDescription(PQExpBuffer buf, TocEntry* te, ArchiveHandle* 
     /* objects named by just a name */
     if (strcmp(type, "DATABASE") == 0 || strcmp(type, "PROCEDURAL LANGUAGE") == 0 || strcmp(type, "SCHEMA") == 0 ||
         strcmp(type, "DIRECTORY") == 0 || strcmp(type, "FOREIGN DATA WRAPPER") == 0 || strcmp(type, "SERVER") == 0 ||
-        strcmp(type, "USER MAPPING") == 0) {
+        strcmp(type, "USER MAPPING") == 0 || strcmp(type, "PUBLICATION") == 0 || strcmp(type, "SUBSCRIPTION") == 0) {
         (void)appendPQExpBuffer(buf, "%s %s", type, fmtId(te->tag));
         return;
     }
@@ -2994,6 +3062,8 @@ static void _getObjectDescription(PQExpBuffer buf, TocEntry* te, ArchiveHandle* 
 
         free(first);
         first = NULL;
+        return;
+    } else if (strcmp(type, "PACKAGE") == 0 || strcmp(type, "PACKAGE BODY") == 0) {
         return;
     }
 
@@ -3181,10 +3251,13 @@ static void _printTocEntry(ArchiveHandle* AH, TocEntry* te, RestoreOptions* ropt
                 || strcmp(te->desc, "VIEW") == 0 
                 || strcmp(te->desc, "MATERIALIZED VIEW") == 0
                 || strcmp(te->desc, "SEQUENCE") == 0 
+                || strcmp(te->desc, "LARGE SEQUENCE") == 0
                 || strcmp(te->desc, "TEXT SEARCH DICTIONARY") == 0 
                 || strcmp(te->desc, "TEXT SEARCH CONFIGURATION") == 0 
                 || strcmp(te->desc, "FOREIGN DATA WRAPPER") == 0 
-                || strcmp(te->desc, "SERVER") == 0) {
+                || strcmp(te->desc, "SERVER") == 0 ||
+                strcmp(te->desc, "PUBLICATION") == 0 ||
+                strcmp(te->desc, "SUBSCRIPTION") == 0) {
             PQExpBuffer temp = createPQExpBuffer();
             (void)appendPQExpBuffer(temp, "ALTER ");
             _getObjectDescription(temp, te, AH);
@@ -3201,7 +3274,8 @@ static void _printTocEntry(ArchiveHandle* AH, TocEntry* te, RestoreOptions* ropt
                    strcmp(te->desc, "CONSTRAINT") == 0 || strcmp(te->desc, "DEFAULT") == 0 ||
                    strcmp(te->desc, "FK CONSTRAINT") == 0 || strcmp(te->desc, "INDEX") == 0 ||
                    strcmp(te->desc, "RULE") == 0 || strcmp(te->desc, "TRIGGER") == 0 ||
-                   strcmp(te->desc, "USER MAPPING") == 0) {
+                   strcmp(te->desc, "USER MAPPING") == 0 || strcmp(te->desc, "PACKAGE BODY") ||
+                   strcmp(te->desc, "PACKAGE")) {
             /* these object types don't have separate owners */
         } else {
             write_msg(modulename, "WARNING: don't know how to set owner for object type %s\n", te->desc);
@@ -4465,8 +4539,6 @@ static void DeCloneArchive(ArchiveHandle* AH)
  */
 void check_encrypt_parameters(Archive* fout, const char* encrypt_mode, const char* encrypt_key)
 {
-    int key_lenth = 0;
-
     if (NULL == encrypt_mode && NULL == encrypt_key) {
         fout->encryptfile = false;
         return;
@@ -4479,19 +4551,16 @@ void check_encrypt_parameters(Archive* fout, const char* encrypt_mode, const cha
     }
     if (NULL == encrypt_key) {
         exit_horribly(NULL, "No key for encryption,please input the key\n");
-    } else {
-        key_lenth = strlen(encrypt_key);
     }
-    if (KEY_LEN != key_lenth) {
-        exit_horribly(NULL, "The key is illegal,the length must be %d\n", KEY_LEN);
-    } else {
-        if (!check_key(encrypt_key, KEY_LEN))
-            exit_horribly(NULL, "The key is illegal, must be letters or numbers\n");
+    if (!check_input_password(encrypt_key)) {
+        exit_horribly(NULL, "The input key must be %d~%d bytes and "
+            "contain at least three kinds of characters!\n",
+            MIN_KEY_LEN, MAX_KEY_LEN);
     }
 
     errno_t rc = memset_s(fout->Key, KEY_MAX_LEN, 0, KEY_MAX_LEN);
     securec_check_c(rc, "\0", "\0");
-    rc = strncpy_s((char*)fout->Key, KEY_MAX_LEN, encrypt_key, KEY_LEN);
+    rc = strncpy_s((char*)fout->Key, KEY_MAX_LEN, encrypt_key, KEY_MAX_LEN - 1);
     securec_check_c(rc, "\0", "\0");
     fout->encryptfile = true;
 }
@@ -4981,3 +5050,10 @@ bool CheckIfStandby(struct Archive *fout)
     return isStandby;
 }
 
+static void get_role_password(RestoreOptions* opts) {
+    GS_FREE(opts->rolepassword);
+    opts->rolepassword = simple_prompt("Role Password: ", 100, false);
+    if (opts->rolepassword == NULL) {
+        exit_horribly(NULL, "out of memory\n");
+    }
+}

@@ -2,7 +2,7 @@
  *
  * c.h
  *	  Fundamental C definitions.  This is included by every .c file in
- *	  PostgreSQL (via either postgres.h or postgres_fe.h, as appropriate).
+ *	  openGauss (via either postgres.h or postgres_fe.h, as appropriate).
  *
  *	  Note that the definitions here are not intended to be exposed to clients
  *	  of the frontend interface libraries --- so we don't worry much about
@@ -12,6 +12,7 @@
  * Portions Copyright (c) 2020 Huawei Technologies Co.,Ltd.
  * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
+ * Portions Copyright (c) 2021, openGauss Contributors
  *
  * src/include/c.h
  *
@@ -45,6 +46,10 @@
  */
 #ifndef C_H
 #define C_H
+
+#ifndef GS_GRAPH
+#define GS_GRAPH
+#endif
 
 /*
  * We have to include stdlib.h here because it defines many of these macros
@@ -172,6 +177,19 @@
 
 #ifndef __GNUC__
 #define __attribute__(_arg_)
+#endif
+
+/*
+ * Mark a point as unreachable in a portable fashion.  This should preferably
+ * be something that the compiler understands, to aid code generation.
+ * In assert-enabled builds, we prefer abort() for debugging reasons.
+ */
+#if defined(HAVE__BUILTIN_UNREACHABLE) && !defined(USE_ASSERT_CHECKING)
+#define pg_unreachable() __builtin_unreachable()
+#elif defined(_MSC_VER) && !defined(USE_ASSERT_CHECKING)
+#define pg_unreachable() __assume(0)
+#else
+#define pg_unreachable() abort()
 #endif
 
 /* ----------------------------------------------------------------
@@ -356,7 +374,7 @@ typedef unsigned int Index;
 typedef signed int Offset;
 
 /*
- * Common Postgres datatype names (as used in the catalogs)
+ * Common openGauss datatype names (as used in the catalogs)
  */
 
 typedef int8 int1;
@@ -406,6 +424,10 @@ typedef union {
 #define INT128_MAX (int128)(((uint128)1 << 127) - 1)
 #define INT128_MIN (-INT128_MAX - 1)
 #define UINT128_MAX (((uint128)INT128_MAX << 1) + 1)
+
+#define PG_INT128_MAX INT128_MAX
+#define PG_INT128_MIN INT128_MIN
+#define PG_UINT128_MAX UINT128_MAX
 
 #define UINT128_IS_EQUAL(x, y) ((x).u128 == (y).u128)
 #define UINT128_COPY(x, y)  (x).u128 = (y).u128
@@ -532,6 +554,8 @@ typedef struct {
     int lbound1;
     int2 values[FLEXIBLE_ARRAY_MEMBER];
 } int2vector;
+
+typedef int2vector int2vector_extend;
 
 typedef struct {
     int32 vl_len_;    /* these fields must match ArrayType! */
@@ -708,8 +732,8 @@ typedef struct pathData {
  * ----------------
  */
 
-#define TYPEALIGN(ALIGNVAL, LEN) (((uintptr_t)(LEN) + ((ALIGNVAL)-1)) & ~((uintptr_t)((ALIGNVAL)-1)))
-
+#define TYPEALIGN(ALIGNVAL, LEN) (((uintptr_t)(LEN) + ((ALIGNVAL) - 1)) & ~((uintptr_t)((ALIGNVAL) - 1)))
+#define IS_TYPE_ALIGINED(ALIGNVAL, LEN) ((((uintptr_t)(LEN)) & ((uintptr_t)((ALIGNVAL) - 1))) == 0)
 #define SHORTALIGN(LEN) TYPEALIGN(ALIGNOF_SHORT, (LEN))
 #define INTALIGN(LEN) TYPEALIGN(ALIGNOF_INT, (LEN))
 #define LONGALIGN(LEN) TYPEALIGN(ALIGNOF_LONG, (LEN))
@@ -1180,5 +1204,7 @@ const T& min(const T& a, const T& b)
 #define INT2SIZET(val) (Size)((unsigned int)(val))
 
 #define isIntergratedMachine false  // not work for now, adapt it later
+
+typedef void* Tuple;
 
 #endif /* C_H */

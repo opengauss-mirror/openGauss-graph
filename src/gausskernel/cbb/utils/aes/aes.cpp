@@ -35,6 +35,10 @@
 
 #define MAX_INT_NUM 2147483647
 
+#ifdef ENABLE_UT
+#define static
+#endif
+
 static bool decryptFromFile(FILE* source, DecryptInfo* pDecryptInfo);
 
 /*
@@ -234,7 +238,9 @@ static bool decryptFromFile(FILE* source, DecryptInfo* pDecryptInfo)
         char *tmp = NULL;
         cipherlen = strtoul((char *)cipherleninfo, &tmp, 10);
         if (*tmp != '\0' || cipherlen > PG_UINT32_MAX || cipherlen == 0) {
+#ifndef ENABLE_UT
             printf("Invalid cipherlen(%s), maybe the content is corrupt.\n", cipherleninfo);
+#endif
             return false;
         }
         ciphertext = (GS_UCHAR*)malloc((size_t)cipherlen);
@@ -336,6 +342,7 @@ bool aes128Encrypt(GS_UCHAR* PlainText, GS_UINT32 PlainLen, GS_UCHAR* Key, GS_UI
     GS_UCHAR deriver_key[RANDOM_LEN] = {0};
     GS_UCHAR aes_vector[RANDOM_LEN] = {0};
     GS_UINT32 retval = 0;
+    errno_t errorno = EOK;
 
     if (PlainText == NULL) {
         (void)fprintf(stderr, _("invalid plain text, please check it!\n"));
@@ -347,13 +354,15 @@ bool aes128Encrypt(GS_UCHAR* PlainText, GS_UINT32 PlainLen, GS_UCHAR* Key, GS_UI
         (char*)Key, keylen, RandSalt, RANDOM_LEN, ITERATE_TIMES, (EVP_MD*)EVP_sha256(), RANDOM_LEN, deriver_key);
     if (!retval) {
         (void)fprintf(stderr, _("generate the derived key failed, errcode:%u\n"), retval);
-        CleanupBuffer(deriver_key, RANDOM_LEN);
+        errorno = memset_s(deriver_key, RANDOM_LEN, 0, RANDOM_LEN);
+        securec_check_c(errorno, "", "");
         return false;
     }
 
     /* get random aes vector for encryption */
     if (init_aes_vector_random(aes_vector, RANDOM_LEN) == false) {
-        CleanupBuffer(deriver_key, RANDOM_LEN);
+        errorno = memset_s(deriver_key, RANDOM_LEN, 0, RANDOM_LEN);
+        securec_check_c(errorno, "", "");
         return false;
     }
 
@@ -362,20 +371,24 @@ bool aes128Encrypt(GS_UCHAR* PlainText, GS_UINT32 PlainLen, GS_UCHAR* Key, GS_UI
         NID_aes_128_cbc, deriver_key, RANDOM_LEN, aes_vector, RANDOM_LEN, PlainText, PlainLen, CipherText, CipherLen);
 
     if (retval != 0) {
-        CleanupBuffer(aes_vector, RANDOM_LEN);
-        CleanupBuffer(deriver_key, RANDOM_LEN);
+        errorno = memset_s(aes_vector, RANDOM_LEN, 0, RANDOM_LEN);
+        securec_check_c(errorno, "", "");
+        errorno = memset_s(deriver_key, RANDOM_LEN, 0, RANDOM_LEN);
+        securec_check_c(errorno, "", "");
         (void)fprintf(stderr, _("encrypt plain text to cipher text failed, errcode:%u\n"), retval);
         return false;
     } 
 
     /* copy vector salt(aes_vector) to the cipher for decrypt */
-    errno_t errorno = memcpy_s(CipherText + (*CipherLen), RANDOM_LEN, aes_vector, RANDOM_LEN);
+    errorno = memcpy_s(CipherText + (*CipherLen), RANDOM_LEN, aes_vector, RANDOM_LEN);
     securec_check_c(errorno, "\0", "\0");
     *CipherLen = *CipherLen + RANDOM_LEN;
     
     /* clean the decrypt_key and aes_vector for security */
-    CleanupBuffer(aes_vector, RANDOM_LEN);
-    CleanupBuffer(deriver_key, RANDOM_LEN);
+    errorno = memset_s(aes_vector, RANDOM_LEN, 0, RANDOM_LEN);
+    securec_check_c(errorno, "", "");
+    errorno = memset_s(deriver_key, RANDOM_LEN, 0, RANDOM_LEN);
+    securec_check_c(errorno, "", "");
     return true;
 }
 
@@ -408,7 +421,8 @@ bool aes128Decrypt(GS_UCHAR* CipherText, GS_UINT32 CipherLen, GS_UCHAR* Key, GS_
         (char*)Key, keylen, RandSalt, RANDOM_LEN, ITERATE_TIMES, (EVP_MD*)EVP_sha256(), RANDOM_LEN, decrypt_key);
     if (!retval) {
         /* clean the decrypt_key for security */
-        CleanupBuffer(decrypt_key, RANDOM_LEN);
+        errorno = memset_s(decrypt_key, RANDOM_LEN, 0, RANDOM_LEN);
+        securec_check_c(errorno, "", "");
         (void)fprintf(stderr, _("generate the derived key failed, errcode:%u\n"), retval);
         return false;
     }
@@ -430,8 +444,10 @@ bool aes128Decrypt(GS_UCHAR* CipherText, GS_UINT32 CipherLen, GS_UCHAR* Key, GS_
         PlainLen);
 
     /* clean the decrypt_key and aes_vector for security */
-    CleanupBuffer(aes_vector, RANDOM_LEN);
-    CleanupBuffer(decrypt_key, RANDOM_LEN);
+    errorno = memset_s(aes_vector, RANDOM_LEN, 0, RANDOM_LEN);
+    securec_check_c(errorno, "", "");
+    errorno = memset_s(decrypt_key, RANDOM_LEN, 0, RANDOM_LEN);
+    securec_check_c(errorno, "", "");
 
     if (retval != 0) {
         /* try original version decrypt function */
@@ -488,17 +504,23 @@ bool aes128EncryptSpeed(GS_UCHAR* PlainText, GS_UINT32 PlainLen, GS_UCHAR* Key, 
     keylen = strlen((const char*)Key);
     if (keylen > RANDOM_LEN || keylen == 0) {
         (void)fprintf(stderr, _("Key is missing!\n"));
-        CleanupBuffer(input_saved, RANDOM_LEN);
-        CleanupBuffer(derive_vector_saved, RANDOM_LEN);
-        CleanupBuffer(mac_vector_saved, RANDOM_LEN);
+        errorno = memset_s(input_saved, RANDOM_LEN, 0, RANDOM_LEN);
+        securec_check_c(errorno, "", "");
+        errorno = memset_s(derive_vector_saved, RANDOM_LEN, 0, RANDOM_LEN);
+        securec_check_c(errorno, "", "");
+        errorno = memset_s(mac_vector_saved, RANDOM_LEN, 0, RANDOM_LEN);
+        securec_check_c(errorno, "", "");
         return false;
     }
 
     if (NULL == PlainText) {
         (void)fprintf(stderr, _("Invalid plain text, please check it!\n"));
-        CleanupBuffer(input_saved, RANDOM_LEN);
-        CleanupBuffer(derive_vector_saved, RANDOM_LEN);
-        CleanupBuffer(mac_vector_saved, RANDOM_LEN);
+        errorno = memset_s(input_saved, RANDOM_LEN, 0, RANDOM_LEN);
+        securec_check_c(errorno, "", "");
+        errorno = memset_s(derive_vector_saved, RANDOM_LEN, 0, RANDOM_LEN);
+        securec_check_c(errorno, "", "");
+        errorno = memset_s(mac_vector_saved, RANDOM_LEN, 0, RANDOM_LEN);
+        securec_check_c(errorno, "", "");
         return false;
     }
 
@@ -506,10 +528,14 @@ bool aes128EncryptSpeed(GS_UCHAR* PlainText, GS_UINT32 PlainLen, GS_UCHAR* Key, 
     if (false == init_aes_vector_random(aes_vector, RANDOM_LEN)) {
         (void)fprintf(stderr, _("generate IV vector failed\n"));
         /* clean up */
-        CleanupBuffer(input_saved, RANDOM_LEN);
-        CleanupBuffer(derive_vector_saved, RANDOM_LEN);
-        CleanupBuffer(aes_vector, RANDOM_LEN);
-        CleanupBuffer(mac_vector_saved, RANDOM_LEN);
+        errorno = memset_s(input_saved, RANDOM_LEN, 0, RANDOM_LEN);
+        securec_check_c(errorno, "", "");
+        errorno = memset_s(derive_vector_saved, RANDOM_LEN, 0, RANDOM_LEN);
+        securec_check_c(errorno, "", "");
+        errorno = memset_s(aes_vector, RANDOM_LEN, 0, RANDOM_LEN);
+        securec_check_c(errorno, "", "");
+        errorno = memset_s(mac_vector_saved, RANDOM_LEN, 0, RANDOM_LEN);
+        securec_check_c(errorno, "", "");
         return false;
     }
 
@@ -545,12 +571,18 @@ bool aes128EncryptSpeed(GS_UCHAR* PlainText, GS_UINT32 PlainLen, GS_UCHAR* Key, 
         if (!retval) {
             (void)fprintf(stderr, _("generate the derived key failed,errcode:%u\n"), retval);
             /* clean up */
-            CleanupBuffer(input_saved, RANDOM_LEN);
-            CleanupBuffer(derive_vector_saved, RANDOM_LEN);
-            CleanupBuffer(derive_key, RANDOM_LEN);
-            CleanupBuffer(mac_vector_saved, RANDOM_LEN);
-            CleanupBuffer(aes_vector, RANDOM_LEN);
-            CleanupBuffer(user_key, RANDOM_LEN);
+            errorno = memset_s(input_saved, RANDOM_LEN, 0, RANDOM_LEN);
+            securec_check_c(errorno, "", "");
+            errorno = memset_s(derive_vector_saved, RANDOM_LEN, 0, RANDOM_LEN);
+            securec_check_c(errorno, "", "");
+            errorno = memset_s(derive_key, RANDOM_LEN, 0, RANDOM_LEN);
+            securec_check_c(errorno, "", "");
+            errorno = memset_s(mac_vector_saved, RANDOM_LEN, 0, RANDOM_LEN);
+            securec_check_c(errorno, "", "");
+            errorno = memset_s(aes_vector, RANDOM_LEN, 0, RANDOM_LEN);
+            securec_check_c(errorno, "", "");
+            errorno = memset_s(user_key, RANDOM_LEN, 0, RANDOM_LEN);
+            securec_check_c(errorno, "", "");
             return false;
         }
 
@@ -566,13 +598,20 @@ bool aes128EncryptSpeed(GS_UCHAR* PlainText, GS_UINT32 PlainLen, GS_UCHAR* Key, 
         if (!retval) {
             (void)fprintf(stderr, _("generate the mac key failed,errcode:%u\n"), retval);
             /* clean up */
-            CleanupBuffer(input_saved, RANDOM_LEN);
-            CleanupBuffer(derive_vector_saved, RANDOM_LEN);
-            CleanupBuffer(derive_key, RANDOM_LEN);
-            CleanupBuffer(mac_vector_saved, RANDOM_LEN);
-            CleanupBuffer(aes_vector, RANDOM_LEN);
-            CleanupBuffer(user_key, RANDOM_LEN);
-            CleanupBuffer(mac_key, RANDOM_LEN);
+            errorno = memset_s(input_saved, RANDOM_LEN, 0, RANDOM_LEN);
+            securec_check_c(errorno, "", "");
+            errorno = memset_s(derive_vector_saved, RANDOM_LEN, 0, RANDOM_LEN);
+            securec_check_c(errorno, "", "");
+            errorno = memset_s(derive_key, RANDOM_LEN, 0, RANDOM_LEN);
+            securec_check_c(errorno, "", "");
+            errorno = memset_s(mac_vector_saved, RANDOM_LEN, 0, RANDOM_LEN);
+            securec_check_c(errorno, "", "");
+            errorno = memset_s(aes_vector, RANDOM_LEN, 0, RANDOM_LEN);
+            securec_check_c(errorno, "", "");
+            errorno = memset_s(user_key, RANDOM_LEN, 0, RANDOM_LEN);
+            securec_check_c(errorno, "", "");
+            errorno = memset_s(mac_key, RANDOM_LEN, 0, RANDOM_LEN);
+            securec_check_c(errorno, "", "");
             return false;
         }
 
@@ -594,13 +633,20 @@ bool aes128EncryptSpeed(GS_UCHAR* PlainText, GS_UINT32 PlainLen, GS_UCHAR* Key, 
     if (retval != 0) {
         (void)fprintf(stderr, _("encrypt plain text to cipher text failed,errcode:%u\n"), retval);
         /* clean up */
-        CleanupBuffer(input_saved, RANDOM_LEN);
-        CleanupBuffer(derive_vector_saved, RANDOM_LEN);
-        CleanupBuffer(derive_key, RANDOM_LEN);
-        CleanupBuffer(mac_vector_saved, RANDOM_LEN);
-        CleanupBuffer(aes_vector, RANDOM_LEN);
-        CleanupBuffer(user_key, RANDOM_LEN);
-        CleanupBuffer(mac_key, RANDOM_LEN);
+        errorno = memset_s(input_saved, RANDOM_LEN, 0, RANDOM_LEN);
+        securec_check_c(errorno, "", "");
+        errorno = memset_s(derive_vector_saved, RANDOM_LEN, 0, RANDOM_LEN);
+        securec_check_c(errorno, "", "");
+        errorno = memset_s(derive_key, RANDOM_LEN, 0, RANDOM_LEN);
+        securec_check_c(errorno, "", "");
+        errorno = memset_s(mac_vector_saved, RANDOM_LEN, 0, RANDOM_LEN);
+        securec_check_c(errorno, "", "");
+        errorno = memset_s(aes_vector, RANDOM_LEN, 0, RANDOM_LEN);
+        securec_check_c(errorno, "", "");
+        errorno = memset_s(user_key, RANDOM_LEN, 0, RANDOM_LEN);
+        securec_check_c(errorno, "", "");
+        errorno = memset_s(mac_key, RANDOM_LEN, 0, RANDOM_LEN);
+        securec_check_c(errorno, "", "");
         return false;
     }
 
@@ -614,13 +660,20 @@ bool aes128EncryptSpeed(GS_UCHAR* PlainText, GS_UINT32 PlainLen, GS_UCHAR* Key, 
     if (retval != 0 || mac_length != MAC_LEN) {
         (void)fprintf(stderr, _("generate mac text based on plain text failed,errcode:%u\n"), retval);
         /* clean up */
-        CleanupBuffer(input_saved, RANDOM_LEN);
-        CleanupBuffer(derive_vector_saved, RANDOM_LEN);
-        CleanupBuffer(derive_key, RANDOM_LEN);
-        CleanupBuffer(mac_vector_saved, RANDOM_LEN);
-        CleanupBuffer(aes_vector, RANDOM_LEN);
-        CleanupBuffer(user_key, RANDOM_LEN);
-        CleanupBuffer(mac_key, RANDOM_LEN);
+        errorno = memset_s(input_saved, RANDOM_LEN, 0, RANDOM_LEN);
+        securec_check_c(errorno, "", "");
+        errorno = memset_s(derive_vector_saved, RANDOM_LEN, 0, RANDOM_LEN);
+        securec_check_c(errorno, "", "");
+        errorno = memset_s(derive_key, RANDOM_LEN, 0, RANDOM_LEN);
+        securec_check_c(errorno, "", "");
+        errorno = memset_s(mac_vector_saved, RANDOM_LEN, 0, RANDOM_LEN);
+        securec_check_c(errorno, "", "");
+        errorno = memset_s(aes_vector, RANDOM_LEN, 0, RANDOM_LEN);
+        securec_check_c(errorno, "", "");
+        errorno = memset_s(user_key, RANDOM_LEN, 0, RANDOM_LEN);
+        securec_check_c(errorno, "", "");
+        errorno = memset_s(mac_key, RANDOM_LEN, 0, RANDOM_LEN);
+        securec_check_c(errorno, "", "");
         return false;
     }
 
@@ -630,10 +683,14 @@ bool aes128EncryptSpeed(GS_UCHAR* PlainText, GS_UINT32 PlainLen, GS_UCHAR* Key, 
     *CipherLen = *CipherLen + MAC_LEN;
 
     /* clean the user_key, mac_key, derive_key and aes_vector for security */
-    CleanupBuffer(user_key, RANDOM_LEN);
-    CleanupBuffer(mac_key, RANDOM_LEN);
-    CleanupBuffer(derive_key, RANDOM_LEN);
-    CleanupBuffer(aes_vector, RANDOM_LEN);
+    errorno = memset_s(user_key, RANDOM_LEN, 0, RANDOM_LEN);
+    securec_check_c(errorno, "", "");
+    errorno = memset_s(mac_key, RANDOM_LEN, 0, RANDOM_LEN);
+    securec_check_c(errorno, "", "");
+    errorno = memset_s(derive_key, RANDOM_LEN, 0, RANDOM_LEN);
+    securec_check_c(errorno, "", "");
+    errorno = memset_s(aes_vector, RANDOM_LEN, 0, RANDOM_LEN);
+    securec_check_c(errorno, "", "");
 
     return true;
 }
@@ -805,10 +862,14 @@ bool aes128DecryptSpeed(GS_UCHAR* CipherText, GS_UINT32 CipherLen, GS_UCHAR* Key
             (char*)Key, keylen, RandSalt, RANDOM_LEN, ITERATE_TIMES, (EVP_MD*)EVP_sha256(), RANDOM_LEN, decrypt_key);
         if (!retval) {
             /* clean the decrypt_key and aes_vector for security */
-            CleanupBuffer(aes_vector, RANDOM_LEN);
-            CleanupBuffer(decrypt_key, RANDOM_LEN);
-            CleanupBuffer(user_key, RANDOM_LEN);
-            CleanupBuffer(mac_key, RANDOM_LEN);
+            errorno = memset_s(aes_vector, RANDOM_LEN, 0, RANDOM_LEN);
+            securec_check_c(errorno, "", "");
+            errorno = memset_s(decrypt_key, RANDOM_LEN, 0, RANDOM_LEN);
+            securec_check_c(errorno, "", "");
+            errorno = memset_s(user_key, RANDOM_LEN, 0, RANDOM_LEN);
+            securec_check_c(errorno, "", "");
+            errorno = memset_s(mac_key, RANDOM_LEN, 0, RANDOM_LEN);
+            securec_check_c(errorno, "", "");
             (void)fprintf(stderr, _("generate the derived key failed,errcode:%u\n"), retval);
             return false;
         }
@@ -824,10 +885,14 @@ bool aes128DecryptSpeed(GS_UCHAR* CipherText, GS_UINT32 CipherLen, GS_UCHAR* Key
 
         if (!retval) {
             /* clean the decrypt_key and mac_key for security */
-            CleanupBuffer(mac_key, RANDOM_LEN);
-            CleanupBuffer(decrypt_key, RANDOM_LEN);
-            CleanupBuffer(user_key, RANDOM_LEN);
-            CleanupBuffer(aes_vector, RANDOM_LEN);
+            errorno = memset_s(mac_key, RANDOM_LEN, 0, RANDOM_LEN);
+            securec_check_c(errorno, "", "");
+            errorno = memset_s(decrypt_key, RANDOM_LEN, 0, RANDOM_LEN);
+            securec_check_c(errorno, "", "");
+            errorno = memset_s(user_key, RANDOM_LEN, 0, RANDOM_LEN);
+            securec_check_c(errorno, "", "");
+            errorno = memset_s(aes_vector, RANDOM_LEN, 0, RANDOM_LEN);
+            securec_check_c(errorno, "", "");
             (void)fprintf(stderr, _("generate the mac key failed,errcode:%u\n"), retval);
             return false;
         }
@@ -860,14 +925,17 @@ bool aes128DecryptSpeed(GS_UCHAR* CipherText, GS_UINT32 CipherLen, GS_UCHAR* Key
         PlainLen);
 
     /* clean the decrypt_key and aes_vector for security */
-    CleanupBuffer(aes_vector, RANDOM_LEN);
-    CleanupBuffer(decrypt_key, RANDOM_LEN);
+    errorno = memset_s(aes_vector, RANDOM_LEN, 0, RANDOM_LEN);
+    securec_check_c(errorno, "", "");
+    errorno = memset_s(decrypt_key, RANDOM_LEN, 0, RANDOM_LEN);
+    securec_check_c(errorno, "", "");
 
     if (retval != 0) {
         (void)fprintf(stderr, _("decrypt cipher text to plain text failed,errcode:%u\n"), retval);
-
-        CleanupBuffer(user_key, RANDOM_LEN);
-        CleanupBuffer(mac_key, RANDOM_LEN);
+        errorno = memset_s(user_key, RANDOM_LEN, 0, RANDOM_LEN);
+        securec_check_c(errorno, "", "");
+        errorno = memset_s(mac_key, RANDOM_LEN, 0, RANDOM_LEN);
+        securec_check_c(errorno, "", "");
         return false;
     }
 
@@ -878,8 +946,10 @@ bool aes128DecryptSpeed(GS_UCHAR* CipherText, GS_UINT32 CipherLen, GS_UCHAR* Key
     retval =
         CRYPT_hmac(NID_hmac_sha1, mac_key, RANDOM_LEN, CipherText, cipherpartlen + RANDOM_LEN, mac_text, &mac_length);
 
-    CleanupBuffer(user_key, RANDOM_LEN);
-    CleanupBuffer(mac_key, RANDOM_LEN);
+    errorno = memset_s(user_key, RANDOM_LEN, 0, RANDOM_LEN);
+    securec_check_c(errorno, "", "");
+    errorno = memset_s(mac_key, RANDOM_LEN, 0, RANDOM_LEN);
+    securec_check_c(errorno, "", "");
 
     if (retval != 0 || mac_length != MAC_LEN) {
         (void)fprintf(stderr, _("Mac generation failed,errcode:%u\n"), retval);
@@ -903,9 +973,12 @@ bool aes128DecryptSpeed(GS_UCHAR* CipherText, GS_UINT32 CipherLen, GS_UCHAR* Key
     decryption_count++;
     if (decryption_count > decryption_count_max) {
         for (GS_UINT32 i = 0; i < NUMBER_OF_SAVED_DERIVEKEYS; ++i) {
-            CleanupBuffer(derive_vector_used[i], RANDOM_LEN);
-            CleanupBuffer(user_input_used[i], RANDOM_LEN);
-            CleanupBuffer(mac_vector_used[i], RANDOM_LEN);
+            errorno = memset_s(derive_vector_used[i], RANDOM_LEN, 0, RANDOM_LEN);
+            securec_check_c(errorno, "", "");
+            errorno = memset_s(user_input_used[i], RANDOM_LEN, 0, RANDOM_LEN);
+            securec_check_c(errorno, "", "");
+            errorno = memset_s(mac_vector_used[i], RANDOM_LEN, 0, RANDOM_LEN);
+            securec_check_c(errorno, "", "");
             usage_frequency[i] = i;
         }
         decryption_count = 0;

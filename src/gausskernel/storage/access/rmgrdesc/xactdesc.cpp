@@ -63,9 +63,10 @@ static void desc_library(StringInfo buf, char *filename, int nlibrary)
     }
 }
 
-static void xact_desc_commit(StringInfo buf, xl_xact_commit *xlrec, bool hasbucket)
+static void xact_desc_commit(StringInfo buf, xl_xact_commit *xlrec, RepOriginId origin_id)
 {
     int i;
+    int nsubxacts = xlrec->nsubxacts;
     TransactionId *subxacts = NULL;
 
     subxacts = (TransactionId *)&xlrec->xnodes[xlrec->nrels];
@@ -135,15 +136,24 @@ static void xact_desc_commit(StringInfo buf, xl_xact_commit *xlrec, bool hasbuck
     SharedInvalidationMessage* msgs = (SharedInvalidationMessage*)&subxacts[xlrec->nsubxacts];
     TransactionId* recentXmin = (TransactionId *)&(msgs[xlrec->nmsgs]);
     appendStringInfo(buf, "; RecentXmin:%lu", *recentXmin);
+    nsubxacts++;
 #endif
 
     if (xlrec->nlibrary > 0) {
         char *filename = NULL;
 
         filename = (char *)xlrec->xnodes + (xlrec->nrels * sizeof(ColFileNodeRel)) +
-                   (xlrec->nsubxacts * sizeof(TransactionId)) + (xlrec->nmsgs * sizeof(SharedInvalidationMessage));
+                   (nsubxacts * sizeof(TransactionId)) + (xlrec->nmsgs * sizeof(SharedInvalidationMessage));
 
         desc_library(buf, filename, xlrec->nlibrary);
+    }
+
+    if (xlrec->xinfo & XACT_HAS_ORIGIN) {
+        xl_xact_origin *origin = (xl_xact_origin *)GetRepOriginPtr((char *)xlrec->xnodes, xlrec->xinfo,
+            xlrec->nsubxacts, xlrec->nmsgs, xlrec->nrels, xlrec->nlibrary);
+        appendStringInfo(buf, "; origin: node %u, lsn %X/%X, at %s", origin_id,
+            (uint32)(origin->origin_lsn >> BITS_PER_INT),
+            (uint32)origin->origin_lsn, timestamptz_to_str(origin->origin_timestamp));
     }
 }
 
@@ -165,7 +175,7 @@ static void xact_desc_commit_compact(StringInfo buf, xl_xact_commit_compact *xlr
 #endif
 }
 
-static void xact_desc_abort(StringInfo buf, xl_xact_abort *xlrec, bool hasbucket)
+static void xact_desc_abort(StringInfo buf, xl_xact_abort *xlrec, bool abortXlogNewVersion)
 {
     int i;
 
@@ -207,17 +217,46 @@ static void xact_desc_abort(StringInfo buf, xl_xact_abort *xlrec, bool hasbucket
         char *filename = NULL;
         filename = (char *)xlrec->xnodes + (xlrec->nrels * sizeof(ColFileNodeRel)) +
                    (xlrec->nsubxacts * sizeof(TransactionId));
-
+        if (abortXlogNewVersion) {
+            appendStringInfo(buf, "; current xact: %lu", *(TransactionId*)(filename));
+            filename += sizeof(TransactionId);
+        }
         desc_library(buf, filename, xlrec->nlibrary);
+    } else if (abortXlogNewVersion) {
+        appendStringInfo(buf, "; current xact: %lu", *(TransactionId*)((char *)xlrec->xnodes +
+            (xlrec->nrels * sizeof(ColFileNodeRel)) + (xlrec->nsubxacts * sizeof(TransactionId))));
     }
 }
+
+const char *xact_type_name(uint8 subtype)
+{
+    uint8 info = subtype & ~XLR_INFO_MASK;
+    if (info == XLOG_XACT_COMMIT_COMPACT) {
+        return "commit_compact";
+    } else if (info == XLOG_XACT_COMMIT) {
+        return "commit";
+    } else if (info == XLOG_XACT_ABORT) {
+        return "abort";
+    } else if (info == XLOG_XACT_ABORT_WITH_XID) {
+        return "abort_with_xid";
+    } else if (info == XLOG_XACT_PREPARE) {
+        return "prepare";
+    } else if (info == XLOG_XACT_COMMIT_PREPARED) {
+        return "commit_prepared";
+    } else if (info == XLOG_XACT_ABORT_PREPARED) {
+        return "abort_prepared";
+    } else if (info == XLOG_XACT_ASSIGNMENT) {
+        return "assignment";
+    } else {
+        return "unkown_type";
+    }
+}
+
 
 void xact_desc(StringInfo buf, XLogReaderState *record)
 {
     char *rec = XLogRecGetData(record);
     uint8 info = XLogRecGetInfo(record) & ~XLR_INFO_MASK;
-    bool hasbucket = (XLogRecGetInfo(record) & XLR_REL_HAS_BUCKET) != 0;
-
     if (info == XLOG_XACT_COMMIT_COMPACT) {
         xl_xact_commit_compact *xlrec = (xl_xact_commit_compact *)rec;
 
@@ -227,12 +266,16 @@ void xact_desc(StringInfo buf, XLogReaderState *record)
         xl_xact_commit *xlrec = (xl_xact_commit *)rec;
 
         appendStringInfo(buf, "XLOG_XACT_COMMIT commit: ");
-        xact_desc_commit(buf, xlrec, hasbucket);
+        xact_desc_commit(buf, xlrec, XLogRecGetOrigin(record));
     } else if (info == XLOG_XACT_ABORT) {
         xl_xact_abort *xlrec = (xl_xact_abort *)rec;
 
         appendStringInfo(buf, "abort: ");
-        xact_desc_abort(buf, xlrec, hasbucket);
+        xact_desc_abort(buf, xlrec, false);
+    } else if (info == XLOG_XACT_ABORT_WITH_XID) {
+        xl_xact_abort *xlrec = (xl_xact_abort *)rec;
+        appendStringInfo(buf, "abort_with_xid: ");
+        xact_desc_abort(buf, xlrec, true);
     } else if (info == XLOG_XACT_PREPARE) {
         TwoPhaseFileHeader *hdr = (TwoPhaseFileHeader *)rec;
         appendStringInfo(buf, "prepare transaction, gid: %s", hdr->gid);
@@ -240,12 +283,12 @@ void xact_desc(StringInfo buf, XLogReaderState *record)
         xl_xact_commit_prepared *xlrec = (xl_xact_commit_prepared *)rec;
 
         appendStringInfo(buf, "commit prepared " XID_FMT ": ", xlrec->xid);
-        xact_desc_commit(buf, &xlrec->crec, hasbucket);
+        xact_desc_commit(buf, &xlrec->crec, XLogRecGetOrigin(record));
     } else if (info == XLOG_XACT_ABORT_PREPARED) {
         xl_xact_abort_prepared *xlrec = (xl_xact_abort_prepared *)rec;
 
         appendStringInfo(buf, "abort prepared " XID_FMT ": ", xlrec->xid);
-        xact_desc_abort(buf, &xlrec->arec, hasbucket);
+        xact_desc_abort(buf, &xlrec->arec, false);
     } else if (info == XLOG_XACT_ASSIGNMENT) {
         xl_xact_assignment *xlrec = (xl_xact_assignment *)rec;
 

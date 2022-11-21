@@ -84,6 +84,10 @@ CATALOG(pg_class,1259) BKI_BOOTSTRAP BKI_ROWTYPE_OID(83) BKI_SCHEMA_MACRO
     TransactionId relfrozenxid64; /* all Xids < this are frozen in this rel */
     Oid relbucket;                /* bucket info in pg_hashbucket */
     int2vector relbucketkey;      /* Column number of hash partition */
+#ifdef CATALOG_VARLEN
+    TransactionId relminmxid;     /* all multixacts in this rel are >= this.
+                                   * this is really a MultiXactId */
+#endif
 }
 FormData_pg_class;
 
@@ -101,7 +105,8 @@ typedef FormData_pg_class* Form_pg_class;
  *		compiler constants for pg_class
  * ----------------
  */
-#define Natts_pg_class 39
+
+#define Natts_pg_class 40
 #define Anum_pg_class_relname 1
 #define Anum_pg_class_relnamespace 2
 #define Anum_pg_class_reltype 3
@@ -141,6 +146,7 @@ typedef FormData_pg_class* Form_pg_class;
 #define Anum_pg_class_relfrozenxid64 37
 #define Anum_pg_class_relbucket 38
 #define Anum_pg_class_relbucketkey 39
+#define Anum_pg_class_relminmxid 40
 
 /* ----------------
  *		initial contents of pg_class
@@ -151,20 +157,40 @@ typedef FormData_pg_class* Form_pg_class;
  * ----------------
  */
 
-/* Note: "3" in the relfrozenxid and the relfrozenxid64 column stands for FirstNormalTransactionId */
-DATA(insert OID = 1247 (  pg_type       PGNSP 71 0 PGUID 0 0 0 0 0 0 0 0 0 0 0 0 f f p r 30 0 t f f f f 0 f f n 3 _null_ _null_ n 3 _null_ _null_));
+/*
+ * Note: "3" in the relfrozenxid and the relfrozenxid64 column stands for FirstNormalTransactionId;
+ * similarly, "1" in relminmxid stands for FirstMultiXactId.
+ */
+DATA(insert OID = 1247 (  pg_type       PGNSP 71 0 PGUID 0 0 0 0 0 0 0 0 0 0 0 0 f f p r 30 0 t f f f f 0 f f n 3 _null_ _null_ n 3 _null_ _null_ 1));
 DESCR("");
-DATA(insert OID = 1249 (  pg_attribute  PGNSP 75 0 PGUID 0 0 0 0 0 0 0 0 0 0 0 0 f f p r 24 0 f f f f f 0 f f n 3 _null_ _null_ n 3 _null_ _null_));
+DATA(insert OID = 1249 (  pg_attribute  PGNSP 75 0 PGUID 0 0 0 0 0 0 0 0 0 0 0 0 f f p r 24 0 f f f f f 0 f f n 3 _null_ _null_ n 3 _null_ _null_ 1));
 DESCR("");
-DATA(insert OID = 1255 (  pg_proc       PGNSP 81 0 PGUID 0 0 0 0 0 0 0 0 0 0 0 0 f f p r 32 0 t f f f f 0 f f n 3 _null_ _null_ n 3 _null_ _null_));
+DATA(insert OID = 1255 (  pg_proc       PGNSP 81 0 PGUID 0 0 0 0 0 0 0 0 0 0 0 0 f f p r 39 0 t f f f f 0 f f n 3 _null_ _null_ n 3 _null_ _null_ 1));
 DESCR("");
-DATA(insert OID = 1259 (  pg_class      PGNSP 83 0 PGUID 0 0 0 0 0 0 0 0 0 0 0 0 f f p r 39 0 t f f f f 0 f f n 3 _null_ _null_ n 3 _null_ _null_));
+DATA(insert OID = 7815 (  gs_package       PGNSP 9745 0 PGUID 0 0 0 0 0 0 0 0 0 0 0 0 f f p r 8 0 t f f f f 0 f f n 3 _null_ _null_ n 3 _null_ _null_ 1));
 DESCR("");
+DATA(insert OID = 1259 (  pg_class      PGNSP 83 0 PGUID 0 0 0 0 0 0 0 0 0 0 0 0 f f p r 40 0 t f f f f 0 f f n 3 _null_ _null_ n 3 _null_ _null_ 1));
+DESCR("");
+
+/*
+ * composite types
+ */
+
+/* graph */
+#ifdef GS_GRAPH
+DATA(insert OID = 8110 ( vertex		PGNSP 8112 0 PGUID 0 8110 0 0 0 0 0 0 0 0 0 0 f f p c 3 0 f f f f f 0 f f n 0 _null_ _null_ n 0 _null_ _null_ 0));
+DESCR("graph vertex");
+DATA(insert OID = 8120 ( edge		PGNSP 8122 0 PGUID 0 8120 0 0 0 0 0 0 0 0 0 0 f f p c 5 0 f f f f f 0 f f n 0 _null_ _null_ n 0 _null_ _null_ 0));
+DESCR("graph edge");
+DATA(insert OID = 8130 ( graphpath	PGNSP 8132 0 PGUID 0 8130 0 0 0 0 0 0 0 0 0 0 f f p c 2 0 f f f f f 0 f f n 0 _null_ _null_ n 0 _null_ _null_ 0));
+DESCR("graph path");
+#endif /* GS_GRAPH */
 
 #define RELKIND_RELATION 'r'                    /* ordinary table */
 #define RELKIND_INDEX 'i'                       /* secondary index */
 #define RELKIND_GLOBAL_INDEX 'I'                /* GLOBAL partitioned index */
 #define RELKIND_SEQUENCE 'S'                    /* sequence object */
+#define RELKIND_LARGE_SEQUENCE 'L'              /* large sequence object that support 128-bit integer */
 #define RELKIND_TOASTVALUE 't'                  /* for out-of-line values */
 #define RELKIND_VIEW 'v'                        /* view */
 #define RELKIND_MATVIEW 'm'                     /* materialized view */
@@ -173,6 +199,7 @@ DESCR("");
 #define RELKIND_STREAM 'e'                      /* stream */
 #define RELKIND_CONTQUERY 'o'                   /* contview */
 #define PARTTYPE_PARTITIONED_RELATION 'p'       /* partitioned relation */
+#define PARTTYPE_SUBPARTITIONED_RELATION 's'       /* subpartitioned relation */
 #define PARTTYPE_VALUE_PARTITIONED_RELATION 'v' /* value partitioned relation */
 #define PARTTYPE_NON_PARTITIONED_RELATION 'n'   /* non-partitioned relation */
 #define RELPERSISTENCE_PERMANENT 'p'            /* regular table */
@@ -197,6 +224,9 @@ DESCR("");
      (relkind) == RELKIND_INDEX || \
      (relkind) == RELKIND_SEQUENCE || \
      (relkind) == RELKIND_TOASTVALUE)
+
+#define RELKIND_IS_SEQUENCE(relkind) \
+    ((relkind) == RELKIND_SEQUENCE || (relkind) == RELKIND_LARGE_SEQUENCE)
 
 /*
  * an explicitly chosen candidate key's columns are used as identity;

@@ -114,16 +114,19 @@ public
         Statement stmt = null;
         PreparedStatement pstmt = null;
         PreparedStatement pstmt2 = null;
+        PreparedStatement pstmt3 = null;
         try {
             String selectSql = "select name from jdbcpbebypass where class=?;";
             String selectSql2 = "select id from jdbcpbebypass where class=?;";
+            String selectSql3 = "select name from jdbcpbebypass where class=? offset 1 limit 10;";
 
             conn.setAutoCommit(false);
             pstmt = conn.prepareStatement(selectSql);
             pstmt2 = conn.prepareStatement(selectSql2);
+            pstmt3 = conn.prepareStatement(selectSql2);
             pstmt.setFetchSize(3);
             pstmt2.setFetchSize(3);
-
+            pstmt3.setFetchSize(2);
             pstmt.setInt(1, 1);
 
             ResultSet rs = pstmt.executeQuery(); // P1 B1
@@ -171,9 +174,20 @@ public
                     break;
             }
             System.err.println("end E2E2");
-
+            System.err.println("start OFFSET 1 LIMIT 10 E2");
+            round = 0;
+            ResultSet rs3 = pstmt2.executeQuery();
+            while (rs3.next()) {
+                System.err.println("name=" + rs.getString(1));
+                System.err.println();
+                round++;
+                if (round == 10)
+                    break;
+            }
+            System.err.println("end OFFSET 1 LIMIT 10 E2");
             pstmt.close();
             pstmt2.close();
+            pstmt3.close();
         } catch (SQLException exception) {
             if (pstmt != null) {
                 try {
@@ -271,6 +285,77 @@ public
         }
     }
 
+public static void SelectDataDataRow(Connection conn) {
+        Statement stmt = null;
+        PreparedStatement pstmt = null;
+        PreparedStatement pstmt2 = null;
+        try{
+             stmt = conn.createStatement();
+             conn.setAutoCommit(false);
+             int rc = stmt.executeUpdate("create table t1(c1 int primary key, c2 int, c3 int);");
+             rc = stmt.executeUpdate("insert into t1 select i,i,i from generate_series(1,100) i;");
+             rc = stmt.executeUpdate("set enable_bitmapscan =off;"); // P B E
+             rc = stmt.executeUpdate("set enable_seqscan =off;"); // P B E
+            String selectSql = "select * from t1 where c1>? limit 2;";
+            pstmt = conn.prepareStatement(selectSql);
+            pstmt.setMaxRows(2);
+            pstmt.setInt(1,1);
+            ResultSet rs = pstmt.executeQuery(); // P1 B1 E1
+            int round =0;
+            while(rs.next()){ //E1 E1 E1
+                System.err.println("c2="+rs.getInt(1));
+                System.err.println();
+                round++;
+            }
+             conn.commit();
+            System.err.println("break of a resultset of pstmt1");
+            round = 0;
+            pstmt.setMaxRows(2);
+            pstmt.setInt(1,1);
+            rs = pstmt.executeQuery();
+            while(rs.next()) {
+                System.err.println("c2="+rs.getInt(1));System.err.println();
+            }
+            System.err.println("break of a resultset of pstmt1");
+           round = 0;
+            pstmt.setMaxRows(2);
+            pstmt.setInt(1,1);
+            rs = pstmt.executeQuery();
+            while(rs.next()) {
+                System.err.println("c2="+rs.getInt(1));System.err.println();
+            }
+            System.err.println("break of a resultset of pstmt1");
+           round = 0;
+            while(rs.next()) { //
+                System.err.println("c2="+rs.getInt(1));
+                System.err.println();
+                round++;
+            }
+            System.err.println("end of a resultset");
+            rc = stmt.executeUpdate("drop table t1;");
+            pstmt.close();
+        } catch (SQLException e) {
+            if (pstmt != null) {
+                try {
+                    pstmt.close();
+                } catch (SQLException e1) {
+                    e1.printStackTrace();
+                }
+
+            }
+            if (stmt != null) {
+                try {
+                    stmt.close();
+                } catch (SQLException e1) {
+                    e1.printStackTrace();
+                }
+            }
+            e.printStackTrace();
+        }
+    }
+
+
+
 public
     static void main(String[] args)
     {
@@ -286,7 +371,7 @@ public
         SelectData(conn);
         UpdateData(conn);
         SelectDataDirectly(conn);
-
+		SelectDataDataRow(conn);
         try {
             conn.close();
             System.out.println("close connection");

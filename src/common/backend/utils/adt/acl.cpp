@@ -5,6 +5,7 @@
  *
  * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
+ * Portions Copyright (c) 2021, openGauss Contributors
  *
  *
  * IDENTIFICATION
@@ -40,7 +41,6 @@
 
 static const char* getid(const char* s, char* n);
 static void putid(char* p, const char* s);
-static Acl* allocacl(int n);
 void check_acl(const Acl* acl);
 static const char* aclparse(const char* s, AclItem* aip);
 static bool aclitem_match(const AclItem* a1, const AclItem* a2);
@@ -81,7 +81,6 @@ static AclResult pg_role_aclcheck(Oid role_oid, Oid roleid, AclMode mode);
 static void RoleMembershipCacheCallback(Datum arg, int cacheid, uint32 hashvalue);
 static Oid get_role_oid_or_public(const char* rolname);
 
-static List * roles_has_privs_of(Oid roleid);
 static Oid convert_cmk_name(text *keyname);
 static Oid convert_column_key_name(text *keyname);
 static AclMode convert_cmk_priv_string(text *priv_type_text);
@@ -122,6 +121,7 @@ const struct AclObjType {
     {ACL_OBJECT_SEQUENCE, ACL_NO_RIGHTS, ACL_ALL_RIGHTS_SEQUENCE},
     {ACL_OBJECT_DATABASE, (ACL_CREATE_TEMP | ACL_CONNECT), ACL_ALL_RIGHTS_DATABASE},
     {ACL_OBJECT_FUNCTION, ACL_EXECUTE, ACL_ALL_RIGHTS_FUNCTION},
+    {ACL_OBJECT_PACKAGE, ACL_NO_RIGHTS, ACL_ALL_RIGHTS_PACKAGE},
     {ACL_OBJECT_LARGEOBJECT, ACL_NO_RIGHTS, ACL_ALL_RIGHTS_LARGEOBJECT},
     {ACL_OBJECT_NAMESPACE, ACL_NO_RIGHTS, ACL_ALL_RIGHTS_NAMESPACE},
     {ACL_OBJECT_NODEGROUP, ACL_NO_RIGHTS, ACL_ALL_RIGHTS_NODEGROUP},
@@ -351,7 +351,7 @@ static const char* aclparse(const char* s, AclItem* aip)
  * RETURNS:
  *		the new Acl
  */
-static Acl* allocacl(int n)
+Acl* allocacl(int n)
 {
     Acl* new_acl = NULL;
     Size size;
@@ -675,6 +675,15 @@ Datum aclitem_eq(PG_FUNCTION_ARGS)
     result = a1->ai_privs == a2->ai_privs && a1->ai_grantee == a2->ai_grantee && a1->ai_grantor == a2->ai_grantor;
     PG_RETURN_BOOL(result);
 }
+Datum aclitem_eq_self(PG_FUNCTION_ARGS)
+{
+    AclItem* a1 = PG_GETARG_ACLITEM_P(0);
+    AclItem* a2 = PG_GETARG_ACLITEM_P(1);
+    bool result = false;
+
+    result = a1->ai_privs == a2->ai_privs && a1->ai_grantee == a2->ai_grantee && a1->ai_grantor == a2->ai_grantor;
+    PG_RETURN_BOOL(result);
+}
 
 /*
  * aclitem hash function
@@ -796,6 +805,9 @@ Datum acldefault_sql(PG_FUNCTION_ARGS)
             break;
         case 'f':
             objtype = ACL_OBJECT_FUNCTION;
+            break;
+        case 'p':
+            objtype = ACL_OBJECT_PACKAGE;
             break;
         case 'l':
             objtype = ACL_OBJECT_LANGUAGE;
@@ -1347,10 +1359,10 @@ static bool has_privs_of_role_without_sysadmin(Oid member, Oid role)
 
 
 /*
- * aclmask_dbe_perf --- compute bitmask of all privileges of held by roleid
- * when related to schema dbe_perf and objects in schema dbe_perf.
+ * aclmask_without_sysadmin --- compute bitmask of all privileges of held by roleid
+ * when related to schema dbe_perf, snapshot and pg_catalog.
  */
-AclMode aclmask_dbe_perf(const Acl *acl, Oid roleid, Oid ownerId, AclMode mask, AclMaskHow how)
+AclMode aclmask_without_sysadmin(const Acl *acl, Oid roleid, Oid ownerId, AclMode mask, AclMaskHow how)
 {
     AclMode result;
     AclMode remaining;
@@ -2031,9 +2043,10 @@ Datum has_sequence_privilege_name_name(PG_FUNCTION_ARGS)
     roleid = get_role_oid_or_public(NameStr(*rolename));
     mode = convert_sequence_priv_string(priv_type_text);
     sequenceoid = convert_table_name(sequencename);
-    if (get_rel_relkind(sequenceoid) != RELKIND_SEQUENCE)
+    if (!(RELKIND_IS_SEQUENCE(get_rel_relkind(sequenceoid))))
         ereport(ERROR,
-            (errcode(ERRCODE_WRONG_OBJECT_TYPE), errmsg("\"%s\" is not a sequence", text_to_cstring(sequencename))));
+            (errcode(ERRCODE_WRONG_OBJECT_TYPE), errmsg("\"%s\" is not a (large) sequence",
+                text_to_cstring(sequencename))));
 
     aclresult = pg_class_aclcheck(sequenceoid, roleid, mode, false);
 
@@ -2058,9 +2071,10 @@ Datum has_sequence_privilege_name(PG_FUNCTION_ARGS)
     roleid = GetUserId();
     mode = convert_sequence_priv_string(priv_type_text);
     sequenceoid = convert_table_name(sequencename);
-    if (get_rel_relkind(sequenceoid) != RELKIND_SEQUENCE)
+    if (!RELKIND_IS_SEQUENCE(get_rel_relkind(sequenceoid)))
         ereport(ERROR,
-            (errcode(ERRCODE_WRONG_OBJECT_TYPE), errmsg("\"%s\" is not a sequence", text_to_cstring(sequencename))));
+            (errcode(ERRCODE_WRONG_OBJECT_TYPE), errmsg("\"%s\" is not a (large) sequence",
+                text_to_cstring(sequencename))));
 
     aclresult = pg_class_aclcheck(sequenceoid, roleid, mode, false);
 
@@ -2087,9 +2101,10 @@ Datum has_sequence_privilege_name_id(PG_FUNCTION_ARGS)
     relkind = get_rel_relkind(sequenceoid);
     if (relkind == '\0')
         PG_RETURN_NULL();
-    else if (relkind != RELKIND_SEQUENCE)
+    else if (!RELKIND_IS_SEQUENCE(relkind))
         ereport(
-            ERROR, (errcode(ERRCODE_WRONG_OBJECT_TYPE), errmsg("\"%s\" is not a sequence", get_rel_name(sequenceoid))));
+            ERROR, (errcode(ERRCODE_WRONG_OBJECT_TYPE), errmsg("\"%s\" is not a (large) sequence",
+                get_rel_name(sequenceoid))));
 
     aclresult = pg_class_aclcheck(sequenceoid, roleid, mode, false);
 
@@ -2116,9 +2131,10 @@ Datum has_sequence_privilege_id(PG_FUNCTION_ARGS)
     relkind = get_rel_relkind(sequenceoid);
     if (relkind == '\0')
         PG_RETURN_NULL();
-    else if (relkind != RELKIND_SEQUENCE)
+    else if (!RELKIND_IS_SEQUENCE(relkind))
         ereport(
-            ERROR, (errcode(ERRCODE_WRONG_OBJECT_TYPE), errmsg("\"%s\" is not a sequence", get_rel_name(sequenceoid))));
+            ERROR, (errcode(ERRCODE_WRONG_OBJECT_TYPE), errmsg("\"%s\" is not a (large) sequence",
+                get_rel_name(sequenceoid))));
 
     aclresult = pg_class_aclcheck(sequenceoid, roleid, mode, false);
 
@@ -2141,9 +2157,10 @@ Datum has_sequence_privilege_id_name(PG_FUNCTION_ARGS)
 
     mode = convert_sequence_priv_string(priv_type_text);
     sequenceoid = convert_table_name(sequencename);
-    if (get_rel_relkind(sequenceoid) != RELKIND_SEQUENCE)
+    if (!RELKIND_IS_SEQUENCE(get_rel_relkind(sequenceoid)))
         ereport(ERROR,
-            (errcode(ERRCODE_WRONG_OBJECT_TYPE), errmsg("\"%s\" is not a sequence", text_to_cstring(sequencename))));
+            (errcode(ERRCODE_WRONG_OBJECT_TYPE), errmsg("\"%s\" is not a (large) sequence",
+                text_to_cstring(sequencename))));
 
     aclresult = pg_class_aclcheck(sequenceoid, roleid, mode, false);
 
@@ -2168,9 +2185,10 @@ Datum has_sequence_privilege_id_id(PG_FUNCTION_ARGS)
     relkind = get_rel_relkind(sequenceoid);
     if (relkind == '\0')
         PG_RETURN_NULL();
-    else if (relkind != RELKIND_SEQUENCE)
+    else if (!RELKIND_IS_SEQUENCE(relkind))
         ereport(
-            ERROR, (errcode(ERRCODE_WRONG_OBJECT_TYPE), errmsg("\"%s\" is not a sequence", get_rel_name(sequenceoid))));
+            ERROR, (errcode(ERRCODE_WRONG_OBJECT_TYPE), errmsg("\"%s\" is not a (large) sequence",
+                get_rel_name(sequenceoid))));
 
     aclresult = pg_class_aclcheck(sequenceoid, roleid, mode, false);
 
@@ -4990,7 +5008,15 @@ static Oid convert_directory_name(text* dirName)
  */
 static AclMode convert_directory_priv_string(text* priv_dir_text)
 {
-    static const priv_map dir_priv_map[] = {{"READ", ACL_READ}, {"WRITE", ACL_WRITE}, {NULL, 0}};
+    static const priv_map dir_priv_map[] = {{"READ", ACL_READ},
+        {"READ WITH GRANT OPTION", ACL_GRANT_OPTION_FOR(ACL_READ)},
+        {"WRITE", ACL_WRITE},
+        {"WRITE WITH GRANT OPTION", ACL_GRANT_OPTION_FOR(ACL_WRITE)},
+        {"ALTER", ACL_ALTER},
+        {"ALTER WITH GRANT OPTION", ADD_DDL_FLAG(ACL_GRANT_OPTION_FOR(REMOVE_DDL_FLAG(ACL_ALTER)))},
+        {"DROP", ACL_DROP},
+        {"DROP WITH GRANT OPTION", ADD_DDL_FLAG(ACL_GRANT_OPTION_FOR(REMOVE_DDL_FLAG(ACL_DROP)))},
+        {NULL, 0}};
 
     return convert_any_priv_string(priv_dir_text, dir_priv_map);
 }
@@ -5193,7 +5219,7 @@ static AclResult pg_role_aclcheck(Oid role_oid, Oid roleid, AclMode mode)
 }
 
 /*
- * initialization function (called by InitPostgres)
+ * initialization function (called by openGauss)
  */
 void initialize_acl(void)
 {
@@ -5202,7 +5228,7 @@ void initialize_acl(void)
          * In normal mode, set a callback on any syscache invalidation of
          * pg_auth_members rows
          */
-        CacheRegisterSyscacheCallback(AUTHMEMROLEMEM, RoleMembershipCacheCallback, (Datum)0);
+        CacheRegisterSessionSyscacheCallback(AUTHMEMROLEMEM, RoleMembershipCacheCallback, (Datum)0);
     }
 }
 
@@ -5245,7 +5271,7 @@ static bool has_rolinherit(Oid roleid)
  * For the benefit of select_best_grantor, the result is defined to be
  * in breadth-first order, ie, closer relationships earlier.
  */
-static List* roles_has_privs_of(Oid roleid)
+List* roles_has_privs_of(Oid roleid)
 {
     List* roles_list = NIL;
     ListCell* l = NULL;
@@ -5281,7 +5307,7 @@ static List* roles_has_privs_of(Oid roleid)
         /* Find roles that memberid is directly a member of */
         memlist = SearchSysCacheList1(AUTHMEMMEMROLE, ObjectIdGetDatum(memberid));
         for (i = 0; i < memlist->n_members; i++) {
-            HeapTuple tup = &memlist->members[i]->tuple;
+            HeapTuple tup = t_thrd.lsc_cxt.FetchTupleFromCatCList(memlist, i);
             Oid otherid = ((Form_pg_auth_members)GETSTRUCT(tup))->roleid;
 
             /*
@@ -5355,7 +5381,7 @@ static List* roles_is_member_of(Oid roleid)
         /* Find roles that memberid is directly a member of */
         memlist = SearchSysCacheList1(AUTHMEMMEMROLE, ObjectIdGetDatum(memberid));
         for (i = 0; i < memlist->n_members; i++) {
-            HeapTuple tup = &memlist->members[i]->tuple;
+            HeapTuple tup = t_thrd.lsc_cxt.FetchTupleFromCatCList(memlist, i);
             Oid otherid = ((Form_pg_auth_members)GETSTRUCT(tup))->roleid;
 
             /*
@@ -5529,7 +5555,7 @@ bool is_admin_of_role(Oid member, Oid role)
          * outside any security-restricted operation, SECURITY DEFINER or
          * similar context.  SQL-standard roles cannot self-admin.  However,
          * SQL-standard users are distinct from roles, and they are not
-         * grantable like roles: PostgreSQL's role-user duality extends the
+         * grantable like roles: openGauss's role-user duality extends the
          * standard.  Checking for a session user match has the effect of
          * letting a role self-admin only when it's conspicuously behaving
          * like a user.  Note that allowing self-admin under a mere SET ROLE
@@ -5569,7 +5595,7 @@ bool is_admin_of_role(Oid member, Oid role)
         /* Find roles that memberid is directly a member of */
         memlist = SearchSysCacheList1(AUTHMEMMEMROLE, ObjectIdGetDatum(memberid));
         for (i = 0; i < memlist->n_members; i++) {
-            HeapTuple tup = &memlist->members[i]->tuple;
+            HeapTuple tup = t_thrd.lsc_cxt.FetchTupleFromCatCList(memlist, i);
             Oid otherid = ((Form_pg_auth_members)GETSTRUCT(tup))->roleid;
 
             if (otherid == role && ((Form_pg_auth_members)GETSTRUCT(tup))->admin_option) {
@@ -5626,12 +5652,13 @@ static int count_one_bits(AclMode mask)
  * *grantorId: receives the OID of the role to do the grant as
  * *grantOptions: receives the grant options actually held by grantorId
  * isDbePerf: if the object in question belonging to schema dbe_perf
+ * isPgCatalog: if the object in question belonging to schema pg_catalog
  *
  * If no grant options exist, we set grantorId to roleId, grantOptions to 0.
  */
 void select_best_grantor(
     Oid roleId, AclMode privileges, AclMode ddlPrivileges, const Acl* acl, Oid ownerId,
-        Oid* grantorId, AclMode* grantOptions, AclMode* grantDdlOptions, bool isDbePerf)
+    Oid* grantorId, AclMode* grantOptions, AclMode* grantDdlOptions, bool isDbePerf, bool isPgCatalog)
 {
     /* remove ddl privileges flag from Aclitem */
     ddlPrivileges = REMOVE_DDL_FLAG(ddlPrivileges);
@@ -5651,6 +5678,13 @@ void select_best_grantor(
      */
     if (isDbePerf) {
         if (roleId == ownerId || roleId == INITIAL_USER_ID || isMonitoradmin(roleId)) {
+            *grantorId = ownerId;
+            *grantOptions = needed_goptions;
+            *grantDdlOptions = ddl_needed_goptions;
+            return;
+        }
+    } else if (isPgCatalog) {
+        if (roleId == ownerId || roleId == INITIAL_USER_ID) {
             *grantorId = ownerId;
             *grantOptions = needed_goptions;
             *grantDdlOptions = ddl_needed_goptions;

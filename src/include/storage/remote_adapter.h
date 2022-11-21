@@ -33,40 +33,20 @@
 #include "c.h"
 
 #include "storage/remote_read.h"
+#include "storage/smgr/relfilenode.h"
+#include "access/xlogdefs.h"
+#include "access/xlog_basic.h"
+#include "storage/smgr/segment_internal.h"
+#include "funcapi.h"
 
-#define Free(x)        \
-    do {               \
-        if ((x))       \
-            free((x)); \
-        (x) = NULL;    \
-    } while (0)
+extern int StandbyReadCUforPrimary(RepairBlockKey key, uint64 offset, int32 size, uint64 lsn, int timeout,
+    bytea** cudata);
+extern int StandbyReadPageforPrimary(RepairBlockKey key, uint32 blocksize, uint64 lsn, bytea** pagedata,
+    int timeout, const XLogPhyBlock *pblk);
 
-typedef struct TlsCertPath {
-    char caPath[MAX_PATH_LEN];
-    char keyPath[MAX_PATH_LEN];
-    char certPath[MAX_PATH_LEN];
-} TlsCertPath;
+extern int ReadFileSizeForRemote(RelFileNode rnode, int32 forknum, XLogRecPtr lsn, int64* res, int timeout);
 
-typedef struct RemoteReadContext RemoteReadContext;
-
-extern RemoteReadContext* InitRemoteReadContext();
-
-extern void ReleaseRemoteReadContext(RemoteReadContext* context);
-
-extern int StandbyReadCUforPrimary(uint32 spcnode, uint32 dbnode, uint32 relnode, int32 colid, uint64 offset,
-    int32 size, uint64 lsn, RemoteReadContext* context, char** cudata);
-
-extern int StandbyReadPageforPrimary(uint32 spcnode, uint32 dbnode, uint32 relnode, int16 bucketnode, int32 forknum, uint32 blocknum,
-    uint32 blocksize, uint64 lsn, RemoteReadContext* context, char** pagedata);
-
-extern void CleanWorkEnv();
-
-extern bool GetCertEnv(const char* envName, char* outputEnvStr, size_t envValueLen);
-
-extern char* GetCertStr(char* path, int* len);
-
-extern int GetRemoteReadMode();
-
-extern void OutputMsgforRPC(int elevel, const char* fmt, ...) __attribute__((format(PG_PRINTF_ATTRIBUTE, 2, 3)));
+Datum gs_read_file_from_remote(PG_FUNCTION_ARGS);
+Datum gs_read_file_size_from_remote(PG_FUNCTION_ARGS);
 
 #endif /* REMOTE_ADAPTER_H */
