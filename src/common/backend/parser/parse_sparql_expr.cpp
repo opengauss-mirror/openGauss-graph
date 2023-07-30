@@ -73,6 +73,7 @@ static void transformVariableEdge(ParseState* pstate, List* triList, List** args
     List** tables, List** attrList);
 static void transformFilters(ParseState* pstate, List* filList, List** args,
     List* tables, List* attrList);
+static void transformLimitOffsetClause(Query* query, ParseState* pstate, SparqlLimitOffsetStmt* limitOffsetClause);
 
 /*
  * deal with all kinds of arguments
@@ -210,7 +211,7 @@ getSparqlNameLoc(Node *n)
             break;
         default:
             elog(ERROR, "Type for SPARQL node is not allowed");
-            return NULL;
+            return 0;
             break;
     }
 }
@@ -1443,6 +1444,7 @@ static void transformTriples(ParseState* pstate, List* triList, List** args,
     ListCell* poc;
     ListCell* obj;
     Node* arg = NULL;
+    List* iriOrExpr = NIL;//Construct a syntax tree to connect all constraints of iri, connect them with "or", and then connect them to the where clause with "and"
 
     foreach (tric, triList) {
         SparqlTriple* tri = (SparqlTriple*)lfirst(tric);
@@ -1461,8 +1463,8 @@ static void transformTriples(ParseState* pstate, List* triList, List** args,
             }
             
             SparqlPathOr* orPath = (SparqlPathOr*)po->pre;
-            SparqlPathAnd* andPath;
-            ListCell* andCell;
+            SparqlPathAnd* andPath = NULL;
+            ListCell* andCell = NULL;
             List* ueids = NIL;
             List* ueidarrs = NIL;
             RangeTblEntry* prev_edge = NULL;
@@ -1477,8 +1479,8 @@ static void transformTriples(ParseState* pstate, List* triList, List** args,
             foreach (andCell, andPath->andList) {
                 SparqlPathEl* pathEl = (SparqlPathEl*)lfirst(andCell);
                 Node* pNode = pathEl->el;   // /*the IRI of the property*/
-                RangeTblEntry* edge;
-                RangeTblEntry* vertex;
+                RangeTblEntry* edge = NULL;
+                RangeTblEntry* vertex = NULL;
 
                 if (lnext(andCell) != NULL) {
                     if (strcmp(getSparqlName(pNode), RdfType) == 0) {
@@ -1572,7 +1574,7 @@ static void transformTriples(ParseState* pstate, List* triList, List** args,
 
                                 if (target == NULL) {
                                     target = addJoin(pstate, sNode, sNode, false);                                        
-                                    *tables = lappend(*tables, vertex);
+                                    *tables = lappend(*tables, target);
                                 }
 
                                 if (pathEl->range == NULL) {
@@ -1595,7 +1597,8 @@ static void transformTriples(ParseState* pstate, List* triList, List** args,
                                         (errcode(ERRCODE_SYNTAX_ERROR), errmsg("attribute not allowed with variable length"), parser_errposition(pstate, ((SparqlIri*)sNode)->location)));
                                 }
                             }
-                        } else if ((nodeTag(sNode) == T_SparqlVar) && (nodeTag(oNode) == T_SparqlVar)) {
+                        } else if (((nodeTag(sNode) == T_SparqlVar) && (nodeTag(oNode) == T_SparqlVar || nodeTag(oNode) == T_SparqlIri))
+                                        || ((nodeTag(sNode) == T_SparqlIri) && (nodeTag(oNode) == T_SparqlVar))) {
                             if (edgeLabelExist(pstate, l, pre->location)) {
                                 if (list_length(andPath->andList) == 1) {
                                     vertex = getEntry(*tables, getSparqlName(sNode));
@@ -1615,6 +1618,15 @@ static void transformTriples(ParseState* pstate, List* triList, List** args,
                                     if (arg != NULL)
                                         *args = lappend(*args, arg);
 
+                                    /*to support the statement that the subject is uri and the object is variable*/ 
+                                    if((nodeTag(sNode) == T_SparqlIri) && (nodeTag(oNode) == T_SparqlVar)){
+                                              arg = transColumn(pstate, vertex, NULL);
+                                              arg = transColumnEqualUri(pstate, arg, getSparqlName(sNode));
+                                              if (arg != NULL){
+                                                iriOrExpr = lappend(iriOrExpr, arg);
+                                              }
+                                    }
+
                                     vertex = getEntry(*tables, getSparqlName(oNode));
                                         
                                     if (vertex == NULL) {
@@ -1622,11 +1634,23 @@ static void transformTriples(ParseState* pstate, List* triList, List** args,
                                             
                                         *tables = lappend(*tables, vertex);
                                     }
+
+                                    
  
                                     arg = addVertexPath(pstate, vertex, pathEl, edge, true);
-                                        
+
                                     if (arg != NULL)
                                         *args = lappend(*args, arg);
+
+                                    /*to support the statement that the subject is variable and the object is uri*/ 
+                                    if((nodeTag(sNode) == T_SparqlVar) && (nodeTag(oNode) == T_SparqlIri)){
+                                              arg = transColumn(pstate, vertex, NULL);
+                                              arg = transColumnEqualUri(pstate, arg, getSparqlName(oNode));
+                                              if (arg != NULL){
+                                                // arg = coerce_to_boolean(pstate, arg, "AND");
+                                                iriOrExpr = lappend(iriOrExpr, arg);
+                                              }   
+                                    }
 
                                     if (pathEl->range == NULL) {
                                         Node* eid;
@@ -1715,135 +1739,7 @@ static void transformTriples(ParseState* pstate, List* triList, List** args,
                                     swapNode(&sNode, &oNode);
                                 }
                             }
-                        }else if ((nodeTag(sNode) == T_SparqlVar)
-                            && (nodeTag(oNode) == T_SparqlIri)) {
-                            if (edgeLabelExist(pstate, l, pre->location)) { 
-                                if (list_length(andPath->andList) == 1) {
-                                    vertex = getEntry(*tables,
-                                        getSparqlName(sNode));
-                                    if (vertex == NULL) {
-                                        vertex = addJoin(pstate, sNode, sNode,
-                                            false);
-                                        *tables = lappend(*tables, vertex);
-                                    }
-                                    setInitialVidForVLE(pstate, pathEl,
-                                        (Node*)vertex, prev_pathEl,
-                                        prev_edge);
-                                    edge = transformPropertyPath(pstate,
-                                        pathEl);
-                                    arg = addVertexPath(pstate, vertex, pathEl,
-                                        edge, false);
-                                    if (arg != NULL)
-                                        *args = lappend(*args, arg);
-
-                                    vertex = getEntry(*tables,
-                                        getSparqlName(oNode));
-                                    if (vertex == NULL) {
-                                        vertex = addJoin(pstate, oNode, oNode,
-                                            false);
-                                        *tables = lappend(*tables, vertex);
-                                    }
-                                    arg = addVertexPath(pstate, vertex, pathEl,
-                                        edge, true);
-                                    if (arg != NULL)
-                                        *args = lappend(*args, arg);
-
-                                    arg = transColumn(pstate, vertex, NULL);
-                                    arg = transColumnEqualUri(pstate, arg, getSparqlName(oNode));
-                                    if (arg != NULL)
-                                        *args = lappend(*args, arg);
-
-                                    if (pathEl->range == NULL) {
-                                        Node* eid;
-
-                                        eid = getColumnVar(pstate, edge,
-                                            GS_ELEM_LOCAL_ID);//猜测是获取表
-                                        ueids = list_append_unique(ueids, eid);
-                                    } else {
-                                        Node* eidarr;
-
-                                        eidarr = getColumnVar(pstate, edge,
-                                            VLE_COLNAME_IDS);
-                                        ueidarrs = list_append_unique(ueidarrs,
-                                            eidarr);
-                                    }
-                                } else {
-                                    vertex = NULL;
-                                    arg = addVertexPath(pstate, vertex,
-                                        prev_pathEl, prev_edge, true);
-                                    if (arg != NULL)
-                                        *args = lappend(*args, arg);
-                                    setInitialVidForVLE(pstate, pathEl,
-                                        (Node*)vertex, prev_pathEl,
-                                        prev_edge);
-                                    edge = transformPropertyPath(pstate,
-                                        pathEl);
-                                    arg = addEdgePath(pstate, prev_pathEl,
-                                        prev_edge, pathEl, edge);
-                                    *args = lappend(*args, arg);
-                                    if (pathEl->range == NULL) {
-                                        Node* eid;
-
-                                        eid = getColumnVar(pstate, edge,
-                                            GS_ELEM_LOCAL_ID);
-                                        ueids = list_append_unique(ueids, eid);
-                                    } else {
-                                        Node* eidarr;
-
-                                        eidarr = getColumnVar(pstate, edge,
-                                            VLE_COLNAME_IDS);
-                                        ueidarrs = list_append_unique(ueidarrs,
-                                            eidarr);
-                                    }
-                                    vertex = getEntry(*tables,
-                                        getSparqlName(oNode));
-                                    if (vertex == NULL) {
-                                        vertex = addJoin(pstate, oNode, oNode,
-                                            false);
-                                        *tables = lappend(*tables, vertex);
-                                    }
-                                    arg = addVertexPath(pstate, vertex, pathEl,
-                                        edge, true);
-                                    *args = lappend(*args, arg);
-                                }
-                            } else {
-                                Triple* t = makeNode(Triple);
-                                if (list_length(andPath->andList) == 1) {
-                                    if (pathEl->inv) {
-                                        swapNode(&sNode, &oNode);
-                                    }
-                                    rte = getEntry(*tables,
-                                        getSparqlName(sNode));
-                                    if (rte == NULL) {
-                                        rte = addJoin(pstate, sNode, sNode,
-                                            false);
-                                        *tables = lappend(*tables, rte);
-                                    }
-                                    t->sub = getSparqlName(sNode);
-                                } else {
-                                    if (pathEl->inv) {
-                                        ereport(ERROR,
-                                            (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("attribute can not apply inverse")));
-                                    }
-                                    rte = addJoin(pstate, oNode, oNode, false);
-                                    *tables = lappend(*tables, rte);
-                                    arg = addVertexPath(pstate, rte,
-                                        prev_pathEl, prev_edge, true);
-                                    *args = lappend(*args, arg);
-                                    t->sub = getSparqlName(oNode);
-                                }
-                                t->pre = getSparqlName(pNode);
-                                t->obj = getSparqlName(oNode);
-                                if (list_member(*attrList, t))
-                                    ereport(ERROR,
-                                        (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("target duplicate")));
-                                *attrList = lappend(*attrList, t);
-                                if (list_length(andPath->andList) == 1
-                                    && pathEl->inv) {
-                                    swapNode(&sNode, &oNode);
-                                }
-                            }
-                        } else {
+                        }else {
                             ereport(ERROR,
                                 (errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg("query is meaningless or not support yet")));
                         }
@@ -1851,6 +1747,13 @@ static void transformTriples(ParseState* pstate, List* triList, List** args,
                 }
             }
             addQualUniqueEdges_legcy(pstate, args, ueids, ueidarrs);
+        }
+    }
+    /*connect all iri constraints by "or"*/
+    if(list_length(iriOrExpr) != 0){
+        arg = (Node*)makeBoolExpr(OR_EXPR, iriOrExpr, -1);
+        if(arg != NULL){
+            *args = lappend(*args, arg);
         }
     }
 }
@@ -2235,6 +2138,26 @@ static void transformFilters(ParseState* pstate, List* filList, List** args,
     }
 }
 
+static void transformLimitOffsetClause(Query* query, ParseState* pstate, SparqlLimitOffsetStmt* limitOffsetClause){
+    SparqlLimitClause *limitClause = (SparqlLimitClause*)limitOffsetClause->limitClause;
+    SparqlOffsetClause *offsetClause = (SparqlOffsetClause*)limitOffsetClause->offsetClause;
+    Value *count = limitClause!=NULL ? &((A_Const*)limitClause->number)->val : NULL;
+    // Value *count = limitClause!=NULL?(Value*)makeInteger(3):NULL;
+    Value *offset = offsetClause!=NULL? &((A_Const*)offsetClause->number)->val : NULL;
+    Node* qual = NULL;
+
+    if(count!=NULL){
+        qual = (Node*)make_const(pstate, count, NULL);
+        qual = coerce_to_specific_type(pstate, qual, INT8OID, "LIMIT");
+        query->limitCount = qual;
+    }
+    if(offset!=NULL){
+        qual = (Node*)make_const(pstate, offset, NULL);
+        qual = coerce_to_specific_type(pstate, qual, INT8OID, "OFFSET");
+        query->limitOffset = qual;
+    }
+}
+
 Query* transformSparqlSelectStmt(ParseState* pstate, SparqlSelectStmt* stmt)
 {
     Query* qry = makeNode(Query);
@@ -2244,11 +2167,17 @@ Query* transformSparqlSelectStmt(ParseState* pstate, SparqlSelectStmt* stmt)
     List* attrList = NIL;
 
     SparqlWhere* wc = (SparqlWhere*)(stmt->whereClause);
+    SparqlSolutionModifierStmt *solutionModifier = (SparqlSolutionModifierStmt*)(stmt->solutionModifierClause);
 
     transformTypedTriples(pstate, wc->triList, &args, &tables, &attrList);
     transformTriples(pstate, wc->triList, &args, &tables, &attrList);
     transformVariableEdge(pstate, wc->triList, &args, &tables, &attrList);
     transformFilters(pstate, wc->filterList, &args, tables, attrList);
+    if(solutionModifier != nullptr){
+        /*test*/SparqlLimitOffsetStmt* SparqlLimitOffsetStmtTest = (SparqlLimitOffsetStmt*)(solutionModifier->limitOffsetClause);
+        if(SparqlLimitOffsetStmtTest != nullptr)
+            transformLimitOffsetClause(qry, pstate, (SparqlLimitOffsetStmt*)solutionModifier->limitOffsetClause);
+    }
 
     qual = (Node*)makeBoolExpr(AND_EXPR, args, default_loc);
     qry->jointree = makeFromExpr(pstate->p_joinlist, qual);
@@ -2260,6 +2189,7 @@ Query* transformSparqlSelectStmt(ParseState* pstate, SparqlSelectStmt* stmt)
 
     /* transform window clauses after we have seen all window functions */
     qry->windowClause = transformWindowDefinitions(pstate, pstate->p_windowdefs, &qry->targetList);
+    
 
     /* resolve any still-unresolved output columns as being type text */
     if (pstate->p_resolve_unknowns)

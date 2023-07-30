@@ -299,6 +299,7 @@ void ExecReScanAppend(AppendState* node)
     node->as_whichplan = 0;
     (void)exec_append_initialize_next(node);
 }
+
 #ifdef GS_GRAPH
 void
 ExecNextAppendContext(AppendState *node)

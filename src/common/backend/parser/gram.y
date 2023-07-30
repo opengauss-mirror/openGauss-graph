@@ -788,7 +788,8 @@ static int errstate;
 %type <node>	CypherStmt cypher_with_parens cypher_no_parens
 				cypher_clause_prev cypher_clause_head cypher_clause
 				cypher_expr cypher_c_expr cypher_i_expr cypher_w_expr
-				cypher_expr_opt	cypher_expr_atom cypher_expr_literal cypher_expr_var
+				cypher_expr_opt	cypher_expr_atom cypher_expr_literal cypher_expr_var cypher_expr_filter
+
 
 %type <list>	cypher_expr_comma_list
 %type <value>	cypher_expr_name
@@ -798,12 +799,18 @@ static int errstate;
 %type <list>	cypher_expr_map_keyvals 
 %type <value>	cypher_expr_map_key cypher_expr_escaped_name
 
+%type <node>	cypher_expr_list cypher_expr_lc_where_opt cypher_expr_lc_res_opt
+%type <list>	cypher_expr_list_elems cypher_expr_list_elems_opt
+
+%type <node>	cypher_expr_case cypher_expr_case_when cypher_expr_case_default
+%type <list>	cypher_expr_case_when_list
+
 %type <node>	cypher_expr_func cypher_expr_func_norm
 
-%type <list>	cypher_pattern
+%type <list>	cypher_pattern cypher_anon_pattern
 				cypher_path cypher_path_chain
 				cypher_types cypher_types_opt
-%type <node>	cypher_pattern_part	cypher_pattern_var cypher_anon_pattern_part
+%type <node>	cypher_pattern_part	cypher_pattern_var cypher_anon_pattern_part 
 				cypher_node cypher_rel
 				cypher_var cypher_var_opt cypher_label_opt
 				cypher_varlen_opt cypher_range_opt cypher_range_idx cypher_range_idx_opt
@@ -831,7 +838,7 @@ static int errstate;
 /*
  * SPARQL Query Language
  */
-%type <node> SparqlSelectStmt SparqlPageRankStmt
+%type <node> SparqlSelectStmt SparqlAlgoStmt SparqlPageRankStmt SparqlDegreeStmt SparqlBfsStmt SparqlShortestPathStmt
 %type <target> spar_star spar_retcol_el
 %type <list> spar_dataset_clauses_opt spar_retcols  spar_arg_list_opt spar_arg_list spar_expns
 %type <node> spar_var spar_expn
@@ -839,10 +846,11 @@ static int errstate;
 %type <list> spar_result_set spar_select_rset_1 spar_triples spar_gp_not_triples spar_gp_not_triples_opt spar_triples_opt
 %type <node> spar_triples1  spar_not_triples1  spar_var_or_term
 %type <node> spar_where_clause
+%type <node> spar_solution_modifier_stmt spar_limit_offset_clauses spar_limit_clause spar_offset_clause
 %type <node> spar_graph_node spar_verb spar_graph_term spar_prefix_clause_opt spar_iriref spar_qname spar_rdf_literal spar_optsigned_numeric_literal
 %type <node> spar_boolean_literal
 %type <list> spar_props_opt spar_objects spar_prefix_clause_opt_list
-%type <str> algo_clause vertex_table vertex_id edge_table edge_args out_table damping_factor_opt max_iter_opt threshold_opt prop_maps
+%type <str> algo_clause algob_clause algod_clause algos_clause edgetable nodearg1 nodearg2 nodetable prop_maps
 %type <node> pagerank_list spar_ograph_node 
 %type <node> spar_ret_agg_call
 %type <node> spar_ppath_fwd_or_inv spar_ppath_fwd_or_inv_repcounts spar_ppath_rep
@@ -889,13 +897,13 @@ static int errstate;
  */ 
 %token _CARET_CARET _AT
 %token <str>	QVAR
-%token <str>	BLANK_NODE_LABEL SPARQL_STRING ALGO_CLAUSE PAGERANK_ARG LANGTAG 
+%token <str>	BLANK_NODE_LABEL SPARQL_STRING ALGO_CLAUSE ALGOB_CLAUSE ALGOD_CLAUSE ALGOS_CLAUSE PAGERANK_ARG LANGTAG 
                 QNAME QNAME_NS Q_IRI_REF
 
 /*
  * SPARQL 
  */
-%type <node> SparqlStmt SparqlLoadStmt
+%type <node> SparqlStmt SparqlLoadStmt 
 
 /*
  * If you want to make any keyword changes, update the keyword table in
@@ -907,11 +915,11 @@ static int errstate;
 /* ordinary key words in alphabetical order */
 /* PGXC - added DISTRIBUTE, DIRECT, COORDINATOR, CLEAN,  NODE, BARRIER, SLICE, DATANODE */
 %token <keyword> ABORT_P ABSOLUTE_P ACCESS ACCOUNT ACTION ADD_P ADMIN AFTER
-	AGGREGATE ALGO ALGORITHM ALL ALLSHORTESTPATHS ALSO ALTER ALWAYS ANALYSE ANALYZE AND ANY APP APPEND ARCHIVE ARRAY AS ASC
+	AGGREGATE ALGO ALGOB ALGOD ALGOS ALGORITHM ALL ALLSHORTESTPATHS ALSO ALTER ALWAYS ANALYSE ANALYZE AND ANY APP APPEND ARCHIVE ARRAY AS ASC
         ASSERTION ASSIGNMENT ASYMMETRIC AT ATTRIBUTE AUDIT AUTHID AUTHORIZATION AUTOEXTEND AUTOMAPPED
 
 	BACKWARD BARRIER BEFORE BEGIN_NON_ANOYBLOCK BEGIN_P BETWEEN BIGINT BINARY BINARY_DOUBLE BINARY_INTEGER BIT BLANKS
-	BLOB_P BLOCKCHAIN BODY_P BOGUS BOOLEAN_P BOTH BUCKETCNT BUCKETS BY BYTEAWITHOUTORDER BYTEAWITHOUTORDERWITHEQUAL
+	BLOB_P BLOCKCHAIN BODY_P BOGUS BOOLEAN_P BOTH BREATHFS BUCKETCNT BUCKETS BY BYTEAWITHOUTORDER BYTEAWITHOUTORDERWITHEQUAL
 
 	CACHE CALL CALLED CANCELABLE CASCADE CASCADED CASE CAST CATALOG_P CHAIN CHAR_P
 	CHARACTER CHARACTERISTICS CHARACTERSET CHECK CHECKPOINT CLASS CLEAN CLIENT CLIENT_MASTER_KEY CLIENT_MASTER_KEYS CLOB CLOSE
@@ -923,13 +931,13 @@ static int errstate;
 	CURRENT_TIME CURRENT_TIMESTAMP CURRENT_USER CURSOR CYCLE CYPHER
 
 	DATA_P DATABASE DATAFILE DATANODE DATANODES DATATYPE_CL DATE_P DATE_FORMAT_P DAY_P DBCOMPATIBILITY_P DEALLOCATE DEC DECIMAL_P DECLARE DECODE DEFAULT DEFAULTS
-	DEFERRABLE DEFERRED DEFINER DELETE_P DELIMITER DELIMITERS DELTA DELTAMERGE DESC DETACH DETERMINISTIC
+	DEFERRABLE DEFERRED DEFINER DEGREE DELETE_P DELIMITER DELIMITERS DELTA DELTAMERGE DESC DETACH DETERMINISTIC
 /* PGXC_BEGIN */
 	DICTIONARY DIRECT DIRECTORY DISABLE_P DISCARD DISTINCT DISTRIBUTE DISTRIBUTION DO DOCUMENT_P DOMAIN_P DOUBLE_P
 /* PGXC_END */
 	DROP DUPLICATE DISCONNECT
 
-	EACH ELABEL ELASTIC ELSE ENABLE_P ENCLOSED ENCODING ENCRYPTED ENCRYPTED_VALUE ENCRYPTION ENCRYPTION_TYPE END_P ENFORCED ENUM_P ERRORS ESCAPE EOL ESCAPING EVERY EXCEPT EXCHANGE
+	EACH EDGE_TABLE ELABEL ELASTIC ELSE ENABLE_P ENCLOSED ENCODING ENCRYPTED ENCRYPTED_VALUE ENCRYPTION ENCRYPTION_TYPE END_P END_NODE ENFORCED ENUM_P ERRORS ESCAPE EOL ESCAPING EVERY EXCEPT EXCHANGE
 	EXCLUDE EXCLUDED EXCLUDING EXCLUSIVE EXECUTE EXISTS EXPIRED_P EXPLAIN
 	EXTENSION EXTERNAL EXTRACT
 
@@ -956,7 +964,7 @@ static int errstate;
 	LOCATION LOCK_P LOG_P LOGGED LOGGING LOGIN_ANY LOGIN_FAILURE LOGIN_SUCCESS LOGOUT LOOP
 	MAPPING MASKING MASTER MATCH MATERIALIZED MATCHED MAXEXTENTS MAXSIZE MAXTRANS MAXVALUE MERGE MINUS_P MINUTE_P MINVALUE MINEXTENTS MODE MODIFY_P MONTH_P MOVE MOVEMENT
 	MODEL // DB4AI
-	NAME_P NAMES NATIONAL NATURAL NCHAR NEXT NO NOCOMPRESS NOCYCLE NODE NOLOGGING NOMAXVALUE NOMINVALUE NONE
+	NAME_P NAMES NATIONAL NATURAL NCHAR NEXT NO NOCOMPRESS NOCYCLE NODE NODE_TABLE NOLOGGING NOMAXVALUE NOMINVALUE NONE
 	NOT NOTHING NOTIFY NOTNULL NOWAIT NULL_P NULLCOLS NULLIF NULLS_P NUMBER_P NUMERIC NUMSTR NVARCHAR NVARCHAR2 NVL
 
 	OBJECT_P OF OFF OFFSET OIDS ON ONLY OPERATOR OPTIMIZATION OPTION OPTIONAL_P OPTIONALLY OPTIONS OR
@@ -981,7 +989,7 @@ static int errstate;
 
 	SAMPLE SAVEPOINT SCHEMA SCROLL SEARCH SECOND_P SECURITY SELECT SEQUENCE SEQUENCES
 	SERIALIZABLE SERVER SESSION SESSION_USER SET SETS SETOF SHARE SHIPPABLE SHORTESTPATH SHOW SHUTDOWN SIBLINGS
-	SIMILAR SIMPLE SIZE SKIP SLICE SMALLDATETIME SMALLDATETIME_FORMAT_P SMALLINT SNAPSHOT SOME SOURCE_P SPACE SPARQL SPILL SPLIT STABLE STANDALONE_P START STARTWITH
+	SIMILAR SIMPLE SIZE SKIP SLICE SMALLDATETIME SMALLDATETIME_FORMAT_P SMALLINT SNAPSHOT SOME SOURCE_P SPACE SPARQL SPILL SPLIT SRC_NODE STABLE STANDALONE_P START STARTWITH
 	STATEMENT STATEMENT_ID STATISTICS STDIN STDOUT STORAGE STORE_P STORED STRATIFY STREAM STRICT_P STRIP_P SUBPARTITION SUBSCRIPTION SUBSTRING
 	SYMMETRIC SYNONYM SYSDATE SYSID SYSTEM_P SYS_REFCURSOR 
 
@@ -7911,6 +7919,13 @@ cypher_pattern_varname:
 			| type_func_name_keyword	{ $$ = pstrdup($1); }
 		;
 
+cypher_anon_pattern:
+			cypher_anon_pattern_part
+					{ $$ = list_make1($1); }
+			| cypher_anon_pattern ',' cypher_anon_pattern_part
+					{ $$ = lappend($1, $3); }
+		;
+
 cypher_anon_pattern_part:
 			cypher_path
 				{
@@ -8197,6 +8212,59 @@ cypher_expr_map_key:
 cypher_expr_escaped_name:
 			Sconst		{ $$ = makeString($1); }
 		;
+cypher_expr_list:
+			'[' cypher_expr_list_elems_opt ']'
+				{
+					CypherListExpr *n;
+
+					n = makeNode(CypherListExpr);
+					n->elems = $2;
+					n->location = @1;
+					$$ = (Node *) n;
+				}
+			| '[' cypher_expr_filter cypher_expr_lc_res_opt ']'
+				{
+					CypherListComp *lc = (CypherListComp *) $2;
+
+					lc->elem = $3;
+					lc->location = @1;
+					$$ = $2;
+				}
+		;
+
+cypher_expr_list_elems:
+			cypher_i_expr
+					{ $$ = list_make1($1); }
+			| cypher_expr_list_elems ',' cypher_expr
+					{ $$ = lappend($1, $3); }
+		;
+
+cypher_expr_list_elems_opt:
+			cypher_expr_list_elems
+			| /* EMPTY */				{ $$ = NIL; }
+		;
+cypher_expr_lc_res_opt:
+			Op cypher_expr
+				{
+					/* scanner treats | as an operator */
+					if (strcmp($1, "|") != 0)
+						ereport(ERROR,
+								(errcode(ERRCODE_SYNTAX_ERROR),
+								 errmsg("syntax error: | expected"),
+								 parser_errposition(@1)));
+
+					$$ = $2;
+				}
+			| /* EMPTY */
+					{ $$ = NULL; }
+		;
+
+cypher_expr_lc_where_opt:
+			WHERE cypher_w_expr
+					{ $$ = $2; }
+			| /*EMPTY*/										%prec Op
+					{ $$ = NULL; }
+		;		
 
 cypher_expr_comma_list:
 			cypher_expr
@@ -8208,6 +8276,18 @@ cypher_expr_comma_list:
 cypher_expr_name:
 			ColLabel		{ $$ = makeString($1); }
 		;
+cypher_expr_filter:
+			cypher_expr_varname IN_P cypher_expr cypher_expr_lc_where_opt
+				{
+					CypherListComp *lc;
+
+					lc = makeNode(CypherListComp);
+					lc->list = $3;
+					lc->varname = $1;
+					lc->cond = $4;
+					$$ = (Node *) lc;
+				}
+		;		
 
 all_or_distinct:
 			ALL										{ $$ = true; }
@@ -8300,10 +8380,10 @@ cypher_expr:
 				{
 					$$ = (Node *) makeSimpleA_Expr(AEXPR_OP, "=", $1, $3, @2);
 				}
-			// | cypher_expr NOT_EQUALS cypher_expr
-			// 	{
-			// 		$$ = (Node *) makeSimpleA_Expr(AEXPR_OP, "<>", $1, $3, @2);
-			// 	}
+			| cypher_expr NOT_EQUALS cypher_expr
+				{
+					$$ = (Node *) makeSimpleA_Expr(AEXPR_OP, "<>", $1, $3, @2);
+			 	}
 			| cypher_expr '<' cypher_expr
 				{
 					$$ = (Node *) makeSimpleA_Expr(AEXPR_OP, "<", $1, $3, @2);
@@ -8312,14 +8392,18 @@ cypher_expr:
 				{
 					$$ = (Node *) makeSimpleA_Expr(AEXPR_OP, ">", $1, $3, @2);
 				}
-			// | cypher_expr LESS_EQUALS cypher_expr
-			// 	{
-			// 		$$ = (Node *) makeSimpleA_Expr(AEXPR_OP, "<=", $1, $3, @2);
-			// 	}
-			// | cypher_expr GREATER_EQUALS cypher_expr
-			// 	{
-			// 		$$ = (Node *) makeSimpleA_Expr(AEXPR_OP, ">=", $1, $3, @2);
-			// 	}
+			| cypher_expr CmpOp cypher_expr
+				{
+					$$ = (Node *) makeSimpleA_Expr(AEXPR_OP, $2, $1, $3, @2);
+				}
+			//  | cypher_expr LESS_EQUALS cypher_expr
+			//  	{
+			//  		$$ = (Node *) makeSimpleA_Expr(AEXPR_OP, "<=", $1, $3, @2);
+			//  	}
+			//  | cypher_expr GREATER_EQUALS cypher_expr
+			//  	{
+			//  		$$ = (Node *) makeSimpleA_Expr(AEXPR_OP, ">=", $1, $3, @2);
+		 	// }
 			| cypher_expr '+' cypher_expr
 				{
 					$$ = (Node *) makeSimpleA_Expr(AEXPR_OP, "+", $1, $3, @2);
@@ -8722,7 +8806,7 @@ cypher_i_expr:
 					n = makeNode(NullTest);
 					n->arg = (Expr *) $1;
 					n->nulltesttype = IS_NULL;
-					n->location = @2;
+					// n->location = @2;
 					$$ = (Node *) n;
 				}
 			| cypher_i_expr IS NOT NULL_P					%prec IS
@@ -8732,7 +8816,7 @@ cypher_i_expr:
 					n = makeNode(NullTest);
 					n->arg = (Expr *) $1;
 					n->nulltesttype = IS_NOT_NULL;
-					n->location = @2;
+					// n->location = @2;
 					$$ = (Node *) n;
 				}
 			| cypher_i_expr TYPECAST type_function_name
@@ -8961,7 +9045,7 @@ cypher_w_expr:
 					n = makeNode(NullTest);
 					n->arg = (Expr *) $1;
 					n->nulltesttype = IS_NULL;
-					n->location = @2;
+					// n->location = @2;
 					$$ = (Node *) n;
 				}
 			| cypher_w_expr IS NOT NULL_P					%prec IS
@@ -8971,7 +9055,7 @@ cypher_w_expr:
 					n = makeNode(NullTest);
 					n->arg = (Expr *) $1;
 					n->nulltesttype = IS_NOT_NULL;
-					n->location = @2;
+					// n->location = @2;
 					$$ = (Node *) n;
 				}
 			| cypher_w_expr TYPECAST type_function_name
@@ -9054,6 +9138,7 @@ cypher_c_expr:
 
 cypher_expr_atom:
 			cypher_expr_literal
+			| cypher_expr_case
 			| cypher_expr_var
 			| cypher_expr_func
 		;
@@ -9066,6 +9151,7 @@ cypher_expr_literal:
 			| FALSE_P				{ $$ = makeBoolAConst(FALSE, @1); }
 			| NULL_P				{ $$ = makeNullAConst(@1); }
 			| cypher_expr_map
+			| cypher_expr_list
 		;
 
 cypher_expr_var:
@@ -9078,6 +9164,47 @@ cypher_expr_var:
 					n->location = @1;
 					$$ = (Node *) n;
 				}
+		;
+
+cypher_expr_case:
+			CASE cypher_expr_opt cypher_expr_case_when_list
+			cypher_expr_case_default END_P
+				{
+					CaseExpr   *n;
+
+					n = makeNode(CaseExpr);
+					n->casetype = InvalidOid;
+					n->arg = (Expr *) $2;
+					n->args = $3;
+					n->defresult = (Expr *) $4;
+					n->location = @1;
+					$$ = (Node *) n;
+				}
+		;
+
+cypher_expr_case_when_list:
+			cypher_expr_case_when
+					{ $$ = list_make1($1); }
+			| cypher_expr_case_when_list cypher_expr_case_when
+					{ $$ = lappend($1, $2); }
+		;
+
+cypher_expr_case_when:
+			WHEN cypher_expr THEN cypher_expr
+				{
+					CaseWhen   *n;
+
+					n = makeNode(CaseWhen);
+					n->expr = (Expr *) $2;
+					n->result = (Expr *) $4;
+					n->location = @1;
+					$$ = (Node *) n;
+				}
+		;
+
+cypher_expr_case_default:
+			ELSE cypher_expr		{ $$ = $2; }
+			| /* EMPTY */			{ $$ = NULL; }
 		;
 
 cypher_load:
@@ -9120,6 +9247,50 @@ cypher_expr_func_subexpr:
 					n->subselect = (Node *) sub;
 					n->location = @1;
 					$$ = (Node *) n;
+				}
+				| COALESCE '(' cypher_expr_comma_list ')'
+				{
+					CoalesceExpr *c;
+
+					c = makeNode(CoalesceExpr);
+					c->args = $3;
+					c->location = @1;
+					c->isnvl=false;
+					$$ = (Node *) c;
+				}
+				| EXISTS '(' cypher_anon_pattern ')'
+				{
+					CypherSubPattern *sub;
+					SubLink	   *n;
+
+					sub = makeNode(CypherSubPattern);
+					sub->kind = CSP_EXISTS;
+					sub->pattern = $3;
+
+					n = makeNode(SubLink);
+					n->subLinkType = EXISTS_SUBLINK;
+					n->subLinkId = 0;
+					n->testexpr = NULL;
+					n->operName = NIL;
+					n->subselect = (Node *) sub;
+					n->location = @1;
+					$$ = (Node *) n;
+				}
+				| NONE '(' cypher_expr_varname IN_P cypher_expr cypher_where ')'
+				{
+					CypherListComp *clc;
+					FuncCall   *n;
+
+					clc = makeNode(CypherListComp);
+					clc->list = $5;
+					clc->varname = $3;
+					clc->cond = $6;
+
+					n = makeFuncCall(SystemFuncName("length"),
+									 list_make1(clc), @1);
+
+					$$ = (Node *) makeSimpleA_Expr(AEXPR_OP, "=", (Node*) n,
+												   makeIntConst(0, -1), @1);
 				}
 		;
 
@@ -9264,7 +9435,7 @@ SparqlStmt:
 		stmt->stmt = $1;
 		$$ = (Node*) stmt;
 	}
-	| SparqlPageRankStmt {
+	| SparqlAlgoStmt {
 		SparqlStmt* stmt = makeNode(SparqlStmt);
 		stmt->stmt = $1;
 		$$ = (Node*) stmt;
@@ -9301,86 +9472,106 @@ SparqlLoadStmt:
  */
  
 SparqlPageRankStmt:
-			SPARQL algo_clause '(' pagerank_list damping_factor_opt max_iter_opt threshold_opt ')'
+			SPARQL PAGERANK '(' EDGE_TABLE edgetable ';' ')'
 				{
 					SparqlPageRankStmt *n = makeNode(SparqlPageRankStmt);
-					n->algoName = $2;
-					n->pagerankList = $4;
-					n->dampingFactor = $5;
-					n->maxIter = $6;
-					n->threshold = $7;
+					n->algoName = "pageRank";
+					n->edgetable = $5;
 					$$ = (Node *) n;
 				}
 		;
 
+SparqlDegreeStmt:
+			SPARQL DEGREE '(' EDGE_TABLE edgetable ';' ')'
+				{
+					SparqlDegreeStmt *n = makeNode(SparqlDegreeStmt);
+					n->algoName = "degree";
+					n->edgetable = $5;
+					$$ = (Node *) n;
+				}
+		;
+
+SparqlBfsStmt:
+			SPARQL BREATHFS '(' EDGE_TABLE edgetable ';' SRC_NODE nodearg1 ';' ')'
+				{
+					SparqlBfsStmt *n = makeNode(SparqlBfsStmt);
+					n->algoName = "bfs";
+					n->edgetable = $5;
+					n->nodearg1 = $8;
+					$$ = (Node *) n;
+				}
+		;
+
+SparqlShortestPathStmt:
+			SPARQL SHORTESTPATH '(' EDGE_TABLE edgetable ';' NODE_TABLE nodetable ';' SRC_NODE nodearg1 ';' END_NODE nodearg2 ';' ')'
+				{
+					SparqlShortestPathStmt *n = makeNode(SparqlShortestPathStmt);
+					n->algoName = "shortestpath";
+					n->edgetable = $5;
+					n->nodetable = $8;
+					n->nodearg1 = $11;
+					n->nodearg2 = $14;
+					$$ = (Node *) n;
+				}
+		;
+
+SparqlAlgoStmt:
+			SparqlShortestPathStmt
+			| SparqlBfsStmt
+			| SparqlPageRankStmt
+			| SparqlDegreeStmt
+		;
 algo_clause: 
-			ALGO '.' PAGERANK
+			ALGO  PAGERANK
 				{
 					$$ = "pageRank";
 				}
-			| ALGO '.' SHORTESTPATH
+		;
+
+algod_clause: 
+			ALGOD  DEGREE
 				{
-					$$ = "shortestPath";
+					$$ = "degree";
+				}
+		;
+
+algob_clause: 
+			ALGOB  BREATHFS
+				{
+					$$ = "bfs";
+				}
+		;
+
+algos_clause: 
+			ALGOS  SHORTESTPATH
+				{
+					$$ = "shortestpath";
 				}
 		;
 				
-pagerank_list:
-			vertex_table ',' vertex_id ',' edge_table ',' edge_args ',' out_table
-				{
-					SparqlPageRankList *n = makeNode(SparqlPageRankList); 
-					n->vertexTable = $1;
-					n->vertex_id = $3;
-					n->edge_table = $5;
-					n->edge_args = $7;
-					n->out_table = $9;
-					$$ = (Node *) n;
-				}
-		;
-				
-vertex_table:
+edgetable:
 			SPARQL_STRING prop_maps
 				{ $$ = $1; }
 			| SPARQL_STRING { $$ = $1; }
-		;
-			
-vertex_id:
-			SPARQL_STRING prop_maps
-				{ $$ = $1; }
-			| SPARQL_STRING { $$ = $1; }
-		;
-		
-edge_table:		
-			SPARQL_STRING prop_maps
-				{ $$ = $1; }
-			| SPARQL_STRING { $$ = $1; }
-		;
-		
-edge_args:
-			SPARQL_STRING prop_maps
-				{ $$ = $1; }
-			| SPARQL_STRING { $$ = $1; }
-		;
-		
-out_table:
-			SPARQL_STRING prop_maps
-				{ $$ = $1; }
-			| SPARQL_STRING { $$ = $1; }
-		;
-		
-damping_factor_opt: 
-			/*empty*/ 
-				{ $$ = NULL; }
 		;
 
-max_iter_opt:
-			/*empty*/ 
-				{ $$ = NULL; }
-		;	 
-
-threshold_opt:
-			/*empty*/ 
-				{ $$ = NULL; }
+nodetable:
+			SPARQL_STRING prop_maps
+				{ $$ = $1; }
+			| SPARQL_STRING { $$ = $1; }
 		;
+
+nodearg1:
+			SPARQL_STRING prop_maps
+				{ $$ = $1; }
+			| SPARQL_STRING { $$ = $1; }
+		;
+
+nodearg2:
+			SPARQL_STRING prop_maps
+				{ $$ = $1; }
+			| SPARQL_STRING { $$ = $1; }
+		;		
 		
 prop_maps:
 			'{' SPARQL_STRING ':' SPARQL_STRING '}'
@@ -9388,16 +9579,60 @@ prop_maps:
 		
 SparqlSelectStmt: 
 			SPARQL spar_prefix_clause_opt SELECT spar_result_set spar_dataset_clauses_opt 
-				WHERE '{' spar_where_clause '}'
+				WHERE '{' spar_where_clause '}' spar_solution_modifier_stmt
 				{
 					SparqlSelectStmt *n = makeNode(SparqlSelectStmt);
 					n->prefixClause = $2;
 					n->targetList = $4;
 					n->fromClause = $5;
 					n->whereClause = $8;
+					n->solutionModifierClause = $10;
 					$$ = (Node *)n;
 				}
 		;
+
+/*Limit clause syntax*/
+spar_solution_modifier_stmt:
+			spar_limit_offset_clauses /*group having等暂时没添加*/
+			{
+				SparqlSolutionModifierStmt *n = makeNode(SparqlSolutionModifierStmt);
+				n->limitOffsetClause = $1;
+				$$ = (Node *)n;
+			}
+			| { $$ = NULL; }
+
+
+spar_limit_offset_clauses:
+			spar_limit_clause
+			{
+				SparqlLimitOffsetStmt *n = makeNode(SparqlLimitOffsetStmt);
+				n->limitClause = $1;
+				$$ = (Node *)n;
+			}
+			/*暂时只实现仅Limit*/
+			/*
+			|spar_offset_clause
+			|spar_limit_clause spar_offset_clause
+			|spar_offset_clause spar_limit_clause
+			*/
+
+spar_limit_clause:
+			LIMIT ICONST
+			{
+				SparqlLimitClause *n = makeNode(SparqlLimitClause);
+				n->number=(Node *)makeIntConst($2,@2);
+				$$ = (Node *)n;
+			}
+
+spar_offset_clause:
+			OFFSET ICONST
+			{
+				SparqlOffsetClause *n = makeNode(SparqlOffsetClause);
+				n->number=(Node *)makeIntConst($2,@2);
+				$$ = (Node *)n;
+			}
+
+/*End of limit clause syntax*/
 
 spar_prefix_clause_opt:
 			spar_prefix_clause_opt_list
@@ -27075,6 +27310,7 @@ unreserved_keyword:
 			| DROP
 			| DUPLICATE
 			| EACH
+			| EDGE_TABLE
 			| ELABEL
 			| ENABLE_P
 			| ENCLOSED
@@ -27083,6 +27319,7 @@ unreserved_keyword:
             | ENCRYPTED_VALUE
 			| ENCRYPTION
             | ENCRYPTION_TYPE
+			| END_NODE
 			| ENFORCED
 			| ENUM_P
 			| EOL
@@ -27201,6 +27438,7 @@ unreserved_keyword:
 			| NO
 			| NOCOMPRESS
 			| NODE
+			| NODE_TABLE
 			| NOLOGGING
 			| NOMAXVALUE
 			| NOMINVALUE
@@ -27328,6 +27566,7 @@ unreserved_keyword:
 			| SPACE
 			| SPILL
 			| SPLIT
+			| SRC_NODE
 			| STABLE
 			| STANDALONE_P
                         | START
@@ -27532,7 +27771,11 @@ type_func_name_keyword:
  * forced to.
  */
 reserved_keyword:
-			  ALL
+			  ALGO
+			| ALGOB
+			| ALGOD
+			| ALGOS
+			| ALL
 			| ANALYSE
 			| ANALYZE
 			| AND
@@ -27543,6 +27786,7 @@ reserved_keyword:
 			| ASYMMETRIC
 			| AUTHID
 			| BOTH
+			| BREATHFS
 			| BUCKETS
 			| CASE
 			| CAST
@@ -27559,6 +27803,7 @@ reserved_keyword:
 			| CURRENT_USER
 			| DEFAULT
 			| DEFERRABLE
+			| DEGREE
 			| DESC
 			| DISTINCT
 			| DO
@@ -27596,6 +27841,7 @@ reserved_keyword:
 			| ONLY
 			| OR
 			| ORDER
+			| PAGERANK
 			| PERFORMANCE
 			| PLACING
 			| PRIMARY
@@ -27606,6 +27852,7 @@ reserved_keyword:
                         | ROWNUM
 			| SELECT
 			| SESSION_USER
+			| SHORTESTPATH
 			| SOME
 			| SYMMETRIC
 			| SYSDATE

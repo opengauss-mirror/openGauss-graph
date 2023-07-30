@@ -2636,7 +2636,32 @@ typedef struct SparqlSelectStmt
 	List 		*targetList;
 	List	 	*fromClause;	/*always be empty, not add this feature for now*/
 	Node 		*whereClause;
+    Node        *solutionModifierClause;
 } SparqlSelectStmt;
+
+/*for sparql limit clause*/
+typedef struct SparqlSolutionModifierStmt{
+    NodeTag		type;
+    Node        *limitOffsetClause;
+    /*其他子句等之后实现 GroupClause HavingClause OrderClause*/
+}SparqlSolutionModifierStmt;
+
+typedef struct SparqlLimitOffsetStmt{
+    NodeTag		type;
+    Node        *limitClause;
+    Node        *offsetClause;
+}SparqlLimitOffsetStmt;
+
+typedef struct SparqlLimitClause{
+    NodeTag		type;
+    Node        *number;
+}SparqlLimitClause;
+
+typedef struct SparqlOffsetClause{
+    NodeTag		type;
+    Node       *number;
+}SparqlOffsetClause;
+/*end of sparql limit clause*/
 
 typedef struct SparqlWhere
 {
@@ -2725,21 +2750,39 @@ typedef struct SparqlPageRankStmt
 {
 	NodeTag		type;
 	char 		*algoName;
-	Node 		*pagerankList;
-	char 		*dampingFactor;
-	char 		*maxIter;
-	char 		*threshold;
+	char 		*edgetable;
 }SparqlPageRankStmt;
 
-typedef struct SparqlPageRankList
+typedef struct SparqlDegreeStmt
 {
 	NodeTag		type;
-	char		*vertexTable;
-	char		*vertex_id;
-	char		*edge_table;
-	char		*edge_args;
-	char		*out_table;
-}SparqlPageRankList;
+	char 		*algoName;
+	char 		*edgetable;
+}SparqlDegreeStmt;
+
+
+typedef struct SparqlBfsStmt
+{
+	NodeTag		type;
+	char 		*algoName;
+	char 		*edgetable;
+    char 		*nodearg1;
+}SparqlBfsStmt;
+
+typedef struct SparqlShortestPathStmt
+{
+	NodeTag		type;
+	char 		*algoName;
+	char 		*edgetable;
+    char 		*nodetable;
+    char 		*nodearg1;
+    char 		*nodearg2;
+}SparqlShortestPathStmt;
+
+typedef struct SparqlAlgoStmt
+{
+	NodeTag		type;
+}SparqlAlgoStmt;
 
 typedef struct Triple
 {

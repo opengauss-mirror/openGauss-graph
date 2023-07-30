@@ -1680,7 +1680,7 @@ typedef struct ModifyGraph
 typedef struct SparqlLoadPlan
 {
     Plan plan;
-    Plan *subplan;      /* plan producing source data */
+    Plan *src_plan;      /* plan producing source data */
 } SparqlLoadPlan;
 
 

@@ -591,7 +591,7 @@ static List* deconstruct_recurse(PlannerInfo* root, Node* jtnode,
             List* sub_joinlist = NIL;
             int sub_members;
 
-            sub_joinlist = deconstruct_recurse(root, (Node*)lfirst(l), below_outer_join,   // wq: lfirst(lc) ((lc)->data.ptr_value)
+            sub_joinlist = deconstruct_recurse(root, (Node*)lfirst(l), below_outer_join,   
                         &sub_qualscope, inner_join_rels, &child_postponed_quals);
             *qualscope = bms_add_members(*qualscope, sub_qualscope);
             sub_members = list_length(sub_joinlist);

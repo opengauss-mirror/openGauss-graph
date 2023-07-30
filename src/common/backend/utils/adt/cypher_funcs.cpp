@@ -110,7 +110,7 @@ jsonb_length(PG_FUNCTION_ARGS)
 	n = DirectFunctionCall1(int4_numeric, Int32GetDatum(cnt));
 	jv.type = jbvNumeric;
 	jv.numeric = DatumGetNumeric(n);
-
+	jv.estSize = 2 * sizeof(JEntry) + VARSIZE_ANY(jv.numeric); 
 	PG_RETURN_JSONB(JsonbValueToJsonb(&jv));
 }
 
@@ -299,6 +299,7 @@ jsonb_round(PG_FUNCTION_ARGS)
 
 			njv.type = jbvNumeric;
 			njv.numeric = DatumGetNumeric(n);
+			njv.estSize = 2 * sizeof(JEntry) + VARSIZE_ANY(njv.numeric); 
 
 			PG_RETURN_JSONB(JsonbValueToJsonb(&njv));
 		}
@@ -365,7 +366,7 @@ jsonb_log10(PG_FUNCTION_ARGS)
 	{
 		JsonbValue *jv;
 
-		jv = getIthJsonbValueFromContainer(&j->root, 0);
+		jv = getIthJsonbValueFromSuperHeader(VARDATA(j), 0);
 		if (jv->type == jbvNumeric)
 		{
 			Datum		n;
@@ -376,6 +377,7 @@ jsonb_log10(PG_FUNCTION_ARGS)
 
 			njv.type = jbvNumeric;
 			njv.numeric = DatumGetNumeric(n);
+			njv.estSize = 2 * sizeof(JEntry) + VARSIZE_ANY(njv.numeric); 
 
 			PG_RETURN_JSONB(JsonbValueToJsonb(&njv));
 		}
@@ -384,7 +386,7 @@ jsonb_log10(PG_FUNCTION_ARGS)
 	ereport(ERROR,
 			(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 			 errmsg("log10(): number is expected but %s",
-					JsonbToCString(NULL,(JsonbSuperHeader) &j->root, VARSIZE(j)))));
+					JsonbToCString(NULL,VARDATA(j), VARSIZE(j)))));
 	PG_RETURN_NULL();
 }
 
@@ -705,6 +707,7 @@ jsonb_substr_no_len(PG_FUNCTION_ARGS)
 			rjv.type = jbvString;
 			rjv.string.val = TextDatumGetCString(r);
 			rjv.string.len = strlen(rjv.string.val);
+			rjv.estSize = sizeof(JEntry) + rjv.string.len;
 
 			PG_RETURN_JSONB(JsonbValueToJsonb(&rjv));
 		}
@@ -759,6 +762,7 @@ jsonb_substr(PG_FUNCTION_ARGS)
 			rjv.type = jbvString;
 			rjv.string.val = TextDatumGetCString(r);
 			rjv.string.len = strlen(rjv.string.val);
+			rjv.estSize = sizeof(JEntry) + rjv.string.len;
 
 			PG_RETURN_JSONB(JsonbValueToJsonb(&rjv));
 		}
@@ -814,6 +818,7 @@ jsonb_tostring(PG_FUNCTION_ARGS)
 			sjv.type = jbvString;
 			sjv.string.val = DatumGetCString(s);
 			sjv.string.len = strlen(sjv.string.val);
+			sjv.estSize = sizeof(JEntry) + sjv.string.len;
 
 			PG_RETURN_JSONB(JsonbValueToJsonb(&sjv));
 		}
@@ -831,6 +836,8 @@ jsonb_tostring(PG_FUNCTION_ARGS)
 				sjv.string.len = 5;
 				sjv.string.val = "false";
 			}
+			sjv.estSize = sizeof(JEntry) + sjv.string.len;
+
 
 			PG_RETURN_JSONB(JsonbValueToJsonb(&sjv));
 		}
@@ -1031,6 +1038,7 @@ datum_to_jsonb(Datum d, Oid type)
 			jv.type = jbvString;
 			jv.string.val = TextDatumGetCString(d);
 			jv.string.len = strlen(jv.string.val);
+			jv.estSize = sizeof(JEntry) + jv.string.len;
 			break;
 		case FLOAT8OID:
 			{
@@ -1040,11 +1048,15 @@ datum_to_jsonb(Datum d, Oid type)
 
 				jv.type = jbvNumeric;
 				jv.numeric = DatumGetNumeric(n);
+				jv.estSize = 2 * sizeof(JEntry) + VARSIZE_ANY(jv.numeric); 
+
 			}
 			break;
 		case NUMERICOID:
 			jv.type = jbvNumeric;
 			jv.numeric = DatumGetNumeric(d);
+			jv.estSize = 2 * sizeof(JEntry) + VARSIZE_ANY(jv.numeric); 
+
 			break;
 		default:
 			elog(ERROR, "unexpected type: %s", format_type_be(type));

@@ -3018,7 +3018,7 @@ void final_cost_nestloop(PlannerInfo* root, NestPath* path, JoinCostWorkspace* w
 #ifdef GS_GRAPH
     else if (path->jointype == JOIN_VLE)
 	{
-		SpecialJoinInfo *sjinfo = sjinfo;
+		SpecialJoinInfo *sjinfo = extra->sjinfo;
 		int			base = (sjinfo->min_hops > 0) ? 1 : 0;
 		int			max_hops = (sjinfo->max_hops == -1) ? 10 : sjinfo->max_hops;
 		int			inner_loop_cnt = max_hops - base;

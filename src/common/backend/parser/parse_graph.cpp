@@ -3683,7 +3683,7 @@ resolve_future_vertex(ParseState *pstate, Node *node, int flags)
 	ctx.flags = flags;
 	ctx.sublevels_up = 0;
 
-	return resolve_future_vertex_mutator(node, &ctx);
+return resolve_future_vertex_mutator(node, &ctx);
 }
 
 static Node *

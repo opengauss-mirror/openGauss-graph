@@ -61,6 +61,7 @@ typedef struct SeqScanContext
 	TableScanDesc scanDesc;
 } SeqScanContext;
 #endif
+
 /* ----------------------------------------------------------------
  *		prefetch_pages
  *
@@ -1214,7 +1215,12 @@ void ExecReScanSeqScan(SeqScanState* node)
         (((RowTableSample*)node->sampleScanInfo.tsm_state)->resetSampleScan)();
     }
 
+#ifdef GS_GRAPH
+    if (node->ss_currentScanDesc == NULL)
+        node->ss_currentScanDesc = heap_beginscan(node->ss_currentRelation, node->ps.state->es_snapshot, 0, NULL);
+#endif
     scan = node->ss_currentScanDesc;
+
     if (node->isPartTbl) {
         if (PointerIsValid(node->partitions)) {
             /* end scan the prev partition first, */
@@ -1235,6 +1241,7 @@ void ExecReScanSeqScan(SeqScanState* node)
     scan_handler_tbl_init_parallel_seqscan(scan, node->ps.plan->dop, node->partScanDirection);
     ExecScanReScan((ScanState*)node);
 }
+
 #ifdef GS_GRAPH
 static SeqScanContext *getCurrentContext(SeqScanState *node, bool create)
 {

@@ -694,7 +694,6 @@ void PortalStart(Portal portal, ParamListInfo params, int eflags, Snapshot snaps
         switch (portal->strategy) {
             case PORTAL_ONE_SELECT: {
                 ps = (PlannedStmt*)linitial(portal->stmts);
-
                 /* Must set snapshot before starting executor, unless it is a query with only MOT Tables. */
 #ifdef ENABLE_MOT
                 if (!(portal->cplan != NULL && portal->cplan->storageEngineType == SE_TYPE_MOT)) {
@@ -2364,10 +2363,16 @@ appendSparqlLoadTag(char* tagbuf, SparqlLoadStats* stats){
                         (pos > 0)? ", SPARQL LOAD(": "SPARQL LOAD(");
     int opn = pos;
     if (stats->newVLabel)
-        pos = appendAnyTag(tagbuf, pos, "CREATE VLABE", stats->newVLabel, pos > opn);
+        pos = appendAnyTag(tagbuf, pos, "VLABE", stats->newVLabel, pos > opn);
     
     if (stats->newELabel)
-        pos = appendAnyTag(tagbuf, pos, "CREATE ELABEL", stats->newELabel, pos > opn);
+        pos = appendAnyTag(tagbuf, pos, "ELABEL", stats->newELabel, pos > opn);
+    
+    if (stats->insertEdge)
+        pos = appendAnyTag(tagbuf, pos, "edges", stats->insertEdge, pos > opn);
+    
+    if (stats->insertVertex)
+        pos = appendAnyTag(tagbuf, pos, "vertex:", stats->insertVertex, pos > opn);
     
     if (pos < COMPLETION_TAG_BUFSIZE - 1)
 	{

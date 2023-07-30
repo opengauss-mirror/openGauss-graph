@@ -2024,7 +2024,7 @@ _outSparqlLoadPlan(StringInfo str, const SparqlLoadPlan *node)
 	WRITE_NODE_TYPE("SPARQLLOAD");
 
 	_outPlanInfo(str, (Plan *) node);
-    WRITE_NODE_FIELD(subplan);
+    WRITE_NODE_FIELD(src_plan);
 }
 
 static void
@@ -4195,6 +4195,26 @@ static void _outSelectStmt(StringInfo str, SelectStmt* node)
     WRITE_NODE_FIELD(hintState);
 }
 
+/*
+ * SPARQL out functions
+ * */
+
+static void
+_outSparqlPageRankStmt(StringInfo str, const SparqlPageRankStmt *node)
+{
+	WRITE_NODE_TYPE("SPARQLPAGERANK");
+	WRITE_STRING_FIELD(algoName);
+	WRITE_STRING_FIELD(edgetable);
+}
+
+static void
+_outSparqlDegreeStmt(StringInfo str, const SparqlDegreeStmt *node)
+{
+	WRITE_NODE_TYPE("SPARQLDEGREE");
+	WRITE_STRING_FIELD(algoName);
+	WRITE_STRING_FIELD(edgetable);
+}
+
 static void _outFuncCall(StringInfo str, FuncCall* node)
 {
     WRITE_NODE_TYPE("FUNCCALL");
@@ -6330,6 +6350,12 @@ static void _outNode(StringInfo str, const void* obj)
             case T_SparqlLoadPlan:
                 _outSparqlLoadPlan(str, (SparqlLoadPlan*)obj);
                 break;
+            case T_SparqlPageRankStmt:
+				_outSparqlPageRankStmt(str, (SparqlPageRankStmt*)obj);
+				break;
+            case T_SparqlDegreeStmt:
+				_outSparqlDegreeStmt(str, (SparqlDegreeStmt*)obj);
+				break;
             case T_Shortestpath:
 				_outShortestpath(str, (Shortestpath *)obj);
 				break;

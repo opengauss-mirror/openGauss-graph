@@ -91,3 +91,14 @@ int bitmap_match(const void* key1, const void* key2, Size keysize)
     Assert(keysize == sizeof(Bitmapset*));
     return (int)(!bms_equal(*((const Bitmapset* const*)key1), *((const Bitmapset* const*)key2)));
 }
+
+/*
+ * uint16_hash: hash function for keys that are uint16 or int16
+ *
+ */
+uint32 uint16_hash(const void *key, Size keysize)
+{
+	Assert(keysize == sizeof(uint16));
+    uint32 k = *((uint16*) key);
+	return DatumGetUInt32(hash_uint32(k));
+}

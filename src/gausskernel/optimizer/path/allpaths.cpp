@@ -3214,7 +3214,7 @@ RelOptInfo* standard_join_search(PlannerInfo* root, int levels_needed, List* ini
      */
     root->join_rel_level = (List**)palloc0((levels_needed + 1) * sizeof(List*));
 
-    root->join_rel_level[1] = initial_rels;   // initial_rels ³¤¶ÈÎª 4
+    root->join_rel_level[1] = initial_rels;
 
     for (lev = 2; lev <= levels_needed; lev++) {
         ListCell* lc = NULL;

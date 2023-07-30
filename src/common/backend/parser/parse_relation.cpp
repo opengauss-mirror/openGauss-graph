@@ -1352,7 +1352,7 @@ RangeTblEntry* addRangeTableEntryForRelation(ParseState* pstate, Relation rel, A
 }
 
 /*
- * Add an entry for a subquery to the pstate's range table (p_rtable).
+ * Add an entry for a subquery to the pstate's range table (p_rtable)connect.
  *
  * This is just like addRangeTableEntry() except that it makes a subquery RTE.
  * Note that an alias clause *must* be supplied.
@@ -1911,6 +1911,8 @@ void addRTEtoQuery(
     
         nsitem = (ParseNamespaceItem *) palloc(sizeof(ParseNamespaceItem));
         nsitem->p_rte = rte;
+        nsitem->p_rel_visible = addToRelNameSpace;
+		nsitem->p_cols_visible = addToVarNameSpace;
         nsitem->p_lateral_only = false;
         nsitem->p_lateral_ok = true;
         if (addToRelNameSpace)

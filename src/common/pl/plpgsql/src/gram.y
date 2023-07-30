@@ -403,7 +403,7 @@ static bool need_build_row_for_func_arg(PLpgSQL_rec **rec, PLpgSQL_row **row, in
  */ 
 %token _CARET_CARET _AT
 %token <str>	QVAR
-%token <str>	BLANK_NODE_LABEL SPARQL_STRING ALGO_CLAUSE PAGERANK_ARG LANGTAG QNAME QNAME_NS Q_IRI_REF 
+%token <str>	BLANK_NODE_LABEL SPARQL_STRING ALGO_CLAUSE ALGOB_CLAUSE ALGOD_CLAUSE ALGOS_CLAUSE PAGERANK_ARG LANGTAG QNAME QNAME_NS Q_IRI_REF 
 
 /*
  * Other tokens recognized by plpgsql's lexer interface layer (pl_scanner.c).

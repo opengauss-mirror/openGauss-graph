@@ -12,6 +12,7 @@
 #include "nodes/params.h"
 #include "nodes/parsenodes.h"
 #include "nodes/parsenodes_common.h"
+#include "catalog/objectaddress.h"
 
 extern void CreateGraphCommand(CreateGraphStmt *stmt, const char *queryString);
 extern void RemoveGraphById(Oid graphid);

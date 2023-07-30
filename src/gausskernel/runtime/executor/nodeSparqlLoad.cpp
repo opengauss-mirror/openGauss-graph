@@ -10,380 +10,611 @@
 
 #include "postgres.h"
 
-#include "executor/spi.h"
 #include "executor/executor.h"
 #include "executor/node/nodeSparqlLoad.h"
 #include "utils/builtins.h"
+#include "utils/lsyscache.h"
 #include "utils/syscache.h"
-#include "utils/lsyscache.h"
 
-#include "fmgr.h"
-#include "utils/jsonb.h"
-#include "utils/lsyscache.h"
-#include "nodes/makefuncs.h"
-#include "commands/sequence.h"
-#include "parser/parse_cypher_expr.h"
-#include "utils/int16.h"
-#include "catalog/indexing.h"
 #include "access/heapam.h"
 #include "catalog/gs_graph_fn.h"
+#include "catalog/index.h"
+#include "catalog/indexing.h"
+#include "catalog/pg_opfamily.h"
+#include "commands/graphcmds.h"
+#include "commands/sequence.h"
+#include "fmgr.h"
+#include "nodes/makefuncs.h"
+#include "parser/parse_cypher_expr.h"
+#include "utils/int16.h"
+#include "utils/jsonb.h"
+#include "utils/lsyscache.h"
 
-void CreateVertexTest(){
-	// get the relation
-	Oid graphoid = get_graphname_oid("lubm");
-	uint16 labid = get_labname_labid("student", graphoid);
-    Oid reloid = get_labid_relid(graphoid,labid);
-    Relation rel = heap_open(reloid, RowExclusiveLock);
+#include <fstream>
 
-	std::unordered_map<std::string, std::string> property;
-	property.emplace("name","111");
-	property.emplace("gender","man");
-	JsonbParseState *jpstate = NULL;
-	JsonbValue *jb;
-    pushJsonbValue(&jpstate, WJB_BEGIN_OBJECT, NULL);
-	for(auto& k2v : property)
-	{
-		JsonbIterator *vji;
-		JsonbValue	vjv;
-		JsonbValue	kjv;
-    	Jsonb	   *vjb = DatumGetJsonbP(stringToJsonbSimple(const_cast<char *>(k2v.second.c_str())));
-    	vji = JsonbIteratorInit(VARDATA(vjb));
-		if (JB_ROOT_IS_SCALAR(vjb))
-		{
-			JsonbIteratorNext(&vji, &vjv, true);
-			Assert(vjv.type == jbvArray);
-			JsonbIteratorNext(&vji, &vjv, true);
-			vji = NULL;
-		}
-    	kjv.type = jbvString;
-		kjv.string.val = const_cast<char *>(k2v.first.c_str());
-		kjv.string.len = strlen(kjv.string.val);
-		kjv.estSize = sizeof(JEntry) + kjv.string.len;
-    	pushJsonbValue(&jpstate, WJB_KEY, &kjv);
-    	if (vji == NULL)
-		{
-			Assert(jpstate->contVal.type == jbvObject);
-			vjv.estSize = sizeof(JEntry) + vjv.string.len;
-			pushJsonbValue(&jpstate, WJB_VALUE, &vjv);
-		}
-	}
-	jb = pushJsonbValue(&jpstate, WJB_END_OBJECT, NULL);
+#define MAX_LABEL_NAME_LEN 64
+#define UNKOWN_TYPE_VLABEL "unkown"
+
+typedef struct LabelStatus {
+    Relation rel;
+    uint16 labid;
+    LabelKind kind;
+    uint64 rowno;
+    uint64 startno;
+} LabelStatus;
+
+typedef struct TriplesSameSubject {
+    char* subject;
+    List* types;
+    List* props; /* key val key val .... */
+    List* edges; /* pre obj pre obj .... */
+} TriplesSameSubject;
+
+typedef struct HashEntryNameToStatus {
+    char name[MAX_LABEL_NAME_LEN];
+    LabelStatus* status;
+} HashEntryNameToStatus;
+
+typedef struct HashEntryIdToStatus {
+    uint16 labelid;
+    LabelStatus* status;
+} HashEntryIdToStatus;
+
+static void finalize(SparqlLoadState* state);
+
+static bool isRdfType(const char* pre)
+{
+    return strcmp("<http://www.w3.org/1999/02/22-rdf-syntax-ns#type>", pre) == 0;
+}
+
+static bool isLiteral(const char* obj)
+{
+    Assert(obj != NULL);
+    /*
+     * in dbpedia dataset, the literal may be "<"
+     */
+    return obj[0] != '<' || obj[1] == '\0';
+}
+
+/*
+ * remove the prefix of a uri
+ * for example:
+ * input: <http://xmlns.com/foaf/0.1/name>
+ * ouput: type
+ */
+static char* removePrefix(char* s)
+{
+    int len = strlen(s);
+    char* p = &s[len - 1];
+    Assert(*p == '>');
+    *p = '\0';
+    p--;
+    while (p > s && (*p != '#' && *p != '/')) {
+        p--;
+    }
+    return p + 1;
+}
+
+static char* removeHeadTail(char* s)
+{
+    int len = strlen(s);
+    Assert(len > 2);
+    s[len - 1] = '\0';
+    return s + 1;
+}
+
+static char* toLower(char* s)
+{
+    for (char* p = s; *p; p++) {
+        *p = tolower(*p);
+    }
+    return s;
+}
+
+static uint16 createLabel(char* name, LabelKind labelKind)
+{
+    /*
+     * sql used only for debug purpose
+     */
+    char sql[64];
+    snprintf(sql, sizeof(sql), "CREATE LABEL %s", name);
+    CreateLabelStmt* stmt = makeNode(CreateLabelStmt);
+    stmt->labelKind = labelKind;
+    stmt->relation = makeRangeVar(NULL, name, -1);
+    stmt->if_not_exists = true;
+    CreateLabelCommand(stmt, sql, NULL);
+    uint16 labid = get_labname_labid(name, get_graph_path_oid());
+    return labid;
+}
+
+static LabelStatus* getLabelStatusByName(SparqlLoadState* state, char* name, LabelKind labKind)
+{
+    HTAB* name2label = state->name2label;
+    HTAB* id2label = state->id2label;
+    bool found;
+    HashEntryNameToStatus* entry = (HashEntryNameToStatus*)hash_search(name2label, name, HASH_ENTER, &found);
+    /*
+     * create label if not exist
+     */
+    if (!found) {
+        MemoryContext old = MemoryContextSwitchTo(state->ps.nodeContext);
+        uint16 labid = createLabel(name, labKind);
+        Oid relid = get_labid_relid(get_graph_path_oid(), labid);
+
+        /*
+         * set label status
+         */
+        LabelStatus* status = (LabelStatus*)palloc0(sizeof(LabelStatus));
+        status->labid = labid;
+        status->rel = heap_open(relid, RowExclusiveLock);
+        status->kind = labKind;
+
+        char seqname[64];
+        snprintf(seqname, sizeof(seqname), "%s.%s_id_seq", get_graph_path(false), name);
+        status->startno = DatumGetInt64(DirectFunctionCall1(nextval, CStringGetTextDatum(seqname)));
+        status->rowno = status->startno;
+
+        entry->status = status;
+
+        /*
+         * we need an id to elabel status lookup table
+         * for insertEdge function
+         */
+        if (labKind == LABEL_EDGE) {
+            bool flag = false;
+            HashEntryIdToStatus* idEntry = (HashEntryIdToStatus*)hash_search(id2label, &labid, HASH_ENTER, &flag);
+
+            Assert(!flag);
+            idEntry->status = entry->status;
+        }
+
+        MemoryContextSwitchTo(old);
+    }
+
+    {
+        int natts = entry->status->rel->rd_att->natts;
+        if ((natts == 2 && labKind == LABEL_EDGE) || (natts == 4 && labKind == LABEL_VERTEX)) {
+            ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED), errmsg("Label \"%s\" exists in both the ELABEL and the VLABEL", name)));
+        }
+    }
     
-    Datum vertexProp = JsonbPGetDatum(JsonbValueToJsonb(jb));
+    return entry->status;
+}
 
-	// construct the tuple
-	HeapTuple   tuple;
-    Datum values[2];
-    bool nulls[2];
+static LabelStatus* getLabelStatusByLabelId(SparqlLoadState* state, uint16 labid)
+{
+    HTAB* id2label = state->id2label;
+    bool found = false;
+    HashEntryIdToStatus* entry = (HashEntryIdToStatus*)hash_search(id2label, &labid, HASH_FIND, &found);
+
+    /*
+     * hash entries of id2label should be created in function getLabelStatusByName
+     */
+    Assert(found);
+    return entry->status;
+}
+
+/*
+ * insert vertex, and return its graphid
+ */
+static Graphid insertVertex(LabelStatus* vstat, List* props)
+{
     Graphid id;
-    GraphidSet(&id, (uint16) 4, (uint64)0);
-    values[0] = UInt64GetDatum(id);
-    values[1] = vertexProp;
-    nulls [0] = false;
-    nulls [1] = false;
-    tuple = heap_form_tuple(RelationGetDescr(rel), values, nulls);
+    GraphidSet(&id, vstat->labid, ++vstat->rowno);
 
-	// insert the tuple
-	simple_heap_insert(rel, tuple);
-    heap_close(rel, RowExclusiveLock);
+    /*
+     * transform props into jsonb
+     */
+    JsonbParseState* jbstate = NULL;
+    JsonbValue* jb;
+    pushJsonbValue(&jbstate, WJB_BEGIN_OBJECT, NULL);
+    ListCell* lc = list_head(props);
+    while (lc != NULL) {
+        JsonbValue vjv, kjv;
+        char *key, *val;
+
+        key = (char*)lfirst(lc);
+        kjv.type = jbvString;
+        kjv.string.val = key;
+        kjv.string.len = strlen(key);
+        kjv.estSize = sizeof(JEntry) + kjv.string.len;
+        pushJsonbValue(&jbstate, WJB_KEY, &kjv);
+
+        lc = lnext(lc);
+        Assert(lc != NULL);
+
+        val = (char*)lfirst(lc);
+        vjv.type = jbvString;
+        vjv.string.val = val;
+        vjv.string.len = strlen(val);
+        vjv.estSize = sizeof(JEntry) + vjv.string.len;
+        pushJsonbValue(&jbstate, WJB_VALUE, &vjv);
+
+        lc = lnext(lc);
+    }
+    jb = pushJsonbValue(&jbstate, WJB_END_OBJECT, NULL);
+
+    /*
+     * construct tuple and insert
+     */
+    Datum values[2] = { GraphidGetDatum(id), JsonbPGetDatum(JsonbValueToJsonb(jb)) };
+    bool nulls[2] = { 0 };
+    HeapTuple tuple = heap_form_tuple(RelationGetDescr(vstat->rel), values, nulls);
+    simple_heap_insert(vstat->rel, tuple);
     heap_freetuple(tuple);
-
-	// update the sequence
-	int128 num = 30; // total number of a relation
-	Oid seqReloid = RangeVarGetRelid(makeRangeVar("network", "student_id_seq", -1), NoLock, false);
-	DirectFunctionCall3(setval3_oid,seqReloid,DirectFunctionCall1(int16_numeric,Int128GetDatum(num)),true);
+    return id;
 }
 
-void RunQuery(int &&flag, const char *keyword, const char *name)
+static void insertUri2id(SparqlLoadState* state, char* uri, Graphid id)
 {
-	char		sqlcmd[128];
-	switch (flag)
-	{
-	case 1:
-		// create vlabel or elabel
-		if(keyword == "VLABEL"){
-			snprintf(sqlcmd, sizeof(sqlcmd), "CREATE VLABEL \"%s\"", name);
-			SPI_exec(sqlcmd, 0);
-		}else if(keyword == "ELABEL"){
-			snprintf(sqlcmd, sizeof(sqlcmd), "CREATE ELABEL \"%s\"", name);
-			SPI_exec(sqlcmd, 0);
-		}else{
-			ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("the keyword %s is not \"VLABEL\" or \"ELABEL\"", keyword)));
-		}
-		break;
-	case 2:
-		// rebuild the index
-		snprintf(sqlcmd, sizeof(sqlcmd), "REINDEX TABLE %s", name);
-		SPI_exec(sqlcmd, 0);
-		break;
-	default:
-		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("The flag %d is invalid", flag)));
-		break;
-	}
+    Tuplesortstate* uri2id = state->uri2id;
+    // uri, id
+    TupleDesc tupdesc = state->uri2idDesc;
+
+    TupleTableSlot* slot = MakeSingleTupleTableSlot(tupdesc);
+    memset(slot->tts_isnull, 0, sizeof(bool) * tupdesc->natts);
+    slot->tts_isempty = false;
+    slot->tts_values[0] = CStringGetTextDatum(uri);
+    slot->tts_values[1] = GraphidGetDatum(id);
+    tuplesort_puttupleslot(uri2id, slot);
 }
 
-void ConstuctTupleAndInsert(std::vector<Datum> &values, Relation &rel)
+static void insertEdgesTemp(SparqlLoadState* state, Graphid id, List* edges)
 {
-	HeapTuple   tuple;
-	bool 	nulls[values.size()] = {0};
-    tuple = heap_form_tuple(RelationGetDescr(rel), values.data(), nulls);
+    Tuplesortstate* edgesTmp = state->edgesTmp;
+    TupleDesc tupdesc = state->edgesTmpDesc;
+    TupleTableSlot* slot = MakeSingleTupleTableSlot(tupdesc);
+    memset(slot->tts_isnull, 0, sizeof(bool) * tupdesc->natts);
+    slot->tts_isempty = false;
 
-	// insert the tuple
-	simple_heap_insert(rel, tuple);
-	heap_freetuple(tuple);
+    // start_id, end_uri, label_id
+    slot->tts_values[0] = GraphidGetDatum(id);
+
+    ListCell* lc = list_head(edges);
+    while (lc != NULL) {
+        char* pre = (char*)lfirst(lc);
+        LabelStatus* estat = getLabelStatusByName(state, pre, LABEL_EDGE);
+        slot->tts_values[2] = UInt16GetDatum(estat->labid);
+
+        lc = lnext(lc);
+        Assert(lc != NULL);
+        char* obj = (char*)lfirst(lc);
+        slot->tts_values[1] = CStringGetTextDatum(obj);
+
+        tuplesort_puttupleslot(edgesTmp, slot);
+        lc = lnext(lc);
+    }
 }
 
-void InsertVertex(const Vertex &v, std::pair<Relation,int> &p)
+static void handleVertexData(SparqlLoadState* state, TriplesSameSubject& tss)
 {
-	std::vector<Datum> values;
-	values.emplace_back(UInt64GetDatum(v.id));	
-	// construct the property of the vertex to insert
-    JsonbParseState *jpstate = NULL;
-	JsonbValue *jb;
-    pushJsonbValue(&jpstate, WJB_BEGIN_OBJECT, NULL);
-	for(auto& k2v : v.property)
-	{
-		JsonbIterator *vji;
-		JsonbValue	vjv;
-		JsonbValue	kjv;
-    	Jsonb	   *vjb = DatumGetJsonbP(stringToJsonbSimple(const_cast<char *>(k2v.second.c_str())));
-    	vji = JsonbIteratorInit(VARDATA(vjb));
-		if (JB_ROOT_IS_SCALAR(vjb))
-		{
-			JsonbIteratorNext(&vji, &vjv, true);
-			Assert(vjv.type == jbvArray);
-			JsonbIteratorNext(&vji, &vjv, true);
-			vji = NULL;
-		}
-    	kjv.type = jbvString;
-		kjv.string.val = const_cast<char *>(k2v.first.c_str());
-		kjv.string.len = strlen(kjv.string.val);
-		kjv.estSize = sizeof(JEntry) + kjv.string.len;
-    	pushJsonbValue(&jpstate, WJB_KEY, &kjv);
-    	if (vji == NULL)
-		{
-			Assert(jpstate->contVal.type == jbvObject);
-			vjv.estSize = sizeof(JEntry) + vjv.string.len;
-			pushJsonbValue(&jpstate, WJB_VALUE, &vjv);
-		}
-	}
-	jb = pushJsonbValue(&jpstate, WJB_END_OBJECT, NULL);
-    
-    Datum vertexProp = JsonbPGetDatum(JsonbValueToJsonb(jb));
-	values.emplace_back(vertexProp);
-	
-	// construct the tuple and insert
-	ConstuctTupleAndInsert(values, p.first);
-	p.second++;
+    if (list_length(tss.types) == 0) {
+        tss.types = lappend(tss.types, pstrdup(UNKOWN_TYPE_VLABEL));
+    }
+
+    /*
+     * add subject uri into props
+     */
+    tss.props = list_concat(tss.props, list_make2(pstrdup("uri"), tss.subject));
+
+    LabelStatus* vstat = getLabelStatusByName(state, (char*)linitial(tss.types), LABEL_VERTEX);
+    Graphid id = insertVertex(vstat, tss.props);
+    insertUri2id(state, tss.subject, id);
+    insertEdgesTemp(state, id, tss.edges);
 }
 
-void InsertEdges(std::vector<Edge> &edges, std::unordered_map<std::string, uint64> &uri2id, std::unordered_map<std::string, std::pair<Relation, int>> &edgeType2relation)
+static void insertEdge(SparqlLoadState* state, Graphid start, Graphid end, uint16 labelid)
 {
-	for(auto& e:edges)
-	{
-		uint64 startId = uri2id[e.start];
-		uint64 endId = uri2id[e.end];
-		std::vector<Datum> values;
-		values.emplace_back(UInt64GetDatum(e.id));
-		values.emplace_back(UInt64GetDatum(startId));
-		values.emplace_back(UInt64GetDatum(endId));
-		ConstuctTupleAndInsert(values,edgeType2relation[e.type].first);
-		edgeType2relation[e.type].second++; 
-	}
+    Datum values[4];
+    bool nulls[4] = {};
+    Graphid id;
+    JsonbParseState* jbstate = NULL;
+    JsonbValue* jb;
+
+    // build an empty jsonb object
+    pushJsonbValue(&jbstate, WJB_BEGIN_OBJECT, NULL);
+    jb = pushJsonbValue(&jbstate, WJB_END_OBJECT, NULL);
+
+    LabelStatus* estat = getLabelStatusByLabelId(state, labelid);
+    Assert(estat->labid == labelid);
+    GraphidSet(&id, labelid, ++estat->rowno);
+    values[0] = GraphidGetDatum(id);
+    values[1] = GraphidGetDatum(start);
+    values[2] = GraphidGetDatum(end);
+    values[3] = JsonbPGetDatum(JsonbValueToJsonb(jb));
+    HeapTuple tuple = heap_form_tuple(RelationGetDescr(estat->rel), values, nulls);
+    simple_heap_insert(estat->rel, tuple);
+    heap_freetuple(tuple);
 }
 
-bool IsType(const std::string &pre)
+/*
+ * edge:  start_id, end_uri, label_id
+ * uri2id:  uri, id
+ *
+ * texteq is faster than text_cmp since it can return false directly
+ * if the length of the strings are unequal
+ */
+static bool isUriEqual(TupleTableSlot* edge, TupleTableSlot* ui)
 {
-	if(pre.size() == 0){
-		return false;
-	}
-	if(pre.find("#type")!=std::string::npos){
-		return true;
-	}
-	return false;
+    bool isNull = false;
+    Datum end_uri = slot_getattr(edge, 2, &isNull);
+    Datum uri = slot_getattr(ui, 1, &isNull);
+    Datum equal = DirectFunctionCall2(texteq, end_uri, uri);
+    return DatumGetBool(equal);
 }
 
-bool IsLiteral(const std::string &obj){
-	// TextDatumGetCString will not keep the symbol \"
-	if(obj[0]!='<' && obj[obj.size()-1]!='>'){
-		return true;
-	}else{
-		return false;
-	}
-}
-
-void UpdateAndCloseRelation(std::unordered_map<std::string, std::pair<Relation,int>> &vertexType2relation, std::unordered_map<std::string, std::pair<Relation,int>> &edgeType2relation, SparqlLoadStats* stats)
+/*
+ * edge:  start_id, end_uri, label_id
+ * uri2id:  uri, id
+ */
+static int uriCmp(TupleTableSlot* edge, TupleTableSlot* ui)
 {
-	// vertex relation
-	for(auto& v2r:vertexType2relation){
-		// close the relation
-		heap_close(v2r.second.first, RowExclusiveLock);
-		// update the sequence
-		std::string seqname = v2r.first+"_id_seq";
-		Oid seqReloid = RangeVarGetRelid(makeRangeVar(get_graph_path(true), const_cast<char*>(seqname.c_str()), -1), NoLock, false);
-		DirectFunctionCall3(setval3_oid,seqReloid,DirectFunctionCall1(int16_numeric,Int128GetDatum(v2r.second.second)),true);
-		// update the stats
-		stats->insertVertex += v2r.second.second;
-		// rebuild index
-		std::string name = (std::string)get_graph_path(true)+"."+v2r.first;
-		RunQuery(2, NULL, name.c_str());
-	}
-	// edge relation
-	for(auto& e2r:edgeType2relation){
-		// close the relation
-		heap_close(e2r.second.first, RowExclusiveLock);
-		// update the sequence
-		std::string seqname = e2r.first+"_id_seq";
-		Oid seqReloid = RangeVarGetRelid(makeRangeVar(get_graph_path(true), const_cast<char*>(seqname.c_str()), -1), NoLock, false);
-		DirectFunctionCall3(setval3_oid,seqReloid,DirectFunctionCall1(int16_numeric,Int128GetDatum(e2r.second.second)),true);
-		// update the stats
-		stats->insertEdge += e2r.second.second;
-		// rebuild index
-		std::string name = (std::string)get_graph_path(true)+"."+e2r.first;
-		RunQuery(2, NULL, name.c_str());
-	}
+    bool isNull = false;
+    text* end_uri = DatumGetTextPP(slot_getattr(edge, 2, &isNull));
+    text* uri = DatumGetTextPP(slot_getattr(ui, 1, &isNull));
+    return text_cmp(end_uri, uri, DEFAULT_COLLATION_OID);
 }
 
-TupleTableSlot* ExecSparqlLoad(SparqlLoadState* slstate)
+static void constructEdge(SparqlLoadState* state, TupleTableSlot* edge, TupleTableSlot* ui)
 {
-    EState *estate = slstate->ps.state;
-    SparqlLoadStats* stats = estate->es_sparqlloadstats;
+    bool isNull;
+    Graphid start = DatumGetGraphid(slot_getattr(edge, 1, &isNull));
+    int16 labid = DatumGetUInt16(slot_getattr(edge, 3, &isNull));
+    Graphid end;
 
-	// get the graph
-	// CreateVertexTest();
-	Oid graphoid = get_graph_path_oid();
+    if (ui == NULL) {
+        char* subject = TextDatumGetCString(slot_getattr(edge, 2, &isNull));
+        LabelStatus* unkownLabelStat = getLabelStatusByName(state, pstrdup(UNKOWN_TYPE_VLABEL), LABEL_VERTEX);
+        end = insertVertex(unkownLabelStat, list_make2(pstrdup("uri"), subject));
+    } else {
+        end = DatumGetGraphid(slot_getattr(ui, 2, &isNull));
+    }
+    insertEdge(state, start, end, labid);
+}
 
-	std::unordered_map<std::string, uint64> uri2id;	// mapping uri to id <uri(char*),id(int)>
-	std::unordered_map<std::string, std::pair<Relation,int>> vertexType2relation;	// mapping the types of all processed vertexes to relation and the number of tuples
-	std::unordered_map<std::string, std::pair<Relation,int>> edgeType2relation;	// mapping the types of all processed edges to relation
-	std::vector<Edge> edgeUnInserted; // all the edges to insert
+static void constructEdges(SparqlLoadState* state)
+{
+    Tuplesortstate* edgesTmp = state->edgesTmp;
+    Tuplesortstate* uri2id = state->uri2id;
+    TupleTableSlot* edge = MakeSingleTupleTableSlot(state->edgesTmpDesc);
+    TupleTableSlot* ui = MakeSingleTupleTableSlot(state->uri2idDesc);
 
-	std::string lastSub = "";
-	int edgeNum = 0;
-	Vertex v;
-	std::vector<Edge> edges;
+    tuplesort_performsort(edgesTmp);
+    tuplesort_performsort(uri2id);
+    /*
+     * edgesTemp left merge join uri2id
+     * on edgesTemp.end_uri = uri2id.uri
+     *
+     */
+    MemoryContext old = MemoryContextSwitchTo(state->eCtx);
+    tuplesort_gettupleslot(uri2id, true, ui, NULL);
+    tuplesort_gettupleslot(edgesTmp, true, edge, NULL);
+    while (!ui->tts_isempty && !edge->tts_isempty) {
+        while (!ui->tts_isempty && !edge->tts_isempty) {
+            int cmp = uriCmp(edge, ui);
+            if (cmp == 0)
+                break;
+            else if (cmp < 0) {
+                constructEdge(state, edge, ui);
+                tuplesort_gettupleslot(edgesTmp, true, edge, NULL);
+            } else {
+                tuplesort_gettupleslot(uri2id, true, ui, NULL);
+            }
+        }
 
-    for (;;){
-        TupleTableSlot *slot;
-        slot = ExecProcNode(slstate->subplan);
+        while (!ui->tts_isempty && !edge->tts_isempty && isUriEqual(edge, ui)) {
+            constructEdge(state, edge, ui);
+            tuplesort_gettupleslot(edgesTmp, true, edge, NULL);
+        }
+        MemoryContextReset(CurrentMemoryContext);
+    }
+
+    while (!edge->tts_isempty) {
+        constructEdge(state, edge, NULL);
+        tuplesort_gettupleslot(edgesTmp, true, edge, NULL);
+        MemoryContextReset(CurrentMemoryContext);
+    }
+    MemoryContextSwitchTo(old);
+}
+
+TupleTableSlot* ExecSparqlLoad(SparqlLoadState* state)
+{
+    TriplesSameSubject tss {};
+    tss.subject = "";
+
+    /*
+     * we employ two vertexContexs to avoid redundant copy
+     */
+    MemoryContext old = MemoryContextSwitchTo(state->vCtx1);
+    MemoryContext vertexContext = state->vCtx2;
+
+    for (;;) {
+        TupleTableSlot* slot;
+        slot = ExecProcNode(state->src_plan);
 
         if (TupIsNull(slot))
             break;
 
         bool isNull;
-        Datum subject_datum = slot_getattr(slot, 1, &isNull);
-        Datum predicate_datum = slot_getattr(slot, 2, &isNull);
-        Datum object_datum = slot_getattr(slot, 3, &isNull);
+        char* subject = TextDatumGetCString(slot_getattr(slot, 1, &isNull));
+        char* predicate = TextDatumGetCString(slot_getattr(slot, 2, &isNull));
+        Datum od = slot_getattr(slot, 3, &isNull);
+        char* object = "";
+        if (!isNull) {
+            object = TextDatumGetCString(od);
+        }
 
-        std::string sub = TextDatumGetCString(subject_datum);
-		std::string pre = TextDatumGetCString(predicate_datum);
-		std::string obj = TextDatumGetCString(object_datum);
+        subject = removeHeadTail(subject);
 
-		sub = sub.substr(1,sub.size()-2);
-		pre = pre.substr(1,pre.size()-2);
-		// process the triple
-		if(sub!=lastSub) 
-		{
-			if(v.property.find("uri")!=v.property.end())
-			{
-				// not the first line of file
-				uint16 relid = get_labname_labid(v.type.c_str(), graphoid);
-				GraphidSet(&v.id, (uint16) relid, (uint64)uri2id.size());
-				uri2id.emplace(v.property["uri"], v.id);
-				InsertVertex(v, vertexType2relation[v.type]);
-				vertexType2relation[v.type].second++;
-				InsertEdges(edges, uri2id, edgeType2relation);
-				v.clear();
-				edges.clear();
-			}
-			v.property.emplace("uri", sub);
-		}
-		if(IsType(pre)){
-			// type
-			obj = obj.substr(1,obj.size()-2);
-			std::string type = obj.substr(obj.find("#")+1);
-			std::transform(type.begin(),type.end(),type.begin(),::tolower);
-			if(vertexType2relation.find(type)==vertexType2relation.end()){
-				// new type
-				RunQuery(1, "VLABEL", type.c_str());
-				stats->newVLabel++;
-				// open the relation
-				uint16 relid = get_labname_labid(type.c_str(), graphoid);
-				Oid reloid = get_labid_relid(graphoid, relid);
-				Relation rel = heap_open(reloid, RowExclusiveLock);
-				vertexType2relation.emplace(type, std::make_pair(rel,0));
-			}
-			v.type = type;
-		}else if(IsLiteral(obj)){
-			// property
-			v.property.emplace(pre.substr(pre.find("#")+1), obj);
-		}else{
-			Edge e;
-			e.type = pre.substr(pre.find("#")+1);
-			std::transform(e.type.begin(),e.type.end(),e.type.begin(),::tolower);
-			e.start = sub;
-			e.end = obj.substr(1,obj.size()-2);
-			uint16 relid;
-			// edge
-			if(edgeType2relation.find(e.type)==edgeType2relation.end()){
-				// new edge type
-				RunQuery(1, "ELABEL", e.type.c_str());
-				stats->newELabel++;
-				relid = get_labname_labid(e.type.c_str(), graphoid);
-				// open the relation
-				Oid reloid = get_labid_relid(graphoid, relid);
-				Relation rel = heap_open(reloid, RowExclusiveLock);
-				edgeType2relation.emplace(e.type, std::make_pair(rel,0));
-			}else{
-				relid = get_labname_labid(e.type.c_str(), graphoid);
-			}
-			GraphidSet(&e.id, (uint16) relid, (uint64)edgeNum);
+        if (strcmp(subject, tss.subject) != 0) {
+            if (tss.subject[0] != '\0') {
+                handleVertexData(state, tss);
+            }
+            tss.subject = subject;
+            tss.edges = tss.props = tss.types = NIL;
 
-			if(uri2id.find(e.end)==uri2id.end()){
-				// new vertex
-				edgeUnInserted.emplace_back(e);
-			}else{
-				// e.end = std::to_string(uri2id[e.end]);
-				edges.emplace_back(e);
-			}
-			edgeNum++;
-		}
-		lastSub = sub;
+            /*
+             * we only reset the previous vertex context, so memroy in current MemoryContext is still available
+             */
+            MemoryContextReset(vertexContext);
+            vertexContext = MemoryContextSwitchTo(vertexContext);
+        }
+
+        if (isRdfType(predicate)) {
+            tss.types = lappend(tss.types, toLower(removePrefix(object)));
+        } else if (isLiteral(object)) {
+            tss.props = lappend(tss.props, removePrefix(predicate));
+            tss.props = lappend(tss.props, object);
+        } else {
+            tss.edges = lappend(tss.edges, toLower(removePrefix(predicate)));
+            tss.edges = lappend(tss.edges, removeHeadTail(object));
+        }
     }
-	// handle the case of the last group of slot
-	uint16 relid = get_labname_labid(v.type.c_str(), graphoid);
-	GraphidSet(&v.id, (uint16) relid, (uint64)uri2id.size());
-	uri2id.emplace(v.property["uri"], v.id);
-	InsertVertex(v, vertexType2relation[v.type]);
-	vertexType2relation[v.type].second++;
-	InsertEdges(edges, uri2id, edgeType2relation);
+    handleVertexData(state, tss);
+    MemoryContextSwitchTo(old);
 
-	InsertEdges(edgeUnInserted, uri2id, edgeType2relation);
-	UpdateAndCloseRelation(vertexType2relation, edgeType2relation, stats);
-	
+    constructEdges(state);
+
+    finalize(state);
     return NULL;
 }
 
 SparqlLoadState* ExecInitSparqlLoad(SparqlLoadPlan* node, EState* estate, int eflags)
 {
     SparqlLoadState* state = makeNode(SparqlLoadState);
-    state->ps.plan = (Plan*) node;
+    state->ps.plan = (Plan*)node;
     state->ps.state = estate;
-    estate->es_sparqlloadstats = (SparqlLoadStats*) palloc0(sizeof(SparqlLoadStats));
+    estate->es_sparqlloadstats = (SparqlLoadStats*)palloc0(sizeof(SparqlLoadStats));
     memset(estate->es_sparqlloadstats, 0, sizeof(SparqlLoadStats));
 
     ExecInitResultTupleSlot(estate, &state->ps);
-    state->subplan = ExecInitNode(node->subplan, estate, eflags);
+    state->src_plan = ExecInitNode(node->src_plan, estate, eflags);
 
-    if (SPI_connect() != SPI_OK_CONNECT)
-        elog(ERROR, "SPI_connect failed");
+    /*
+     * allocate memory context
+     */
+    state->vCtx1 = AllocSetContextCreate(state->ps.nodeContext, "Vertex1", ALLOCSET_DEFAULT_MINSIZE, ALLOCSET_DEFAULT_INITSIZE, ALLOCSET_DEFAULT_MAXSIZE);
+    state->vCtx2 = AllocSetContextCreate(state->ps.nodeContext, "Vertex2", ALLOCSET_DEFAULT_MINSIZE, ALLOCSET_DEFAULT_INITSIZE, ALLOCSET_DEFAULT_MAXSIZE);
+    state->eCtx = AllocSetContextCreate(state->ps.nodeContext, "Edge", ALLOCSET_DEFAULT_MINSIZE, ALLOCSET_DEFAULT_INITSIZE, ALLOCSET_DEFAULT_MAXSIZE);
+
+    /*
+     * init hash tabel for name to LabelStatus
+     */
+    HASHCTL info = { 0 };
+    info.keysize = MAX_LABEL_NAME_LEN;
+    info.entrysize = sizeof(HashEntryNameToStatus);
+    info.hash = string_hash;
+    info.hcxt = CurrentMemoryContext;
+    state->name2label = hash_create("name to label status lookup table", 8192, &info, HASH_ELEM | HASH_FUNCTION | HASH_CONTEXT);
+
+    /*
+     * init hash tabel for labid to LabelStatus
+     */
+    info.keysize = sizeof(uint16);
+    info.entrysize = sizeof(HashEntryIdToStatus);
+    info.hash = uint16_hash;
+    info.hcxt = CurrentMemoryContext;
+    state->id2label = hash_create("int to label status lookup table", 8192, &info, HASH_ELEM | HASH_FUNCTION | HASH_CONTEXT);
+
+    /*
+     * init uri2id tuple sort state
+     */
+    TupleDesc uri2idDesc = CreateTemplateTupleDesc(2, false);
+    TupleDescInitEntry(uri2idDesc, (AttrNumber)1, "uri", TEXTOID, -1, 0);
+    TupleDescInitEntry(uri2idDesc, (AttrNumber)2, "id", GRAPHIDOID, -1, 0);
+    AttrNumber attrNums[] = { 1 };
+    Oid sortOps[] = { get_opfamily_member(TEXT_BTREE_FAM_OID, TEXTOID, TEXTOID, BTLessStrategyNumber) };
+    Oid sortCollations[] = { DEFAULT_COLLATION_OID };
+    const bool nullsFirst[] = { false };
+    state->uri2id = tuplesort_begin_heap(uri2idDesc,
+        1,
+        attrNums,
+        sortOps,
+        sortCollations,
+        nullsFirst,
+        u_sess->attr.attr_memory.work_mem / 2,
+        false);
+    state->uri2idDesc = uri2idDesc;
+
+    /*
+     * init edgesTmp tuple sort state
+     */
+    TupleDesc edgesTmpDesc = CreateTemplateTupleDesc(3, false);
+    TupleDescInitEntry(edgesTmpDesc, (AttrNumber)1, "start_id", GRAPHIDOID, -1, 0);
+    TupleDescInitEntry(edgesTmpDesc, (AttrNumber)2, "end_uri", TEXTOID, -1, 0);
+    TupleDescInitEntry(edgesTmpDesc, (AttrNumber)3, "label_id", INT2OID, -1, 0);
+
+    attrNums[0] = 2;
+    state->edgesTmp = tuplesort_begin_heap(edgesTmpDesc,
+        1,
+        attrNums,
+        sortOps,
+        sortCollations,
+        nullsFirst,
+        u_sess->attr.attr_memory.work_mem / 2,
+        false);
+    state->edgesTmpDesc = edgesTmpDesc;
 
     return state;
 }
 
-void ExecEndSparqlLoad(SparqlLoadState* node){
-    ExecClearTuple(node->ps.ps_ResultTupleSlot);
-    ExecEndNode(node->subplan);
-    if (SPI_finish() != SPI_OK_FINISH)
-        elog(ERROR, "SPI_finish failed");
+static void finalize(SparqlLoadState* state)
+{
+    EState* estate = state->ps.state;
+    SparqlLoadStats* stats = estate->es_sparqlloadstats;
+
+    /*
+     * sequence scan all labels
+     */
+    HASH_SEQ_STATUS seqStatus;
+    hash_seq_init(&seqStatus, state->name2label);
+    HashEntryNameToStatus* entry;
+    char seqname[128];
+    while ((entry = (HashEntryNameToStatus*)hash_seq_search(&seqStatus)) != NULL) {
+        LabelStatus* lstat = entry->status;
+
+        /*
+         * get statistics information
+         */
+        if (lstat->kind == LABEL_VERTEX) {
+            stats->newVLabel++;
+            stats->insertVertex += (lstat->rowno - lstat->startno);
+        } else if (lstat->kind == LABEL_EDGE) {
+            stats->newELabel++;
+            stats->insertEdge += (lstat->rowno - lstat->startno);
+        } else {
+            // unkown label type
+            Assert(false);
+        }
+
+        /*
+         * close label and reindex label
+         */
+        Oid relid = lstat->rel->rd_id;
+        heap_close(lstat->rel, RowExclusiveLock);
+        ReindexRelation(relid, (REINDEX_REL_PROCESS_TOAST | REINDEX_REL_CHECK_CONSTRAINTS), REINDEX_ALL_INDEX);
+
+        /*
+         * set sequence number
+         */
+        snprintf(seqname, sizeof(seqname), "%s_id_seq", entry->name);
+        Oid seqOid = RangeVarGetRelid(makeRangeVar(get_graph_path(false), seqname, -1), NoLock, false);
+        DirectFunctionCall2(setval_oid, seqOid, DirectFunctionCall1(int16_numeric, Int128GetDatum(lstat->rowno + 1)));
+    }
+}
+
+void ExecEndSparqlLoad(SparqlLoadState* state)
+{
+    ExecClearTuple(state->ps.ps_ResultTupleSlot);
+    ExecEndNode(state->src_plan);
+
+    MemoryContextDelete(state->vCtx1);
+    MemoryContextDelete(state->vCtx2);
+    MemoryContextDelete(state->eCtx);
+
+    hash_destroy(state->name2label);
+    hash_destroy(state->id2label);
+
+    tuplesort_end(state->uri2id);
+    tuplesort_end(state->edgesTmp);
 }

@@ -502,6 +502,7 @@ datum_to_jsonb(Datum val, bool is_null, JsonbInState *result,
 	{
 		Assert(!key_scalar);
 		jb.type = jbvNull;
+		jb.estSize = sizeof(JEntry);
 	}
 	else if (key_scalar &&
 			 (tcategory == JSONBTYPE_ARRAY ||
@@ -1560,7 +1561,7 @@ setPathObject(JsonbIterator **it, Datum *path_elems, bool *path_nulls,
 		newkey.type = jbvString;
 		newkey.string.len = VARSIZE_ANY_EXHDR(path_elems[level]);
 		newkey.string.val = VARDATA_ANY(path_elems[level]);
-
+		newkey.estSize = sizeof(JEntry) + newkey.string.len;
 		(void) pushJsonbValue(st, WJB_KEY, &newkey);
 		addJsonbToParseState(st, newval);
 	}
@@ -1614,7 +1615,7 @@ setPathObject(JsonbIterator **it, Datum *path_elems, bool *path_nulls,
 				newkey.type = jbvString;
 				newkey.string.len = VARSIZE_ANY_EXHDR(path_elems[level]);
 				newkey.string.val = VARDATA_ANY(path_elems[level]);
-
+				newkey.estSize = sizeof(JEntry) + newkey.string.len;
 				(void) pushJsonbValue(st, WJB_KEY, &newkey);
 				addJsonbToParseState(st, newval);
 			}
