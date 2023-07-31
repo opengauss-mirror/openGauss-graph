@@ -475,6 +475,7 @@ vertex_label(PG_FUNCTION_ARGS)
 	jv.type = jbvString;
 	jv.string.len = strlen(label);
 	jv.string.val = label;
+	jv.estSize = sizeof(JEntry) + jv.string.len;
 
 	PG_RETURN_JSONB(JsonbValueToJsonb(&jv));
 }
@@ -500,6 +501,7 @@ int_to_jsonb(int i)
 
 	jv.type = jbvNumeric;
 	jv.numeric = DatumGetNumeric(n);
+	jv.estSize = 2 * sizeof(JEntry) + VARSIZE_ANY(jv.numeric); 
 
 	return JsonbValueToJsonb(&jv);
 }
@@ -643,6 +645,7 @@ edge_label(PG_FUNCTION_ARGS)
 	jv.type = jbvString;
 	jv.string.len = strlen(label);
 	jv.string.val = label;
+	jv.estSize = sizeof(JEntry) + jv.string.len;
 
 	PG_RETURN_JSONB(JsonbValueToJsonb(&jv));
 }
@@ -1154,7 +1157,8 @@ cache_labels(FmgrInfo *flinfo, uint16 labid)
 				jv.type = jbvString;
 				jv.string.len = strlen(ancestor_labname);
 				jv.string.val = ancestor_labname;
-
+				jv.estSize = sizeof(JEntry) + jv.string.len;
+				
 				pushJsonbValue(&jpstate, WJB_ELEM, &jv);
 			}
 		}

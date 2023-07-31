@@ -2608,7 +2608,14 @@ typedef struct RownumState {
  */ 
 typedef struct SparqlLoadState{
     PlanState ps;
-    PlanState *subplan;
+    PlanState *src_plan;
+    HTAB* name2label;
+    HTAB* id2label;
+    Tuplesortstate* uri2id;
+    TupleDesc uri2idDesc;
+    Tuplesortstate* edgesTmp;
+    TupleDesc edgesTmpDesc;
+    MemoryContext vCtx1, vCtx2, eCtx;
 } SparqlLoadState;
 
 /*
@@ -2624,6 +2631,20 @@ typedef struct CypherTypeCastState {
     ExprState* arg_state;
     FunctionCallInfo fcinfo_data_in;
 } CypherTypeCastState;
+
+typedef struct CypherListExprState
+{
+	ExprState	xprstate;
+	List	   *elems;
+} CypherListExprState;
+
+typedef struct CypherListCompExprState
+{
+	ExprState	xprstate;
+	ExprState  *list;
+	ExprState  *cond;
+	ExprState  *elem;
+} CypherListCompExprState;
 
 // states for CypherAccessPathElem
 typedef struct PathElem{

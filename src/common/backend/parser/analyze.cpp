@@ -101,6 +101,9 @@
 #ifndef ENABLE_MULTIPLE_NODES
 #include "optimizer/clauses.h"
 #endif
+
+extern TypeName* SystemTypeName(char* name);
+
 /* Hook for plugins to get control at end of parse analysis */
 THR_LOCAL post_parse_analyze_hook_type post_parse_analyze_hook = NULL;
 static const int MILLISECONDS_PER_SECONDS = 1000;
@@ -110,6 +113,14 @@ static Query* transformInsertStmt(ParseState* pstate, InsertStmt* stmt);
 static void checkUpsertTargetlist(Relation targetTable, List* updateTlist);
 static UpsertExpr* transformUpsertClause(ParseState* pstate, UpsertClause* upsertClause, RangeVar* relation);
 static int count_rowexpr_columns(ParseState* pstate, Node* expr);
+static Query* transformSparqlPageRankStmt(ParseState *pstate,
+		SparqlPageRankStmt *stmt);
+static Query* transformSparqlDegreeStmt(ParseState *pstate,
+		SparqlDegreeStmt *stmt);
+static Query* transformSparqlBfsStmt(ParseState *pstate,
+		SparqlBfsStmt *stmt);
+static Query* transformSparqlShortestPathStmt(ParseState *pstate,
+		SparqlShortestPathStmt *stmt);
 static Query* transformSelectStmt(
     ParseState* pstate, SelectStmt* stmt, bool isFirstNode = true, bool isCreateView = false);
 static Query* transformValuesClause(ParseState* pstate, SelectStmt* stmt);
@@ -154,6 +165,13 @@ static const char* NOKEYUPDATE_KEYSHARE_ERRMSG = "/NO KEY UPDATE/KEY SHARE";
 #else
 static const char* NOKEYUPDATE_KEYSHARE_ERRMSG = "";
 #endif
+
+static Node* makeIntConst(int val, int location);
+static Node* makeStringConst(char *str, int location);
+static char* getNo(char *str);
+static char *getLabel(char *input);
+static char *getKey(char *input);
+static char *getVal(char *input);
 
 /*
  * parse_analyze
@@ -4930,6 +4948,18 @@ transformSparqlStmt(ParseState *pstate, SparqlStmt *stmt)
     case T_SparqlSelectStmt:
         qry = transformSparqlSelectStmt(pstate, (SparqlSelectStmt*)parseTree);
         break;
+	case T_SparqlPageRankStmt:
+		qry = transformSparqlPageRankStmt(pstate, (SparqlPageRankStmt*)parseTree);
+		break;
+	case T_SparqlDegreeStmt:
+		qry = transformSparqlDegreeStmt(pstate, (SparqlDegreeStmt*)parseTree);
+		break;
+	case T_SparqlBfsStmt:
+		qry = transformSparqlBfsStmt(pstate, (SparqlBfsStmt*)parseTree);
+		break;
+	case T_SparqlShortestPathStmt:
+		qry = transformSparqlShortestPathStmt(pstate, (SparqlShortestPathStmt*)parseTree);
+		break;
     case T_SparqlInsertStmt:
         qry = transformSparqlInsertStmt(pstate, (SparqlInsertStmt*)parseTree);
         break;
@@ -5098,4 +5128,337 @@ LCS_asString(LockClauseStrength strength)
 			return "FOR UPDATE";
 	}
 	return "FOR some";			/* shouldn't happen */
+}
+
+/*
+ * some functions PAGERANK & SHORTESTPATH need
+ */
+
+static Node*
+makeStringConst(char *str, int location) {
+	A_Const *n = makeNode(A_Const);
+
+	n->val.type = T_String;
+	n->val.val.str = str;
+	n->location = location;
+
+	return (Node*) n;
+}
+
+static Node*
+makeIntConst(int val, int location) {
+	A_Const *n = makeNode(A_Const);
+
+	n->val.type = T_Integer;
+	n->val.val.ival = val;
+	n->location = location;
+
+	return (Node*) n;
+}
+
+static char* getNo(char *str) {
+	char *end, *sp, *ep;
+	int len;
+	sp = str;
+	end = str + strlen(str) - 1;
+	ep = end;
+
+	while (sp <= end && (*sp == '\''))
+		sp++;
+	while (ep >= sp && (*ep == '\''))
+		ep--;
+	len = (ep < sp) ? 0 : (ep - sp) + 1;
+	sp[len] = '\0';
+	return sp;
+}
+static char *getLabel(char *input){
+	char *sp, *end, *ep;
+	int len;
+	sp = input;
+	end = input + strlen(input) - 1;
+	ep = input;
+
+	while(sp<=end && *sp != ':'){
+		sp++;
+	}
+	sp++;
+	while(ep<=end){
+		if(*ep == '{') {
+			ep--;
+			break;
+		}
+		ep++;
+	}
+	len = (ep<sp) ? 0 : (ep - sp) + 1;
+	sp[len] = '\0';
+	return sp;
+
+}
+
+static char *getKey(char *input){
+	char *sp, *end, *ep;
+	int len;
+	sp = input;
+	end = input + strlen(input) - 1;
+	ep = input;
+
+	while(sp<=end && *sp != '{'){
+		sp++;
+	}
+	sp++;
+	int flag = 0;
+	while(ep<=end){
+
+		if(*ep == ':' && flag == 0) {
+			flag = 1;
+		}
+		else if(*ep == ':' && flag == 1){
+			ep--;
+			break;
+		}
+		ep++;
+	}
+	len = (ep<sp) ? 0 : (ep - sp) + 1;
+	sp[len] = '\0';
+	return sp;
+}
+
+
+static char *getVal(char *input){
+	char *sp, *end, *ep;
+	int len;
+	sp = input;
+	end = input + strlen(input) - 1;
+	ep = end;
+
+	while(sp<=end && *sp != '\"'){
+		sp++;
+	}
+	sp++;
+	while(ep>=sp && *ep != '\"'){
+		ep--;
+	}
+	ep--;
+	len = (ep<sp) ? 0 : (ep - sp) + 1;
+	sp[len] = '\0';
+	return sp;
+}
+
+/*
+ * PAGERANK & SHORTESTPATH
+ */
+static Query*
+transformSparqlPageRankStmt(ParseState *pstate, SparqlPageRankStmt *stmt) {
+    if (strcmp(stmt->algoName, "pageRank") == 0) {
+    	SelectStmt *selectStmt;
+
+		List *funcTargetList;
+		ColumnRef *tarColunmnRef;
+		ResTarget *resTarget;
+
+		RangeFunction *rangeFunctionAll;
+		RangeFunction *rangeFunction;
+		FuncCall *funcCall;
+		List *constList;
+		List *listForFun;
+
+		TypeName *typeName1;
+		TypeName *typeName2;
+		ColumnDef *columnDef1;
+		ColumnDef *columnDef2;
+		List *columnDefList;
+		List *colDefList;
+		List *fromList;
+
+		resTarget = makeNode(ResTarget);
+		resTarget->name = NULL;
+		resTarget->indirection = NULL;
+
+		listForFun = list_make1(makeString("calpagerank"));
+        char* tmp = getNo(stmt->edgetable);
+        Node* canshu = makeStringConst(getNo(stmt->edgetable), -1);
+        constList = list_make1(makeStringConst(getNo(stmt->edgetable), -1));
+
+		funcCall = makeFuncCall(listForFun, constList, -1);
+		funcCall->agg_order = NULL;
+
+        resTarget->val = (Node*) funcCall;
+		resTarget->location = -1;
+		funcTargetList = list_make1(resTarget);
+
+		selectStmt = makeNode(SelectStmt);
+		selectStmt->targetList = funcTargetList;
+		selectStmt->intoClause = NULL;
+		selectStmt->fromClause = NULL;
+		selectStmt->whereClause = NULL;
+		selectStmt->groupClause = NULL;
+		selectStmt->havingClause = NULL;
+		selectStmt->windowClause = NULL;
+		return transformSelectStmt(pstate, selectStmt);
+	}
+	return NULL;
+}
+
+static Query*
+transformSparqlDegreeStmt(ParseState *pstate, SparqlDegreeStmt *stmt) {
+    if (strcmp(stmt->algoName, "degree") == 0) {
+    	SelectStmt *selectStmt;
+
+		List *funcTargetList;
+		ColumnRef *tarColunmnRef;
+		ResTarget *resTarget;
+
+		RangeFunction *rangeFunctionAll;
+		RangeFunction *rangeFunction;
+		FuncCall *funcCall;
+		List *constList;
+		List *listForFun;
+
+		TypeName *typeName1;
+		TypeName *typeName2;
+		ColumnDef *columnDef1;
+		ColumnDef *columnDef2;
+		List *columnDefList;
+		List *colDefList;
+		List *fromList;
+
+		resTarget = makeNode(ResTarget);
+		resTarget->name = NULL;
+		resTarget->indirection = NULL;
+
+		listForFun = list_make1(makeString("caldegree"));
+        char* tmp = getNo(stmt->edgetable);
+        Node* canshu = makeStringConst(getNo(stmt->edgetable), -1);
+        constList = list_make1(makeStringConst(getNo(stmt->edgetable), -1));
+
+		funcCall = makeFuncCall(listForFun, constList, -1);
+		funcCall->agg_order = NULL;
+
+        resTarget->val = (Node*) funcCall;
+		resTarget->location = -1;
+		funcTargetList = list_make1(resTarget);
+
+		selectStmt = makeNode(SelectStmt);
+		selectStmt->targetList = funcTargetList;
+		selectStmt->intoClause = NULL;
+		selectStmt->fromClause = NULL;
+		selectStmt->whereClause = NULL;
+		selectStmt->groupClause = NULL;
+		selectStmt->havingClause = NULL;
+		selectStmt->windowClause = NULL;
+		return transformSelectStmt(pstate, selectStmt);
+	}
+	return NULL;
+}
+
+static Query*
+transformSparqlBfsStmt(ParseState *pstate, SparqlBfsStmt *stmt) {
+    if (strcmp(stmt->algoName, "bfs") == 0) {
+    	SelectStmt *selectStmt;
+
+		List *funcTargetList;
+		ColumnRef *tarColunmnRef;
+		ResTarget *resTarget;
+
+		RangeFunction *rangeFunctionAll;
+		RangeFunction *rangeFunction;
+		FuncCall *funcCall;
+		List *constList;
+		List *listForFun;
+
+		TypeName *typeName1;
+		TypeName *typeName2;
+		ColumnDef *columnDef1;
+		ColumnDef *columnDef2;
+		List *columnDefList;
+		List *colDefList;
+		List *fromList;
+
+		resTarget = makeNode(ResTarget);
+		resTarget->name = NULL;
+		resTarget->indirection = NULL;
+
+		listForFun = list_make1(makeString("calbfs"));
+        char* tmp = getNo(stmt->edgetable);
+        Node* canshu = makeStringConst(getNo(stmt->edgetable), -1);
+        constList = list_make1(makeStringConst(getNo(stmt->edgetable), -1));
+        constList = lappend(constList,
+				makeStringConst(getNo(stmt->nodearg1), -1));
+
+		funcCall = makeFuncCall(listForFun, constList, -1);
+		funcCall->agg_order = NULL;
+
+        resTarget->val = (Node*) funcCall;
+		resTarget->location = -1;
+		funcTargetList = list_make1(resTarget);
+
+		selectStmt = makeNode(SelectStmt);
+		selectStmt->targetList = funcTargetList;
+		selectStmt->intoClause = NULL;
+		selectStmt->fromClause = NULL;
+		selectStmt->whereClause = NULL;
+		selectStmt->groupClause = NULL;
+		selectStmt->havingClause = NULL;
+		selectStmt->windowClause = NULL;
+		return transformSelectStmt(pstate, selectStmt);
+	}
+	return NULL;
+}
+
+static Query*
+transformSparqlShortestPathStmt(ParseState *pstate, SparqlShortestPathStmt *stmt) {
+    if (strcmp(stmt->algoName, "shortestpath") == 0) {
+    	SelectStmt *selectStmt;
+
+		List *funcTargetList;
+		ColumnRef *tarColunmnRef;
+		ResTarget *resTarget;
+
+		RangeFunction *rangeFunctionAll;
+		RangeFunction *rangeFunction;
+		FuncCall *funcCall;
+		List *constList;
+		List *listForFun;
+
+		TypeName *typeName1;
+		TypeName *typeName2;
+		ColumnDef *columnDef1;
+		ColumnDef *columnDef2;
+		List *columnDefList;
+		List *colDefList;
+		List *fromList;
+
+		resTarget = makeNode(ResTarget);
+		resTarget->name = NULL;
+		resTarget->indirection = NULL;
+
+		listForFun = list_make1(makeString("caldijkstra"));
+        char* tmp = getNo(stmt->edgetable);
+        Node* canshu = makeStringConst(getNo(stmt->edgetable), -1);
+        constList = list_make1(makeStringConst(getNo(stmt->edgetable), -1));
+        constList = lappend(constList,
+				makeStringConst(getNo(stmt->nodetable), -1));
+        constList = lappend(constList,
+				makeStringConst(getNo(stmt->nodearg1), -1));
+        constList = lappend(constList,
+				makeStringConst(getNo(stmt->nodearg2), -1));
+
+		funcCall = makeFuncCall(listForFun, constList, -1);
+		funcCall->agg_order = NULL;
+
+        resTarget->val = (Node*) funcCall;
+		resTarget->location = -1;
+		funcTargetList = list_make1(resTarget);
+
+		selectStmt = makeNode(SelectStmt);
+		selectStmt->targetList = funcTargetList;
+		selectStmt->intoClause = NULL;
+		selectStmt->fromClause = NULL;
+		selectStmt->whereClause = NULL;
+		selectStmt->groupClause = NULL;
+		selectStmt->havingClause = NULL;
+		selectStmt->windowClause = NULL;
+		return transformSelectStmt(pstate, selectStmt);
+	}
+	return NULL;
 }

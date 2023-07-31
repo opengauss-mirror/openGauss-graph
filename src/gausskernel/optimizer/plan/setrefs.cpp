@@ -1040,7 +1040,7 @@ static Plan* set_plan_refs(PlannerInfo* root, Plan* plan, int rtoffset)
         } break;
         case T_SparqlLoadPlan: {
             SparqlLoadPlan *sl = (SparqlLoadPlan*) plan;
-            sl->subplan = set_plan_refs(root, sl->subplan, rtoffset);
+            sl->src_plan = set_plan_refs(root, sl->src_plan, rtoffset);
         } break;
 #endif
         default: {

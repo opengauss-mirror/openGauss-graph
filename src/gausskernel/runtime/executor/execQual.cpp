@@ -653,6 +653,7 @@ static Datum ExecEvalCypherAccessExpr(CypherAccessState* state, ExprContext* eco
 		_vjv.type = jbvBinary;
 		_vjv.binary.len = argjb->vl_len_;
 		_vjv.binary.data = VARDATA(argjb);
+        _vjv.estSize = _vjv.binary.len + 2 * sizeof(JEntry);
 		vjv = &_vjv;
 	}
 
@@ -903,6 +904,74 @@ ExecEvalCypherTypeCast(CypherTypeCastState* state, ExprContext* econtext, bool* 
 	return FunctionCallInvoke(fcinfo_data_in);
 }
 
+static Datum
+ExecEvalCypherList(CypherListExprState *clstate, ExprContext *econtext,
+				   bool *isNull, ExprDoneCond *isDone)
+{
+	ListCell   *le;
+	JsonbParseState *jpstate = NULL;
+	JsonbValue *j;
+
+	pushJsonbValue(&jpstate, WJB_BEGIN_ARRAY, NULL);
+
+	foreach(le, clstate->elems)
+	{
+		ExprState  *e;
+		bool		eisnull;
+		Datum		ed;
+		JsonbValue	ejv;
+		Jsonb	   *ej;
+		JsonbIterator *it;
+
+		e =(ExprState *) lfirst(le);
+
+		Assert(exprType((Node *) e->expr) == JSONBOID);
+
+		ed = ExecEvalExpr(e, econtext, &eisnull, NULL);
+		if (eisnull)
+		{
+			ejv.type = jbvNull;
+            ejv.estSize = sizeof(JEntry);
+			pushJsonbValue(&jpstate, WJB_ELEM, &ejv);
+			continue;
+		}
+
+		ej = DatumGetJsonb(ed);
+		// it = JsonbIteratorInit(&ej->root);
+        it = JsonbIteratorInit(VARDATA(ej));
+		if (JB_ROOT_IS_SCALAR(ej))
+		{
+			JsonbIteratorNext(&it, &ejv, true);
+			Assert(ejv.type == jbvArray);
+			JsonbIteratorNext(&it, &ejv, true);
+
+			Assert(jpstate->contVal.type == jbvArray);
+			pushJsonbValue(&jpstate, WJB_ELEM, &ejv);
+		}
+		else
+		{
+			int tok;
+
+			while ((tok = JsonbIteratorNext(&it, &ejv, false)) != WJB_DONE)
+			{
+				if (tok == WJB_BEGIN_ARRAY || tok == WJB_END_ARRAY ||
+					tok == WJB_BEGIN_OBJECT || tok == WJB_END_OBJECT)
+					pushJsonbValue(&jpstate, tok, NULL);
+				else
+					pushJsonbValue(&jpstate, tok, &ejv);
+			}
+		}
+	}
+
+	j = pushJsonbValue(&jpstate, WJB_END_ARRAY, NULL);
+
+	*isNull = false;
+	if (isDone != NULL)
+		*isDone = ExprSingleResult;
+
+	return JsonbGetDatum(JsonbValueToJsonb(j));
+}
+
 static Datum ExecEvalCypherMapExpr(CypherMapState* mapstate, ExprContext* econtext, bool* isNull, ExprDoneCond* isDone)
 {
 	int			npairs = list_length(mapstate->key_valstate) / 2; 
@@ -959,6 +1028,7 @@ static Datum ExecEvalCypherMapExpr(CypherMapState* mapstate, ExprContext* econte
 		{
 			vji = NULL;
 			vjv.type = jbvNull;
+            vjv.estSize = sizeof(JEntry);
 		}
 		else
 		{
@@ -6663,9 +6733,18 @@ ExprState* ExecInitExpr(Expr* node, PlanState* parent)
                 state->evalfunc = (ExprStateEvalFunc) ExecEvalCypherMapExpr;
 			} break;
 
-		case T_CypherListExpr:
+	    case T_CypherListExpr:
 			{
-                Assert(false);
+                CypherListExpr *cl = (CypherListExpr *) node;
+			    CypherListExprState *clstate;
+
+				clstate = (CypherListExprState *)makeNode(CypherListExprState);
+				clstate->xprstate.evalfunc =
+						(ExprStateEvalFunc) ExecEvalCypherList;
+				clstate->elems = (List *) ExecInitExpr((Expr *) cl->elems,
+													   parent);
+
+				state = (ExprState *) clstate;
 				break;
 			}
 
@@ -6674,7 +6753,6 @@ ExprState* ExecInitExpr(Expr* node, PlanState* parent)
                 Assert(false);
 				break;
 			}
-
 		case T_CypherListCompVar:
 			{
                 Assert(false);

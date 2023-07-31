@@ -770,6 +770,23 @@ _equalCypherIndices(const CypherIndices *a, const CypherIndices *b)
 
 	return true;
 }
+
+static bool
+_equalSparqlPageRankStmt(const SparqlPageRankStmt *a, const SparqlPageRankStmt *b)
+{
+	COMPARE_STRING_FIELD(algoName);
+	COMPARE_STRING_FIELD(edgetable);
+	return true;
+}
+
+static bool
+_equalSparqlDegreeStmt(const SparqlDegreeStmt *a, const SparqlDegreeStmt *b)
+{
+	COMPARE_STRING_FIELD(algoName);
+	COMPARE_STRING_FIELD(edgetable);
+	return true;
+}
+
 #endif /* GS_GRAPH */
 
 static bool _equalMergeAction(const MergeAction* a, const MergeAction* b)
@@ -2577,6 +2594,14 @@ _equalGraphDelElem(const GraphDelElem *a, const GraphDelElem *b)
 
 	return true;
 }
+static bool
+_equalT_Triple(const Triple *a, const Triple *b)
+{
+	COMPARE_STRING_FIELD(sub);
+	COMPARE_STRING_FIELD(pre);
+    COMPARE_STRING_FIELD(obj);
+	return true;
+}
 #endif /* GS_GRAPH */
 
 static bool _equalCreateConversionStmt(const CreateConversionStmt* a, const CreateConversionStmt* b)
@@ -3799,6 +3824,12 @@ bool equal(const void* a, const void* b)
 		case T_CypherIndices:
 			retval = _equalCypherIndices((CypherIndices* )a, (CypherIndices* )b);
 			break;
+        case T_SparqlPageRankStmt:
+			retval = _equalSparqlPageRankStmt((SparqlPageRankStmt* )a, (SparqlPageRankStmt* )b);
+			break;
+        case T_SparqlDegreeStmt:
+			retval = _equalSparqlDegreeStmt((SparqlDegreeStmt* )a, (SparqlDegreeStmt* )b);
+			break;
 #endif /* GS_GRAPH */
         case T_MergeAction:
             retval = _equalMergeAction((MergeAction*)a, (MergeAction*)b);
@@ -4574,6 +4605,9 @@ bool equal(const void* a, const void* b)
 		case T_GraphDelElem:
 			retval = _equalGraphDelElem((GraphDelElem* )a, (GraphDelElem* )b);
 			break;
+        case T_Triple:
+			retval = _equalT_Triple((Triple* )a, (Triple* )b);
+			break;    
 #endif /* GS_GRAPH */
 
         default:

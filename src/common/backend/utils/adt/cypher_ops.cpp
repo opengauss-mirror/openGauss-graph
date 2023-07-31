@@ -70,6 +70,7 @@ jsonb_add(PG_FUNCTION_ARGS)
 		jv.type = jbvString;
 		jv.string.len = len;
 		jv.string.val = buf;
+		jv.estSize = sizeof(JEntry) + jv.string.len;
 
 		PG_RETURN_JSONB(JsonbValueToJsonb(&jv));
 	}
@@ -89,6 +90,7 @@ jsonb_add(PG_FUNCTION_ARGS)
 		jv.type = jbvString;
 		jv.string.len = len;
 		jv.string.val = buf;
+		jv.estSize = sizeof(JEntry) + jv.string.len;
 
 		PG_RETURN_JSONB(JsonbValueToJsonb(&jv));
 	}
@@ -108,7 +110,8 @@ jsonb_add(PG_FUNCTION_ARGS)
 		jv.type = jbvString;
 		jv.string.len = len;
 		jv.string.val = buf;
-
+		jv.estSize = sizeof(JEntry) + jv.string.len;
+		
 		PG_RETURN_JSONB(JsonbValueToJsonb(&jv));
 	}
 	else if (ljv->type == jbvNumeric && rjv->type == jbvNumeric)
@@ -190,7 +193,8 @@ jnumber_op(PGFunction f, Jsonb *l, Jsonb *r)
 
 	if (l != NULL)
 	{
-		jv = getIthJsonbValueFromContainer(&l->root, 0);
+		// jv = getIthJsonbValueFromContainer(&l->root, 0);
+		jv = getIthJsonbValueFromSuperHeader(VARDATA(l), 0); 
 		if (jv->type != jbvNumeric)
 			ereport_op(f, l, r);
 
@@ -199,7 +203,8 @@ jnumber_op(PGFunction f, Jsonb *l, Jsonb *r)
 		fcinfo.nargs++;
 	}
 
-	jv = getIthJsonbValueFromContainer(&r->root, 0);
+	// jv = getIthJsonbValueFromContainer(&r->root, 0);
+	jv = getIthJsonbValueFromSuperHeader(VARDATA(r), 0); 
 	if (jv->type != jbvNumeric)
 		ereport_op(f, l, r);
 
@@ -231,6 +236,7 @@ numeric_to_jnumber(Numeric n)
 
 	jv.type = jbvNumeric;
 	jv.numeric = n;
+	jv.estSize = 2 * sizeof(JEntry) + VARSIZE_ANY(jv.numeric); 
 
 	return JsonbValueToJsonb(&jv);
 }
@@ -354,7 +360,7 @@ bool_jsonb(PG_FUNCTION_ARGS)
 
 	jv.type = jbvBool;
 	jv.boolean = b;
-
+	jv.estSize = sizeof(JEntry);
 	PG_RETURN_JSONB(JsonbValueToJsonb(&jv));
 }
 

@@ -151,5 +151,6 @@ extern uint32 uint32_hash(const void *key, Size keysize);
 extern uint32 oid_hash(const void* key, Size keysize);
 extern uint32 bitmap_hash(const void* key, Size keysize);
 extern int bitmap_match(const void* key1, const void* key2, Size keysize);
+extern uint32 uint16_hash(const void *key, Size keysize);
 
 #endif /* HSEARCH_H */

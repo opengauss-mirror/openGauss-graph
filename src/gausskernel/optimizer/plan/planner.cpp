@@ -3026,7 +3026,7 @@ static Plan* grouping_planner(PlannerInfo* root, double tuple_fraction)
         /* 
          * Finally, generate the best unsorted and presorted paths for 
          * this Query. 
-         */
+         */ 
         generate_cheapest_and_sorted_path(root, 
                                           final_rel,
                                           &cheapest_path, 

@@ -1866,11 +1866,11 @@ create_modifygraph_plan(PlannerInfo *root, ModifyGraphPath *best_path)
 }
 
 SparqlLoadPlan*
-make_sparqlLoadPlan(PlannerInfo *root, Plan* subplan){
+make_sparqlLoadPlan(PlannerInfo *root, Plan* src_plan){
     SparqlLoadPlan* loadPlan;
 
     loadPlan = makeNode(SparqlLoadPlan);
-    loadPlan->subplan = subplan;
+    loadPlan->src_plan = src_plan;
     return loadPlan;
 }
 #endif
@@ -6630,6 +6630,7 @@ static CStoreIndexOr* make_cstoreindex_or(List* ctidplans)
 
     return node;
 }
+
 #ifdef GS_GRAPH
 static NestLoop* make_nestloop(List* tlist, List* joinclauses, List* otherclauses, List* nestParams, Plan* lefttree,
     Plan* righttree, JoinType jointype, bool inner_unique, int minhops, int maxhops)
@@ -6663,6 +6664,7 @@ static NestLoop* make_nestloop(List* tlist, List* joinclauses, List* otherclause
 	return node;
 }
 #endif
+
 static NestLoop* make_nestloop(List* tlist, List* joinclauses, List* otherclauses, List* nestParams, Plan* lefttree,
     Plan* righttree, JoinType jointype)
 {

@@ -46,6 +46,7 @@
 #include "utils/jsonb.h"
 #include "utils/lsyscache.h"
 #include "knl/knl_session.h"
+#include "nodes/print.h"
 
 static Node *transformCypherExprRecurse(ParseState *pstate, Node *expr);
 static Node *transformColumnRef_cypher(ParseState *pstate, ColumnRef *cref);
@@ -405,6 +406,7 @@ transformColumnRef_cypher(ParseState *pstate, ColumnRef *cref)
 			 */
 			if (nsitem->p_cols_visible)
 			{
+				// pprint(rte);
 				node = scanRTEForVar(pstate, node, rte, strVal(field1),
 									 location);
 				nmatched = 1;

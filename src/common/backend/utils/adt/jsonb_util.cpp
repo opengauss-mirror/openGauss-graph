@@ -627,6 +627,7 @@ fillJsonbValue(JsonbContainer *container, int index,
 	if (JBE_ISNULL(entry))
 	{
 		result->type = jbvNull;
+        result->estSize = sizeof(JEntry);
 	}
 	else if (JBE_ISSTRING(entry))
 	{
@@ -634,21 +635,25 @@ fillJsonbValue(JsonbContainer *container, int index,
 		result->string.val = base_addr + offset;
 		result->string.len = getJsonbLength(container, index);
 		Assert(result->string.len >= 0);
+        result->estSize = sizeof(JEntry) + result->string.len;
 	}
 	else if (JBE_ISNUMERIC(entry))
 	{
 		result->type = jbvNumeric;
 		result->numeric = (Numeric) (base_addr + INTALIGN(offset));
+        result->estSize = 2 * sizeof(JEntry) + VARSIZE_ANY(result->numeric); 
 	}
 	else if (JBE_ISBOOL_TRUE(entry))
 	{
 		result->type = jbvBool;
 		result->boolean = true;
+        result->estSize = sizeof(JEntry);
 	}
 	else if (JBE_ISBOOL_FALSE(entry))
 	{
 		result->type = jbvBool;
 		result->boolean = false;
+        result->estSize = sizeof(JEntry);
 	}
 	else
 	{
@@ -658,6 +663,7 @@ fillJsonbValue(JsonbContainer *container, int index,
 		result->binary.data = base_addr + INTALIGN(offset);
 		result->binary.len = getJsonbLength(container, index) -
 			(INTALIGN(offset) - offset);
+        result->estSize = result->binary.len + 2 * sizeof(JEntry);
 	}
 }
 
@@ -1090,6 +1096,7 @@ JsonbValue *arrayToJsonbSortedArray(ArrayType *array)
             result->array.elems[j].type = jbvString;
             result->array.elems[j].string.val = VARDATA(key_datums[i]);
             result->array.elems[j].string.len = VARSIZE(key_datums[i]) - VARHDRSZ;
+            result->array.elems[j].estSize = sizeof(JEntry) + result->array.elems[j].string.len;
             j++;
         }
     }

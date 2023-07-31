@@ -896,7 +896,7 @@ other			.
 {add_equals}	{
 						SET_YYLLOC();
 						return ADD_EQUALS;
-				}
+				}				
 {self}			{
 					SET_YYLLOC();
 					/*
@@ -917,7 +917,8 @@ other			.
 					}
 					yyextra->is_hint_str = false;
 					return yytext[0];
-				}			
+				}	
+						
 {operator}      {
 					/*
 					 * Check for embedded slash-star or dash-dash; those
@@ -1128,6 +1129,8 @@ other			.
 								 keyword->value == (isPlpgsqlKeyword? yyextra->plKeywordValue->update : UPDATE) ||
 								 keyword->value == (isPlpgsqlKeyword? yyextra->plKeywordValue->insert : INSERT) ||
 								 keyword->value == (isPlpgsqlKeyword? yyextra->plKeywordValue->Delete : DELETE_P) ||
+								 keyword->value == LIMIT ||
+								 keyword->value == OFFSET ||
 								 keyword->value == MERGE)
 						{
 							yyextra->is_hint_str = true;

@@ -112,6 +112,7 @@ static void match_unsorted_outer_for_vle(
 // static void consider_parallel_nestloop(
 //     PlannerInfo *root, RelOptInfo *joinrel, RelOptInfo *outerrel, RelOptInfo *innerrel, JoinType jointype, JoinPathExtraData *extra);
 #endif
+
 void debug1_print_outerrel_and_innerrel(PlannerInfo* root, RelOptInfo* outerrel, RelOptInfo* innerrel)
 {
     if (log_min_messages > DEBUG1)

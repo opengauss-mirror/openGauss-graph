@@ -3652,3 +3652,273 @@ BEGIN
     RETURN 'SUCCESS!';
 END
 $$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION calpagerank(in edge_table text,out node text,out pagerankval numeric) RETURNS SETOF RECORD AS $$
+	DECLARE 
+		flag BOOLEAN := true;
+		nodeNum Integer;
+		delta double precision;
+        		rec record;
+	BEGIN
+
+		DROP TABLE IF EXISTS pagerank_ans;
+		DROP TABLE IF EXISTS edgeWithOuterDegree;
+		DROP TABLE IF EXISTS tmp;
+
+		-- EXECUTE format('CREATE TABLE tmp AS SELECT src,des FROM %I',edge_table);
+	
+        EXECUTE 'SELECT start as src,"end" as des,1 as distance ' || 
+        ' into tmp '||
+        ' FROM '|| edge_table || ' ';
+
+		SELECT COUNT(*) INTO nodeNum FROM (SELECT DISTINCT src FROM tmp
+							  UNION
+							  SELECT DISTINCT des FROM tmp) foo;
+
+        EXECUTE 'SELECT *, (1.00 / ' || nodeNum ||  ') as pr ' ||
+            'into pagerank_ans ' ||
+            'FROM (SELECT DISTINCT src FROM tmp
+							  UNION
+							  SELECT DISTINCT des FROM tmp) foo';
+
+		CREATE TABLE weight AS SELECT tmp.src, 1.00/COUNT(tmp.des) AS wei FROM tmp GROUP BY tmp.src;
+		CREATE TABLE edgeWithOuterDegree AS SELECT tmp.src, tmp.des, weight.wei FROM tmp JOIN weight ON tmp.src = weight.src;
+		DROP TABLE weight;
+
+
+
+		WHILE flag LOOP
+
+			flag := false;
+
+
+			CREATE TABLE ppagerank1 AS SELECT edgeWithOuterDegree.des as src, SUM(pagerank_ans.pr*edgeWithOuterDegree.wei*0.85) AS pr
+
+					FROM pagerank_ans LEFT JOIN edgeWithOuterDegree ON pagerank_ans.src = edgeWithOuterDegree.src GROUP BY edgeWithOuterDegree.des;
+            
+            EXECUTE 'SELECT pagerank_ans.src, (0.15 / ' || nodeNum ||  ') + COALESCE(ppagerank1.pr,0) as pr ' ||
+            'into currentppagerank ' ||
+            'FROM pagerank_ans LEFT JOIN ppagerank1 ON pagerank_ans.src = ppagerank1.src';
+
+			DROP TABLE ppagerank1;
+
+			SELECT |/SUM((pagerank_ans.pr - currentppagerank.pr)^2) INTO delta FROM pagerank_ans JOIN currentppagerank ON pagerank_ans.src = currentppagerank.src;
+
+			IF delta < 0.0000001 THEN
+
+				flag = true;
+
+			END IF;
+
+			DROP TABLE pagerank_ans;
+
+			ALTER TABLE currentppagerank RENAME TO pagerank_ans;
+
+		END LOOP;
+
+		DROP TABLE IF EXISTS edgeWithOuterDegree;
+		DROP TABLE IF EXISTS tmp;
+
+        for rec in (select src,pr from pagerank_ans) loop
+		node := rec.src;
+		pagerankval := ROUND(rec.pr,5);
+		RETURN NEXT;
+		END LOOP;
+		
+        RETURN;
+	END;
+
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION calshortestpath(in valuetable text,in ssp text,in eep text,out src text,out des text,out path text,out distance text) RETURNS SETOF RECORD AS $$
+DECLARE
+	rec record;
+	tablename text;
+BEGIN
+	DROP TABLE IF EXISTS tmp;
+	DROP TABLE IF EXISTS shortestpath_ans;
+	tablename :=replace(valuetable,'"','');
+	
+	EXECUTE 'SELECT start as src,"end" as des, (properties->>''distance'')::int as distance ' || 
+	' into tmp '||
+	' FROM '|| tablename ||' ';
+
+	create table shortestpath_ans(src text,des text,path text,distance numeric);
+	for rec in (
+	WITH RECURSIVE t (src, des, distance, path) AS 
+	(SELECT 
+	  a.src,a.des,cast(a.distance as numeric),
+	  CAST(CONCAT(a.src, ' -> ', a.des) AS text) AS path 
+	FROM
+	  tmp a 
+	WHERE cast(a.src  as text)= ssp 
+	UNION ALL 
+	SELECT 
+	  t.src,
+	  b.des,
+	  cast(t.distance as numeric) + cast(b.distance as numeric),
+	  CAST(
+		CONCAT(t.path, ' -> ', b.des) AS text
+	  ) AS path 
+	FROM
+	  t 
+	  INNER JOIN tmp b 
+		ON b.src = t.des),
+	t1 AS 
+	(SELECT 
+	  *,
+	  row_number () over (
+		PARTITION BY t.src,
+		t.des 
+		ORDER BY t.distance
+		) AS rn 
+	FROM
+	  t)
+
+	SELECT t1.src,t1.des,t1.path,t1.distance FROM t1 WHERE rn = 1 and cast(t1.des as text)=eep) loop
+		src:=rec.src;
+		des:=rec.des;
+		path:=rec.path;
+		distance:=rec.distance;
+		
+		insert into shortestpath_ans values(src,des,path,rec.distance);
+		
+		RETURN NEXT;
+		END LOOP;
+	
+	DROP TABLE IF EXISTS tmp;
+	RETURN;
+END;
+
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION calbfs(in edgetable text,in parent text,out src text,out level numeric) RETURNS SETOF RECORD AS $$
+DECLARE
+	rec record;
+BEGIN
+    DROP TABLE IF EXISTS tmp;
+	DROP TABLE IF EXISTS bfs_ans;
+	EXECUTE 'SELECT start as src,"end" as des ' || 
+	' into tmp '||
+	' FROM '|| edgetable ||' ';
+	insert into tmp values(null,cast(parent as graphid));
+	CREATE TABLE bfs_ans AS (
+	with recursive bfs as
+	(
+		select des,1 as layer
+		from tmp
+		where des=cast(parent as graphid)
+		union all
+		select e.des,layer+1	
+		from tmp e,bfs b
+		where e.src=b.des
+	)
+	select distinct des,layer from bfs order by layer);
+	DROP TABLE IF EXISTS tmp;
+	for rec in (select * from bfs_ans) loop
+		src := rec.des;
+		level := rec.layer;
+		RETURN NEXT;
+		END LOOP;
+		
+        RETURN;
+	END;
+
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION caldegree(in dist_table text,out node text,out degreeval numeric) RETURNS SETOF RECORD AS $$
+	DECLARE 
+		rec record;
+	BEGIN
+		DROP TABLE IF EXISTS tmp;
+		DROP TABLE IF EXISTS degree_ans;
+		EXECUTE format('CREATE TABLE tmp AS (select src as node from %I union select des as node from %I)',dist_table,dist_table);
+		EXECUTE format('create table degree_ans as(
+		select 
+		distinct tmp.node, 
+		(select sum(value) from %I where(src = tmp.node or des = tmp.node)) as degree 
+		from %I ,tmp)',dist_table,dist_table);
+		DROP TABLE IF EXISTS tmp;
+		for rec in (select degree_ans.node,degree_ans.degree from degree_ans) loop
+			node := rec.node;
+			degreeval := rec.degree;
+			RETURN NEXT;
+		END LOOP;
+		
+        RETURN;
+	END;
+
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION caldijkstra(edgetable text,nodetable text,startnode text, endnode text)
+  RETURNS TABLE(id text, distance int, path text) AS $$
+DECLARE
+    rowcount int;
+    currentfromnode text;
+    currentestimate int;
+BEGIN
+DROP TABLE IF EXISTS node;
+DROP TABLE IF EXISTS edgeedge;
+DROP TABLE IF EXISTS nodeestimate;
+
+	EXECUTE 'SELECT id as id ' || 
+	' into node '||
+	' FROM '|| nodetable ||' ';    
+
+	EXECUTE 'SELECT start as fromnode,"end" as tonode,1 as weight ' || 
+	' into edgeedge '||
+	' FROM '|| edgetable ||' ';
+
+    CREATE TABLE nodeestimate
+    (
+        id text NOT NULL, 
+        estimate int NOT NULL,
+        predecessor text NULL, 
+        done boolean NOT NULL 
+    ) ;
+
+    INSERT INTO nodeestimate (id, estimate, predecessor, done)
+        SELECT node.id, 999999999, NULL, FALSE FROM node;
+    
+    UPDATE nodeestimate SET estimate = 0 WHERE nodeestimate.id = startnode;
+    GET DIAGNOSTICS rowcount = ROW_COUNT;
+    IF rowcount <> 1 THEN
+        DROP TABLE nodeestimate;
+        RAISE 'Could not set start node';
+        RETURN;
+    END IF;
+
+    LOOP
+        currentfromnode := NULL;
+    
+        SELECT nodeestimate.id, estimate INTO currentfromnode, currentestimate
+	        FROM nodeestimate WHERE done = FALSE AND estimate < 999999999
+	        ORDER BY estimate LIMIT 1;
+
+        IF currentfromnode IS NULL OR currentfromnode = endnode THEN EXIT; END IF;
+
+        UPDATE nodeestimate SET done = TRUE WHERE nodeestimate.id = currentfromnode;
+
+        UPDATE nodeestimate n
+            SET estimate = currentestimate + weight, predecessor = currentfromnode
+            FROM edgeedge AS e
+            WHERE n.id = cast(e.tonode as text) AND n.done = FALSE AND cast(e.fromnode as text)  = currentfromnode AND (currentestimate + e.weight) < n.estimate;
+
+    END LOOP;
+
+    RETURN QUERY WITH RECURSIVE BacktraceCTE(id, distance, path)
+    AS (
+        SELECT n.id, n.estimate, n.id::text
+	    FROM nodeestimate n JOIN node ON n.id = cast(node.id as text)
+	    WHERE n.id = startnode
+		
+        UNION ALL
+		
+        SELECT n.id, n.estimate, cte.path || ',' || n.id::text
+            FROM nodeestimate n JOIN BacktraceCTE cte ON n.predecessor = cte.id
+            JOIN node ON n.id = cast(node.id as text)
+    ) SELECT  cte.id, cte.distance, cte.path FROM BacktraceCTE cte
+        WHERE cte.id = endnode OR endnode IS NULL 
+        ORDER BY cte.id;
+END;
+$$ LANGUAGE plpgsql;

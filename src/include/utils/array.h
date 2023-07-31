@@ -454,6 +454,7 @@ extern Datum array_get_element(Datum arraydatum, int nSubscripts, int *indx,
 	int arraytyplen, int elmlen, bool elmbyval, char elmalign, bool *isNull);
 extern void deconstruct_expanded_array(ExpandedArrayHeader *eah);
 extern Datum makeArrayResultForVLE(ArrayBuildState* astate, MemoryContext rcontext);
+extern Datum array_position(PG_FUNCTION_ARGS);
 #endif
 
 #endif /* ARRAY_H */

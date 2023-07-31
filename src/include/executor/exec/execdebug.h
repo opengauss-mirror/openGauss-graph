@@ -35,6 +35,7 @@
  *		nest loop node by NL_printf() and ENL_printf() in nodeNestloop.c
  * ----------------
 #undef EXEC_NESTLOOPDEBUG
+
  */
 
 /* ----------------
@@ -89,11 +90,12 @@
  *		nest loop vle debugging defines
  * ----------------
  */
+// #define EXEC_NESTLOOPVLEDEBUG 1
 #ifdef EXEC_NESTLOOPVLEDEBUG
 #define NLV_nodeDisplay(l)				nodeDisplay(l)
-#define NLV_printf(s)					printf(s)
-#define NLV1_printf(s, a)				printf(s, a)
-#define ENLV1_printf(message)			printf("ExecNestLoopVLE: %s\n", message)
+#define NLV_printf(s)					fprintf(stderr, s)
+#define NLV1_printf(s, a)				fprintf(stderr, s, a)
+#define ENLV1_printf(message)			fprintf(stderr, "ExecNestLoopVLE: %s\n", message);
 #else
 #define NLV_nodeDisplay(l)
 #define NLV_printf(s)

@@ -146,7 +146,7 @@ ExecNestLoopVLE(NestLoopVLEState *node)
 		 */
 		if (node->nls.nl_NeedNewOuter)
 		{
-			ENL1_printf("getting new outer tuple");
+			ENLV1_printf("getting new outer tuple");
 			outerTupleSlot = ExecProcNode(outerPlan);
 
 			/*
@@ -164,7 +164,7 @@ ExecNestLoopVLE(NestLoopVLEState *node)
                     (node->js.ps.plan)->plan_node_id,
                     getSessionMemoryUsageMB()));
 
-                ENL1_printf("no outer tuple, ending join");
+                ENLV1_printf("no outer tuple, ending join");
                 
 				return NULL;
 			}
@@ -353,6 +353,7 @@ ExecNestLoopVLE(NestLoopVLEState *node)
 					else
 						result = NULL;
 
+					ENLV1_printf("ExecNextContext");
 					ExecNextContext(innerPlan);
 
 					fetchOuterVars(nlv, econtext, outerTupleSlot, innerPlan);

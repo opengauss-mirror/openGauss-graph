@@ -2138,6 +2138,7 @@ void exec_init_poolhandles(void)
  */
 static void exec_simple_query(const char* query_string, MessageType messageType, StringInfo msg = NULL)
 {
+
     CommandDest dest = (CommandDest)t_thrd.postgres_cxt.whereToSendOutput;
     MemoryContext oldcontext;
     MemoryContext OptimizerContext;
@@ -2164,9 +2165,9 @@ static void exec_simple_query(const char* query_string, MessageType messageType,
      */
     char* sql_query_string = NULL;
     char* info_query_string = NULL;
-    extern int base_yydebug;
-    base_yydebug = 1;
-    fprintf(stderr, "\nStarting parse, the query is %s\n", query_string);
+    // extern int base_yydebug;
+    // base_yydebug = 1;
+    // fprintf(stderr, "\nStarting parse, the query is %s\n", query_string);
 
 
 #ifdef ENABLE_DISTRIBUTE_TEST

@@ -7268,22 +7268,16 @@ _copySparqlPageRankStmt(const SparqlPageRankStmt *from)
 {
 	SparqlPageRankStmt *newnode = makeNode(SparqlPageRankStmt);
 	COPY_STRING_FIELD(algoName);
-	COPY_NODE_FIELD(pagerankList);
-	COPY_STRING_FIELD(dampingFactor);
-	COPY_STRING_FIELD(maxIter);
-	COPY_STRING_FIELD(threshold);
+	COPY_STRING_FIELD(edgetable);
 	return newnode;
 }
 
-static SparqlPageRankList *
-_copySparqlPageRankListStmt(const SparqlPageRankList *from)
+static SparqlDegreeStmt *
+_copySparqlDegreeStmt(const SparqlDegreeStmt *from)
 {
-	SparqlPageRankList *newnode = makeNode(SparqlPageRankList);
-	COPY_STRING_FIELD(vertexTable);
-	COPY_STRING_FIELD(vertex_id);
-	COPY_STRING_FIELD(edge_table);
-	COPY_STRING_FIELD(edge_args);
-	COPY_STRING_FIELD(out_table);
+	SparqlDegreeStmt *newnode = makeNode(SparqlDegreeStmt);
+	COPY_STRING_FIELD(algoName);
+	COPY_STRING_FIELD(edgetable);
 	return newnode;
 }
 
@@ -7304,8 +7298,44 @@ _copySparqlSelectStmt(const SparqlSelectStmt *from)
 	COPY_NODE_FIELD(targetList);
 	COPY_NODE_FIELD(fromClause);
 	COPY_NODE_FIELD(whereClause);
+    COPY_NODE_FIELD(solutionModifierClause);
 	return newnode;
 }
+
+static SparqlSolutionModifierStmt *
+_copySparqlSolutionModifierStmt(const SparqlSolutionModifierStmt *from)
+{
+	SparqlSolutionModifierStmt *newnode = makeNode(SparqlSolutionModifierStmt);
+	COPY_NODE_FIELD(limitOffsetClause);
+	return newnode;
+}
+
+static SparqlLimitOffsetStmt *
+_copySparqlLimitOffsetStmt(const SparqlLimitOffsetStmt *from)
+{
+	SparqlLimitOffsetStmt *newnode = makeNode(SparqlLimitOffsetStmt);
+	COPY_NODE_FIELD(limitClause);
+    COPY_NODE_FIELD(offsetClause);
+	return newnode;
+}
+
+static SparqlLimitClause *
+_copySparqlLimitClause(const SparqlLimitClause *from)
+{
+	SparqlLimitClause *newnode = makeNode(SparqlLimitClause);
+	COPY_SCALAR_FIELD(number);
+	return newnode;
+}
+
+static SparqlOffsetClause *
+_copySparqlOffsetClause(const SparqlOffsetClause *from)
+{
+	SparqlOffsetClause *newnode = makeNode(SparqlOffsetClause);
+	COPY_SCALAR_FIELD(number);
+	return newnode;
+}
+
+
 
 static SparqlWhere *
 _copySparqlWhereStmt(const SparqlWhere *from)
@@ -8796,6 +8826,18 @@ void* copyObject(const void* from)
         case T_SparqlSelectStmt:
             retval = _copySparqlSelectStmt((SparqlSelectStmt*)from);
             break;
+        case T_SparqlSolutionModifierStmt:
+            retval = _copySparqlSolutionModifierStmt((SparqlSolutionModifierStmt*)from);
+            break;
+        case T_SparqlLimitOffsetStmt:
+            retval = _copySparqlLimitOffsetStmt((SparqlLimitOffsetStmt*)from);
+            break;
+        case T_SparqlLimitClause:
+            retval = _copySparqlLimitClause((SparqlLimitClause*)from);
+            break;
+        case T_SparqlOffsetClause:
+            retval = _copySparqlOffsetClause((SparqlOffsetClause*)from);
+            break;
         case T_SparqlWhere:
             retval = _copySparqlWhereStmt((SparqlWhere*)from);
             break;
@@ -8831,9 +8873,6 @@ void* copyObject(const void* from)
             break;
         case T_SparqlPageRankStmt:
             retval = _copySparqlPageRankStmt((SparqlPageRankStmt*)from);
-            break;
-        case T_SparqlPageRankList:
-            retval = _copySparqlPageRankListStmt((SparqlPageRankList*) from);
             break;
         case T_SparqlTextSearch:
             retval = _copySparqlTextSearch((SparqlTextSearch*)from);

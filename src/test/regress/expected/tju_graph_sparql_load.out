@@ -20,182 +20,86 @@ options
  );
 SPARQL LOAD lubm_profile_regress;
 NOTICE:  merging column "id" with inherited definition
-CONTEXT:  SQL statement "CREATE VLABEL "publication""
 NOTICE:  merging column "properties" with inherited definition
-CONTEXT:  SQL statement "CREATE VLABEL "publication""
 NOTICE:  CREATE TABLE / PRIMARY KEY will create implicit index "publication_pkey" for table "publication"
-CONTEXT:  SQL statement "CREATE VLABEL "publication""
 NOTICE:  merging column "id" with inherited definition
-CONTEXT:  SQL statement "CREATE ELABEL "publicationauthor""
 NOTICE:  merging column "start" with inherited definition
-CONTEXT:  SQL statement "CREATE ELABEL "publicationauthor""
 NOTICE:  merging column "end" with inherited definition
-CONTEXT:  SQL statement "CREATE ELABEL "publicationauthor""
 NOTICE:  merging column "properties" with inherited definition
-CONTEXT:  SQL statement "CREATE ELABEL "publicationauthor""
 NOTICE:  merging column "id" with inherited definition
-CONTEXT:  SQL statement "CREATE VLABEL "assistantprofessor""
 NOTICE:  merging column "properties" with inherited definition
-CONTEXT:  SQL statement "CREATE VLABEL "assistantprofessor""
 NOTICE:  CREATE TABLE / PRIMARY KEY will create implicit index "assistantprofessor_pkey" for table "assistantprofessor"
-CONTEXT:  SQL statement "CREATE VLABEL "assistantprofessor""
 NOTICE:  merging column "id" with inherited definition
-CONTEXT:  SQL statement "CREATE ELABEL "doctoraldegreefrom""
 NOTICE:  merging column "start" with inherited definition
-CONTEXT:  SQL statement "CREATE ELABEL "doctoraldegreefrom""
 NOTICE:  merging column "end" with inherited definition
-CONTEXT:  SQL statement "CREATE ELABEL "doctoraldegreefrom""
 NOTICE:  merging column "properties" with inherited definition
-CONTEXT:  SQL statement "CREATE ELABEL "doctoraldegreefrom""
 NOTICE:  merging column "id" with inherited definition
-CONTEXT:  SQL statement "CREATE ELABEL "mastersdegreefrom""
 NOTICE:  merging column "start" with inherited definition
-CONTEXT:  SQL statement "CREATE ELABEL "mastersdegreefrom""
 NOTICE:  merging column "end" with inherited definition
-CONTEXT:  SQL statement "CREATE ELABEL "mastersdegreefrom""
 NOTICE:  merging column "properties" with inherited definition
-CONTEXT:  SQL statement "CREATE ELABEL "mastersdegreefrom""
 NOTICE:  merging column "id" with inherited definition
-CONTEXT:  SQL statement "CREATE ELABEL "teacherof""
 NOTICE:  merging column "start" with inherited definition
-CONTEXT:  SQL statement "CREATE ELABEL "teacherof""
 NOTICE:  merging column "end" with inherited definition
-CONTEXT:  SQL statement "CREATE ELABEL "teacherof""
 NOTICE:  merging column "properties" with inherited definition
-CONTEXT:  SQL statement "CREATE ELABEL "teacherof""
 NOTICE:  merging column "id" with inherited definition
-CONTEXT:  SQL statement "CREATE ELABEL "undergraduatedegreefrom""
 NOTICE:  merging column "start" with inherited definition
-CONTEXT:  SQL statement "CREATE ELABEL "undergraduatedegreefrom""
 NOTICE:  merging column "end" with inherited definition
-CONTEXT:  SQL statement "CREATE ELABEL "undergraduatedegreefrom""
 NOTICE:  merging column "properties" with inherited definition
-CONTEXT:  SQL statement "CREATE ELABEL "undergraduatedegreefrom""
 NOTICE:  merging column "id" with inherited definition
-CONTEXT:  SQL statement "CREATE ELABEL "worksfor""
 NOTICE:  merging column "start" with inherited definition
-CONTEXT:  SQL statement "CREATE ELABEL "worksfor""
 NOTICE:  merging column "end" with inherited definition
-CONTEXT:  SQL statement "CREATE ELABEL "worksfor""
 NOTICE:  merging column "properties" with inherited definition
-CONTEXT:  SQL statement "CREATE ELABEL "worksfor""
 NOTICE:  merging column "id" with inherited definition
-CONTEXT:  SQL statement "CREATE VLABEL "associateprofessor""
 NOTICE:  merging column "properties" with inherited definition
-CONTEXT:  SQL statement "CREATE VLABEL "associateprofessor""
 NOTICE:  CREATE TABLE / PRIMARY KEY will create implicit index "associateprofessor_pkey" for table "associateprofessor"
-CONTEXT:  SQL statement "CREATE VLABEL "associateprofessor""
 NOTICE:  merging column "id" with inherited definition
-CONTEXT:  SQL statement "CREATE VLABEL "course""
 NOTICE:  merging column "properties" with inherited definition
-CONTEXT:  SQL statement "CREATE VLABEL "course""
 NOTICE:  CREATE TABLE / PRIMARY KEY will create implicit index "course_pkey" for table "course"
-CONTEXT:  SQL statement "CREATE VLABEL "course""
 NOTICE:  merging column "id" with inherited definition
-CONTEXT:  SQL statement "CREATE VLABEL "fullprofessor""
 NOTICE:  merging column "properties" with inherited definition
-CONTEXT:  SQL statement "CREATE VLABEL "fullprofessor""
 NOTICE:  CREATE TABLE / PRIMARY KEY will create implicit index "fullprofessor_pkey" for table "fullprofessor"
-CONTEXT:  SQL statement "CREATE VLABEL "fullprofessor""
 NOTICE:  merging column "id" with inherited definition
-CONTEXT:  SQL statement "CREATE ELABEL "headof""
 NOTICE:  merging column "start" with inherited definition
-CONTEXT:  SQL statement "CREATE ELABEL "headof""
 NOTICE:  merging column "end" with inherited definition
-CONTEXT:  SQL statement "CREATE ELABEL "headof""
 NOTICE:  merging column "properties" with inherited definition
-CONTEXT:  SQL statement "CREATE ELABEL "headof""
 NOTICE:  merging column "id" with inherited definition
-CONTEXT:  SQL statement "CREATE VLABEL "graduatecourse""
 NOTICE:  merging column "properties" with inherited definition
-CONTEXT:  SQL statement "CREATE VLABEL "graduatecourse""
 NOTICE:  CREATE TABLE / PRIMARY KEY will create implicit index "graduatecourse_pkey" for table "graduatecourse"
-CONTEXT:  SQL statement "CREATE VLABEL "graduatecourse""
 NOTICE:  merging column "id" with inherited definition
-CONTEXT:  SQL statement "CREATE VLABEL "graduatestudent""
 NOTICE:  merging column "properties" with inherited definition
-CONTEXT:  SQL statement "CREATE VLABEL "graduatestudent""
 NOTICE:  CREATE TABLE / PRIMARY KEY will create implicit index "graduatestudent_pkey" for table "graduatestudent"
-CONTEXT:  SQL statement "CREATE VLABEL "graduatestudent""
 NOTICE:  merging column "id" with inherited definition
-CONTEXT:  SQL statement "CREATE VLABEL "researchassistant""
-NOTICE:  merging column "properties" with inherited definition
-CONTEXT:  SQL statement "CREATE VLABEL "researchassistant""
-NOTICE:  CREATE TABLE / PRIMARY KEY will create implicit index "researchassistant_pkey" for table "researchassistant"
-CONTEXT:  SQL statement "CREATE VLABEL "researchassistant""
-NOTICE:  merging column "id" with inherited definition
-CONTEXT:  SQL statement "CREATE ELABEL "advisor""
 NOTICE:  merging column "start" with inherited definition
-CONTEXT:  SQL statement "CREATE ELABEL "advisor""
 NOTICE:  merging column "end" with inherited definition
-CONTEXT:  SQL statement "CREATE ELABEL "advisor""
 NOTICE:  merging column "properties" with inherited definition
-CONTEXT:  SQL statement "CREATE ELABEL "advisor""
 NOTICE:  merging column "id" with inherited definition
-CONTEXT:  SQL statement "CREATE ELABEL "memberof""
 NOTICE:  merging column "start" with inherited definition
-CONTEXT:  SQL statement "CREATE ELABEL "memberof""
 NOTICE:  merging column "end" with inherited definition
-CONTEXT:  SQL statement "CREATE ELABEL "memberof""
 NOTICE:  merging column "properties" with inherited definition
-CONTEXT:  SQL statement "CREATE ELABEL "memberof""
 NOTICE:  merging column "id" with inherited definition
-CONTEXT:  SQL statement "CREATE ELABEL "takescourse""
 NOTICE:  merging column "start" with inherited definition
-CONTEXT:  SQL statement "CREATE ELABEL "takescourse""
 NOTICE:  merging column "end" with inherited definition
-CONTEXT:  SQL statement "CREATE ELABEL "takescourse""
 NOTICE:  merging column "properties" with inherited definition
-CONTEXT:  SQL statement "CREATE ELABEL "takescourse""
 NOTICE:  merging column "id" with inherited definition
-CONTEXT:  SQL statement "CREATE VLABEL "teachingassistant""
-NOTICE:  merging column "properties" with inherited definition
-CONTEXT:  SQL statement "CREATE VLABEL "teachingassistant""
-NOTICE:  CREATE TABLE / PRIMARY KEY will create implicit index "teachingassistant_pkey" for table "teachingassistant"
-CONTEXT:  SQL statement "CREATE VLABEL "teachingassistant""
-NOTICE:  merging column "id" with inherited definition
-CONTEXT:  SQL statement "CREATE ELABEL "teachingassistantof""
 NOTICE:  merging column "start" with inherited definition
-CONTEXT:  SQL statement "CREATE ELABEL "teachingassistantof""
 NOTICE:  merging column "end" with inherited definition
-CONTEXT:  SQL statement "CREATE ELABEL "teachingassistantof""
 NOTICE:  merging column "properties" with inherited definition
-CONTEXT:  SQL statement "CREATE ELABEL "teachingassistantof""
 NOTICE:  merging column "id" with inherited definition
-CONTEXT:  SQL statement "CREATE VLABEL "lecturer""
 NOTICE:  merging column "properties" with inherited definition
-CONTEXT:  SQL statement "CREATE VLABEL "lecturer""
 NOTICE:  CREATE TABLE / PRIMARY KEY will create implicit index "lecturer_pkey" for table "lecturer"
-CONTEXT:  SQL statement "CREATE VLABEL "lecturer""
 NOTICE:  merging column "id" with inherited definition
-CONTEXT:  SQL statement "CREATE VLABEL "researchgroup""
 NOTICE:  merging column "properties" with inherited definition
-CONTEXT:  SQL statement "CREATE VLABEL "researchgroup""
 NOTICE:  CREATE TABLE / PRIMARY KEY will create implicit index "researchgroup_pkey" for table "researchgroup"
-CONTEXT:  SQL statement "CREATE VLABEL "researchgroup""
 NOTICE:  merging column "id" with inherited definition
-CONTEXT:  SQL statement "CREATE ELABEL "suborganizationof""
 NOTICE:  merging column "start" with inherited definition
-CONTEXT:  SQL statement "CREATE ELABEL "suborganizationof""
 NOTICE:  merging column "end" with inherited definition
-CONTEXT:  SQL statement "CREATE ELABEL "suborganizationof""
 NOTICE:  merging column "properties" with inherited definition
-CONTEXT:  SQL statement "CREATE ELABEL "suborganizationof""
 NOTICE:  merging column "id" with inherited definition
-CONTEXT:  SQL statement "CREATE VLABEL "undergraduatestudent""
 NOTICE:  merging column "properties" with inherited definition
-CONTEXT:  SQL statement "CREATE VLABEL "undergraduatestudent""
 NOTICE:  CREATE TABLE / PRIMARY KEY will create implicit index "undergraduatestudent_pkey" for table "undergraduatestudent"
-CONTEXT:  SQL statement "CREATE VLABEL "undergraduatestudent""
 NOTICE:  merging column "id" with inherited definition
-CONTEXT:  SQL statement "CREATE VLABEL "department""
 NOTICE:  merging column "properties" with inherited definition
-CONTEXT:  SQL statement "CREATE VLABEL "department""
 NOTICE:  CREATE TABLE / PRIMARY KEY will create implicit index "department_pkey" for table "department"
-CONTEXT:  SQL statement "CREATE VLABEL "department""
 NOTICE:  merging column "id" with inherited definition
-CONTEXT:  SQL statement "CREATE VLABEL "university""
 NOTICE:  merging column "properties" with inherited definition
-CONTEXT:  SQL statement "CREATE VLABEL "university""
 NOTICE:  CREATE TABLE / PRIMARY KEY will create implicit index "university_pkey" for table "university"
-CONTEXT:  SQL statement "CREATE VLABEL "university""

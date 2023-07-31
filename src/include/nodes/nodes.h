@@ -820,7 +820,9 @@ typedef enum NodeTag {
     T_CypherMapExpr,
     T_CypherMapState,
     T_CypherListExpr,
+    T_CypherListExprState,
     T_CypherListCompExpr,
+    T_CypherListCompExprState,
     T_CypherListCompVar,
     T_CypherAccessExpr,
     T_CypherAccessState,
@@ -848,6 +850,10 @@ typedef enum NodeTag {
     /*
 	 * TAGS FOR SPARQL
 	 */
+    T_SparqlAlgoStmt,
+    T_SparqlBfsStmt,
+    T_SparqlDegreeStmt,
+    T_SparqlShortestPathStmt,
     T_SparqlStmt,
     T_SparqlLoadStmt,
 	T_SparqlSelectStmt,
@@ -863,7 +869,6 @@ typedef enum NodeTag {
 	T_SparqlPathAnd,
 	T_SparqlPathEl,
 	T_SparqlPageRankStmt,
-	T_SparqlPageRankList,
     T_SparqlPrefixClause, /* for spar_prefix_clause (keyword:PREFIX) */
     T_SparqlIri, /*for spar_iriref & spar_qname (keyword:PREFIX) */
 	T_Triple,
@@ -874,7 +879,11 @@ typedef enum NodeTag {
     T_SparqlQuadTriple,
     T_SparqlQuadPreObj,
     T_SparqlTriplesNode,
-    T_SparqlDeleteDataStmt
+    T_SparqlDeleteDataStmt,
+    T_SparqlSolutionModifierStmt,
+    T_SparqlLimitOffsetStmt,
+    T_SparqlLimitClause,
+    T_SparqlOffsetClause
 } NodeTag;
 
 /* if you add to NodeTag also need to add nodeTagToString */
@@ -1031,7 +1040,7 @@ typedef enum CmdType {
     CMD_GRAPHWRITE,	 /* graph write query */
     CMD_SPARQLLOAD,  /* sparql load */
 #endif /* GS_GRAPH */
-} CmdType;
+}  CmdType;
 
 /*
  * JoinType -

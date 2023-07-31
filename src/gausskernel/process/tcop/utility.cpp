@@ -9149,6 +9149,21 @@ const char* CreateCommandTag(Node* parse_tree)
             case T_SparqlSelectStmt:
                 tag = "SPARQL SELECT";
                 break;
+            case T_SparqlPageRankStmt:
+			    tag = "SPARQL ALGO PAGERANK";
+			    break;
+            case T_SparqlDegreeStmt:
+			    tag = "SPARQL ALGOD DEGREE";
+			    break;
+            case T_SparqlBfsStmt:
+			    tag = "SPARQL ALGOB BREATHFS";
+			    break;
+            case T_SparqlShortestPathStmt:
+			    tag = "SPARQL ALGOS SHORTESTPATH";
+			    break;
+            case T_SparqlAlgoStmt:
+			    tag = "SPARQL ALGO";
+			    break;
             case T_SparqlLoadStmt:
                 tag = "SPARQL LOAD";
                 break;

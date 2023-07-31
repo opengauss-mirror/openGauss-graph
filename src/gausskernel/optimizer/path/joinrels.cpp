@@ -562,7 +562,7 @@ RelOptInfo* make_join_rel(PlannerInfo* root, RelOptInfo* rel1, RelOptInfo* rel2)
     joinrelids = bms_union(rel1->relids, rel2->relids);
 
     /* Check validity and determine join type. */
-    if (!join_is_legal(root, rel1, rel2, joinrelids, &sjinfo, &reversed)) {   // ����һ���п����� sjinfo ��Ϊ�ǿ�
+    if (!join_is_legal(root, rel1, rel2, joinrelids, &sjinfo, &reversed)) {
         /* invalid join path */
         bms_free_ext(joinrelids);
         return NULL;
