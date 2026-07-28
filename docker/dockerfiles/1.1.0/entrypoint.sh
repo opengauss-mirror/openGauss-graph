@@ -214,16 +214,6 @@ EOSQL
 }
 
 
-docker_setup_rep_user() {
-        if [ -n "$SERVER_MODE" ] && [ "$SERVER_MODE" = "primary" ]; then
-                GS_DB= docker_process_sql --dbname postgres --set passwd="RepUser@2020" --set user="repuser" <<-'EOSQL'
-                        create user :"user" SYSADMIN REPLICATION password :"passwd" ;
-EOSQL
-        else
-                echo " default no repuser created"
-        fi
-}
-
 # Loads various settings that are used elsewhere in the script
 # This should be called before any other functions
 docker_setup_env() {
@@ -252,9 +242,6 @@ opengauss_setup_hba_conf() {
                 fi
                 echo "host all all 0.0.0.0/0 $GS_HOST_AUTH_METHOD"
                 echo "host replication gaussdb 0.0.0.0/0 md5"
-                if [ -n "$SERVER_MODE" ]; then
-                    echo "host replication repuser $OG_SUBNET trust"
-                fi
         } >> "$PGDATA/pg_hba.conf"
 }
 
@@ -398,7 +385,6 @@ _main() {
                         if [ -z "$SERVER_MODE" ] || [ "$SERVER_MODE" = "primary" ]; then
                         docker_setup_db
                         docker_setup_user
-                        docker_setup_rep_user
 #                        docker_setup_slot
                         docker_process_init_files /docker-entrypoint-initdb.d/*
                         fi
